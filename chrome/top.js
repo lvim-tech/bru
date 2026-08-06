@@ -79,7 +79,14 @@
       var tab = tabs[i] || {};
 
       var el = document.createElement("div");
-      el.className = "tab " + (tab.active ? "active " : "") + loadClass(tab);
+      // `pinned` is src/session.rs's addition; chrome.css already had colours
+      // for it (--tabs-pinned-*) and drew nothing, because nothing set the
+      // class.
+      el.className =
+        "tab " +
+        (tab.active ? "active " : "") +
+        (tab.pinned ? "pinned " : "") +
+        loadClass(tab);
       el.title = tab.url || "";
       // The one place a pointer is worth having in a keyboard-driven browser:
       // the strip is the only chrome a mouse naturally goes for. The index is
@@ -99,7 +106,11 @@
 
       var title = document.createElement("span");
       title.className = "title";
-      title.textContent = tab.title || tab.url || "";
+      // qutebrowser puts the mute marker in the title, not in a colour:
+      // tabs.title.format is "{audio}{index}: {current_title}" and {audio} is
+      // "[M] " when muted (tabwidget.py:40). Same string here, so a muted tab
+      // reads the same in both browsers and needs no stylesheet of its own.
+      title.textContent = (tab.muted ? "[M] " : "") + (tab.title || tab.url || "");
       el.appendChild(title);
 
       host.appendChild(el);
@@ -108,10 +119,6 @@
 
   window.bru = {
     // state = {tabs: [{title, url, active, pinned, muted}, ...]}
-    render: function (state) {
-      var host = document.getElementById("tabs");
-      if (!host) {
-    // state = {tabs: [{title, url, active}, ...]}
     render: function (pushed) {
       state = pushed || { tabs: [] };
       draw();
@@ -123,44 +130,6 @@
     favicon: function (key, dataUrl) {
       if (!key || !dataUrl) {
         return;
-      }
-      var tabs = (state && state.tabs) || [];
-
-      // textContent, not innerHTML: #tabs:empty is a real selector and a
-      // whitespace text node would defeat it.
-      host.textContent = "";
-
-      for (var i = 0; i < tabs.length; i++) {
-        var tab = tabs[i] || {};
-
-        var el = document.createElement("div");
-        // `pinned` is src/session.rs's addition; chrome.css already had colours for it
-        // (--tabs-pinned-*) and drew nothing, because nothing set the class.
-        el.className =
-          "tab " +
-          (tab.active ? "active " : "") +
-          (tab.pinned ? "pinned " : "") +
-          loadClass(tab);
-        el.title = tab.url || "";
-        // The one place a pointer is worth having in a keyboard-driven browser:
-        // the strip is the only chrome a mouse naturally goes for. The index is
-        // the strip's own order, which is what BruState calls a tab index.
-        el.dataset.index = String(i);
-
-        var favicon = document.createElement("span");
-        favicon.className = "favicon";
-        el.appendChild(favicon);
-
-        var title = document.createElement("span");
-        title.className = "title";
-        // qutebrowser puts the mute marker in the title, not in a colour:
-        // tabs.title.format is "{audio}{index}: {current_title}" and {audio} is
-        // "[M] " when muted (tabwidget.py:40). Same string here, so a muted tab
-        // reads the same in both browsers and needs no stylesheet of its own.
-        title.textContent = (tab.muted ? "[M] " : "") + (tab.title || tab.url || "");
-        el.appendChild(title);
-
-        host.appendChild(el);
       }
       icons[key] = dataUrl;
       draw();

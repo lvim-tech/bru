@@ -36,7 +36,12 @@ body {
        is a table, and columns that do not line up read as a bug. */
     font-family: monospace;
     font-size: 13px;
-    line-height: 1;
+    /* Not 1. At line-height 1 the line box is exactly the font size, which is
+       smaller than the font's own ascent + descent, so the glyphs overflow it
+       and sit low — flexbox centres the *box*, and the box is not where the
+       ink is. 1.4 is a little over what this face reports, which puts the ink
+       in the middle of the box that gets centred. */
+    line-height: 1.4;
     /* Chrome is never scrolled or selected; only the page is. */
     overflow: hidden;
     user-select: none;
@@ -44,7 +49,7 @@ body {
 }
 
 :root {
-    --tab-h: 28px;
+    --tab-h: 40px;
     --bar-h: 24px;
     --row-h: 20px;
     --completion-max-h: 300px;
@@ -63,6 +68,11 @@ body {
 
 body[data-view="top"] {
     height: var(--tab-h);
+    /* The border is inside the height, not added to it. Without this the
+       document is one pixel taller than the view CEF gave it, the last row is
+       clipped, and every tab's text sits a pixel high — which reads as "not
+       centred" rather than as "clipped". */
+    box-sizing: border-box;
     background: var(--tabs-bar-bg);
     border-bottom: 1px solid var(--tabs-bar-border);
 }
@@ -71,11 +81,20 @@ body[data-view="top"] {
     display: flex;
     height: 100%;
     align-items: stretch;
+    /* Breathing room at the window's edge. qutebrowser's strip runs edge to
+       edge because Qt draws the tab shapes themselves; here a tab is a plain
+       box, and a box touching the frame reads as unfinished. */
+    padding: 4px var(--pad-x) 0;
+    gap: 2px;
+    box-sizing: border-box;
 }
 
 #tabs .tab {
     display: flex;
+    /* Both axes: the row is taller than the text now, so centring is what puts
+       the title on the middle line instead of against the top edge. */
     align-items: center;
+    justify-content: flex-start;
     gap: 6px;
     min-width: 0;
     max-width: 240px;
@@ -84,8 +103,12 @@ body[data-view="top"] {
     color: var(--tabs-even-fg);
     background: var(--tabs-even-bg);
     /* The indicator is qutebrowser's loading stripe down the tab's leading
-       edge; transparent until a tab is loading. */
-    border-left: 2px solid var(--tabs-indicator-system);
+       edge; transparent until a tab is loading. Drawn as a pseudo-element
+       rather than a border so it can be inset: a border always runs the tab's
+       full height, and a bar welded to both edges reads as a divider between
+       tabs instead of as a mark belonging to one. */
+    position: relative;
+    padding-left: calc(var(--pad-x) + 4px);
 }
 
 #tabs .tab:nth-child(odd) {
@@ -125,16 +148,28 @@ body[data-view="top"] {
     background: var(--tabs-pinned-selected-odd-bg);
 }
 
-#tabs .tab.loading {
-    border-left-color: var(--tabs-indicator-start);
+/* Inset top and bottom, and rounded, so it floats inside the tab. */
+#tabs .tab::before {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 5px;
+    bottom: 5px;
+    width: 2px;
+    border-radius: 1px;
+    background: var(--tabs-indicator-system);
 }
 
-#tabs .tab.loaded {
-    border-left-color: var(--tabs-indicator-stop);
+#tabs .tab.loading::before {
+    background: var(--tabs-indicator-start);
 }
 
-#tabs .tab.error {
-    border-left-color: var(--tabs-indicator-error);
+#tabs .tab.loaded::before {
+    background: var(--tabs-indicator-stop);
+}
+
+#tabs .tab.error::before {
+    background: var(--tabs-indicator-error);
 }
 
 #tabs .favicon {
@@ -147,6 +182,10 @@ body[data-view="top"] {
 }
 
 #tabs .title {
+    /* The row is 40px and the text is 13px; centring is the flex parent's job,
+       and this only has to not fight it. An explicit height would reintroduce
+       exactly the mismatch the line-height above exists to remove. */
+    line-height: 1.4;
     min-width: 0;
     overflow: hidden;
     white-space: nowrap;
