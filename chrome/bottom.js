@@ -6,6 +6,24 @@
 // here, because a key that entered JavaScript would already have cost more than
 // the scrolling this browser was built for.
 //
+// One exception, and it is the command line's. In command mode the letters do
+// reach #cmdline — CEF-NOTES.md trap 11 stays in force for everything else, and
+// Rust decides key by key in cmdline::types_into_cmdline. This file reports what
+// the input holds with three messages and nothing more:
+//
+//   {type:"text-changed", text, cursor}  every edit and every caret move
+//   {type:"accept", text}                Enter, or Rust asking via bru.accept()
+//   {type:"cancel"}                      Escape
+//
+// text-changed is a mirror Rust reads for the completion; it is one IPC hop
+// behind and must never be what a command runs. That is why accept carries the
+// text again: Rust asks, the DOM answers, and the last character typed cannot be
+// lost to a race with the Enter that followed it.
+//
+// Rust's pushes carry cmdline.rev, and the input's value is only overwritten
+// when the revision is new. Without that a status-bar update arriving mid-word —
+// a URL change, a keystring — would rewrite what is being typed.
+//
 // Three things this file owns, because chrome.css depends on them:
 //
 //   - `document.body.className` is `mode-<mode>` and nothing else. That class is
@@ -66,75 +84,104 @@
     return "warn";
   }
 
-  // <span class="col">…</span>, with the matched substring in <span class="match">.
-  // A column is either a plain string or {text, match}.
-  function column(spec) {
-    var el = document.createElement("span");
-    el.className = "col";
-
-    var text = typeof spec === "string" ? spec : (spec && spec.text) || "";
-    var match = typeof spec === "string" ? "" : (spec && spec.match) || "";
-    var at = match ? text.indexOf(match) : -1;
-
-    if (at === -1) {
-      el.textContent = text;
-      return el;
+  // The completion table is completion.js's, not this file's. Stage 1 had a
+  // renderer here that read {text, match} substrings; the contract sends
+  // {cols: [...], match: [[start, len], …]}, and two renderers against two
+  // shapes is one silently drawing the wrong thing. This file no longer knows
+  // what a category looks like.
+  //
+  // Guarded because bottom.html gains its <script src="completion.js"> at merge:
+  // until then the bar still renders, with no completion.
+  function renderCompletion(categories) {
+    if (window.bruCompletion) {
+      window.bruCompletion.render(categories);
     }
-
-    el.appendChild(document.createTextNode(text.slice(0, at)));
-    var hit = document.createElement("span");
-    hit.className = "match";
-    hit.textContent = text.slice(at, at + match.length);
-    el.appendChild(hit);
-    el.appendChild(document.createTextNode(text.slice(at + match.length)));
-    return el;
   }
 
-  // state.completion = [{name, items: [{cols: [...], selected}]}, ...], in
-  // qutebrowser's order: Search engines, Quickmarks, Bookmarks, History.
-  // Nothing pushes this yet — the completion model is a later milestone — but
-  // the clear below runs on every render and is what keeps the bar at 24px.
-  function renderCompletion(categories) {
-    var host = document.getElementById("completion");
-    if (!host) {
+  // --- the command line ---------------------------------------------------
+
+  var cmdline = null;
+  // The last revision Rust said was its own edit, and the last thing reported
+  // back. Both exist to keep the two sides from talking over each other.
+  var appliedRev = -1;
+  var sentText = null;
+  var sentCursor = -1;
+
+  function report() {
+    if (!cmdline) {
       return;
     }
-
-    host.textContent = "";
-    if (!categories || !categories.length) {
+    var text = cmdline.value;
+    var cursor = cmdline.selectionStart;
+    // Arrow keys, Home and End move the caret without changing the text, and
+    // Rust's readline commands need to know where it is. Nothing is sent when
+    // neither moved: this runs on keyup, which is every keystroke.
+    if (text === sentText && cursor === sentCursor) {
       return;
     }
+    sentText = text;
+    sentCursor = cursor;
+    query({ type: "text-changed", text: text, cursor: cursor });
+  }
 
-    for (var c = 0; c < categories.length; c++) {
-      var category = categories[c] || {};
-      var items = category.items || [];
+  // Rust calls this through execute_java_script when <Return> runs
+  // command-accept, and the keydown below calls it if Enter ever reaches the
+  // input directly. Two callers, one message; Rust ignores an accept that
+  // arrives when command mode is already over, so a double one is harmless.
+  function accept() {
+    if (!cmdline) {
+      return;
+    }
+    query({ type: "accept", text: cmdline.value });
+  }
 
-      var el = document.createElement("div");
-      el.className = "category";
+  function cancel() {
+    query({ type: "cancel" });
+  }
 
-      var header = document.createElement("div");
-      header.className = "cat-header";
-      header.textContent = category.name || "";
-      el.appendChild(header);
+  function renderCmdline(spec) {
+    if (!cmdline) {
+      return;
+    }
+    spec = spec || {};
+    var text = spec.text || "";
 
-      for (var i = 0; i < items.length; i++) {
-        var item = items[i] || {};
-        var row = document.createElement("div");
-        row.className = item.selected ? "item selected" : "item";
-
-        var cols = item.cols || [];
-        for (var j = 0; j < cols.length; j++) {
-          row.appendChild(column(cols[j]));
-        }
-        el.appendChild(row);
+    // Only an edit Rust made — cmd-set-text, a readline command, a history
+    // recall — carries a revision this side has not applied yet.
+    if (typeof spec.rev === "number" && spec.rev !== appliedRev) {
+      appliedRev = spec.rev;
+      if (cmdline.value !== text) {
+        cmdline.value = text;
       }
-
-      host.appendChild(el);
+      sentText = cmdline.value;
+      sentCursor = -1;
     }
+
+    if (!spec.focus) {
+      if (document.activeElement === cmdline) {
+        cmdline.blur();
+      }
+      return;
+    }
+
+    if (document.activeElement !== cmdline) {
+      cmdline.focus();
+    }
+    var at = typeof spec.cursor === "number" ? spec.cursor : cmdline.value.length;
+    at = Math.max(0, Math.min(at, cmdline.value.length));
+    // Guarded: setSelectionRange on every push would drag the caret back to
+    // wherever Rust last thought it was, one keystroke ago.
+    if (cmdline.selectionStart !== at || cmdline.selectionEnd !== at) {
+      cmdline.setSelectionRange(at, at);
+    }
+    sentCursor = at;
   }
 
   window.bru = {
-    // state = {url, title, mode, keystring, scroll, tabindex}
+    accept: accept,
+    cancel: cancel,
+
+    // state = {url, title, mode, keystring, scroll, tabindex, cmdline}
     render: function (state) {
       state = state || {};
 
@@ -152,6 +199,7 @@
       document.body.className = "mode-" + (state.mode || "normal");
 
       renderCompletion(state.completion);
+      renderCmdline(state.cmdline);
 
       // The title is not a status-line field — the window wears it — but it is
       // pushed with the rest and is what proves the display handler arrived, so
@@ -163,6 +211,23 @@
   function ready() {
     // An attribute, not a class: className belongs to the mode.
     document.body.setAttribute("data-view", VIEW);
+
+    cmdline = document.getElementById("cmdline");
+    if (cmdline) {
+      cmdline.addEventListener("input", report);
+      // Left, Right, Home and End fire no input event, and Rust's readline
+      // commands are wrong by however far the caret moved without it.
+      cmdline.addEventListener("keyup", report);
+      cmdline.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          accept();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancel();
+        }
+      });
+    }
 
     query({ type: "ready", view: VIEW }, function (response) {
       // Rust answers the ready query with the current state, so the bar is

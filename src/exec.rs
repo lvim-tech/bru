@@ -29,6 +29,14 @@ const ZOOM_DEFAULT: u32 = 100;
 /// `browser` is always a tab, never a chrome strip: `keys.rs` redirects a key that landed on a strip
 /// at the showing tab before calling here (CEF-NOTES trap 11).
 pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count: Option<u32>) {
+    // The command line takes its own commands first. `cmd-set-text`, `command-accept` and every
+    // `rl-*` / `command-history-*` binding are handled inside `cmdline.rs` — the last two groups
+    // arrive as `Command::Unimplemented` and are matched there by name, so they never reach the
+    // match below. `false` means it was none of them.
+    if crate::cmdline::run_command(command, count) {
+        return;
+    }
+
     // `3j` is three steps of `j`, not one big one — qutebrowser repeats the command.
     let repeat = count.unwrap_or(1).clamp(1, MAX_COUNT);
 
@@ -241,7 +249,8 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 
         // --- the command line ---------------------------------------------------------------
-        // SLOT: src/cmdline.rs.
+        // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
+        // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
@@ -295,11 +304,15 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::ModeEnter(_) | Command::ModeLeave => true,
 
-        Command::CmdSetText { .. } | Command::CommandAccept { .. } => false,
+        // Claimed by `cmdline.rs` before this match ever runs.
+        Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
 
         Command::Nop | Command::ClearKeychain => true,
 
-        Command::Unimplemented(_) => false,
+        // Almost all of these are still waiting for a milestone — but the readline and history
+        // bindings reach `cmdline.rs` by name rather than as a variant, so it is the only thing
+        // that can say whether one of them does something. Asking is what keeps the count honest.
+        Command::Unimplemented(_) => crate::cmdline::claims(command),
     }
 }
 
@@ -621,10 +634,11 @@ mod tests {
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
         assert_eq!(DEFAULT_BINDINGS.len(), 226);
-        // Stage 2, as each workstream is wired in: 27 before any of it, 70 after the dispatcher,
-        // 76 once `scroll.rs` made `gg`, `G` and the page keys real. Raise this when a milestone
+        // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
+        // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
+        // `cmd-set-text`, `command-accept` and the readline bindings. Raise this when a milestone
         // raises the number, never to make a failing build pass.
-        assert_eq!(live, 76, "the live-binding count moved");
+        assert_eq!(live, 100, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
