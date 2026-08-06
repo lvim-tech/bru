@@ -530,7 +530,20 @@ pub enum TabMove {
 }
 
 impl Command {
-    /// Whether this command (and every link of a chain) does something.
+    /// Whether every link of this command is a `Command` variant rather than an `Unimplemented`.
+    ///
+    /// **`#[cfg(test)]`, and that is the point.** This is not "does pressing it do something", and
+    /// mistaking it for that has now cost three separate people: `command-history-prev` and every
+    /// `rl-*` binding are `Unimplemented` here and act perfectly well, because they reach
+    /// `cmdline.rs` by name rather than as a variant. Asking this question in production code
+    /// undercounted the live bindings by 17 for a whole stage, marked live keys "not yet" on
+    /// `bru://chrome/help`, and made the startup line say 29 where the help page said 13. The
+    /// question production code wants is always [`crate::exec::is_live`]; taking this one out of
+    /// its reach is cheaper than remembering.
+    ///
+    /// It survives because the classification in `exec::tests::split` genuinely wants it: a binding
+    /// that is inert but named is a different thing from one with no command behind the name.
+    #[cfg(test)]
     pub fn is_implemented(&self) -> bool {
         match self {
             Command::Unimplemented(_) => false,

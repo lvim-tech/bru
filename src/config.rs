@@ -415,7 +415,9 @@ impl Bindings {
     /// it would change how partial matches resolve.
     pub fn into_tries(self) -> HashMap<Mode, BindingTrie<Command>> {
         let mut tries: HashMap<Mode, BindingTrie<Command>> = HashMap::new();
-        let mut unimplemented = 0usize;
+        // Two counts, because there are two things a key that does not act can be waiting for, and
+        // one line that conflated them said something false for a whole stage.
+        let (mut waiting, mut refused) = (0usize, 0usize);
 
         let mut modes: Vec<_> = self.per_mode.into_iter().collect();
         modes.sort_by_key(|(mode, _)| *mode);
@@ -428,8 +430,19 @@ impl Bindings {
             for (sequence, command) in bindings {
                 match commands::parse(&command) {
                     Ok(parsed) => {
-                        if !parsed.is_implemented() {
-                            unimplemented += 1;
+                        // `exec::is_live`, never `is_implemented`. A binding is live if pressing it
+                        // does something and nothing else is the question: `command-history-prev`
+                        // and every `rl-*` parse to `Unimplemented` and act all the same, because
+                        // they reach `cmdline.rs` by name rather than as a `Command`. Asking the
+                        // parser here made this line report 29 while `bru://chrome/help` — which
+                        // asks the dispatcher — reported 13, and the same mistake once undercounted
+                        // the live-binding total by 17 for a whole stage.
+                        if !crate::exec::is_live(&parsed) {
+                            if crate::exec::refusal(&parsed).is_some() {
+                                refused += 1;
+                            } else {
+                                waiting += 1;
+                            }
                         }
                         trie.insert(&sequence, parsed);
                     }
@@ -441,10 +454,16 @@ impl Bindings {
             }
         }
 
-        if unimplemented > 0 {
+        if waiting > 0 {
             eprintln!(
-                "bru: {unimplemented} bindings name commands that are not implemented yet; \
+                "bru: {waiting} bindings name commands that are not implemented yet; \
                  pressing them will say so rather than do nothing silently"
+            );
+        }
+        if refused > 0 {
+            eprintln!(
+                "bru: {refused} bindings name something CEF 151 cannot do at all; they are not \
+                 waiting for a milestone, and `bru://chrome/help` gives the reason for each"
             );
         }
         tries
