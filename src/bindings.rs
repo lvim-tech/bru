@@ -733,6 +733,31 @@ impl KeyParser {
         self.count.clear();
     }
 
+    /// Take the pending chain and count out, leaving the parser empty.
+    ///
+    /// **This exists so that the chain can be per window while the table stays per process.** A
+    /// `BindingTrie` is a few hundred nodes and there is no reason to build one per window; a
+    /// half-typed `g` is a fact about one window and there is every reason not to share it. So
+    /// `BruState::handle_key` swaps this window's pair in before the key and takes it back out
+    /// after — see there. Two moves of a `Vec` and a `String`, which is six words and no
+    /// allocation: the buffers travel by pointer and are handed straight back.
+    pub fn take_pending(&mut self) -> (Vec<KeyInfo>, String) {
+        (std::mem::take(&mut self.sequence), std::mem::take(&mut self.count))
+    }
+
+    /// Whether anything is half-typed. Cheap enough to ask on the key path, and what lets
+    /// `BruState::handle_key` skip the swap entirely for a key that matches outright — which is
+    /// almost every key, and certainly `j`.
+    pub fn has_pending(&self) -> bool {
+        !self.sequence.is_empty() || !self.count.is_empty()
+    }
+
+    /// Put a pending chain and count back. The other half of [`KeyParser::take_pending`].
+    pub fn set_pending(&mut self, sequence: Vec<KeyInfo>, count: String) {
+        self.sequence = sequence;
+        self.count = count;
+    }
+
     /// Handle one keypress. Port of `BaseKeyParser.handle` plus the filtering tail of
     /// `modeman._handle_keypress`.
     pub fn handle(&mut self, info: KeyInfo) -> KeyOutcome {
@@ -850,9 +875,13 @@ impl KeyParsers {
         KeyParsers { parsers }
     }
 
-    /// Feed a key to the parser for `mode`.
+    /// Feed a key to the parser for `mode`, on the parser's own pending chain.
     ///
-    /// This is the whole key path. `src/keys.rs` calls it and does what the outcome says.
+    /// **Not the key path any more.** `BruState::handle_key` reaches `parser_mut` directly, because
+    /// it has to swap the *window's* chain in and out around the call — the tables are one set for
+    /// the process and the half-typed keys are not. This convenience is what the binding tests use,
+    /// and it is exactly right for them: a test has no windows.
+    #[cfg(test)]
     pub fn handle(&mut self, mode: Mode, info: KeyInfo) -> KeyOutcome {
         self.parser_mut(mode).handle(info)
     }

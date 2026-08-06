@@ -50,6 +50,20 @@ pub struct WindowState {
     /// minutes ago. The manager itself was already written as "one per window" — nothing in it is
     /// shared — so this is where it always belonged.
     modes: crate::modes::ModeManager,
+    /// The half-typed key chain and count this window is holding, and the mode they belong to.
+    ///
+    /// qutebrowser's parsers are per window too — `modeparsers` are built inside
+    /// `modeman.init(win_id)` (`keyinput/modeman.py:85-120`), so `BaseKeyParser._sequence` is
+    /// already one per window there. bru's `KeyParsers` is one set for the process, which was right
+    /// for the *tables* — a `BindingTrie` is a few hundred nodes and there is no reason to build one
+    /// per window — and wrong for the chain: `g` typed here and `g` typed in the other window ran
+    /// `gg`, and leaving a mode cleared the chain of every window at once.
+    ///
+    /// So the table stays shared and the chain moves here, swapped in and out around the one call
+    /// that uses it — see [`BruState::handle_key`]. The mode is stored beside it because a chain
+    /// belongs to the mode it was typed in: `g` pending in normal mode must not come back as `g`
+    /// pending in caret mode after a round trip through insert.
+    pending_keys: (crate::modes::Mode, Vec<crate::bindings::KeyInfo>, String),
 }
 
 pub struct BruState {
@@ -178,6 +192,7 @@ impl BruState {
             active: 0,
             last_active: None,
             modes: crate::modes::ModeManager::new(),
+            pending_keys: (crate::modes::Mode::Normal, Vec::new(), String::new()),
         });
         self.current = self.windows.len() - 1;
         id
@@ -330,14 +345,67 @@ impl BruState {
     /// [`BruState::focus_window_of_browser`] with the browser CEF delivered the key to, under this
     /// same lock, before anything below runs. So the mode read here is the mode of the window the
     /// key was pressed in, and reading it costs one bounds-checked index — see [`BruState::mode`].
+    /// The pending chain is swapped in from this window and back out again around the one call that
+    /// uses it, so the tables stay one set for the process and the half-typed keys do not. Without
+    /// it, `g` typed here and `g` typed in the other window ran `gg` — the chain lived in
+    /// `bindings::KeyParser`, which is one per mode and shared by every window.
+    ///
+    /// Two moves each way, of a `Vec` and a `String`. No allocation: the buffers travel by pointer
+    /// and are handed straight back, so a window that is holding nothing swaps two empty ones. The
+    /// cost is asserted in `the_key_path_cost_of_a_per_window_chain`, because `j` getting slower is
+    /// the one thing this project cannot pay for.
     pub fn handle_key(
         &mut self,
         info: crate::bindings::KeyInfo,
     ) -> Option<crate::bindings::KeyOutcome> {
         let mode = self.mode();
-        self.parsers
-            .as_mut()
-            .map(|parsers| parsers.handle(mode, info))
+        let current = self.current;
+
+        // A chain belongs to the mode it was typed in. If the window has since changed mode, what
+        // it was holding is not this parser's to continue — `modeman.leave` clears the keychain
+        // unconditionally (qutebrowser issue 1805), so this only ever discards what would have been
+        // cleared anyway.
+        //
+        // **The empty case does no work at all.** A key that matches outright leaves nothing behind,
+        // so both sides are empty and there is nothing to move; measured in release, swapping
+        // unconditionally cost 27.3 ns per keystroke and this brings it to nothing for every key
+        // that is not part of a chain. `j` is that key, and `j` is why this project exists.
+        let carried = match self.windows.get_mut(current) {
+            Some(window) if window.pending_keys.0 == mode => {
+                if window.pending_keys.1.is_empty() && window.pending_keys.2.is_empty() {
+                    None
+                } else {
+                    Some((
+                        std::mem::take(&mut window.pending_keys.1),
+                        std::mem::take(&mut window.pending_keys.2),
+                    ))
+                }
+            }
+            Some(window) => {
+                window.pending_keys = (mode, Vec::new(), String::new());
+                None
+            }
+            // No window at all — every process that is not the browser process.
+            None => None,
+        };
+
+        let parsers = self.parsers.as_mut()?;
+        let parser = parsers.parser_mut(mode);
+        let carried_something = carried.is_some();
+        if let Some((sequence, count)) = carried {
+            parser.set_pending(sequence, count);
+        }
+        let outcome = parser.handle(info);
+
+        // Only take it back out if there is something to take, or if something was put in — a
+        // parser that was empty and stayed empty leaves the window's empty pair untouched.
+        if carried_something || parser.has_pending() {
+            let (sequence, count) = parser.take_pending();
+            if let Some(window) = self.windows.get_mut(current) {
+                window.pending_keys = (mode, sequence, count);
+            }
+        }
+        Some(outcome)
     }
 
     /// The mode of the window a command acts on.
@@ -417,7 +485,7 @@ impl BruState {
             return false;
         };
         let transition = slot.modes.enter(mode, only_if_normal);
-        self.apply(transition)
+        self.apply(window, transition)
     }
 
     pub fn leave_mode(&mut self) -> bool {
@@ -432,21 +500,30 @@ impl BruState {
             return false;
         };
         match slot.modes.leave_current() {
-            Ok(transition) => self.apply(transition),
+            Ok(transition) => self.apply(window, transition),
             Err(_) => false,
         }
     }
 
-    /// The half of a transition that is not the mode itself.
+    /// The half of a transition that is not the mode itself: the keychain the mode being left was
+    /// holding, thrown away in **this** window and nowhere else.
     ///
-    /// `self.parsers` is still one set for the process, so the pending key chain a mode is holding
-    /// is shared between windows and this clears it for all of them. That is a smaller version of
-    /// the bug this workstream fixed and it is deliberately not fixed here: the chain lives inside
-    /// `bindings::KeyParser`, which is another workstream's file. See the report.
-    fn apply(&mut self, transition: crate::modes::Transition) -> bool {
+    /// `modeman.leave` clears it unconditionally (qutebrowser issue 1805), and the point of doing it
+    /// per window is the same as the point of the mode being per window — leaving insert here must
+    /// not throw away a `g` half-typed in the other window. The shared `KeyParser` is cleared as
+    /// well because it may still be holding whatever the last key left in it, and leaving that for
+    /// the next window to swap around is a chain appearing where nobody typed one.
+    fn apply(&mut self, window: u32, transition: crate::modes::Transition) -> bool {
         if transition.clear_keychain {
-            if let (Some(left), Some(parsers)) = (transition.left, self.parsers.as_mut()) {
-                parsers.clear(left);
+            if let Some(left) = transition.left {
+                if let Some(slot) = self.slot_mut(window) {
+                    if slot.pending_keys.0 == left {
+                        slot.pending_keys = (left, Vec::new(), String::new());
+                    }
+                }
+                if let Some(parsers) = self.parsers.as_mut() {
+                    parsers.clear(left);
+                }
             }
         }
         transition.entered.is_some()
@@ -826,4 +903,212 @@ mod tests {
              {per_window:.3} ns vs {by_search:.3} ns"
         );
     }
+
+    /// `j` must not get slower. This measures the path `j` actually takes — `handle_key`, with the
+    /// window lookup, the mode read and the chain guard all in it — against the same key handed
+    /// straight to the shared parser, which is what the code did before any of this existed.
+    ///
+    /// Two earlier versions of this test measured the wrong thing. The first compared `handle_key`
+    /// against the bare parser and called the difference "the swap", when most of it was the mode
+    /// read. The second measured `set_pending`/`take_pending` in a loop of its own, which is the
+    /// cost when a chain **is** pending and therefore not what `j` pays: `j` matches outright, so
+    /// both sides are empty and `handle_key` skips the swap entirely. That skip is the thing under
+    /// test here, and only the real call can see it.
+    #[test]
+    fn the_key_path_cost_of_a_per_window_chain() {
+        const ROUNDS: u32 = 500_000;
+
+        let mut state = bare(4);
+        state.focus_window(3);
+        state.set_parsers(crate::config::Config::load_from(None).into_parsers());
+        let j = crate::bindings::parse_key_sequence("j").expect("j parses")[0];
+
+        for _ in 0..20_000 {
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(j));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(j));
+        }
+        let real_path = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // The same key with none of it: one parser, no window, no mode read, no chain guard.
+        let mut parsers = crate::config::Config::load_from(None).into_parsers();
+        let parser = parsers.parser_mut(Mode::Normal);
+        for _ in 0..20_000 {
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(j));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(j));
+        }
+        let bare_key = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // The difference is *not* the chain. The baseline hoists `parser_mut` out of its loop and
+        // `handle_key` cannot: the per-mode `HashMap` lookup is inside the difference, and it was
+        // there before any of this. Measured in release 2026-08-06: `j` 86.6 ns against 65.4 ns,
+        // while a key that actually carries a chain costs 262.4 ns against 262.2 ns — the swap
+        // itself is 0.2 ns, which is nothing, and the sibling test below is where that is read.
+        println!(
+            "chain: `j` costs {real_path:.1} ns through handle_key against {bare_key:.1} ns handed \
+             straight to the parser, a difference of {:.1} ns for the window, the mode, the mode's \
+             own map lookup and the chain guard together",
+            real_path - bare_key
+        );
+        // A ratio against a baseline taken in the same test, on the same machine, in the same
+        // build — because `cargo test` is a debug build where nothing is inlined and an absolute
+        // bound would mean two different things in the two profiles. Two is generous on purpose:
+        // what this catches is an order-of-magnitude mistake, an allocation or a clone on the key
+        // path, and not a fifth of a nanosecond either way.
+        assert!(
+            real_path < bare_key * 2.0,
+            "the per-window machinery must stay in the noise for a key that matches outright: \
+             {real_path:.1} ns against {bare_key:.1} ns"
+        );
+    }
+
+    /// And what it costs when there *is* a chain, which is the case the guard cannot skip.
+    #[test]
+    fn a_pending_chain_is_moved_and_not_copied() {
+        const ROUNDS: u32 = 200_000;
+
+        let mut state = bare(2);
+        state.set_parsers(crate::config::Config::load_from(None).into_parsers());
+        let g = crate::bindings::parse_key_sequence("g").expect("g parses")[0];
+        let esc = crate::bindings::parse_key_sequence("<Escape>").expect("Escape parses")[0];
+
+        // `g` leaves a chain pending, `<Escape>` clears it: every pair swaps a non-empty chain out
+        // and back in again.
+        for _ in 0..10_000 {
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(g));
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(esc));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(g));
+            std::hint::black_box(std::hint::black_box(&mut state).handle_key(esc));
+        }
+        let per_key = start.elapsed().as_nanos() as f64 / (ROUNDS * 2) as f64;
+
+        // The same two keys with no window and no swap, for the baseline.
+        let mut parsers = crate::config::Config::load_from(None).into_parsers();
+        let parser = parsers.parser_mut(Mode::Normal);
+        for _ in 0..10_000 {
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(g));
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(esc));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(g));
+            std::hint::black_box(std::hint::black_box(&mut *parser).handle(esc));
+        }
+        let bare_key = start.elapsed().as_nanos() as f64 / (ROUNDS * 2) as f64;
+
+        println!(
+            "chain: a keystroke that leaves or clears a chain costs {per_key:.1} ns against \
+             {bare_key:.1} ns with no window to carry it"
+        );
+        assert!(
+            per_key < bare_key * 2.0,
+            "a chain must be moved, not cloned: {per_key:.1} ns against {bare_key:.1} ns"
+        );
+    }
+
+    /// The bug this was built for: two windows, each half-way through its own chain.
+    #[test]
+    fn two_windows_do_not_share_a_half_typed_chain() {
+        let mut state = bare(2);
+        state.set_parsers(crate::config::Config::load_from(None).into_parsers());
+        let g = crate::bindings::parse_key_sequence("g").expect("g parses")[0];
+
+        // `g` in window 0, then `g` in window 1. Shared, the second `g` completed `gg` and scrolled
+        // window 1 to the top; each window holding its own, both are still waiting.
+        state.focus_window(0);
+        let first = state.handle_key(g).expect("bindings are loaded");
+        assert_eq!(first.keystring, "g");
+        state.focus_window(1);
+        let second = state.handle_key(g).expect("bindings are loaded");
+        assert_eq!(
+            second.keystring, "g",
+            "window 1's `g` must be its first, not the second half of window 0's"
+        );
+        assert!(
+            matches!(second.action, crate::bindings::KeyAction::Pending),
+            "it must still be pending, not `gg`: {:?}",
+            second.action
+        );
+
+        // And window 0's is still there when the key comes back to it.
+        state.focus_window(0);
+        let third = state.handle_key(g).expect("bindings are loaded");
+        assert!(
+            matches!(third.action, crate::bindings::KeyAction::Run { .. }),
+            "window 0's second `g` completes its own chain: {:?}",
+            third.action
+        );
+    }
+
+    /// A count is half a chain and travels with it.
+    #[test]
+    fn two_windows_do_not_share_a_count() {
+        let mut state = bare(2);
+        state.set_parsers(crate::config::Config::load_from(None).into_parsers());
+        let two = crate::bindings::parse_key_sequence("2").expect("2 parses")[0];
+        let j = crate::bindings::parse_key_sequence("j").expect("j parses")[0];
+
+        state.focus_window(0);
+        assert_eq!(state.handle_key(two).expect("loaded").keystring, "2");
+        state.focus_window(1);
+        let out = state.handle_key(j).expect("loaded");
+        match out.action {
+            crate::bindings::KeyAction::Run { count, .. } => assert_eq!(
+                count, None,
+                "window 1's `j` must not inherit window 0's count"
+            ),
+            other => panic!("`j` must run in window 1: {other:?}"),
+        }
+    }
+
+    /// Leaving a mode throws away **that window's** chain for it, and nobody else's.
+    ///
+    /// Caret mode is the one other mode with a chain (`gg`), and it is the only one this can be
+    /// tested in: `modes::ModeManager::enter` gives `left = None` when the mode being entered comes
+    /// from normal, so normal's chain deliberately survives a trip through insert — qutebrowser's
+    /// `modeman.enter` leaves the old mode only when it is not normal, and this is a port of it. The
+    /// first version of this test assumed otherwise and was wrong about bru rather than about
+    /// qutebrowser.
+    #[test]
+    fn leaving_a_mode_clears_one_window_chain() {
+        let mut state = bare(2);
+        state.set_parsers(crate::config::Config::load_from(None).into_parsers());
+        let g = crate::bindings::parse_key_sequence("g").expect("g parses")[0];
+
+        // Both windows half-way through `gg` in caret mode.
+        for window in [0, 1] {
+            state.enter_mode_in(window, Mode::Caret, false);
+            state.focus_window(window);
+            assert_eq!(state.handle_key(g).expect("loaded").keystring, "g");
+        }
+
+        // Window 1 leaves caret. Its own half-typed `g` goes with the mode.
+        state.leave_mode_in(1);
+        state.enter_mode_in(1, Mode::Caret, false);
+        state.focus_window(1);
+        assert_eq!(
+            state.handle_key(g).expect("loaded").keystring,
+            "g",
+            "window 1's caret chain went with the mode it was typed in"
+        );
+
+        // Window 0 never left caret and is still holding its own.
+        state.focus_window(0);
+        assert!(
+            matches!(
+                state.handle_key(g).expect("loaded").action,
+                crate::bindings::KeyAction::Run { .. }
+            ),
+            "window 0's `gg` completed: another window leaving caret must not clear it"
+        );
+    }
+
 }

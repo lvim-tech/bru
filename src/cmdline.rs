@@ -1445,6 +1445,20 @@ fn inject_key(spec: &str) {
         Some(spec) => (true, spec),
         None => (false, spec),
     };
+    // `key:win1:g` aims at the showing tab of window 1. The key then travels the ordinary path, so
+    // `keys.rs` makes that window current from the browser it arrived at and the window's own mode
+    // and pending chain are the ones consulted — which is the only way to drive two windows' key
+    // chains from a script, and the reason this exists.
+    let (at_window, spec) = match spec.strip_prefix("win") {
+        Some(rest) => match rest.split_once(':') {
+            Some((id, rest)) => match id.parse::<u32>() {
+                Ok(id) => (Some(id), rest),
+                Err(_) => (None, spec),
+            },
+            None => (None, spec),
+        },
+        None => (None, spec),
+    };
     // `key:char:x` sends the CHAR alone, at the bottom strip. That is not a press anyone can make —
     // it is the *second half* of one. A real keystroke's four events are dispatched one at a time to
     // whichever view holds focus at that instant, so a key whose command moves focus has its
@@ -1463,7 +1477,11 @@ fn inject_key(spec: &str) {
         eprintln!("cmdline-script: {spec:?} is not a key");
         return;
     };
-    let browser = if at_page {
+    let browser = if let Some(window) = at_window {
+        crate::state::BruState::instance().and_then(|state| {
+            state.lock().ok().and_then(|mut state| state.active_browser_in(window))
+        })
+    } else if at_page {
         crate::state::BruState::instance()
             .and_then(|state| state.lock().ok().and_then(|mut state| state.active_browser()))
     } else {
@@ -1556,7 +1574,12 @@ fn inject_key(spec: &str) {
     }
     eprintln!(
         "cmdline-script: injected {spec} at the {}",
-        if char_only { "bottom chrome, CHAR only" } else if at_page { "page" } else { "bottom chrome" }
+        match (at_window, char_only, at_page) {
+            (Some(window), _, _) => format!("page of window {window}"),
+            (None, true, _) => "bottom chrome, CHAR only".to_string(),
+            (None, false, true) => "page".to_string(),
+            (None, false, false) => "bottom chrome".to_string(),
+        }
     );
 }
 
