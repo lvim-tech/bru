@@ -81,6 +81,30 @@ impl Profile {
         Some(Profile { path: scratch, scratch: true })
     }
 
+    /// `--private`: a profile directory that is deleted when this process exits.
+    ///
+    /// **What it covers, and what it does not.** Chromium writes cookies, `localStorage`, its own
+    /// history and its own `Login Data` into `<root_cache_path>/Default` on every run — measured
+    /// 2026-08-06, and *not* switched off by leaving `Settings.cache_path` empty the way
+    /// `cef_types.h` promises (see `main.rs`). This makes that directory a throwaway one, so
+    /// nothing Chromium wrote survives the run. Two honest limits:
+    ///
+    /// - The bytes still reach the disk while bru is running, and a bru that is killed rather than
+    ///   closed leaves them until the next start sweeps them. This is a directory removed on exit,
+    ///   not an in-memory profile. A real off-the-record profile is a `RequestContext` per browser
+    ///   with an empty `cache_path`, which belongs to whoever owns browser creation.
+    /// - **bru's own `history.sqlite` is not affected.** `data.rs` writes it under
+    ///   `$XDG_DATA_HOME/bru` regardless, so a `--private` run still lands in the completion. That
+    ///   is why [`crate::main`] prints what this covers rather than leaving the name to imply it.
+    ///
+    /// The directory is the same `cef.<pid>` shape [`Profile::choose`] falls back to, so [`sweep`]
+    /// already collects one left by a crash, and [`Profile::release`] already deletes it. It is
+    /// emptied first: a pid is reused eventually, and a private run must not open a dead run's
+    /// cookies.
+    pub fn private() -> Option<Profile> {
+        throwaway(&crate::data::data_dir()?)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -95,6 +119,19 @@ impl Profile {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+}
+
+/// The pure half of [`Profile::private`], so a test can drive it against a directory of its own
+/// rather than against the `~/.local/share/bru` this machine is actually using.
+fn throwaway(data_dir: &Path) -> Option<Profile> {
+    sweep(data_dir);
+
+    let dir = data_dir.join("cef").with_extension(std::process::id().to_string());
+    // A pid is reused eventually. Whatever a dead run of the same pid left behind is not this
+    // run's, and a private run opening it would be the one thing this switch exists to prevent.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(Profile { path: dir, scratch: true })
 }
 
 /// Try to become the one process using `dir`.
@@ -267,6 +304,34 @@ mod tests {
         assert!(live.exists(), "a scratch profile in use must survive");
         assert!(odd.exists(), "only cef.<digits> is a scratch profile");
         assert!(history.exists(), "nothing else in the data directory is touched");
+    }
+
+    /// `--private` promises that nothing Chromium wrote outlives the run, and the only thing
+    /// standing behind that promise is that the directory is scratch and starts empty.
+    #[test]
+    fn a_private_profile_starts_empty_and_does_not_survive_its_process() {
+        let t = TempDir::new("private");
+
+        // A dead run of this very pid left a cookie database behind. It must not be inherited.
+        let stale = t.dir.join(format!("cef.{}", std::process::id()));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("Cookies"), b"a previous run's cookies").unwrap();
+
+        let profile = throwaway(&t.dir).expect("a private profile");
+        assert_eq!(profile.path(), stale, "the throwaway directory is cef.<pid>");
+        assert!(profile.path().exists());
+        assert!(
+            !profile.path().join("Cookies").exists(),
+            "a private profile must not open what a dead run of the same pid left"
+        );
+
+        // And the shared profile is untouched: --private must never delete the real one.
+        let shared = t.dir.join("cef");
+        std::fs::create_dir_all(&shared).unwrap();
+
+        profile.release();
+        assert!(!stale.exists(), "a private profile does not survive its process");
+        assert!(shared.exists(), "--private leaves the persistent profile alone");
     }
 
     #[test]

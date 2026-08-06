@@ -81,17 +81,48 @@ fn main() -> Result<(), &'static str> {
     // died on the assert below with "Opening in existing browser session." — CEF-NOTES trap 10.
     // `profile.rs` names bru's own directory and, when another bru already holds it, one that
     // nothing else can be using.
+    //
+    // `--private` asks for a directory that is deleted when this process exits, so a run's cookies
+    // and logins do not outlive it. See `profile::Profile::private` for what that does and does not
+    // cover.
+    let private = cmd_line.has_switch(Some(&CefString::from("private"))) == 1;
     let user_data_dir =
         CefString::from(&cmd_line.switch_value(Some(&CefString::from("user-data-dir")))).to_string();
-    let profile = profile::Profile::choose(Some(user_data_dir.as_str()));
+    let profile = if private {
+        profile::Profile::private()
+    } else {
+        profile::Profile::choose(Some(user_data_dir.as_str()))
+    };
+
+    // Said out loud rather than left to the name. A user who types `--private` and then finds the
+    // site in the completion has been misled by one word; one line at startup is what keeps the
+    // switch's promise the size it actually is.
+    if private {
+        if let Some(profile) = profile.as_ref() {
+            eprintln!(
+                "bru: --private: Chromium's profile is {} and is deleted when bru exits",
+                profile.path().display()
+            );
+        }
+        eprintln!("bru: --private: bru's own history, quickmarks and bookmarks are NOT affected");
+    }
 
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.
         no_sandbox: 1,
-        // `cache_path` is deliberately still empty: that is the profile, and an empty one keeps
-        // browsers in-memory the way they already were. This is the *root*, which is what the
-        // singleton lock is taken on.
+        // `cache_path` is empty, and **that does not mean what `cef_types.h` says it means.** The
+        // header promises "browsers will be created in incognito mode where in-memory caches are
+        // used for storage and no profile-specific data is persisted to disk". Measured 2026-08-06
+        // on CEF 151, against httpbin.org, with a scratch `--user-data-dir`: a cookie set with
+        // `max-age=86400` and a `localStorage` key both came back after a full restart, and
+        // `<root>/Default/Cookies` is a real SQLite file holding the row (`is_persistent = 1`).
+        // Setting `cache_path` to the root as well was measured too and changed nothing at all —
+        // the two profile trees differed only in a blob UUID and one cache entry's name, 4.9 MB
+        // either way. That rule describes the Alloy runtime; these BrowserViews are Chrome style,
+        // where the profile is `<root_cache_path>/Default` on disk whatever this field says. So
+        // there is nothing to switch on here, and a `--cache-path` switch would have been a name
+        // with no behaviour behind it. What survives a restart is decided by `--private` above.
         root_cache_path: profile
             .as_ref()
             .map(|profile| CefString::from(profile.path().to_string_lossy().as_ref()))
