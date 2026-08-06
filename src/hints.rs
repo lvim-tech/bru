@@ -1,7 +1,8 @@
-//! Hint mode — `f` and `F`.
+//! Hint mode — `f`, `F`, and the fourteen `;`-prefixed bindings around them.
 //!
-//! A behavioural port of qutebrowser 3.7.0's `browser/hints.py` (label generation, filtering) and
-//! `javascript/webelem.js` (which elements are hintable, see `chrome/hints.js`).
+//! A behavioural port of qutebrowser 3.7.0's `browser/hints.py` (label generation, filtering,
+//! groups, targets, `--rapid`, `--first`) and `javascript/webelem.js` (which elements are hintable,
+//! see `chrome/hints.js`).
 //!
 //! Three rules shape this file, and none of them is a preference:
 //!
@@ -35,20 +36,115 @@ const MIN_CHARS: usize = 1;
 /// the page's own world to see the page's elements.
 const HINTS_JS: &str = include_str!("../chrome/hints.js");
 
-/// What following a hint does. qutebrowser's `hints.Target`, cut to what M12 implements.
+/// Which elements get a label. The keys of `hints.selectors`, configdata.yml:1803.
+///
+/// The selector lists themselves live in `chrome/hints.js`, because that is where they are used;
+/// this is only the name that crosses over. A group is **not** the `all` list filtered afterwards —
+/// `links` is `a[href], area[href], link[href], [role="link"][href]`, a different query — and
+/// `chrome/hints.js` refuses a name it does not know rather than answering with `all`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    All,
+    Links,
+    Images,
+    Media,
+    Url,
+    Inputs,
+}
+
+impl Group {
+    /// The name `chrome/hints.js` keys `SELECTORS` by. Also what the parser accepts.
+    pub fn name(self) -> &'static str {
+        match self {
+            Group::All => "all",
+            Group::Links => "links",
+            Group::Images => "images",
+            Group::Media => "media",
+            Group::Url => "url",
+            Group::Inputs => "inputs",
+        }
+    }
+}
+
+/// What following a hint does. qutebrowser's `hints.Target`, minus the five that belong to commands
+/// bru has not built (`run`, `spawn`, `userscript`, `delete`, `right-click`).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Target {
-    /// `f` — click the element where it sits.
+    /// `normal` / `current` (`f`) — click the element where it sits, on Chromium's own input path.
     Normal,
-    /// `F` — take the element's URL and open it in a background tab.
+    /// `tab` / `tab-bg` (`F`, `;b`) — the element's URL in a background tab.
+    ///
+    /// `tab` honours `tabs.background`, whose default is **true** (configdata.yml:2217), so the two
+    /// spellings land in the same place until bru has a setting for it.
     TabBg,
+    /// `tab-fg` (`;f`) — the element's URL in a tab that is switched to.
+    TabFg,
+    /// `window` (`wf`) — a new window in qutebrowser; bru has one window by DESIGN.md, so this is a
+    /// foreground tab, exactly as `:open -w` already is (`exec.rs`, `Command::Open`).
+    Window,
+    /// `hover` (`;h`) — move the mouse onto the element and leave it there.
+    Hover,
+    /// `yank` (`;y`) — the URL to the clipboard. **Needs [`Clipboard`], which nobody installs yet.**
+    Yank,
+    /// `yank-primary` (`;Y`) — the URL to the primary selection. Same hole.
+    YankPrimary,
+    /// `download` (`;d`) — **needs [`Downloads`], which nobody installs yet.**
+    Download,
+    /// `fill` (`;o`, `;O`) — put the command line text into `:`, with `{hint-url}` replaced.
+    Fill(String),
+}
+
+impl Target {
+    /// `hints.py:start`'s `no_rapid_targets`, plus bru's one addition.
+    ///
+    /// qutebrowser refuses `--rapid` with `tab-fg` (it opens a tab and switches to it), `fill` (it
+    /// leaves hint mode by entering command mode), `right-click` and `delete`. bru adds `window`,
+    /// because with one window `window` *is* `tab-fg` — see [`Target::Window`]. That is why `;R`
+    /// (`hint --rapid links window`) is the one hint binding this milestone leaves inert.
+    fn allows_rapid(&self) -> bool {
+        !matches!(self, Target::TabFg | Target::Window | Target::Fill(_))
+    }
+
+    /// Whether following needs the element's URL out of the page. The other targets act on the
+    /// element's position and never leave Rust.
+    fn needs_url(&self) -> bool {
+        !matches!(self, Target::Normal | Target::Hover)
+    }
+
+    /// `HINT_TEXTS`, hints.py:640 — what the status line would say. Printed rather than shown; the
+    /// status bar has no field for it yet.
+    fn describe(&self) -> &'static str {
+        match self {
+            Target::Normal => "Follow hint",
+            Target::TabBg => "Follow hint in background tab",
+            Target::TabFg => "Follow hint in foreground tab",
+            Target::Window => "Follow hint in new window",
+            Target::Hover => "Hover over a hint",
+            Target::Yank => "Yank hint to clipboard",
+            Target::YankPrimary => "Yank hint to primary selection",
+            Target::Download => "Download hint",
+            Target::Fill(_) => "Set hint in commandline",
+        }
+    }
 }
 
 /// One run of hint mode: from `f` to a follow, an `<Escape>`, or a page that reported nothing.
+///
+/// With `--rapid` a follow does **not** end it: the labels stay drawn, the typed chain is reset,
+/// and the next label follows another element. That is the whole difference between `;b` and `;r`.
 struct Session {
-    /// The tab this belongs to. A hint session survives no tab switch — checked on every answer.
+    /// The tab this belongs to. A hint session survives no tab switch — checked on every answer
+    /// and on every key.
     browser_id: i32,
+    group: Group,
     target: Target,
+    /// `--rapid`: the session outlives a follow.
+    rapid: bool,
+    /// `--first`: follow the first element as soon as the page answers, with no keypress at all.
+    first: bool,
+    /// `hints.py`'s `first_run` — false from the second follow of a rapid session on. The clipboard
+    /// workstream needs it: a rapid yank appends to what is already there rather than replacing it.
+    first_run: bool,
     /// Minted here, handed to the injected script, and required back on every answer.
     token: String,
     /// Click points in view coordinates, in the order the page reported them.
@@ -57,6 +153,15 @@ struct Session {
     labels: Vec<String>,
     /// label → index into `points`. The generic [`BindingTrie`] doing hint mode's half of its job.
     trie: BindingTrie<usize>,
+    /// The `hint:` bindings, configdata.yml:3884 — `<Ctrl-F>`, `<Ctrl-R>`, `<Ctrl-B>`, `<Return>`.
+    ///
+    /// `HintKeyParser.handle` (modeparsers.py:196) tries the **command** parser before the labels,
+    /// which is the only reason those four keys can do anything while hint mode is on. Snapshotted
+    /// per session out of the live table, so a `config.lua` that rebinds them is honoured.
+    commands: BindingTrie<crate::commands::Command>,
+    /// The chain typed towards one of those bindings, kept apart from the label chain the way
+    /// qutebrowser keeps two parsers apart.
+    command_sequence: Vec<KeyInfo>,
     /// The hint characters typed so far.
     sequence: Vec<KeyInfo>,
     /// When `start` injected the script, so collection can be timed rather than asserted.
@@ -164,11 +269,24 @@ pub fn hint_strings(count: usize) -> Vec<String> {
 // Starting and ending a session
 // ------------------------------------------------------------------------------------------------
 
-/// `f` / `F` — start hint mode on `browser`.
+/// `hint [--rapid] [--first] <group> <target>` — start hint mode on `browser`.
 ///
 /// Returns after asking the page for its elements; hint mode is not entered until the page answers,
 /// which is what stops `f` on a blank tab from trapping the keyboard in a mode with nothing in it.
-pub fn start(state: &SharedState, browser: &mut Browser, target: Target) {
+pub fn start(
+    state: &SharedState,
+    browser: &mut Browser,
+    group: Group,
+    target: Target,
+    rapid: bool,
+    first: bool,
+) {
+    // hints.py:1030 raises CommandError here rather than doing something surprising, and so does
+    // this. `;R` is the only default binding that lands on it.
+    if rapid && !target.allows_rapid() {
+        eprintln!("bru: rapid hinting makes no sense with target {}", target.describe());
+        return;
+    }
     let Some(frame) = browser.main_frame() else {
         return;
     };
@@ -178,23 +296,59 @@ pub fn start(state: &SharedState, browser: &mut Browser, target: Target) {
     // begins with the script's own `clear()`; on any other page they went when it was navigated.
     *session().lock().expect("hint session mutex poisoned") = Some(Session {
         browser_id: browser.identifier(),
+        group,
         target,
+        rapid,
+        first,
+        first_run: true,
         token: token.clone(),
         points: Vec::new(),
         labels: Vec::new(),
         trie: BindingTrie::new(),
+        commands: hint_mode_bindings(state),
+        command_sequence: Vec::new(),
         sequence: Vec::new(),
         started: std::time::Instant::now(),
     });
 
     // The script is injected on every `f` rather than once per page load: a navigation throws the
     // world away, and there is no cheap way to know from here whether this one still has it.
-    let code = format!("{HINTS_JS}\nwindow.__bru_hints.collect(\"{token}\");");
+    let code = format!(
+        "{HINTS_JS}\nwindow.__bru_hints.collect(\"{token}\",\"{}\");",
+        group.name()
+    );
     frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
 
     // Nothing enters hint mode here — `on_collected` does, once there is something to hint. `f` on
     // a page with no links must not trap the keyboard in a mode with nothing in it.
-    let _ = state;
+}
+
+/// The `hint:` mode's own bindings, parsed into a trie, out of the table the browser is running on.
+///
+/// Taken once per session rather than per keystroke: `bindings_snapshot` clones the whole table,
+/// and a keypress must not do that. There are four of them, so the trie costs nothing to keep.
+fn hint_mode_bindings(state: &SharedState) -> BindingTrie<crate::commands::Command> {
+    let mut trie = BindingTrie::new();
+    let Some(bindings) = state
+        .lock()
+        .expect("state mutex poisoned")
+        .bindings_snapshot()
+    else {
+        return trie;
+    };
+    for (mode, keys, command) in bindings.all() {
+        if mode != Mode::Hint {
+            continue;
+        }
+        // `<Escape>` is handled before this trie is consulted — see `handle_key`.
+        match (crate::bindings::parse_key_sequence(&keys), crate::commands::parse(&command)) {
+            (Ok(sequence), Ok(command)) => {
+                trie.insert(&sequence, command);
+            }
+            _ => eprintln!("bru: hint-mode binding {keys:?} -> {command:?} was dropped"),
+        }
+    }
+    trie
 }
 
 /// `<Escape>` in hint mode, and every path that ends a session.
@@ -308,12 +462,16 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         })
         .collect();
 
-    let elapsed = {
+    let (elapsed, group, describe) = {
         let guard = session().lock().expect("hint session mutex poisoned");
-        guard.as_ref().map(|s| s.started.elapsed())
+        (
+            guard.as_ref().map(|s| s.started.elapsed()),
+            guard.as_ref().map(|s| s.group.name()).unwrap_or("?"),
+            guard.as_ref().map(|s| s.target.describe()).unwrap_or("?"),
+        )
     };
     eprintln!(
-        "bru[hints]: {} elements in {:.1} ms ({} bytes of payload)",
+        "bru[hints]: group {group}: {} elements in {:.1} ms ({} bytes of payload) — {describe}",
         points.len(),
         elapsed.map(|e| e.as_secs_f64() * 1000.0).unwrap_or(0.0),
         data.len(),
@@ -337,7 +495,7 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         }
     }
 
-    {
+    let first = {
         let mut guard = session().lock().expect("hint session mutex poisoned");
         let Some(open) = guard.as_mut() else {
             return;
@@ -346,7 +504,8 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         open.labels = labels.clone();
         open.trie = trie;
         open.sequence.clear();
-    }
+        open.first
+    };
 
     debug(&format!("labels {}", labels.join(" ")));
 
@@ -365,47 +524,168 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         crate::ipc::set_mode(Mode::Hint.name().to_string());
         crate::ipc::set_keystring(String::new());
     }
+
+    // `--first` (`gi`): follow element 0 without waiting for a key. `hints.py:_start_cb` fires
+    // `strings[0]`, which is the label of the *first element* — the labels are scattered, so the
+    // index is 0 and the label is not necessarily "a".
+    if first {
+        follow(state, browser, 0);
+    }
 }
 
-/// The page has reported the URL behind a followed hint (`F`).
+/// The page has reported the URL behind a followed hint — every target except `normal` and `hover`.
 fn on_href(state: &SharedState, browser: &mut Browser, url: &str) {
-    *session().lock().expect("hint session mutex poisoned") = None;
-    clear_labels(browser);
-    leave_mode(state);
+    let Some((target, rapid, first_run)) = ({
+        let guard = session().lock().expect("hint session mutex poisoned");
+        guard.as_ref().map(|s| (s.target.clone(), s.rapid, s.first_run))
+    }) else {
+        return;
+    };
+
+    // The session ends *here* and not in `follow`, because `clear()` on the page drops the element
+    // array along with the labels — it is the teardown, not a repaint — and `href` would then be
+    // looking up an index in an empty array. Measured 2026-08-06: clearing first reported no URL
+    // for every link on the page.
+    finish(state, browser, rapid);
 
     if url.is_empty() {
-        eprintln!("bru: no URL for this element");
+        eprintln!("bru: no suitable link found for this element");
         return;
     }
-    eprintln!("bru[hints]: opening {url} in a background tab");
 
-    // **Not `tabs::new_tab` from here.** This runs inside the message router's query handler, and
-    // the router holds `browser_query_info_map` across that call. Opening a tab is
-    // `window.add_child_view_at`, which creates the browser *synchronously* (CEF-NOTES, Tabs) and
-    // navigates it, which reaches `RequestHandler::on_before_browse`, which bru must forward to the
-    // router, which takes that same lock. Measured 2026-08-06: bru froze with its window still
-    // painted, and `eu-stack` showed the whole ring —
+    // **No CEF call that navigates, and nothing that takes bru's own locks, from here.** This runs
+    // inside the message router's query handler, and the router holds `browser_query_info_map`
+    // across that call. Opening a tab is `window.add_child_view_at`, which creates the browser
+    // *synchronously* (CEF-NOTES, Tabs) and navigates it, which reaches
+    // `RequestHandler::on_before_browse`, which bru must forward to the router, which takes that
+    // same lock. Measured 2026-08-06: bru froze with its window still painted, and `eu-stack`
+    // showed the whole ring —
     //   on_process_message_received → on_query_str → hints::on_page_query → tabs::new_tab
     //   → add_child_view_at → …Navigate → on_before_browse → cancel_pending_for → BrowserInfoMap
     //   → lock_contended.
-    // Posting it puts the tab on the next turn of the message loop, by which time the router has
-    // let go.
-    let mut task = OpenBackgroundTab::new(url.to_string());
+    // Posting it puts the work on the next turn of the message loop, by which time the router has
+    // let go. Every URL target goes through here, not just the two that navigate: `fill` focuses
+    // the bottom chrome and `download` will start a request, and neither is worth a second
+    // deadlock to find out about.
+    eprintln!("bru[hints]: {} -> {url}", target.describe());
+    let mut task = FollowUrl::new(target, url.to_string(), first_run);
     post_task(ThreadId::UI, Some(&mut task));
 }
 
 wrap_task! {
-    struct OpenBackgroundTab {
+    struct FollowUrl {
+        target: Target,
         url: String,
+        first_run: bool,
     }
 
     impl Task {
         fn execute(&self) {
-            if let Some(state) = BruState::instance() {
-                crate::tabs::new_tab(&state, &self.url, true);
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            match &self.target {
+                // `f`/`;h` never get here — they act on the element, not on a URL.
+                Target::Normal | Target::Hover => {}
+
+                Target::TabBg => crate::tabs::new_tab(&state, &self.url, true),
+                Target::TabFg => crate::tabs::new_tab(&state, &self.url, false),
+                // One window (DESIGN.md), so `window` is a foreground tab — the same collapse
+                // `:open -w` already makes in `exec.rs`.
+                Target::Window => crate::tabs::new_tab(&state, &self.url, false),
+
+                // `;o` / `;O`. qutebrowser's `preset_cmd_text`: substitute `{hint-url}`, then
+                // refuse anything that is not a command line — a text not starting with `:`, `/`
+                // or `?` cannot be one, and filling it would leave the user in command mode with
+                // something unrunnable.
+                Target::Fill(text) => {
+                    let text = text.replace("{hint-url}", &self.url);
+                    match text.chars().next() {
+                        Some(first) if crate::cmdline::STARTCHARS.contains(first) => {
+                            crate::cmdline::cmd_set_text(&text, false, false, false, None);
+                        }
+                        _ => eprintln!("bru: invalid command text {text:?}"),
+                    }
+                }
+
+                // --- the two holes -------------------------------------------------------------
+                // `;y`, `;Y`, `;d`. The URL is in hand and correct; what is missing is the sink.
+                // Both are another workstream's, and a second implementation here would be the
+                // thing that has to be deleted later. See `Clipboard` and `Downloads`.
+                Target::Yank | Target::YankPrimary => {
+                    let selection = self.target == Target::YankPrimary;
+                    match clipboard() {
+                        Some(clipboard) => clipboard.yank_url(&self.url, selection, self.first_run),
+                        None => eprintln!(
+                            "bru: hint yank has no clipboard yet — \
+                             hints::install_clipboard has not been called"
+                        ),
+                    }
+                }
+                Target::Download => match downloads() {
+                    Some(downloads) => downloads.download_url(&self.url),
+                    None => eprintln!(
+                        "bru: hint download has no download manager yet — \
+                         hints::install_downloads has not been called"
+                    ),
+                },
             }
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// The two things hint mode needs and does not own
+// ------------------------------------------------------------------------------------------------
+
+/// `wl-copy` / `wl-paste`, decided 2026-08-06 (STAGE3-CONTRACTS.md). **Not implemented here.**
+///
+/// `;y` and `;Y` are `hint links yank` / `yank-primary`, and `:yank` is its own command in another
+/// workstream. This is the whole of what hint mode needs from it; the module that owns the
+/// clipboard implements it and calls [`install_clipboard`] once at startup. Until then `;y` prints
+/// why it did nothing, which is the honest answer and is why `exec::is_live` says it is not live.
+pub trait Clipboard: Send + Sync {
+    /// `hints.py:HintActions.yank`. `selection` is the primary selection rather than the clipboard.
+    ///
+    /// `first_run` is false for the second and later follows of a **rapid** session, and it is the
+    /// one piece of hint state the clipboard cannot work out for itself: qutebrowser *appends* to
+    /// what is already there, joined with a newline, so `;r`-style repeated yanking collects a list
+    /// instead of overwriting it each time.
+    fn yank_url(&self, url: &str, selection: bool, first_run: bool);
+}
+
+/// `;d` — `hint links download`. **Not implemented here**; the download handler is its own
+/// workstream and this is all hint mode asks of it. See [`Clipboard`] for the shape and the reason.
+pub trait Downloads: Send + Sync {
+    /// Start a download of `url`, as `hints.py:HintActions.download` does.
+    fn download_url(&self, url: &str);
+}
+
+static CLIPBOARD: std::sync::OnceLock<Box<dyn Clipboard>> = std::sync::OnceLock::new();
+static DOWNLOADS: std::sync::OnceLock<Box<dyn Downloads>> = std::sync::OnceLock::new();
+
+/// Hands the clipboard workstream's implementation to hint mode, once, at startup.
+///
+/// `dead_code` because nothing calls it **yet** — that is the hole, and it is deliberate. Delete
+/// the attribute in the commit that adds the call, and raise the live count in the same one.
+#[allow(dead_code)]
+pub fn install_clipboard(clipboard: Box<dyn Clipboard>) {
+    let _ = CLIPBOARD.set(clipboard);
+}
+
+/// Hands the download workstream's implementation to hint mode, once, at startup. See
+/// [`install_clipboard`] for why this is allowed to be dead.
+#[allow(dead_code)]
+pub fn install_downloads(downloads: Box<dyn Downloads>) {
+    let _ = DOWNLOADS.set(downloads);
+}
+
+fn clipboard() -> Option<&'static dyn Clipboard> {
+    CLIPBOARD.get().map(|c| c.as_ref())
+}
+
+fn downloads() -> Option<&'static dyn Downloads> {
+    DOWNLOADS.get().map(|d| d.as_ref())
 }
 
 fn show(browser: &mut Browser, code: &str) {
@@ -431,11 +711,66 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
     }
     debug(&format!("key {info}"));
 
-    // `hint:` bindings, configdata.yml:3884. `<Escape>` is the one bru implements; `<Return>`
-    // (hint-follow) has nothing to follow while a match follows itself, and the three `hint …`
-    // rebindings are other targets, which are stage 3.
+    // A session belongs to one tab, and `--rapid` is the first thing that can outlive a tab switch.
+    // If the key arrived at a different browser the labels are on a page nobody is looking at, and
+    // matching against them would follow a link the user cannot see. End the session and answer
+    // `None`, so `keys.rs` treats this as the ordinary key it now is.
+    //
+    // (The stale labels stay on the other tab until its next `collect`, which begins with `clear`,
+    // or until it navigates. Reaching across to remove them would mean holding that tab's `Browser`
+    // for the length of the session, and a live reference is what stops a tab from closing —
+    // CEF-NOTES, Tabs.)
+    let stale = {
+        let guard = session().lock().expect("hint session mutex poisoned");
+        guard.as_ref().map(|open| open.browser_id != browser.identifier()) == Some(true)
+    };
+    if stale {
+        *session().lock().expect("hint session mutex poisoned") = None;
+        leave_mode(state);
+        return None;
+    }
+
+    // `<Escape>` is `mode-leave` in the `hint:` table, and it is taken *before* that table rather
+    // than through it: `exec`'s `mode-leave` knows how to leave a mode and nothing about a hint
+    // session, so running it would leave the labels drawn over the page and the session open behind
+    // them. qutebrowser does not need the special case because `HintManager.on_mode_left` is wired
+    // to the mode manager's signal; bru has no such signal, and one function is cheaper than one.
     if info.key == Key::Named(NamedKey::Escape) {
         cancel(state, browser);
+        return Some(true);
+    }
+
+    // `HintKeyParser.handle` (modeparsers.py:196): the command parser gets a dry run first, and
+    // only a key it does not want is offered to the labels. This is what makes `<Ctrl-F>`
+    // (`hint links`), `<Ctrl-R>` (`hint --rapid links tab-bg`) and `<Ctrl-B>` (`hint all tab-bg`)
+    // work from inside hint mode. Hint labels are spelled out of `hints.chars`, so nothing here can
+    // shadow a label.
+    let binding = {
+        let mut guard = session().lock().expect("hint session mutex poisoned");
+        match guard.as_mut() {
+            None => crate::bindings::MatchType::NoMatch,
+            Some(open) => {
+                open.command_sequence.push(info);
+                match open.commands.matches(&open.command_sequence) {
+                    Match::Exact(command) => {
+                        let command = command.clone();
+                        open.command_sequence.clear();
+                        // Not run under the lock: `exec::run` reaches `hints::start`, which takes
+                        // it again.
+                        drop(guard);
+                        crate::exec::run(state, browser, &command, None);
+                        return Some(true);
+                    }
+                    Match::Partial => crate::bindings::MatchType::PartialMatch,
+                    Match::NoMatch => {
+                        open.command_sequence.clear();
+                        crate::bindings::MatchType::NoMatch
+                    }
+                }
+            }
+        }
+    };
+    if binding == crate::bindings::MatchType::PartialMatch {
         return Some(true);
     }
 
@@ -513,9 +848,10 @@ fn redraw(browser: &mut Browser) {
     );
 }
 
-/// A hint matched. `f` clicks it; `F` asks the page for its URL and opens a background tab.
+/// A hint matched. The element's position is enough for `normal` and `hover`; every other target
+/// needs its URL, which only the page can give, so those ask and continue in [`on_href`].
 fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
-    let (target, point, token) = {
+    let (target, rapid, point, token) = {
         let guard = session().lock().expect("hint session mutex poisoned");
         let Some(open) = guard.as_ref() else {
             return;
@@ -523,30 +859,63 @@ fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
         let Some(point) = open.points.get(index).copied() else {
             return;
         };
-        (open.target, point, open.token.clone())
+        (open.target.clone(), open.rapid, point, open.token.clone())
     };
+
+    if target.needs_url() {
+        // Ask before clearing, and clear in `on_href` — see the comment there for why the order is
+        // not free. The session stays open until the page answers.
+        show(
+            browser,
+            &format!("window.__bru_hints.href(\"{token}\",{index});"),
+        );
+        return;
+    }
+
+    // qutebrowser leaves hint mode *before* running the handler (`hints.py:_fire`), and so does
+    // this: the click that follows may navigate, and a mode left afterwards is a mode left on a
+    // page that no longer exists.
+    finish(state, browser, rapid);
 
     match target {
         Target::Normal => {
-            *session().lock().expect("hint session mutex poisoned") = None;
-            clear_labels(browser);
-            leave_mode(state);
             eprintln!("bru[hints]: clicking hint {index} at ({}, {})", point.0, point.1);
             click(browser, point.0, point.1);
         }
-        Target::TabBg => {
-            // Ask before clearing, and clear in `on_href`. `clear()` drops the element array along
-            // with the labels — it is the teardown, not a repaint — so a `clear_labels` here would
-            // leave `href` looking up an index in an empty array and reporting no URL for every
-            // link on the page. Measured 2026-08-06: it did exactly that.
-            //
-            // The session stays open until the page answers; `on_href` closes it.
-            show(
-                browser,
-                &format!("window.__bru_hints.href(\"{token}\",{index});"),
-            );
+        // `;h`. qutebrowser calls `elem.hover()`, which dispatches a synthetic `mouseover`; bru
+        // moves the real pointer instead, for the same reason the follow is a real click — a
+        // synthetic event skips everything that checks `isTrusted`, and a menu that opens on hover
+        // is exactly the kind of thing that checks.
+        Target::Hover => {
+            eprintln!("bru[hints]: hovering hint {index} at ({}, {})", point.0, point.1);
+            hover(browser, point.0, point.1);
         }
+        _ => unreachable!("every other target needs a URL and returned above"),
     }
+}
+
+/// End a follow: with `--rapid` the session and the labels stay and only the typed chain is reset;
+/// without it, everything goes.
+///
+/// `hints.py:_fire` again — the rapid branch resets the filter and redraws every label with no
+/// highlighted prefix, which is what lets the next label be typed straight away.
+fn finish(state: &SharedState, browser: &mut Browser, rapid: bool) {
+    if !rapid {
+        *session().lock().expect("hint session mutex poisoned") = None;
+        clear_labels(browser);
+        leave_mode(state);
+        return;
+    }
+
+    {
+        let mut guard = session().lock().expect("hint session mutex poisoned");
+        let Some(open) = guard.as_mut() else {
+            return;
+        };
+        open.sequence.clear();
+        open.first_run = false;
+    }
+    redraw(browser);
 }
 
 /// The follow, on Chromium's real input path.
@@ -561,6 +930,15 @@ fn click(browser: &mut Browser, x: i32, y: i32) {
     host.send_mouse_move_event(Some(&event), 0);
     host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 0, 1);
     host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 1, 1);
+}
+
+/// `;h` — the move without the press. `mouse_leave = 0` means the pointer is entering, which is
+/// what raises `mouseover`/`:hover` on the element and everything nested under it.
+fn hover(browser: &mut Browser, x: i32, y: i32) {
+    let Some(host) = browser.host() else {
+        return;
+    };
+    host.send_mouse_move_event(Some(&MouseEvent { x, y, modifiers: 0 }), 0);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -600,9 +978,18 @@ fn percent_decode(src: &str) -> String {
 // The debug switch
 // ------------------------------------------------------------------------------------------------
 
-/// `--hint-script=f,a,s --hint-step-ms=2000` drives hint mode from posted UI tasks: `f`/`F` start a
-/// session, `esc` cancels one, and every other step is fed to the key parser one character at a
-/// time.
+/// `--hint-script='hint images,esc,f,a,s' --hint-step-ms=2000` drives hint mode from posted UI
+/// tasks. A step is one of:
+///
+/// | | |
+/// |---|---|
+/// | `hint …` | any `hint` command string, through the real parser and the real dispatcher |
+/// | `esc` | cancel the session |
+/// | anything else | fed to the key parser one character at a time |
+///
+/// There is deliberately **no `f` shorthand**. `f` is a hint label — `hints.chars` is `asdfghjkl` —
+/// and a step that meant "start hinting" would shadow the fourth label on every page; it did, and
+/// a follow that quietly re-collected instead looked exactly like a click that missed.
 ///
 /// It exists for the same reason as `--tab-script`. The only key-injection tool on this machine is
 /// `wtype`, which attaches a virtual keyboard, and CEF segfaults in `xkb_state_update_mask` when
@@ -633,11 +1020,31 @@ wrap_task! {
             };
 
             match self.step.as_str() {
-                // Collection is a round trip through the page, so there is nothing to report here
-                // yet; `on_collected` prints the count and the timing when the answer lands.
-                "f" => return start(&state, &mut browser, Target::Normal),
-                "F" => return start(&state, &mut browser, Target::TabBg),
                 "esc" => cancel(&state, &mut browser),
+                // Collection is a round trip through the page, so there is nothing to report for a
+                // `hint` step here; `on_collected` prints the count and the timing when the answer
+                // lands. The groups and the targets are reached the way a keypress reaches them,
+                // through `commands::parse` and `exec::run`, so what this drives is what `;i` does
+                // and not a second path.
+                step if step.starts_with("hint") => match crate::commands::parse(step) {
+                    Ok(command) => {
+                        eprintln!("hint-script: {step:?} -> {command:?}");
+                        return crate::exec::run(&state, &mut browser, &command, None);
+                    }
+                    Err(e) => eprintln!("hint-script: {step:?}: {e}"),
+                },
+                // A step in `<…>` spelling is one key, not a run of characters — that is how the
+                // `hint:` bindings (`<Ctrl-F>`, `<Ctrl-R>`, `<Ctrl-B>`) can be driven at all.
+                keys if keys.starts_with('<') => {
+                    match crate::bindings::parse_key_sequence(keys) {
+                        Ok(sequence) => {
+                            for info in sequence {
+                                handle_key(&state, &mut browser, info);
+                            }
+                        }
+                        Err(e) => eprintln!("hint-script: {keys:?}: {e}"),
+                    }
+                }
                 keys => {
                     for c in keys.chars() {
                         match crate::bindings::parse_key_sequence(&c.to_string()) {
@@ -652,16 +1059,24 @@ wrap_task! {
                 }
             }
 
-            let mode = state.lock().expect("state mutex poisoned").mode();
+            // Tabs and the URL as well as the mode, because that is what the targets change and
+            // there is otherwise nothing to read: `;f` and `;b` differ only in which tab is
+            // active, and `;h` and `f` only in what the page did about it.
+            let (mode, tabs, active) = {
+                let guard = state.lock().expect("state mutex poisoned");
+                (guard.mode(), guard.tab_count(), guard.active_tab())
+            };
             let guard = session().lock().expect("hint session mutex poisoned");
             eprintln!(
-                "hint-script: after {:?} -> mode {mode}, {} hints, chain {:?}",
+                "hint-script: after {:?} -> mode {mode}, {} hints, chain {:?}, \
+                 tabs={tabs} active={active}, url={}",
                 self.step,
                 guard.as_ref().map(|s| s.labels.len()).unwrap_or(0),
                 guard
                     .as_ref()
                     .map(|s| crate::bindings::sequence_to_string(&s.sequence))
                     .unwrap_or_default(),
+                crate::ipc::current_url(),
             );
         }
     }
@@ -838,6 +1253,90 @@ mod tests {
             percent_decode("https%3A%2F%2Fwww.vesti.bg%2Fa%3Fb%3D1%26c%3D%C3%A4"),
             "https://www.vesti.bg/a?b=1&c=ä"
         );
+    }
+
+    /// Every `Group` bru can name must be a key of `SELECTORS` in `chrome/hints.js`, and the JS
+    /// must not offer a group Rust cannot ask for.
+    ///
+    /// The two lists are in different languages in different files, and the failure when they
+    /// drift is silent: `;i` collects nothing and prints "no hintable elements found", which reads
+    /// as a page with no images. Checked against the file itself rather than against a copy of it.
+    #[test]
+    fn every_group_name_is_a_selector_list_the_page_knows() {
+        let groups = [
+            Group::All,
+            Group::Links,
+            Group::Images,
+            Group::Media,
+            Group::Url,
+            Group::Inputs,
+        ];
+        for group in groups {
+            assert!(
+                HINTS_JS.contains(&format!("\"{}\": [", group.name())),
+                "chrome/hints.js has no SELECTORS entry for {:?}",
+                group.name()
+            );
+        }
+
+        // The other direction: count the entries in the object literal. `hints.selectors`'
+        // default has exactly these six (configdata.yml:1803).
+        let start = HINTS_JS.find("const SELECTORS = {").expect("SELECTORS is gone");
+        let end = start + HINTS_JS[start..].find("\n    };").expect("SELECTORS never closes");
+        let declared = HINTS_JS[start..end]
+            .lines()
+            .filter(|line| line.trim_end().ends_with("\": ["))
+            .count();
+        assert_eq!(declared, groups.len(), "chrome/hints.js declares a group Rust cannot name");
+    }
+
+    /// `;i` must ask for a different set of elements than `f`, not the same set filtered.
+    #[test]
+    fn the_group_selectors_are_qutebrowsers_own() {
+        // `links` is anchors *with an href* — the distinction that makes `;o` fill a command line
+        // rather than sometimes filling nothing.
+        assert!(HINTS_JS.contains("\"a[href]\""));
+        assert!(HINTS_JS.contains("\"area[href]\""));
+        // `images` is one selector, and the `all` list's `img` is a different entry.
+        assert!(HINTS_JS.contains("\"images\": [\n            \"img\",\n        ],"));
+        // `inputs` is typed inputs plus contenteditable and textarea — never `input[type=hidden]`,
+        // never a button.
+        assert!(HINTS_JS.contains("'input[type=\"password\"]'"));
+        assert!(HINTS_JS.contains("\"input:not([type])\""));
+        assert!(!HINTS_JS.contains("\"inputs\": [\n            \"button\""));
+    }
+
+    #[test]
+    fn rapid_is_refused_exactly_where_qutebrowser_refuses_it() {
+        // hints.py:1027's `no_rapid_targets`, plus `window` because bru has one window.
+        assert!(!Target::TabFg.allows_rapid());
+        assert!(!Target::Window.allows_rapid());
+        assert!(!Target::Fill(":open {hint-url}".to_string()).allows_rapid());
+        // And the ones `;r` and `<Ctrl-R>` actually use.
+        assert!(Target::TabBg.allows_rapid());
+        assert!(Target::Normal.allows_rapid());
+        assert!(Target::Hover.allows_rapid());
+        assert!(Target::Yank.allows_rapid());
+        assert!(Target::Download.allows_rapid());
+    }
+
+    #[test]
+    fn only_the_two_element_targets_stay_inside_rust() {
+        // A target that needs a URL costs a round trip to the page; one that does not must not
+        // take it, or `f` — the binding this project is measured on — grows a query per follow.
+        assert!(!Target::Normal.needs_url());
+        assert!(!Target::Hover.needs_url());
+        for target in [
+            Target::TabBg,
+            Target::TabFg,
+            Target::Window,
+            Target::Yank,
+            Target::YankPrimary,
+            Target::Download,
+            Target::Fill(":open {hint-url}".to_string()),
+        ] {
+            assert!(target.needs_url(), "{target:?} has no URL to act on");
+        }
     }
 
     #[test]

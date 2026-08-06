@@ -92,14 +92,18 @@ pub enum Command {
     /// `fullscreen [--enter|--leave]`
     Fullscreen { enter: bool, leave: bool },
 
-    /// `hint [group] [target]` — draw labels over the page and follow the one that is typed.
+// --- src/hints.rs --------------------------------------------------------------------------
+    /// `hint [--rapid] [--first] [group] [target] [args…]` — draw labels over the page and follow
+    /// the one that is typed.
     ///
-    /// `f` is a bare `hint`, `F` is `hint all tab`. The group and the targets bru does not
-    /// implement yet parse into [`Command::Unimplemented`] rather than into a variant that would
-    /// silently do the wrong thing.
-    Hint { target: HintTarget },
+    /// `f` is a bare `hint`, `F` is `hint all tab`, `;i` is `hint images`. The targets bru does not
+    /// implement — `run`, `spawn`, `userscript`, `delete`, `right-click` — parse into
+    /// [`Command::Unimplemented`] rather than into a variant that would silently do the wrong
+    /// thing.
+    Hint { group: HintGroup, target: HintTarget, rapid: bool, first: bool },
     /// `hint-follow` — the `<Return>` binding in hint mode.
     HintFollow,
+// --- end src/hints.rs ----------------------------------------------------------------------
 
     /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
     Help { tab: bool },
@@ -127,18 +131,66 @@ pub enum ScrollDirection {
     PageDown,
 }
 
-/// The `hint` targets M12 implements. `hints.Target` has sixteen; the rest — yank, download,
-/// userscript, fill, hover, … — arrive with the commands they depend on.
+// --- src/hints.rs --------------------------------------------------------------------------
+/// The `hints.selectors` group a `hint` command names — which elements get a label.
+///
+/// A parallel of `crate::hints::Group`, which is the same set. The two are kept apart because this
+/// file is about what a command *string* means and knows nothing about CEF; `exec.rs` maps between
+/// them in one match, the way it already does for [`ScrollDirection`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HintTarget {
-    /// `hint` (no target): click the element where it is.
-    Normal,
-    /// `hint all tab` / `hint all tab-bg`: open the element's URL in a background tab.
-    ///
-    /// `tab` and `tab-bg` differ by `tabs.background`, which bru has no setting for yet; both open
-    /// in the background, which is `tabs.background = true` and is what `F` does here today.
-    TabBg,
+pub enum HintGroup {
+    All,
+    Links,
+    Images,
+    Media,
+    Url,
+    Inputs,
 }
+
+impl HintGroup {
+    /// The six keys of `hints.selectors`' default. A name that is not one of them is a group only
+    /// a `config.lua` could have added, and bru has no `hints.selectors` setting to add it in.
+    fn parse(name: &str) -> Option<HintGroup> {
+        Some(match name {
+            "all" => HintGroup::All,
+            "links" => HintGroup::Links,
+            "images" => HintGroup::Images,
+            "media" => HintGroup::Media,
+            "url" => HintGroup::Url,
+            "inputs" => HintGroup::Inputs,
+            _ => return None,
+        })
+    }
+}
+
+/// The `hint` targets bru implements. `hints.Target` has sixteen; `run`, `spawn`, `userscript`,
+/// `delete` and `right-click` are the five that arrive with the commands they depend on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HintTarget {
+    /// `hint` / `hint all current` (no target): click the element where it is.
+    Normal,
+    /// `hint all tab` / `hint all tab-bg`: the element's URL in a background tab.
+    ///
+    /// `tab` and `tab-bg` differ by `tabs.background`, whose default is **true**
+    /// (configdata.yml:2217), so both open in the background until bru has a setting for it.
+    TabBg,
+    /// `hint all tab-fg`: a tab that is switched to.
+    TabFg,
+    /// `hint all window`: a new window in qutebrowser, a foreground tab in bru — one window.
+    Window,
+    /// `hint all hover`
+    Hover,
+    /// `hint links yank` — **the clipboard is another workstream's**; see `hints::Clipboard`.
+    Yank,
+    /// `hint links yank-primary` — same.
+    YankPrimary,
+    /// `hint links download` — **downloads are another workstream's**; see `hints::Downloads`.
+    Download,
+    /// `hint links fill :open {hint-url}` — the text to put in the command line, `{hint-url}` and
+    /// all. Substitution happens when a hint is followed, because only then is there a URL.
+    Fill(String),
+}
+// --- end src/hints.rs ----------------------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -353,6 +405,30 @@ impl Args {
     fn arg(&self, i: usize) -> Option<&str> {
         self.positional.get(i).map(String::as_str)
     }
+
+// --- src/hints.rs --------------------------------------------------------------------------
+    /// `maxsplit=2`, which `hint` is registered with (hints.py:743).
+    ///
+    /// The same trick as [`Args::maxsplit0`] and the same source (`parser.py:_split_args`): find
+    /// the first non-flag token, re-split with `that index + 2` as the limit, and everything past
+    /// it is one verbatim argument. It is what keeps `;O` working —
+    /// `hint links fill :open -t -r {hint-url}` must reach `fill` as the single string
+    /// `:open -t -r {hint-url}`, and a plain flag split would eat the `-t` and the `-r` as `hint`'s
+    /// own. Flags *before* the group are still flags, which is how `hint --rapid links tab-bg`
+    /// parses, and argparse's ordinary interspersing is why `hint inputs --first` does too.
+    fn maxsplit2(tokens: &[String]) -> Args {
+        let Some(first) = tokens.iter().position(|t| t != "--" && !is_flag(t)) else {
+            // Only flags: nothing to hold back, and the first split was already right.
+            return Args::new(tokens);
+        };
+        let limit = first + 2;
+        let mut pieces: Vec<String> = tokens[..limit.min(tokens.len())].to_vec();
+        if tokens.len() > limit {
+            pieces.push(tokens[limit..].join(" "));
+        }
+        Args::new(&pieces)
+    }
+// --- end src/hints.rs ----------------------------------------------------------------------
 }
 
 fn is_flag(token: &str) -> bool {
@@ -517,28 +593,57 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             leave: args.has("leave"),
         },
 
-        // `hint [group] [target] [args…]`, with qutebrowser's own defaults of group=all,
-        // target=normal — so a bare `hint`, which is what `f` is bound to, is the click case.
+// --- src/hints.rs --------------------------------------------------------------------------
+        // `hint [--rapid] [--first] [group] [target] [args…]`, with qutebrowser's own defaults of
+        // group=all, target=normal — so a bare `hint`, which is what `f` is bound to, is the click
+        // case.
         //
-        // Only the `all` group is accepted. `links`, `images`, `inputs` and the rest name different
-        // `hints.selectors` entries, and answering them with the `all` selector would hint the wrong
-        // elements quietly; unimplemented says so instead.
+        // `maxsplit=2` (hints.py:743), which is not a detail: `;O` is
+        // `hint links fill :open -t -r {hint-url}`, and its `-t -r` belong to the `:open` that ends
+        // up in the command line, not to `hint`. See [`Args::maxsplit2`].
         "hint" => {
-            let group = args.arg(0).unwrap_or("all");
+            let args = Args::maxsplit2(&tokens[1..]);
+            // `--mode number|word` and `--add-history` are real flags of real features bru has not
+            // built. Silently ignoring either would give the wrong hints or a wrong history.
+            if args.any(&["mode", "add-history"]) {
+                return Ok(Command::Unimplemented(s.trim().to_string()));
+            }
+
+            let Some(group) = HintGroup::parse(args.arg(0).unwrap_or("all")) else {
+                return Ok(Command::Unimplemented(s.trim().to_string()));
+            };
             let target = args.arg(1).unwrap_or("normal");
-            let has_args = args.arg(2).is_some();
-            let flags = args.any(&["rapid", "first", "mode", "add-history"]);
-            match (group, target, has_args || flags) {
-                ("all", "normal" | "current", false) => {
-                    Command::Hint { target: HintTarget::Normal }
-                }
-                ("all", "tab" | "tab-fg" | "tab-bg", false) => {
-                    Command::Hint { target: HintTarget::TabBg }
-                }
-                _ => Command::Unimplemented(s.trim().to_string()),
+            let rest = args.arg(2);
+
+            let target = match (target, rest) {
+                // `current` also removes `target="_blank"` in qutebrowser. bru clicks the element
+                // where it is either way, which is what both spellings mean here.
+                ("normal" | "current", None) => HintTarget::Normal,
+                ("tab" | "tab-bg", None) => HintTarget::TabBg,
+                ("tab-fg", None) => HintTarget::TabFg,
+                ("window", None) => HintTarget::Window,
+                ("hover", None) => HintTarget::Hover,
+                ("yank", None) => HintTarget::Yank,
+                ("yank-primary", None) => HintTarget::YankPrimary,
+                ("download", None) => HintTarget::Download,
+                // `_check_args`, hints.py:565: fill is the one target here that *requires* an
+                // argument, and one with no command line text to set is an error, not a no-op.
+                ("fill", Some(text)) => HintTarget::Fill(text.to_string()),
+                ("fill", None) => return Err(bad("hint fill needs the command line text")),
+                // `run`, `spawn`, `userscript`, `delete`, `right-click`, and any target with
+                // arguments it has no use for.
+                _ => return Ok(Command::Unimplemented(s.trim().to_string())),
+            };
+
+            Command::Hint {
+                group,
+                target,
+                rapid: args.any(&["r", "rapid"]),
+                first: args.any(&["f", "first"]),
             }
         }
         "hint-follow" => Command::HintFollow,
+// --- end src/hints.rs ----------------------------------------------------------------------
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
@@ -738,26 +843,96 @@ mod tests {
 
     #[test]
     fn hints() {
+        let hint = |group, target| Command::Hint { group, target, rapid: false, first: false };
+
         // `f: hint` — no group, no target, so qutebrowser's defaults: all, normal.
-        assert_eq!(parse("hint").unwrap(), Command::Hint { target: HintTarget::Normal });
-        // `F: hint all tab`, and `;b: hint all tab-bg` reaches the same place.
-        assert_eq!(parse("hint all tab").unwrap(), Command::Hint { target: HintTarget::TabBg });
-        assert_eq!(parse("hint all tab-bg").unwrap(), Command::Hint { target: HintTarget::TabBg });
+        assert_eq!(parse("hint").unwrap(), hint(HintGroup::All, HintTarget::Normal));
+        // `F: hint all tab`, and `;b: hint all tab-bg` reaches the same place — `tabs.background`
+        // defaults to true (configdata.yml:2217).
+        assert_eq!(parse("hint all tab").unwrap(), hint(HintGroup::All, HintTarget::TabBg));
+        assert_eq!(parse("hint all tab-bg").unwrap(), hint(HintGroup::All, HintTarget::TabBg));
         assert_eq!(parse("hint-follow").unwrap(), Command::HintFollow);
 
-        // Everything M12 does not do stays unimplemented rather than becoming a near miss. A
-        // `links` group hinted with the `all` selector would draw labels on images and buttons and
-        // look like a bug in the visibility test.
+        // Every one of the fifteen bindings around `f`, spelled as configdata.yml:3723-3739 spells
+        // them. A total is not enough: `;i` and `;I` differ by one word and by everything.
+        assert_eq!(parse("hint all window").unwrap(), hint(HintGroup::All, HintTarget::Window));
+        assert_eq!(parse("hint all tab-fg").unwrap(), hint(HintGroup::All, HintTarget::TabFg));
+        assert_eq!(parse("hint all hover").unwrap(), hint(HintGroup::All, HintTarget::Hover));
+        assert_eq!(parse("hint images").unwrap(), hint(HintGroup::Images, HintTarget::Normal));
+        assert_eq!(parse("hint images tab").unwrap(), hint(HintGroup::Images, HintTarget::TabBg));
+        assert_eq!(parse("hint links yank").unwrap(), hint(HintGroup::Links, HintTarget::Yank));
+        assert_eq!(
+            parse("hint links yank-primary").unwrap(),
+            hint(HintGroup::Links, HintTarget::YankPrimary)
+        );
+        assert_eq!(
+            parse("hint links download").unwrap(),
+            hint(HintGroup::Links, HintTarget::Download)
+        );
+        assert_eq!(parse("hint inputs").unwrap(), hint(HintGroup::Inputs, HintTarget::Normal));
+
+        // `--rapid` and `--first`, before the group and after it. argparse takes optionals in
+        // either place, and `;r` and `gi` are one of each.
+        assert_eq!(
+            parse("hint --rapid links tab-bg").unwrap(),
+            Command::Hint {
+                group: HintGroup::Links,
+                target: HintTarget::TabBg,
+                rapid: true,
+                first: false
+            }
+        );
+        assert_eq!(
+            parse("hint inputs --first").unwrap(),
+            Command::Hint {
+                group: HintGroup::Inputs,
+                target: HintTarget::Normal,
+                rapid: false,
+                first: true
+            }
+        );
+        assert_eq!(
+            parse("hint --rapid links window").unwrap(),
+            Command::Hint {
+                group: HintGroup::Links,
+                target: HintTarget::Window,
+                rapid: true,
+                first: false
+            }
+        );
+
+        // `;o` and `;O`. maxsplit=2 is the whole point: the `-t` and the `-r` belong to the
+        // `:open` that ends up in the command line, and a plain flag split would eat them as
+        // `hint`'s own and leave `:open {hint-url}` behind.
+        assert_eq!(
+            parse("hint links fill :open {hint-url}").unwrap(),
+            hint(HintGroup::Links, HintTarget::Fill(":open {hint-url}".to_string()))
+        );
+        assert_eq!(
+            parse("hint links fill :open -t -r {hint-url}").unwrap(),
+            hint(HintGroup::Links, HintTarget::Fill(":open -t -r {hint-url}".to_string()))
+        );
+        // …and those flags must not have been read as `hint`'s.
+        assert!(matches!(
+            parse("hint links fill :open -t -r {hint-url}").unwrap(),
+            Command::Hint { rapid: false, first: false, .. }
+        ));
+        // `fill` with nothing to fill is an error, not a hint session that ends in silence
+        // (`_check_args`, hints.py:565).
+        assert!(parse("hint links fill").is_err());
+
+        // What bru still does not do stays unimplemented rather than becoming a near miss: a
+        // target it answered with a click would look like a bug in the follow, not a missing
+        // feature.
         for cmd in [
-            "hint links",
-            "hint images",
-            "hint inputs",
-            "hint all window",
-            "hint all hover",
-            "hint all yank",
-            "hint --rapid links tab-bg",
-            "hint inputs --first",
-            "hint links fill :open {hint-url}",
+            "hint all run :later 500 scroll down",
+            "hint all spawn mpv {hint-url}",
+            "hint all userscript view_in_mpv",
+            "hint all delete",
+            "hint all right-click",
+            "hint --mode number links",
+            "hint links yank --add-history",
+            "hint whatever",
         ] {
             assert_eq!(
                 parse(cmd).unwrap(),

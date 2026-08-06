@@ -248,16 +248,34 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
 
-        // --- hints --------------------------------------------------------------------------
-        // `f` and `F`. The labels are drawn by injected JS, but every keystroke that follows is
-        // matched in Rust by a `BindingTrie<usize>` in hint mode — nothing typed reaches the page.
-        Command::Hint { target } => {
-            let target = match target {
-                crate::commands::HintTarget::Normal => crate::hints::Target::Normal,
-                crate::commands::HintTarget::TabBg => crate::hints::Target::TabBg,
+// --- src/hints.rs -----------------------------------------------------------------------
+        // `f`, `F` and the fourteen `;` bindings. The labels are drawn by injected JS, but every
+        // keystroke that follows is matched in Rust by a `BindingTrie<usize>` in hint mode —
+        // nothing typed reaches the page.
+        Command::Hint { group, target, rapid, first } => {
+            use crate::commands::{HintGroup, HintTarget};
+            let group = match group {
+                HintGroup::All => crate::hints::Group::All,
+                HintGroup::Links => crate::hints::Group::Links,
+                HintGroup::Images => crate::hints::Group::Images,
+                HintGroup::Media => crate::hints::Group::Media,
+                HintGroup::Url => crate::hints::Group::Url,
+                HintGroup::Inputs => crate::hints::Group::Inputs,
             };
-            crate::hints::start(state, browser, target);
+            let target = match target {
+                HintTarget::Normal => crate::hints::Target::Normal,
+                HintTarget::TabBg => crate::hints::Target::TabBg,
+                HintTarget::TabFg => crate::hints::Target::TabFg,
+                HintTarget::Window => crate::hints::Target::Window,
+                HintTarget::Hover => crate::hints::Target::Hover,
+                HintTarget::Yank => crate::hints::Target::Yank,
+                HintTarget::YankPrimary => crate::hints::Target::YankPrimary,
+                HintTarget::Download => crate::hints::Target::Download,
+                HintTarget::Fill(text) => crate::hints::Target::Fill(text.clone()),
+            };
+            crate::hints::start(state, browser, group, target, *rapid, *first);
         }
+// --- end src/hints.rs -------------------------------------------------------------------
         // `<Return>` in hint mode. Labels are prefix-free, so an exact match has already followed
         // itself by the time this could run — it exists because the binding does.
         Command::HintFollow => {}
@@ -326,7 +344,26 @@ pub fn is_live(command: &Command) -> bool {
         // Claimed by `cmdline.rs` before this match ever runs.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
 
-        Command::Hint { .. } => true,
+// --- src/hints.rs -----------------------------------------------------------------------
+        // Three targets and one combination are inert on purpose, and each for a different
+        // reason. Raise this when the reason goes away, in the commit that removes it.
+        //
+        // - `yank` / `yank-primary` (`;y`, `;Y`) collect the URL and have nowhere to put it:
+        //   the clipboard is another workstream's, and `hints::Clipboard` is the whole of what
+        //   this one needs from it. Live the moment `hints::install_clipboard` is called.
+        // - `download` (`;d`) is the same shape against `hints::Downloads`.
+        // - `--rapid` with `window` (`;R`) is refused, as qutebrowser refuses `--rapid tab-fg`:
+        //   bru has one window, so `window` *is* a foreground tab, and a rapid session cannot
+        //   survive the tab it is drawn on being switched away from.
+        Command::Hint { target, rapid, .. } => {
+            use crate::commands::HintTarget;
+            match target {
+                HintTarget::Yank | HintTarget::YankPrimary | HintTarget::Download => false,
+                HintTarget::Window | HintTarget::TabFg | HintTarget::Fill(_) => !rapid,
+                _ => true,
+            }
+        }
+// --- end src/hints.rs -------------------------------------------------------------------
         Command::Help { .. } => true,
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
@@ -708,10 +745,65 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Stage 3:
+        // 117 once hint mode had groups, targets and `--rapid` — eleven new, because `;f` was
+        // already counted (it answered `hint all tab-fg` with a *background* tab, which is live
+        // and wrong; it opens a foreground tab now). Raise this when a milestone raises the
+        // number, never to make a failing build pass.
+        assert_eq!(live, 117, "the live-binding count moved");
     }
+
+// --- src/hints.rs -----------------------------------------------------------------------
+    /// The bindings hint groups and targets turned on, and the four still inert, named one by one.
+    /// 106 → 117 is not enough to notice that `;i` went live and `;I` did not.
+    #[test]
+    fn the_bindings_hint_groups_and_targets_turned_on() {
+        let live_now = [
+            ("normal", "wf"),  // hint all window
+            // Live before this milestone too, and wrong: it opened a *background* tab. Named here
+            // because "still live" is not the claim — `HintTarget::TabFg` is.
+            ("normal", ";f"),  // hint all tab-fg
+            ("normal", ";h"),  // hint all hover
+            ("normal", ";i"),  // hint images
+            ("normal", ";I"),  // hint images tab
+            ("normal", ";o"),  // hint links fill :open {hint-url}
+            ("normal", ";O"),  // hint links fill :open -t -r {hint-url}
+            ("normal", ";r"),  // hint --rapid links tab-bg
+            ("normal", ";t"),  // hint inputs
+            ("normal", "gi"),  // hint inputs --first
+            // The `hint:` table, reachable because `hints::handle_key` consults it before the
+            // labels — modeparsers.py:196.
+            ("hint", "<Ctrl-R>"), // hint --rapid links tab-bg
+            ("hint", "<Ctrl-F>"), // hint links
+        ];
+        for (mode, keys) in live_now {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(m, k, _)| *m == mode && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys} in {mode}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+
+        // And the four that are not, each for a reason written down in `is_live`.
+        for cmd in [
+            "hint links yank",          // ;y — no clipboard yet
+            "hint links yank-primary",  // ;Y
+            "hint links download",      // ;d — no download manager yet
+            "hint --rapid links window", // ;R — one window, so `window` is `tab-fg`
+        ] {
+            assert!(
+                !is_live(&commands::parse(cmd).unwrap()),
+                "{cmd:?} claims to be live and has nowhere to put its result"
+            );
+        }
+        // …but the same targets without `--rapid`, and `--rapid` with a target that survives it,
+        // are live. Otherwise the four above would pass with the whole feature switched off.
+        assert!(is_live(&commands::parse("hint links window").unwrap()));
+        assert!(is_live(&commands::parse("hint --rapid links tab-bg").unwrap()));
+        assert!(is_live(&commands::parse("hint --rapid all hover").unwrap()));
+    }
+// --- end src/hints.rs -------------------------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.

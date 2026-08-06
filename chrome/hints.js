@@ -15,39 +15,79 @@
 "use strict";
 
 window.__bru_hints = (function () {
-    // hints.selectors["all"], configdata.yml:1803. Kept in qutebrowser's order and spelling.
-    const SELECTOR = [
-        "a",
-        "area",
-        "textarea",
-        "select",
-        'input:not([type="hidden"])',
-        "button",
-        "frame",
-        "iframe",
-        "img",
-        "link",
-        "summary",
-        '[contenteditable]:not([contenteditable="false"])',
-        "[onclick]",
-        "[onmousedown]",
-        '[role="link"]',
-        '[role="option"]',
-        '[role="button"]',
-        '[role="tab"]',
-        '[role="checkbox"]',
-        '[role="switch"]',
-        '[role="menuitem"]',
-        '[role="menuitemcheckbox"]',
-        '[role="menuitemradio"]',
-        '[role="treeitem"]',
-        "[aria-haspopup]",
-        "[ng-click]",
-        "[ngClick]",
-        "[data-ng-click]",
-        "[x-ng-click]",
-        '[tabindex]:not([tabindex="-1"])',
-    ].join(", ");
+    // hints.selectors, configdata.yml:1803 — every group, in qutebrowser's order and spelling.
+    // These lists are the accumulated answer to "what is clickable", and the groups are the whole
+    // point of `;i`, `;t` and `;o`: `links` is not "the `all` list filtered afterwards", it is a
+    // different query. Rust names the group; this file never chooses one.
+    const SELECTORS = {
+        "all": [
+            "a",
+            "area",
+            "textarea",
+            "select",
+            'input:not([type="hidden"])',
+            "button",
+            "frame",
+            "iframe",
+            "img",
+            "link",
+            "summary",
+            '[contenteditable]:not([contenteditable="false"])',
+            "[onclick]",
+            "[onmousedown]",
+            '[role="link"]',
+            '[role="option"]',
+            '[role="button"]',
+            '[role="tab"]',
+            '[role="checkbox"]',
+            '[role="switch"]',
+            '[role="menuitem"]',
+            '[role="menuitemcheckbox"]',
+            '[role="menuitemradio"]',
+            '[role="treeitem"]',
+            "[aria-haspopup]",
+            "[ng-click]",
+            "[ngClick]",
+            "[data-ng-click]",
+            "[x-ng-click]",
+            '[tabindex]:not([tabindex="-1"])',
+        ],
+        "links": [
+            "a[href]",
+            "area[href]",
+            "link[href]",
+            '[role="link"][href]',
+        ],
+        "images": [
+            "img",
+        ],
+        "media": [
+            "audio",
+            "img",
+            "video",
+        ],
+        "url": [
+            "[src]",
+            "[href]",
+        ],
+        "inputs": [
+            'input[type="text"]',
+            'input[type="date"]',
+            'input[type="datetime-local"]',
+            'input[type="email"]',
+            'input[type="month"]',
+            'input[type="number"]',
+            'input[type="password"]',
+            'input[type="search"]',
+            'input[type="tel"]',
+            'input[type="time"]',
+            'input[type="url"]',
+            'input[type="week"]',
+            "input:not([type])",
+            '[contenteditable]:not([contenteditable="false"])',
+            "textarea",
+        ],
+    };
 
     // A ceiling on how many hints one collection reports. The message router puts a request over
     // 16 KB through shared memory, where it arrives as binary and bru's string handler never sees
@@ -226,10 +266,20 @@ window.__bru_hints = (function () {
         });
     }
 
-    // Find every hintable element and tell Rust where each one would be clicked.
-    function collect(token) {
+    // Find every hintable element in `group` and tell Rust where each one would be clicked.
+    //
+    // An unknown group is refused rather than silently answered with `all`: hinting every button on
+    // the page when `;i` asked for images looks exactly like a bug in the visibility test, and
+    // costs an afternoon to find.
+    function collect(token, group) {
         clear();
         state.token = token;
+
+        const selector = (SELECTORS[group] || []).join(", ");
+        if (!selector) {
+            report(token, "elems", "");
+            return;
+        }
 
         // Everywhere an element can hide: the document, same-domain iframes, open shadow roots.
         const containers = [[document, null]];
@@ -250,7 +300,7 @@ window.__bru_hints = (function () {
         for (const [container, frame] of containers) {
             let matched = [];
             try {
-                matched = container.querySelectorAll(SELECTOR);
+                matched = container.querySelectorAll(selector);
             } catch (exc) {
                 continue;
             }
@@ -333,23 +383,37 @@ window.__bru_hints = (function () {
         }
     }
 
-    // The URL behind one element, for `F`. Asked for only when a hint has been followed, so this is
-    // one element and not a second copy of the whole page.
-    function href(token, index) {
-        const elem = state.elems[index];
-        let url = "";
-        if (elem) {
-            // `elem.href` is already absolute, and is a SVGAnimatedString on an <svg> <a>.
-            if (typeof elem.href === "string" && elem.href) {
-                url = elem.href;
-            } else {
-                const anchor = elem.closest && elem.closest("a[href], area[href], link[href]");
-                if (anchor && typeof anchor.href === "string") {
-                    url = anchor.href;
-                }
+    // webelem.resolve_url: the `href` attribute, or failing that `src`, resolved against the
+    // document's base URL. `src` is what makes `;I` (hint images tab) open the image rather than
+    // nothing, and it is why this is not simply `elem.href`.
+    function resolve_url(elem) {
+        for (const attr of ["href", "src"]) {
+            const text = (elem.getAttribute && elem.getAttribute(attr) || "").trim();
+            if (!text) {
+                continue;
+            }
+            try {
+                return new URL(text, elem.ownerDocument.baseURI).href;
+            } catch (exc) {
+                return "";
             }
         }
-        report(token, "href", url);
+        // Not qutebrowser's, and needed because bru hints the element the selector matched: an
+        // `[onclick]` <span> or a <button> sitting inside an <a> has no URL of its own, and the
+        // link it lives in is the only sensible answer.
+        const anchor = elem.closest && elem.closest("a[href], area[href], link[href]");
+        if (anchor) {
+            return resolve_url(anchor);
+        }
+        return "";
+    }
+
+    // The URL behind one element, for every target that acts on a URL rather than on a click.
+    // Asked for only when a hint has been followed, so this is one element and not a second copy of
+    // the whole page.
+    function href(token, index) {
+        const elem = state.elems[index];
+        report(token, "href", elem ? resolve_url(elem) : "");
     }
 
     return {
