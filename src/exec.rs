@@ -267,6 +267,35 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
         }
 
+// --- src/history.rs --------------------------------------------------------
+        // Quickmarks, bookmarks and the history page. Every one of these is one call: the argument
+        // handling and the "which page am I on" question live in `history.rs`, so that this block
+        // stays small enough to merge beside eleven others.
+        Command::QuickmarkSave { name } => {
+            crate::history::quickmark_save(state, name.as_deref())
+        }
+        Command::QuickmarkLoad { name, tab, bg, window } => {
+            crate::history::quickmark_load(state, browser, name.as_deref(), *tab || *window, *bg)
+        }
+        Command::QuickmarkDel { name } => crate::history::quickmark_del(state, name.as_deref()),
+        Command::BookmarkAdd { url, title, toggle } => {
+            crate::history::bookmark_add(state, url.as_deref(), title.as_deref(), *toggle)
+        }
+        Command::BookmarkLoad { url, tab, bg, window, delete } => crate::history::bookmark_load(
+            state,
+            browser,
+            url.as_deref(),
+            *tab || *window,
+            *bg,
+            *delete,
+        ),
+        Command::BookmarkDel { url } => crate::history::bookmark_del(state, url.as_deref()),
+        Command::BookmarkList { jump, bg } => {
+            crate::history::bookmark_list(state, browser, *jump, *bg)
+        }
+        Command::History { bg } => crate::history::show(state, browser, *bg),
+// --- end src/history.rs ----------------------------------------------------
+
         // --- the command line ---------------------------------------------------------------
         // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
         // stay because the match has no `_`, and they document where the two actually go.
@@ -328,6 +357,19 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
+
+// --- src/history.rs --------------------------------------------------------
+        // All eight act. `quickmark-save` with no name acts by opening the command line rather than
+        // by saving, which is still something happening when the key is pressed — see the arm.
+        Command::QuickmarkSave { .. }
+        | Command::QuickmarkLoad { .. }
+        | Command::QuickmarkDel { .. }
+        | Command::BookmarkAdd { .. }
+        | Command::BookmarkLoad { .. }
+        | Command::BookmarkDel { .. }
+        | Command::BookmarkList { .. }
+        | Command::History { .. } => true,
+// --- end src/history.rs ----------------------------------------------------
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 
@@ -708,10 +750,57 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. 111 once
+        // quickmarks, bookmarks and `:history` had commands — `m`, `M`, `Sq`, `Sb`, `Sh`, named one
+        // by one in `the_bindings_history_turned_on` below. `b`, `B`, `wb`, `gb`, `gB` and `wB` were
+        // already counted: every one of them is a `cmd-set-text`, which the command line has claimed
+        // since M10, and what they prefill only became a real command now. Raise this when a
+        // milestone raises the number, never to make a failing build pass.
+        assert_eq!(live, 111, "the live-binding count moved");
     }
+
+// --- src/history.rs --------------------------------------------------------
+    /// The five bindings this workstream made live, named rather than counted — a total cannot
+    /// notice that `Sq` went live and `Sb` did not.
+    #[test]
+    fn the_bindings_history_turned_on() {
+        for keys in [
+            "m",  // quickmark-save
+            "M",  // bookmark-add
+            "Sq", // bookmark-list
+            "Sb", // bookmark-list --jump
+            "Sh", // history
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+
+        // The six that prefill the command line were live before this and still are — but what they
+        // prefill has to parse to something the dispatcher runs, or pressing `b`, typing a name and
+        // hitting Enter reaches "not implemented yet" instead of a page.
+        for (keys, typed) in [
+            ("b", "quickmark-load go"),
+            ("B", "quickmark-load -t go"),
+            ("wb", "quickmark-load -w go"),
+            ("gb", "bookmark-load https://example.com/"),
+            ("gB", "bookmark-load -t https://example.com/"),
+            ("wB", "bookmark-load -w https://example.com/"),
+        ] {
+            assert!(
+                DEFAULT_BINDINGS
+                    .iter()
+                    .any(|(mode, k, _)| *mode == "normal" && *k == keys),
+                "no default binding for {keys}"
+            );
+            let parsed = commands::parse(typed).expect("the line the binding prefills must parse");
+            assert!(is_live(&parsed), "{typed:?} is still inert");
+        }
+    }
+// --- end src/history.rs ----------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.

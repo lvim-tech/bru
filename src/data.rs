@@ -24,13 +24,11 @@
 //! than one per *visit*, and its `last_atime` index means the `ORDER BY` costs nothing. Measured on
 //! this machine at 9,000 rows: see `completion_at_nine_thousand_rows` at the bottom of this file.
 
-// Nothing outside this module calls into it yet: `src/exec.rs` is one workstream's file and the
-// dispatcher arms for `quickmark-save`, `quickmark-load` and `bookmark-add` are wired at merge, as
-// are `completion.rs`'s calls to `quickmarks`, `bookmarks` and `history_completion`
-// (STAGE2-CONTRACTS.md, "The dispatcher — one owner, one file"). Until then every `pub fn` below is
-// dead code to the compiler and would be seventeen warnings on a build that has none.
-// **Delete this line at merge**, once the arms exist — after that a warning here is a real one.
-#![allow(dead_code)]
+// The module-level `#![allow(dead_code)]` that stood here is gone: `src/history.rs` records the
+// visits, `src/exec.rs` has the arms for `quickmark-save`, `quickmark-load`, `quickmark-del`,
+// `bookmark-add`, `bookmark-load`, `bookmark-del`, `bookmark-list` and `history`, and
+// `completion.rs` reads the three sources. What is still unreached is marked one item at a time,
+// with the milestone it is waiting for, so that a warning here is now a real one.
 
 use rusqlite::Connection;
 use std::fmt;
@@ -56,6 +54,21 @@ pub struct Quickmark {
 pub struct Bookmark {
     pub url: String,
     pub title: String,
+}
+
+/// One row of `History`, the visit log — what `bru://chrome/history` lists.
+///
+/// The completion reads `CompletionHistory` instead and gets one row per *site*; this is one row per
+/// *visit*, which is the whole point of the page: it answers "when was I on that" rather than "what
+/// have I been on".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visit {
+    pub url: String,
+    pub title: String,
+    /// `YYYY-MM-DD`, local time — what the page groups by.
+    pub date: String,
+    /// `HH:MM`, local time.
+    pub time: String,
 }
 
 /// One row of `CompletionHistory`, which is what the History completion category is built from.
@@ -188,7 +201,9 @@ impl Data {
         Ok(Data { dir: dir.to_path_buf(), conn, quickmarks, bookmarks, last_url: None })
     }
 
-    /// The directory this `Data` owns. Only tests and error messages want it.
+    /// The directory this `Data` owns. Only tests want it today; `:history-clear` and an import
+    /// command will both need to name it in a message.
+    #[allow(dead_code)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -303,8 +318,36 @@ impl Data {
         Ok((visits as usize, completion as usize))
     }
 
+    /// The newest `limit` visits, for `bru://chrome/history`.
+    ///
+    /// Redirects are left out: the log keeps them because it is a log, but a page that listed the
+    /// URL that bounced *and* the one it bounced to would show every visit twice. That is
+    /// qutebrowser's `qute://history` too — `qutescheme.py:201-225` reads the same table and drops
+    /// them (`history.py:421`, where a redirect never reaches the completion either).
+    ///
+    /// The two timestamp strings are formatted in SQL because SQLite knows the local timezone and
+    /// bru has no date crate — the same reason `history_completion` formats `atime` there.
+    pub fn recent_visits(&self, limit: usize) -> Result<Vec<Visit>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT url, title,
+                    strftime('%Y-%m-%d', atime, 'unixepoch', 'localtime'),
+                    strftime('%H:%M', atime, 'unixepoch', 'localtime')
+             FROM History WHERE redirect = 0 ORDER BY atime DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(Visit {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                date: row.get(2)?,
+                time: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Forget one URL, from both tables. Behind the completion's delete key, and `:history-clear`
-    /// for one entry.
+    /// for one entry — neither of which exists yet, which is why nothing calls this.
+    #[allow(dead_code)]
     pub fn forget_url(&mut self, url: &str) -> Result<()> {
         self.conn.execute("DELETE FROM History WHERE url = ?1", (url,))?;
         self.conn.execute("DELETE FROM CompletionHistory WHERE url = ?1", (url,))?;
@@ -462,12 +505,39 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Schemes that are never worth completing to, and never worth a row in the log.
 ///
-/// `data:` and `view-source:` are qutebrowser's (`WebHistory._is_excluded_entirely`); a `data:` URL
-/// can be a megabyte of base64 and would be a megabyte of history. `bru://` is bru's own chrome,
-/// which is not a page the user navigated to.
+/// The rule is qutebrowser's, from `WebHistory._is_excluded_entirely` (`history.py:245-257`): a URL
+/// "which can't be visited at a later point; or which is usually excessively long". The list is
+/// longer than qutebrowser's because bru learns its addresses from `DisplayHandler::on_address_change`
+/// and therefore sees things Qt never showed qutebrowser:
+///
+/// | | |
+/// |---|---|
+/// | `data:` | qutebrowser's. A `data:` URL can be a megabyte of base64, and would be a megabyte of history |
+/// | `view-source:` | qutebrowser's |
+/// | `bru://` | bru's own chrome — `bru://chrome/top.html` is not a page the user navigated to. qutebrowser excludes `qute://back` and `qute://pdfjs` for the same reason |
+/// | `about:` | **CEF.** A `BrowserView` with no URL commits `about:blank`, so every tab bru opens would otherwise log one |
+/// | `chrome-error://` | **CEF.** A failed navigation commits `chrome-error://chromewebdata/`; completing to it would reopen the error, not the site |
+/// | `chrome://`, `chrome-untrusted://`, `devtools://` | **CEF.** Chromium's own UI, which bru does not offer and cannot be asked to reopen |
+/// | `javascript:`, `blob:` | neither survives the page it belonged to |
+///
+/// Measured 2026-08-06 before the list grew: a run that visited two pages logged four rows, the two
+/// extras being `about:blank` from the first tab and one `chrome-error://chromewebdata/`.
 fn is_excluded(url: &str) -> bool {
+    const EXCLUDED: [&str; 9] = [
+        "data:",
+        "view-source:",
+        "bru://",
+        "about:",
+        "chrome-error://",
+        "chrome://",
+        "chrome-untrusted://",
+        "devtools://",
+        "javascript:",
+    ];
     let lower = url.to_ascii_lowercase();
-    lower.starts_with("data:") || lower.starts_with("view-source:") || lower.starts_with("bru://")
+    // `blob:` is spelled out rather than listed because a blob URL carries its origin after the
+    // scheme (`blob:https://example.com/<uuid>`), and a prefix test reads oddly beside the rest.
+    lower.starts_with("blob:") || EXCLUDED.iter().any(|scheme| lower.starts_with(scheme))
 }
 
 /// Escape the two SQL `LIKE` wildcards so a user's `%` or `_` is a literal character.
@@ -769,6 +839,72 @@ mod tests {
         assert!(!data.record_visit_at("bru://bottom", "", false, 1000).unwrap());
         assert!(!data.record_visit_at("", "", false, 1000).unwrap());
         assert_eq!(data.history_counts().unwrap(), (0, 0));
+    }
+
+    /// The five schemes the list grew by once a real `DisplayHandler` was feeding it. Every one of
+    /// these was observed coming out of `on_address_change` on this machine, or is the same kind of
+    /// address as one that was; none of them is a page a user can be sent back to.
+    #[test]
+    fn the_addresses_cef_reports_that_are_not_pages() {
+        let t = TempData::new("cef-addresses");
+        let mut data = t.open();
+        for url in [
+            "about:blank",
+            "chrome-error://chromewebdata/",
+            "chrome://newtab/",
+            "chrome-untrusted://new-tab-page/",
+            "devtools://devtools/bundled/devtools_app.html",
+            "javascript:void(0)",
+            "blob:https://example.com/8f2c-4d1e",
+            // Case is not the browser's to normalise: Chromium lowercases a scheme, but a row that
+            // slipped in because of capitals would be a row nobody could explain.
+            "About:Blank",
+            "DATA:text/html,x",
+        ] {
+            assert!(
+                !data.record_visit_at(url, "", false, 1000).unwrap(),
+                "{url} reached the history"
+            );
+        }
+        assert_eq!(data.history_counts().unwrap(), (0, 0));
+
+        // And the near misses that must still be recorded — a prefix test is easy to make too eager.
+        for url in [
+            "https://about.gitlab.com/",
+            "https://example.com/chrome://x",
+            "https://blob.example.com/",
+        ] {
+            assert!(data.record_visit_at(url, "", false, 1000).unwrap(), "{url} was dropped");
+        }
+        assert_eq!(data.history_counts().unwrap(), (3, 3));
+    }
+
+    /// The visit log, newest first, with redirects left out — what `bru://chrome/history` lists.
+    #[test]
+    fn the_history_page_reads_visits_not_sites() {
+        let t = TempData::new("recent-visits");
+        let mut data = t.open();
+        data.record_visit_at("https://a.com/", "A", false, 1_760_000_000).unwrap();
+        data.record_visit_at("https://b.com/", "B", false, 1_760_000_060).unwrap();
+        // The same page again: one row in the completion table, two in the log.
+        data.record_visit_at("https://a.com/", "A", false, 1_760_000_120).unwrap();
+        data.record_visit_at("http://redirect.example/", "", true, 1_760_000_180).unwrap();
+
+        assert_eq!(data.history_counts().unwrap(), (4, 2), "the log keeps the redirect");
+
+        let visits = data.recent_visits(10).unwrap();
+        let urls: Vec<&str> = visits.iter().map(|v| v.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://a.com/", "https://b.com/", "https://a.com/"],
+            "newest first, and no redirect"
+        );
+        // Both timestamp strings come out of SQLite in local time, so only the shape is asserted.
+        assert_eq!(visits[0].date.len(), 10, "YYYY-MM-DD, got {:?}", visits[0].date);
+        assert_eq!(visits[0].time.len(), 5, "HH:MM, got {:?}", visits[0].time);
+        assert_eq!(visits[0].title, "A");
+
+        assert_eq!(data.recent_visits(2).unwrap().len(), 2, "the limit is honoured");
     }
 
     #[test]

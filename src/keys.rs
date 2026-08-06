@@ -299,6 +299,12 @@ wrap_display_handler! {
             if !is_tab {
                 return;
             }
+// --- src/history.rs --------------------------------------------------------
+            // A tab's main frame committed an address: that is a visit, and this is the callback
+            // `data.rs` was written against. Below the `is_tab` guard, so a chrome strip's own
+            // bru:// URL can never reach the history.
+            crate::history::visited(id, &url);
+// --- end src/history.rs ----------------------------------------------------
             if is_active {
                 crate::ipc::set_url(url);
             }
@@ -319,6 +325,11 @@ wrap_display_handler! {
             if !is_tab {
                 return;
             }
+// --- src/history.rs --------------------------------------------------------
+            // The row written at commit has no title yet — the address arrives first. This is what
+            // fills it in, against the URL *this* browser was last reported to be on.
+            crate::history::retitled(id, &title);
+// --- end src/history.rs ----------------------------------------------------
             if is_active {
                 crate::ipc::set_title(title);
             }

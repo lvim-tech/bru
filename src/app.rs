@@ -270,6 +270,23 @@ wrap_browser_process_handler! {
                 crate::scroll::schedule_script(&script, step_ms);
             }
 
+// --- src/history.rs --------------------------------------------------------
+            // Debug hook, off unless asked for. See history::schedule_script — it is the only way to
+            // read what the completion contains, which no other harness here can show.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("history-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("history-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(1000);
+                crate::history::schedule_script(&script, step_ms);
+            }
+// --- end src/history.rs ----------------------------------------------------
+
             // --- M12 (merge: this block belongs to src/hints.rs's workstream) --------------------
             // Debug hook, off unless asked for. See hints::schedule_hint_script.
             let script =
