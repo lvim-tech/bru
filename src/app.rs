@@ -16,6 +16,13 @@ wrap_app! {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(BruBrowserProcessHandler::new(RefCell::new(None)))
         }
+
+        // --- M2 --------------------------------------------------------------------------------
+        // Runs in every process: browser, renderer, GPU, zygote. Keep it pure — there is no state
+        // to reach for out here, and a renderer that missed this call refuses to load bru:// at all.
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            crate::chrome::register_scheme(registrar);
+        }
     }
 }
 
@@ -29,6 +36,9 @@ wrap_browser_process_handler! {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
             let command_line = command_line_get_global().expect("no global command line");
+
+            // M2: the factory has to exist before anything can ask for a bru:// URL.
+            crate::chrome::register_factory();
 
             // The client is kept here because CEF asks for it again through default_client when it
             // creates popups, and handing out a fresh one each time loses the handlers.

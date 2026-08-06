@@ -5,6 +5,7 @@
 //! before anything else and the non-browser cases must return without initialising CEF.
 
 mod app;
+mod chrome;
 mod keys;
 mod window;
 
@@ -20,7 +21,17 @@ fn main() -> Result<(), &'static str> {
     };
 
     let is_browser_process = cmd_line.has_switch(Some(&CefString::from("type"))) != 1;
-    let ret = execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
+
+    // The App goes to execute_process as well as to initialize, so that the child processes get it
+    // too. Two callbacks depend on that: on_register_custom_schemes, which has to run everywhere or
+    // the renderer treats bru:// as an opaque origin, and render_process_handler, which is where
+    // the renderer half of the message router is built.
+    let mut app = app::BruApp::new();
+    let ret = execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
 
     if !is_browser_process {
         // A renderer, GPU or zygote process. execute_process ran its loop and is done; initialising
@@ -30,7 +41,6 @@ fn main() -> Result<(), &'static str> {
     }
     assert_eq!(ret, -1, "browser process could not execute");
 
-    let mut app = app::BruApp::new();
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.
