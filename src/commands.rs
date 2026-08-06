@@ -104,6 +104,13 @@ pub enum Command {
     /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
     Help { tab: bool },
 
+// --- src/clip.rs -----------------------------------------------------------
+    /// `yank [what] [-s]` — `yy`, `yY`, `yt`, `yT`, `yd`, `yD`, `yp`, `yP`, `ym`, `yM`.
+    ///
+    /// `sel` is `-s`/`--sel` and means the **primary selection**, not the clipboard.
+    Yank { what: YankWhat, sel: bool },
+// --- end src/clip.rs -------------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -139,6 +146,26 @@ pub enum HintTarget {
     /// in the background, which is `tabs.background = true` and is what `F` does here today.
     TabBg,
 }
+
+// --- src/clip.rs -----------------------------------------------------------
+/// The `what` of `yank` (`commands.py:710`).
+///
+/// `selection` — the caret-mode one — is deliberately absent: bru has no caret mode, and a `yank
+/// selection` that quietly yanked the URL instead would be worse than an unimplemented binding.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum YankWhat {
+    /// `url`, the default: the address fully encoded, without a password or a tracking parameter.
+    Url,
+    /// `pretty-url`: the same address with its spaces and its Unicode readable.
+    PrettyUrl,
+    /// `title`: the page's title.
+    Title,
+    /// `domain`: scheme, host, and the port when the URL states one.
+    Domain,
+    /// `inline <text>`: the text itself, with `{title}` and `{url:yank}` filled in when it runs.
+    Inline(String),
+}
+// --- end src/clip.rs -------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -539,6 +566,31 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "hint-follow" => Command::HintFollow,
+
+// --- src/clip.rs -----------------------------------------------------------
+        // `yank [what] [inline-text] [-s]`. Ordinary argparse, not maxsplit=0: `ym` is
+        // `yank inline [{title}]({url:yank})` and `yM` puts its `-s` *after* the block, so the
+        // flag has to be recognised wherever it appears.
+        "yank" => {
+            let what = match args.arg(0).unwrap_or("url") {
+                "url" => YankWhat::Url,
+                "pretty-url" => YankWhat::PrettyUrl,
+                "title" => YankWhat::Title,
+                "domain" => YankWhat::Domain,
+                "inline" => {
+                    let Some(text) = args.arg(1).filter(|t| !t.is_empty()) else {
+                        return Err(bad("inline needs a block of text"));
+                    };
+                    YankWhat::Inline(text.to_string())
+                }
+                // A real qutebrowser argument bru has no caret mode for — unbuilt, not invalid.
+                "selection" => return Ok(Command::Unimplemented(s.trim().to_string())),
+                other => return Err(bad(&format!("cannot yank {other:?}"))),
+            };
+            Command::Yank { what, sel: args.any(&["s", "sel"]) }
+        }
+// --- end src/clip.rs -------------------------------------------------------
+
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
@@ -731,10 +783,55 @@ mod tests {
 
     #[test]
     fn unknown_commands_are_kept_verbatim_not_rejected() {
-        let cmd = parse("yank pretty-url").unwrap();
-        assert_eq!(cmd, Command::Unimplemented("yank pretty-url".to_string()));
+        // `<Ctrl-Alt-p>` in the default table. Printing is in no milestone; the binding still has
+        // to keep its place in the trie.
+        let cmd = parse("print").unwrap();
+        assert_eq!(cmd, Command::Unimplemented("print".to_string()));
         assert!(!cmd.is_implemented());
     }
+
+// --- src/clip.rs -----------------------------------------------------------
+    #[test]
+    fn yank_in_its_ten_spellings() {
+        // The ten default bindings, in the order config.rs lists them: yy yY yt yT yd yD yp yP
+        // ym yM. `-s` is the primary selection every time it appears.
+        for (cmd, want) in [
+            ("yank", Command::Yank { what: YankWhat::Url, sel: false }),
+            ("yank -s", Command::Yank { what: YankWhat::Url, sel: true }),
+            ("yank title", Command::Yank { what: YankWhat::Title, sel: false }),
+            ("yank title -s", Command::Yank { what: YankWhat::Title, sel: true }),
+            ("yank domain", Command::Yank { what: YankWhat::Domain, sel: false }),
+            ("yank domain -s", Command::Yank { what: YankWhat::Domain, sel: true }),
+            ("yank pretty-url", Command::Yank { what: YankWhat::PrettyUrl, sel: false }),
+            ("yank pretty-url -s", Command::Yank { what: YankWhat::PrettyUrl, sel: true }),
+            (
+                "yank inline [{title}]({url:yank})",
+                Command::Yank {
+                    what: YankWhat::Inline("[{title}]({url:yank})".to_string()),
+                    sel: false,
+                },
+            ),
+            // `yM` puts the flag *after* the block of text, which is why this is not maxsplit=0.
+            (
+                "yank inline [{title}]({url:yank}) -s",
+                Command::Yank {
+                    what: YankWhat::Inline("[{title}]({url:yank})".to_string()),
+                    sel: true,
+                },
+            ),
+        ] {
+            assert_eq!(parse(cmd).unwrap(), want, "{cmd:?}");
+        }
+
+        // `yank selection` is caret mode's, and bru has no caret mode.
+        assert_eq!(
+            parse("yank selection").unwrap(),
+            Command::Unimplemented("yank selection".to_string())
+        );
+        assert!(parse("yank sideways").is_err());
+        assert!(parse("yank inline").is_err());
+    }
+// --- end src/clip.rs -------------------------------------------------------
 
     #[test]
     fn hints() {
