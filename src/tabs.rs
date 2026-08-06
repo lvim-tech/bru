@@ -110,7 +110,65 @@ impl BruState {
     }
 
     pub fn set_active(&mut self, index: usize) {
+        if index != self.active {
+            self.last_active = Some(self.active);
+        }
         self.active = index;
+    }
+
+    /// Where `tab-focus last` goes. `None` until a second tab has been shown.
+    pub fn last_active_tab(&self) -> Option<usize> {
+        self.last_active.filter(|index| *index < self.tabs.len())
+    }
+
+    /// The address of a tab, as the display handler last reported it.
+    pub fn tab_url(&self, index: usize) -> Option<String> {
+        self.tabs.get(index).map(|tab| tab.url.clone())
+    }
+
+    /// The `depth`-th most recently closed tab's URL, removed from the undo stack. Depth 1 is the
+    /// tab closed last, which is what a bare `u` wants; `2u` reaches the one before it
+    /// (`commands.py:831-861`, where the count *is* the depth).
+    pub fn take_closed_tab(&mut self, depth: usize) -> Option<String> {
+        let index = self.closed.len().checked_sub(depth.max(1))?;
+        Some(self.closed.remove(index))
+    }
+
+    /// Moves the showing tab to `to`, keeping it the showing one.
+    ///
+    /// Only bru's own order changes; the tabs' order among the window's children does not, and does
+    /// not need to. One tab is visible at a time, so the window stacks nothing — what the strip
+    /// draws comes from [`BruState::tabs_json`], which reads this vector.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = to;
+        self.last_active = None;
+    }
+
+    /// Removes every tab but the showing one and hands their views back to be dropped.
+    pub fn take_other_tabs(&mut self) -> Vec<BrowserView> {
+        if self.tabs.is_empty() {
+            return Vec::new();
+        }
+        let active = self.active;
+        let mut taken = Vec::new();
+        let mut kept = Vec::new();
+        for (index, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if index == active {
+                kept.push(tab);
+            } else {
+                self.closed.push(tab.url.clone());
+                taken.push(tab.view.clone());
+            }
+        }
+        self.tabs = kept;
+        self.active = 0;
+        self.last_active = None;
+        taken
     }
 
     pub fn push_tab(&mut self, view: BrowserView) -> usize {
@@ -129,9 +187,12 @@ impl BruState {
             return None;
         }
         let tab = self.tabs.remove(self.active);
+        // Kept so `u` can open it again. Only the URL — see `BruState::closed`.
+        self.closed.push(tab.url.clone());
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
             self.active = self.tabs.len() - 1;
         }
+        self.last_active = None;
         Some(tab.view)
     }
 }
@@ -241,6 +302,41 @@ pub fn prev_tab(state: &SharedState) {
         return;
     }
     select(state, (active + count - 1) % count);
+}
+
+/// Closes every tab but the showing one — `co`, qutebrowser's `:tab-only`.
+///
+/// The views come out of the window and are dropped, exactly as [`close_current`] does it, and for
+/// the same reason: `host.close_browser` on a Views browser closes the window it is parented to.
+pub fn close_others(state: &SharedState) {
+    let (closed, window, tabs) = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let closed = state.take_other_tabs();
+        (closed, state.window(), state.tabs_json())
+    };
+    if closed.is_empty() {
+        return;
+    }
+    for view in &closed {
+        if let Some(window) = &window {
+            window.remove_child_view(Some(&mut View::from(view)));
+        }
+    }
+    drop(closed);
+
+    crate::ipc::set_tabs(tabs);
+    select(state, 0);
+}
+
+/// Moves the showing tab to `to` in the strip — `gm`, `gJ`, `gK`.
+pub fn move_current(state: &SharedState, to: usize) {
+    let tabs = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let from = state.active_tab();
+        state.move_tab(from, to);
+        state.tabs_json()
+    };
+    crate::ipc::set_tabs(tabs);
 }
 
 /// Closes the showing tab. Closing the last one closes the window, which is what the plan settled

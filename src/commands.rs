@@ -52,6 +52,12 @@ pub enum Command {
     TabOnly { force: bool },
     /// `tab-focus [index]`
     TabFocus { index: Option<TabIndex> },
+    /// `tab-move [+|-|start|end|index]`
+    TabMove { to: TabMove },
+    /// `tab-clone [-b|-w|-p]`
+    TabClone { bg: bool, window: bool, private: bool },
+    /// `undo [-w]` — reopen the last closed tab.
+    Undo { window: bool },
 
     /// `open [-t|-b|-w] [-p] [-r] [--] [url]`
     Open {
@@ -76,6 +82,15 @@ pub enum Command {
     Quit { save: bool },
     /// `close` — this window, not the application.
     Close,
+
+    /// `zoom [level]` — no level means the default, 100%.
+    Zoom { level: Option<u32> },
+    /// `zoom-in`
+    ZoomIn,
+    /// `zoom-out`
+    ZoomOut,
+    /// `fullscreen [--enter|--leave]`
+    Fullscreen { enter: bool, leave: bool },
 
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
@@ -107,6 +122,20 @@ pub enum TabIndex {
     Number(i32),
     /// The previously focused tab.
     Last,
+}
+
+/// The argument of `tab-move`.
+///
+/// `commands.py:1025-1065`: `+`/`-` move by [count] places from where the tab is now; everything
+/// else is an absolute destination, and a [count] overrides it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabMove {
+    /// `+` (1) or `-` (-1) — the direction; how far is the count's business.
+    Relative(i32),
+    /// 1-based; negative counts from the end.
+    Index(i32),
+    Start,
+    End,
 }
 
 impl Command {
@@ -395,6 +424,27 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
                 )),
             },
         },
+        // `-` and `+` reach here as positionals: `is_flag` refuses a bare `-`, and `+` never
+        // looked like one.
+        "tab-move" => Command::TabMove {
+            to: match args.arg(0) {
+                // "If neither is given, move it to the first position."
+                None => TabMove::Start,
+                Some("+") => TabMove::Relative(1),
+                Some("-") => TabMove::Relative(-1),
+                Some("start") => TabMove::Start,
+                Some("end") => TabMove::End,
+                Some(n) => TabMove::Index(
+                    n.parse().map_err(|_| bad(&format!("invalid index {n:?}")))?,
+                ),
+            },
+        },
+        "tab-clone" => Command::TabClone {
+            bg: args.any(&["b", "bg"]),
+            window: args.any(&["w", "window"]),
+            private: args.any(&["p", "private"]),
+        },
+        "undo" => Command::Undo { window: args.any(&["w", "window"]) },
 
         // maxsplit=0: the URL is whatever follows the flags, verbatim.
         "open" => {
@@ -423,6 +473,24 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "home" => Command::Home,
         "quit" => Command::Quit { save: args.has("save") },
         "close" => Command::Close,
+
+        // `zoom 150%` and `zoom 150` are the same thing — `zoomcommands.py:68` strips the sign.
+        "zoom" => Command::Zoom {
+            level: match args.arg(0) {
+                None => None,
+                Some(l) => Some(
+                    l.trim_end_matches('%')
+                        .parse()
+                        .map_err(|_| bad(&format!("invalid zoom level {l:?}")))?,
+                ),
+            },
+        },
+        "zoom-in" => Command::ZoomIn,
+        "zoom-out" => Command::ZoomOut,
+        "fullscreen" => Command::Fullscreen {
+            enter: args.has("enter"),
+            leave: args.has("leave"),
+        },
 
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.
@@ -576,7 +644,9 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], Command::ClearKeychain);
         assert_eq!(parts[1], Command::Unimplemented("search".to_string()));
-        assert_eq!(parts[2], Command::Unimplemented("fullscreen --leave".to_string()));
+        assert_eq!(parts[2], Command::Fullscreen { enter: false, leave: true });
+        // Still not implemented as a whole: `search` is src/find.rs's, and a chain is only as
+        // implemented as its least-implemented link.
         assert!(!Command::Chain(parts).is_implemented());
     }
 

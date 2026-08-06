@@ -1,23 +1,13 @@
-//! Keyboard handling.
+//! Keyboard handling: a CEF key event in, a [`crate::commands::Command`] out, and one call to the
+//! dispatcher.
 //!
-//! Scrolling is sent as a synthetic WHEEL event rather than run as JavaScript, and that choice is
-//! the reason bru exists. `send_mouse_wheel_event` goes through Chromium's real input path,
-//! animation included; `window.scrollBy` is what qutebrowser does, and it is the reason its
-//! scrolling never felt like Brave's. Measured on 2026-08-06: through the wheel path it does.
+//! What a command then *does* lives in `src/exec.rs`, which is the only place a command becomes an
+//! action. This file translates and routes; it decides nothing about any individual command.
 
 use cef::*;
 use std::sync::{Arc, Mutex};
 
-use crate::commands::{Command, ScrollDirection};
 use crate::state::BruState;
-
-/// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
-/// delivers per click, and near enough to qutebrowser's step for the two to be compared.
-const STEP: i32 = 120;
-
-/// A ceiling on `<count><command>`. qutebrowser has none, but a typo like `99999j` should not lock
-/// the UI thread up sending wheel events.
-const MAX_COUNT: u32 = 1000;
 
 wrap_keyboard_handler! {
     pub struct BruKeyboardHandler {
@@ -117,7 +107,7 @@ wrap_keyboard_handler! {
             crate::ipc::set_keystring(outcome.keystring.clone());
 
             if let crate::bindings::KeyAction::Run { command, count } = outcome.action {
-                run(&self.state, target, &command, count);
+                crate::exec::run(&self.state, target, &command, count);
             }
 
             // A key that came in on a chrome strip is always swallowed, matched or not — see above.
@@ -127,132 +117,6 @@ wrap_keyboard_handler! {
             outcome.swallow as ::std::os::raw::c_int
         }
     }
-}
-
-/// Run one command against the browser the key arrived at.
-///
-/// Everything stage 1 implements is here; the rest of qutebrowser's command set arrives with the
-/// command line in M9 and is deliberately inert rather than absent — an unimplemented command still
-/// occupies its place in the trie, so `gg` does not become a NoMatch that eats the pending `g`.
-fn run(
-    state: &Arc<Mutex<BruState>>,
-    browser: &mut Browser,
-    command: &Command,
-    count: Option<u32>,
-) {
-    // `3j` is three steps of `j`, not one big one — qutebrowser repeats the command.
-    let repeat = count.unwrap_or(1).clamp(1, MAX_COUNT);
-
-    match command {
-        Command::Chain(parts) => {
-            for part in parts {
-                run(state, browser, part, count);
-            }
-        }
-
-        // The reason bru exists. Through `send_mouse_wheel_event`, never `window.scrollBy`: the
-        // wheel path is Chromium's real input path, animation included.
-        Command::Scroll(direction) => {
-            let (dx, dy) = match direction {
-                ScrollDirection::Down => (0, -STEP),
-                ScrollDirection::Up => (0, STEP),
-                ScrollDirection::Left => (STEP, 0),
-                ScrollDirection::Right => (-STEP, 0),
-                // Top/Bottom/PageUp/PageDown need the page height, which is M11's work.
-                _ => return,
-            };
-            for _ in 0..repeat {
-                wheel(browser, dx, dy);
-            }
-        }
-        Command::ScrollPx { dx, dy } => {
-            for _ in 0..repeat {
-                wheel(browser, *dx, -*dy);
-            }
-        }
-
-        Command::TabNext => {
-            for _ in 0..repeat {
-                crate::tabs::next_tab(state);
-            }
-        }
-        Command::TabPrev => {
-            for _ in 0..repeat {
-                crate::tabs::prev_tab(state);
-            }
-        }
-        Command::TabClose { .. } => crate::tabs::close_current(state),
-
-        // `open` is M9's command, and most of it needs the command line to type a URL into. The
-        // part that does not is worth having early: `ga` and `<Ctrl-T>` are bound to a bare
-        // `open -t`, so without this there is no way to reach a second tab from the keyboard at
-        // all, and `J`/`K`/`d` cannot be exercised. A URL only arrives here from a binding that
-        // carries one; the interactive path is M9's.
-        Command::Open { url, tab, bg, window, .. } => {
-            let target = url.as_deref().unwrap_or(crate::app::HOME);
-            // `-w` has no window management behind it yet; treat it as a tab rather than silently
-            // doing nothing, and say so once M9 gives windows a meaning.
-            if *tab || *bg || *window {
-                crate::tabs::new_tab(state, target, *bg);
-            } else if let Some(frame) = browser.main_frame() {
-                frame.load_url(Some(&CefString::from(target)));
-            }
-        }
-
-        Command::ModeEnter(mode) => {
-            let entered = state
-                .lock()
-                .expect("state mutex poisoned")
-                .enter_mode(*mode, false);
-            if entered {
-                crate::ipc::set_mode(mode.name().to_string());
-            }
-        }
-        Command::ModeLeave => {
-            let mut guard = state.lock().expect("state mutex poisoned");
-            if guard.leave_mode() {
-                let now = guard.mode();
-                drop(guard);
-                crate::ipc::set_mode(now.name().to_string());
-                // Leaving insert mode should also give the page's text field up, or the next `j`
-                // is typed into it rather than scrolling.
-                blur(browser);
-            }
-        }
-
-        // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
-        // clear-keychain is already done by the parser reporting the key.
-        Command::Nop | Command::ClearKeychain => {}
-
-        // Parsed, bound, and waiting for the milestone that implements it.
-        _ => {}
-    }
-}
-
-/// Chromium delivers a wheel event to whatever sits under the cursor, so it needs a position inside
-/// the page rather than over a scrollable child.
-fn wheel(browser: &mut Browser, dx: i32, dy: i32) {
-    let Some(host) = browser.host() else {
-        return;
-    };
-    let mouse = MouseEvent { x: 10, y: 10, modifiers: 0 };
-    host.send_mouse_wheel_event(Some(&mouse), dx, dy);
-}
-
-/// Drop focus from whatever the page had focused. One-off script rather than a CEF call because
-/// CEF has no "blur the focused element" — and this runs on leaving insert mode, not on the key
-/// path proper.
-fn blur(browser: &mut Browser) {
-    let Some(frame) = browser.main_frame() else {
-        return;
-    };
-    frame.execute_java_script(
-        Some(&CefString::from(
-            "document.activeElement && document.activeElement.blur();",
-        )),
-        None,
-        0,
-    );
 }
 
 wrap_client! {

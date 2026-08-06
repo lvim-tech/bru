@@ -33,6 +33,14 @@ pub struct BruState {
     /// these; the fields are visible to it and to nothing outside the crate.
     pub(crate) tabs: Vec<crate::tabs::Tab>,
     pub(crate) active: usize,
+    /// The tab that was showing before the current one, which is what `tab-focus last` (`<Ctrl-Tab>`,
+    /// `<Ctrl-^>`) goes back to. An index, so it survives nothing — a tab closed in between leaves
+    /// it pointing at whatever took that place, which is qutebrowser's behaviour too.
+    pub(crate) last_active: Option<usize>,
+    /// URLs of closed tabs, newest last: `u` (`undo`) pops one and opens it again. Only the URL is
+    /// kept — CEF exposes no way to serialise a tab's navigation list, so the reopened tab starts
+    /// with an empty history.
+    pub(crate) closed: Vec<String>,
     /// The binding tries, one per mode, built once at startup from the compiled-in qutebrowser
     /// defaults and whatever `config.lua` changed. `None` until then — and permanently so in the
     /// renderer and GPU processes, which construct this struct and never fill it in.
@@ -67,6 +75,8 @@ impl BruState {
                 chrome_browsers: Vec::new(),
                 tabs: Vec::new(),
                 active: 0,
+                last_active: None,
+                closed: Vec::new(),
                 parsers: None,
                 modes: crate::modes::ModeManager::new(),
             })
