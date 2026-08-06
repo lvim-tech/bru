@@ -148,6 +148,7 @@ impl BrowserSideHandler for BruQueryHandler {
                         // The command line cannot be driven before there is an input to drive, so
                         // its debug script starts here rather than in `on_context_initialized`.
                         start_cmdline_script();
+                        crate::completers::start_script();
                         bar_json()
                     }
                     other => {
@@ -179,7 +180,9 @@ impl BrowserSideHandler for BruQueryHandler {
             Some("text-changed") => {
                 let text = json_field(request, "text").unwrap_or_default();
                 crate::cmdline::on_text_changed(&text, json_number_field(request, "cursor"));
-                set_completion_for(&text);
+                // The completion is derived from the command line rather than pushed into: every
+                // push asks `completers::json` what the table is now. So this only has to push.
+                push();
                 succeed(&callback, "");
             }
             // The authoritative text, in answer to `bru.accept()`. Nothing else may run a command
@@ -252,9 +255,6 @@ struct BarState {
     download: String,
     /// src/clip.rs: what a yank has just said. qutebrowser's message area, with one line in it.
     message: String,
-    /// The completion payload, already JSON — `{categories, selected}` or `null`. Kept as a string
-    /// because `completion::to_json` is what builds it and nothing here needs to look inside.
-    completion: String,
 }
 
 fn bar() -> &'static Mutex<BarState> {
@@ -268,7 +268,6 @@ fn bar() -> &'static Mutex<BarState> {
         search: String::new(),
         download: String::new(),
         message: String::new(),
-        completion: String::new(),
     });
     &BAR
 }
@@ -328,25 +327,6 @@ pub fn set_message(message: String) {
 
 /// Push the bar again. The command line calls it after every edit it makes.
 pub fn push_bar() {
-    push();
-}
-
-/// Rebuild the completion for what is currently typed, and push it.
-///
-/// Only `:open …` completes for now — that is the one model M10 built. Anything else, including a
-/// bare `:`, clears the table, which is also what collapses the bottom bar back to 24 px.
-fn set_completion_for(text: &str) {
-    let json = match text.strip_prefix(":open ").or_else(|| text.strip_prefix(":open")) {
-        Some(rest) => {
-            let cats = crate::completion::categories(rest.trim_start());
-            let selected = if cats.is_empty() { None } else { Some((0, 0)) };
-            crate::completion::to_json(&cats, selected)
-        }
-        None => String::new(),
-    };
-    if let Ok(mut bar) = bar().lock() {
-        bar.completion = json;
-    }
     push();
 }
 
@@ -464,10 +444,10 @@ pub(crate) fn bar_json() -> String {
     // Built before the lock is taken: `cmdline::json` reads the mode out of `BruState`, and a bar
     // lock held across that would order two mutexes against each other for no reason.
     let cmdline = crate::cmdline::json();
-    let completion = match bar().lock() {
-        Ok(bar) if !bar.completion.is_empty() => bar.completion.clone(),
-        _ => "null".to_string(),
-    };
+    // Derived from that line, and rebuilt only when it has moved — see `completers::json`. It is
+    // asked here rather than pushed in so that a table can never be one edit behind the text it
+    // is completing.
+    let completion = crate::completers::json();
     let Ok(bar) = bar().lock() else {
         return "{}".to_string();
     };

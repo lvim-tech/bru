@@ -177,8 +177,10 @@ wrap_browser_process_handler! {
 
             // All three share one Client, so one set of handlers serves the page and the chrome.
             // Which browser an event came from is answered by its identifier, not by its handler.
+            // The third argument is `grows` — see `window::COMPLETION_HEIGHT`. Only the bottom
+            // strip does; the tab strip's height is its own.
             let mut top_delegate =
-                BruChromeViewDelegate::new(self.state.clone(), TOP_HEIGHT);
+                BruChromeViewDelegate::new(self.state.clone(), TOP_HEIGHT, false);
             let top_view = browser_view_create(
                 client.as_mut(),
                 Some(&CefString::from(TOP_URL)),
@@ -203,7 +205,7 @@ wrap_browser_process_handler! {
             // --- end sessions -------------------------------------------------------------------
 
             let mut bottom_delegate =
-                BruChromeViewDelegate::new(self.state.clone(), BOTTOM_HEIGHT);
+                BruChromeViewDelegate::new(self.state.clone(), BOTTOM_HEIGHT, true);
             let bottom_view = browser_view_create(
                 client.as_mut(),
                 Some(&CefString::from(BOTTOM_URL)),

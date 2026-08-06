@@ -10,6 +10,19 @@ use std::sync::{Arc, Mutex};
 use crate::state::BruState;
 use crate::tabs;
 
+// --- src/completers.rs ---------------------------------------------------------------------
+/// How much taller than its own 24 px the **bottom** strip is asking to be, because the completion
+/// table is open above the command line.
+///
+/// The strip is a CEF view with a fixed preferred height, so however tall the table's HTML grows
+/// it is drawn inside 24 logical pixels and cannot be seen. Measured 2026-08-06 with a screenshot
+/// of `:open du`: the command line read `:open du`, the payload had three categories in it, and
+/// the bar was one row tall. `completers::resize_bar` writes here and invalidates the layout;
+/// `preferred_size` below adds it, and only for the strip built with `grows`, so the tab strip
+/// keeps its own height.
+pub static COMPLETION_HEIGHT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// --- end src/completers.rs -----------------------------------------------------------------
+
 /// A `CefString` that survives being written into a struct CEF reads back.
 ///
 /// `CefString::from(&str)` allocates and marks itself owned, and cef-rs's conversion back to the C
@@ -210,13 +223,25 @@ wrap_browser_view_delegate! {
     pub struct BruChromeViewDelegate {
         state: Arc<Mutex<BruState>>,
         height: i32,
+        // --- src/completers.rs ---------------------------------------------------------------
+        // Whether this strip grows with the completion table. The bottom one does; the tab strip
+        // must not, or an open completion would make the tabs 300px tall.
+        grows: bool,
+        // --- end src/completers.rs -----------------------------------------------------------
     }
 
     impl ViewDelegate {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
             // Width is ignored: the box layout stretches the strip across the window. Only the
             // height is a real request.
-            Size { width: 1280, height: self.height }
+// --- src/completers.rs ---------------------------------------------------------------------
+            let extra = if self.grows {
+                COMPLETION_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                0
+            };
+            Size { width: 1280, height: self.height + extra }
+// --- end src/completers.rs -----------------------------------------------------------------
         }
     }
 

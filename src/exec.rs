@@ -429,6 +429,16 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::FakeKey { keystring } => crate::editor::fake_key(browser, keystring),
         // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
 
+// --- src/completers.rs ---------------------------------------------------------------------
+        // The completion's own three, and they need no browser: the table is built from the
+        // command line and from `src/data.rs`, and what they change is the command line.
+        Command::CompletionItemFocus { .. }
+        | Command::CompletionItemDel
+        | Command::CompletionItemYank { .. } => {
+            crate::completers::run_command(command);
+        }
+// --- end src/completers.rs -----------------------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -513,6 +523,13 @@ pub fn is_live(command: &Command) -> bool {
         // one binding that is bare `set` (`Ss`) parses to `Unimplemented` and stays inert.
         Command::Set { option, .. } => option.is_some(),
 // --- end src/settings.rs ---------------------------------------------------
+
+// --- src/completers.rs ---------------------------------------------------------------------
+        Command::CompletionItemFocus { .. } | Command::CompletionItemDel => true,
+        // Bound and reachable, and it says what it would have copied — but there is no clipboard
+        // in bru yet, so claiming it as live would be claiming `<Ctrl-C>` copies something.
+        Command::CompletionItemYank { .. } => false,
+// --- end src/completers.rs -----------------------------------------------------------------
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
@@ -949,7 +966,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 152, "the live-binding count moved");
+        assert_eq!(live, 162, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -1260,6 +1277,31 @@ mod tests {
         }
     }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
+// --- src/completers.rs ---------------------------------------------------------------------
+    /// The ten command-mode bindings the completion turned on, named one by one — a total is not
+    /// enough to notice that `<Tab>` went live and `<Shift-Tab>` did not.
+    #[test]
+    fn the_bindings_the_completion_turned_on() {
+        for keys in [
+            "<Tab>", "<Shift-Tab>",             // next, prev
+            "<Ctrl-Tab>", "<Ctrl-Shift-Tab>",   // next-category, prev-category
+            "<PgDown>", "<PgUp>",               // next-page, prev-page
+            "<Up>", "<Down>",                   // the same two, --history
+            "<Ctrl-D>", "<Shift-Delete>",       // completion-item-del
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "command" && *k == keys)
+                .unwrap_or_else(|| panic!("no command-mode binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // And the two that are deliberately still inert: there is no clipboard to yank into.
+        assert!(!is_live(&commands::parse("completion-item-yank").unwrap()));
+        assert!(!is_live(&commands::parse("completion-item-yank --sel").unwrap()));
+    }
+// --- end src/completers.rs -----------------------------------------------------------------
 
     #[test]
     fn tab_move_arguments() {

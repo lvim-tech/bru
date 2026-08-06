@@ -10,6 +10,7 @@ mod chrome;
 mod clip;
 mod cmdline;
 mod commands;
+mod completers;
 mod completion;
 mod config;
 mod data;

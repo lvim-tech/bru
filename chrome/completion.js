@@ -7,6 +7,7 @@
 // and the shape it is given is the one src/ipc.rs pushes:
 //
 //   {categories: [{name: "History",
+//                  widths: [40, 50, 10],
 //                  items: [{cols: ["url", "title", "5 days ago"],
 //                           match: [[0, 2], [11, 3]]}]}],
 //    selected: [cat_index, item_index]}
@@ -86,9 +87,31 @@
     return el;
   }
 
-  function item(spec, selected) {
+  // "40fr 50fr 10fr" from [40, 50, 10] — qutebrowser's column_widths, which are
+  // per model and not per row, so every category of one model lines up. A row
+  // with fewer columns than the model has leaves the last track empty rather
+  // than stretching into it. Bad numbers cost the widths, not the row.
+  function tracks(widths) {
+    if (!widths || !widths.length) {
+      return "";
+    }
+    var out = [];
+    for (var i = 0; i < widths.length; i++) {
+      var w = Math.floor(widths[i]);
+      if (!isFinite(w) || w <= 0) {
+        return "";
+      }
+      out.push(w + "fr");
+    }
+    return out.join(" ");
+  }
+
+  function item(spec, selected, columns) {
     var row = document.createElement("div");
     row.className = selected ? "item selected" : "item";
+    if (columns) {
+      row.style.gridTemplateColumns = columns;
+    }
 
     var cols = (spec && spec.cols) || [];
     for (var i = 0; i < cols.length; i++) {
@@ -115,8 +138,9 @@
     header.textContent = (spec && spec.name) || "";
     el.appendChild(header);
 
+    var columns = tracks(spec && spec.widths);
     for (var i = 0; i < items.length; i++) {
-      el.appendChild(item(items[i] || {}, i === selectedItem));
+      el.appendChild(item(items[i] || {}, i === selectedItem, columns));
     }
     return el;
   }

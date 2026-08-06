@@ -225,6 +225,16 @@ pub enum Command {
     },
 // --- end src/settings.rs ---------------------------------------------------
 
+// --- src/completers.rs ---------------------------------------------------------------------
+    /// `completion-item-focus [--history] <which>` — the eight `<Tab>`/`<Ctrl-N>`/`<PgDown>`
+    /// bindings command mode has.
+    CompletionItemFocus { which: FocusWhich, history: bool },
+    /// `completion-item-del` — `<Ctrl-D>`.
+    CompletionItemDel,
+    /// `completion-item-yank [--sel]` — `<Ctrl-C>`, `<Ctrl-Shift-C>`.
+    CompletionItemYank { sel: bool },
+// --- end src/completers.rs -----------------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -295,6 +305,33 @@ pub enum NavigateTo {
     Strip,
 }
 // --- end src/navigate.rs --------------------------------------------------------------------------
+
+// --- src/completers.rs ---------------------------------------------------------------------
+/// The argument of `completion-item-focus`, spelled as `completionwidget.py:293-296` declares its
+/// choices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusWhich {
+    Next,
+    Prev,
+    NextCategory,
+    PrevCategory,
+    NextPage,
+    PrevPage,
+}
+
+impl fmt::Display for FocusWhich {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            FocusWhich::Next => "next",
+            FocusWhich::Prev => "prev",
+            FocusWhich::NextCategory => "next-category",
+            FocusWhich::PrevCategory => "prev-category",
+            FocusWhich::NextPage => "next-page",
+            FocusWhich::PrevPage => "prev-page",
+        })
+    }
+}
+// --- end src/completers.rs -----------------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -952,6 +989,28 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // hand instead.
         "set" | "config-cycle" => parse_config_command(name, &tokens[1..], s)?,
 // --- end src/settings.rs ---------------------------------------------------
+
+// --- src/completers.rs ---------------------------------------------------------------------
+        // `--history` is `-H` as well (`completionwidget.py:297`), and it is what `<Up>` and
+        // `<Down>` carry so that they walk the command history when there is no completion.
+        "completion-item-focus" => {
+            let Some(which) = args.arg(0) else {
+                return Err(bad("needs one of next, prev, next-category, …"));
+            };
+            let which = match which {
+                "next" => FocusWhich::Next,
+                "prev" => FocusWhich::Prev,
+                "next-category" => FocusWhich::NextCategory,
+                "prev-category" => FocusWhich::PrevCategory,
+                "next-page" => FocusWhich::NextPage,
+                "prev-page" => FocusWhich::PrevPage,
+                other => return Err(bad(&format!("invalid direction {other:?}"))),
+            };
+            Command::CompletionItemFocus { which, history: args.any(&["H", "history"]) }
+        }
+        "completion-item-del" => Command::CompletionItemDel,
+        "completion-item-yank" => Command::CompletionItemYank { sel: args.has("sel") },
+// --- end src/completers.rs -----------------------------------------------------------------
 
         _ => Command::Unimplemented(s.trim().to_string()),
     };
