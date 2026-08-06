@@ -21,6 +21,13 @@
              right always, the command line takes the left when the mode is
              command. They are grid-placed, so the row is theirs whichever way
              round the source happens to read. -->
+        <!-- src/clip.rs: where qutebrowser's message area would be. Empty in
+             every mode but the moment after a yank, and #message:empty is
+             display:none, so it costs the bar nothing. It shares grid cell 2/1
+             with #cmdline, which the two never occupy at once: the command line
+             is hidden outside command mode and the message is hidden inside
+             it. -->
+        <div id="message"></div>
         <div id="statusline">
             <span id="keystring"></span>
             <span id="url"></span>

@@ -170,7 +170,23 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // `open.rs` decides what the string *is* before anything is loaded: a URL, a file, or a
         // search — and with which engine. `-w` still behaves as a tab, because bru has one window.
         Command::Open { url, tab, bg, window, .. } => {
+// --- src/clip.rs -----------------------------------------------------------
+            // `pp`, `pP`, `Pp`, `PP`, `wp`, `wP` are `open -- {clipboard}` / `{primary}`, and this
+            // is where the substitution happens — at run time, not at parse time. qutebrowser
+            // substitutes in `commands/runners.py::replace_variables`, between parsing a command
+            // and running it; bru parses its bindings once at startup, so doing it there would
+            // paste whatever was on the clipboard when bru launched. An empty selection aborts the
+            // command, as `ClipboardError` does in qutebrowser: opening the literal `{clipboard}`
+            // would search for it.
+            let url = match crate::clip::expand(url.as_deref()) {
+                Ok(url) => url,
+                Err(error) => {
+                    crate::clip::message(error);
+                    return;
+                }
+            };
             crate::open::open(state, browser, url.as_deref(), *tab || *window, *bg)
+// --- end src/clip.rs -------------------------------------------------------
         }
 
         // --- navigation ---------------------------------------------------------------------
@@ -276,6 +292,12 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::DownloadDelete => crate::downloads::delete(count),
         Command::DownloadRetry => crate::downloads::retry(state, browser, count),
 // --- end src/downloads.rs ----------------------------------------------------------------------
+
+// --- src/clip.rs -----------------------------------------------------------
+        // `yy`, `yY`, `yt`, `yT`, `yd`, `yD`, `yp`, `yP`, `ym`, `yM`. `wl-copy` runs here, on the
+        // UI thread, on this same turn — measured at 1.2 ms, and this is not the scroll path.
+        Command::Yank { what, sel } => crate::clip::yank(what, *sel),
+// --- end src/clip.rs -------------------------------------------------------
 
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
@@ -396,6 +418,14 @@ pub fn is_live(command: &Command) -> bool {
         | Command::BookmarkList { .. }
         | Command::History { .. } => true,
 // --- end src/history.rs ----------------------------------------------------
+
+// --- src/clip.rs -----------------------------------------------------------
+        // All five spellings reach `wl-copy`. `open -- {clipboard}` was already counted live
+        // before this milestone — it opened the literal string `{clipboard}` as a search — so the
+        // six paste bindings raise no number here even though they only now do the right thing.
+        Command::Yank { .. } => true,
+// --- end src/clip.rs -------------------------------------------------------
+
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 
@@ -786,7 +816,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 114, "the live-binding count moved");
+        assert_eq!(live, 124, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -894,6 +924,36 @@ mod tests {
         }
     }
 // --- end src/history.rs ----------------------------------------------------
+
+// --- src/clip.rs -----------------------------------------------------------
+    /// The ten bindings the clipboard turned on, named one by one.
+    ///
+    /// The six paste bindings are *not* here, and that is the point: `open -- {clipboard}` counted
+    /// as live before this milestone, because `Command::Open` is live and the parser had no
+    /// opinion about its argument. It opened a search for the literal text `{clipboard}`. So this
+    /// number cannot show that `pp` was fixed — only `clip::expand`'s own tests can, and the run
+    /// against the real browser.
+    #[test]
+    fn the_bindings_the_clipboard_turned_on() {
+        for keys in ["yy", "yY", "yt", "yT", "yd", "yD", "yp", "yP", "ym", "yM"] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // `-s` reached the command, or five of those ten yank to the wrong selection.
+        let sel = ["yY", "yT", "yD", "yP", "yM"].map(|keys| {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .expect("a default binding");
+            matches!(commands::parse(cmd), Ok(Command::Yank { sel: true, .. }))
+        });
+        assert_eq!(sel, [true; 5], "an -s binding lost its primary selection");
+    }
+// --- end src/clip.rs -------------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.

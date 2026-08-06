@@ -7,6 +7,7 @@
 mod app;
 mod bindings;
 mod chrome;
+mod clip;
 mod cmdline;
 mod commands;
 mod completion;

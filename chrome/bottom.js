@@ -185,6 +185,9 @@
     render: function (state) {
       state = state || {};
 
+      // src/clip.rs: what a yank just said. Cleared by Rust two seconds later,
+      // which is qutebrowser's messages.timeout; this side only draws it.
+      put("message", state.message);
       put("keystring", state.keystring);
       put("url", state.url);
       put("scroll", state.scroll);

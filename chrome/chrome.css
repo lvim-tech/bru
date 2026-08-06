@@ -309,6 +309,35 @@ body:not(.mode-command) #cmdline {
     background: var(--completion-item-selected-bg);
 }
 
+/* Message (src/clip.rs) ----------------------------------------------------
+ *
+ * qutebrowser's message area, with one line in it: "Yanked URL to clipboard: …".
+ * It takes the same grid cell as the command line, which is free in every mode
+ * the command line is not — and the two are hidden in each other's mode, so
+ * they never draw over one another. Empty means gone, so the bar is 24px and
+ * the layout never hears about this element at all until something is said.
+ */
+
+#message {
+    grid-row: 2;
+    grid-column: 1;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--messages-info-fg);
+    background: var(--messages-info-bg);
+}
+
+#message:empty,
+body.mode-command #message {
+    display: none;
+}
+
 /* Status group ------------------------------------------------------------- */
 
 #statusline {

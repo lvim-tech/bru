@@ -237,6 +237,8 @@ struct BarState {
     /// `[dl 45%]` while a download is running, empty otherwise — `downloads::summary`. Pushed like
     /// the rest; the chrome has no element for it yet and ignores the key until it does.
     download: String,
+    /// src/clip.rs: what a yank has just said. qutebrowser's message area, with one line in it.
+    message: String,
     /// The completion payload, already JSON — `{categories, selected}` or `null`. Kept as a string
     /// because `completion::to_json` is what builds it and nothing here needs to look inside.
     completion: String,
@@ -252,6 +254,7 @@ fn bar() -> &'static Mutex<BarState> {
         tabindex: String::new(),
         search: String::new(),
         download: String::new(),
+        message: String::new(),
         completion: String::new(),
     });
     &BAR
@@ -291,6 +294,23 @@ pub fn set_mode(mode: String) {
 /// `gO` prefill the line with the current page.
 pub fn current_url() -> String {
     bar().lock().map(|bar| bar.url.clone()).unwrap_or_default()
+}
+
+/// The title of the tab that is showing, for `yank title` and for `{title}` in a `yank inline`.
+pub fn current_title() -> String {
+    bar().lock().map(|bar| bar.title.clone()).unwrap_or_default()
+}
+
+/// src/clip.rs: one line of message on the status bar, or `""` to take it away.
+///
+/// Where qutebrowser's message area would be. The empty string is not a special case here — the
+/// chrome hides `#message` when it holds nothing, the same rule every other status field follows —
+/// and clearing it after a timeout is `clip.rs`'s business, not this file's.
+pub fn set_message(message: String) {
+    if let Ok(mut bar) = bar().lock() {
+        bar.message = message;
+    }
+    push();
 }
 
 /// Push the bar again. The command line calls it after every edit it makes.
@@ -439,10 +459,11 @@ pub(crate) fn bar_json() -> String {
         return "{}".to_string();
     };
     format!(
-        // Three workstreams each added a key here: `search` is the find handler's match count,
-        // `cmdline` the command line's text and cursor, `completion` the table under it. All three
-        // are optional to the chrome, which ignores a key it does not draw.
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
+        // Five workstreams have each added a key here, and every one of them is optional to the
+        // chrome, which ignores a key it has no element for: `search` is the find handler's match
+        // count, `download` a running download's progress, `message` one line after a yank,
+        // `cmdline` the command line's text and cursor, `completion` the table under it.
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"message\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -451,6 +472,7 @@ pub(crate) fn bar_json() -> String {
         json_escape(&bar.tabindex),
         json_escape(&bar.search),
         json_escape(&bar.download),
+        json_escape(&bar.message),
     )
 }
 
