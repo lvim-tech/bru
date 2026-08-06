@@ -45,6 +45,22 @@ pub enum FirstTab<'a> {
 ///
 /// Runs on the UI thread, holds no lock across a CEF call, and must not be called from inside a
 /// message-router query handler — it creates browsers (CEF-NOTES trap 12).
+///
+/// # What a popup handler should call
+///
+/// `LifeSpanHandler::on_before_popup` gets the browser the popup was opened *from*, and that browser
+/// names its window: `BruState::window_of_browser(id) -> Option<u32>`. From there,
+///
+/// - a popup that should be a tab of the window it came from is
+///   [`crate::tabs::new_tab_in`]`(state, window, url, background)`;
+/// - a popup that should be a window of its own is [`open`]`(state, url) -> u32`, which creates it
+///   and brings it to the front, or [`create`] with [`FirstTab::None`] when the tab is going to be
+///   supplied some other way;
+/// - bringing an existing window forward is [`crate::tabs::focus`]`(state, window)`.
+///
+/// None of these may run inside `on_before_popup` itself if that callback is reached from a query
+/// handler — post to `ThreadId::UI` first. `on_before_popup` proper is a CEF callback on the UI
+/// thread and is fine.
 pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
