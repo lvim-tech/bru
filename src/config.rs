@@ -13,6 +13,7 @@
 use crate::bindings::{BindingTrie, KeyInfo, KeyParsers, parse_key_sequence, sequence_to_string};
 use crate::commands::{self, Command};
 use crate::modes::Mode;
+use crate::open::SearchEngines;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -371,11 +372,48 @@ impl Bindings {
     }
 }
 
-/// Everything read at startup. Bindings today; the start page, search engines and the rest as the
-/// milestones that need them land.
+/// Everything read at startup: the bindings, the search engines, and the settings `bru.set` names.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub bindings: Bindings,
+    /// `bru.search(name, template)`. DESIGN.md: "Search engines are a table in `config.lua`, not a
+    /// copied file." Nothing of qutebrowser's is read at runtime.
+    pub search: SearchEngines,
+    /// `bru.set(key, value)`.
+    pub settings: Settings,
+}
+
+/// The settings `bru.set` can name, and nothing else — an unknown key is an error the config author
+/// sees at startup rather than a line that silently does nothing.
+///
+/// One field today. It is a struct rather than a map so that adding a setting means adding a field
+/// and a match arm, and so that every reader gets a typed value.
+#[derive(Debug, Clone, Default)]
+pub struct Settings {
+    /// **DECISIONS.md item 7.** `None` leaves the compiled-in [`crate::app::HOME`] standing.
+    pub start_page: Option<String>,
+}
+
+impl Settings {
+    /// The keys `bru.set` accepts, for the error message that lists them.
+    const KEYS: &'static [&'static str] = &["start_page"];
+
+    /// Set one. The error string is what `bru.set` raises into Lua.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "start_page" => {
+                if value.trim().is_empty() {
+                    return Err("start_page cannot be empty".to_string());
+                }
+                self.start_page = Some(value.to_string());
+                Ok(())
+            }
+            other => Err(format!(
+                "unknown setting {other:?}; bru knows {}",
+                Settings::KEYS.join(", ")
+            )),
+        }
+    }
 }
 
 impl Config {
@@ -390,25 +428,42 @@ impl Config {
 
     /// [`Config::load`] against an explicit path. `None` means "no config file".
     pub fn load_from(path: Option<&Path>) -> Config {
-        let bindings = Bindings::defaults();
+        let config = Config::default_config();
         let Some(path) = path else {
-            return Config { bindings };
+            return config;
         };
         if !path.exists() {
-            return Config { bindings };
+            return config;
         }
         let source = match std::fs::read_to_string(path) {
             Ok(source) => source,
             Err(e) => {
                 eprintln!("bru: could not read {}: {e}", path.display());
-                return Config { bindings };
+                return config;
             }
         };
-        Config { bindings: apply_lua(bindings, &source, &path.display().to_string()) }
+        apply_lua(config, &source, &path.display().to_string())
     }
 
-    /// Hand the bindings over to the key path. After this call nothing in bru can reach Lua.
+    /// What bru is before `config.lua` says anything: qutebrowser's bindings, and its DEFAULT
+    /// search engine.
+    fn default_config() -> Config {
+        Config {
+            bindings: Bindings::defaults(),
+            search: SearchEngines::default(),
+            settings: Settings::default(),
+        }
+    }
+
+    /// Hand the config over to the rest of bru. After this call nothing in bru can reach Lua.
+    ///
+    /// The bindings become tries for the key path; the search engines and the start page go to
+    /// `open.rs`, which is the only thing that reads them. That install happens here, rather than
+    /// in `app.rs`, so that the one existing call site needs no second line — and so that it cannot
+    /// be forgotten, because a `:open` against an empty engine table would silently search
+    /// DuckDuckGo and look almost right.
     pub fn into_parsers(self) -> KeyParsers {
+        crate::open::install(self.search, self.settings.start_page);
         KeyParsers::new(self.bindings.into_tries())
     }
 }
@@ -425,16 +480,22 @@ pub fn config_path() -> Option<PathBuf> {
     Some(base.join("bru").join("config.lua"))
 }
 
-/// Run a `config.lua` against a set of bindings and return the result.
+/// Run a `config.lua` against a config and return the result.
 ///
 /// The `Lua` value is confined to this function's body and dropped before it returns. That is the
 /// enforcement of "Lua is never on the key path": there is no way to keep a handle to it, because
 /// nothing that escapes has a Lua type.
 ///
-/// A syntax error, or a runtime error, is printed once and the bindings applied before it stand —
+/// A syntax error, or a runtime error, is printed once and whatever was applied before it stands —
 /// which for a syntax error is all of the defaults and none of the config, since nothing ran.
-fn apply_lua(bindings: Bindings, source: &str, chunk_name: &str) -> Bindings {
-    let shared = Arc::new(Mutex::new(bindings));
+///
+/// The surface, all of it:
+///
+/// - `bru.bind(mode, keys, command)` / `bru.unbind(mode, keys)`
+/// - `bru.search(name, url_template)` — `{}` in the template is the term, percent-encoded
+/// - `bru.set(key, value)`
+fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
+    let shared = Arc::new(Mutex::new(config));
 
     let result = (|| -> mlua::Result<()> {
         let lua = mlua::Lua::new();
@@ -446,7 +507,8 @@ fn apply_lua(bindings: Bindings, source: &str, chunk_name: &str) -> Bindings {
             lua.create_function(move |_, (mode, keys, command): (String, String, String)| {
                 target
                     .lock()
-                    .expect("the config.lua bindings mutex is never poisoned")
+                    .expect("the config.lua mutex is never poisoned")
+                    .bindings
                     .bind(&mode, &keys, &command)
                     .map_err(mlua::Error::RuntimeError)
             })?,
@@ -458,27 +520,55 @@ fn apply_lua(bindings: Bindings, source: &str, chunk_name: &str) -> Bindings {
             lua.create_function(move |_, (mode, keys): (String, String)| {
                 target
                     .lock()
-                    .expect("the config.lua bindings mutex is never poisoned")
+                    .expect("the config.lua mutex is never poisoned")
+                    .bindings
                     .unbind(&mode, &keys)
+                    .map_err(mlua::Error::RuntimeError)
+            })?,
+        )?;
+
+        // M9. `bru.search("ddg", "https://duckduckgo.com/?q={}")`. DESIGN.md settles that the
+        // engines are a table here and never a file copied from qutebrowser.
+        let target = Arc::clone(&shared);
+        bru.set(
+            "search",
+            lua.create_function(move |_, (name, template): (String, String)| {
+                target
+                    .lock()
+                    .expect("the config.lua mutex is never poisoned")
+                    .search
+                    .set(&name, &template)
+                    .map_err(mlua::Error::RuntimeError)
+            })?,
+        )?;
+
+        // M9. `bru.set("start_page", "https://start.duckduckgo.com/")`.
+        let target = Arc::clone(&shared);
+        bru.set(
+            "set",
+            lua.create_function(move |_, (key, value): (String, String)| {
+                target
+                    .lock()
+                    .expect("the config.lua mutex is never poisoned")
+                    .settings
+                    .set(&key, &value)
                     .map_err(mlua::Error::RuntimeError)
             })?,
         )?;
 
         lua.globals().set("bru", bru)?;
         lua.load(source).set_name(chunk_name).exec()
-        // `lua` is dropped here, along with both closures and their Arcs.
+        // `lua` is dropped here, along with every closure and its Arc.
     })();
 
     if let Err(e) = result {
         eprintln!("bru: {chunk_name}: {e}");
-        eprintln!("bru: continuing with the bindings that loaded before the error");
+        eprintln!("bru: continuing with the configuration that loaded before the error");
     }
 
     Arc::try_unwrap(shared)
-        .map(|m| m.into_inner().expect("the bindings mutex is never poisoned"))
-        .unwrap_or_else(|arc| {
-            arc.lock().expect("the bindings mutex is never poisoned").clone()
-        })
+        .map(|m| m.into_inner().expect("the config mutex is never poisoned"))
+        .unwrap_or_else(|arc| arc.lock().expect("the config mutex is never poisoned").clone())
 }
 
 #[cfg(test)]
@@ -608,6 +698,76 @@ mod tests {
         assert_eq!(normal.matches(&d).match_type(), MatchType::NoMatch);
         let gs = crate::bindings::parse_key_sequence("gs").unwrap();
         assert_eq!(normal.matches(&gs).match_type(), MatchType::ExactMatch);
+    }
+
+    #[test]
+    fn a_config_lua_adds_search_engines() {
+        let cfg = TempConfig::new(
+            "search",
+            r#"
+                bru.search("ddg", "https://duckduckgo.com/?q={}")
+                bru.search("gh", "https://github.com/search?q={}")
+                bru.set("start_page", "https://start.duckduckgo.com/")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        assert_eq!(config.search.get("ddg"), Some("https://duckduckgo.com/?q={}"));
+        assert_eq!(config.search.get("gh"), Some("https://github.com/search?q={}"));
+        // DEFAULT is there whether or not the config mentioned it.
+        assert_eq!(config.search.get("DEFAULT"), Some(crate::open::DEFAULT_ENGINE_URL));
+        assert_eq!(config.settings.start_page.as_deref(), Some("https://start.duckduckgo.com/"));
+
+        // ...and the table survives all the way into the decision `:open` makes.
+        assert_eq!(
+            crate::open::decide("gh rust cef", &config.search),
+            Some(crate::open::Target::Search {
+                engine: "gh".to_string(),
+                term: "rust cef".to_string(),
+                url: "https://github.com/search?q=rust%20cef".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_config_lua_can_replace_the_default_engine() {
+        let cfg = TempConfig::new(
+            "default-engine",
+            r#"bru.search("DEFAULT", "https://search.marginalia.nu/search?query={}")"#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        // DECISIONS item 4: a bare `:open words` goes to DEFAULT, whatever DEFAULT now is.
+        assert_eq!(
+            crate::open::decide("python dict", &config.search).map(|t| t.url().to_string()),
+            Some("https://search.marginalia.nu/search?query=python%20dict".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bad_search_engine_or_setting_is_an_error_the_config_author_can_see() {
+        let cfg = TempConfig::new(
+            "bad-search",
+            r#"
+                bru.search("ok", "https://x/?q={}")
+                bru.set("start_pgae", "https://typo/")
+                bru.search("never", "https://y/?q={}")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        // The call before the bad one took effect; the bad one raised; the one after did not run.
+        assert_eq!(config.search.get("ok"), Some("https://x/?q={}"));
+        assert_eq!(config.settings.start_page, None);
+        assert_eq!(config.search.get("never"), None);
+
+        // A name with a space could never be typed at `:open`, so it is refused rather than kept.
+        let mut engines = SearchEngines::default();
+        assert!(engines.set("two words", "https://x/?q={}").is_err());
+        // A template with no placeholder would drop the search term silently.
+        assert!(engines.set("w", "https://x/").is_err());
+
+        let mut settings = Settings::default();
+        assert!(settings.set("start_page", "").is_err());
+        assert!(settings.set("nonsense", "x").is_err());
+        assert!(settings.set("start_page", "example.com").is_ok());
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod config;
 mod ipc;
 mod keys;
 mod modes;
+mod open;
 mod state;
 mod tabs;
 mod window;
