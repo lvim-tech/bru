@@ -225,7 +225,7 @@ pub enum Command {
     /// the flag would be a field nothing reads. See `settings::TEMP_IS_THE_ONLY_SPELLING`.
     ///
     /// `option` is `Option` only so that a bare `:set` has a shape; the parser never builds that
-    /// one, because it means "open qute://settings" and bru has no settings page.
+    /// one, because it means "open the settings page" and that is [`Command::SettingsPage`].
     Set {
         option: Option<String>,
         value: Option<String>,
@@ -297,6 +297,9 @@ pub enum Command {
     Save { what: Vec<String> },
     /// `cmd-repeat-last` (`repeat-command` before 2.0) — `.`.
     CmdRepeatLast,
+    /// A bare `:set` — `Ss`. qutebrowser loads `qute://settings` (`configcommands.py:95-99`); bru
+    /// loads `bru://chrome/settings`, generated at request time by `src/settingspage.rs`.
+    SettingsPage,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
@@ -1454,11 +1457,18 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
         }
     }
 
-    // A bare `:set` opens qute://settings in qutebrowser. bru has no settings page, so `Ss` stays
-    // bound, stays parsed, and says it does nothing — which is true.
+// --- src/settingspage.rs -------------------------------------------------------------------
+    // A bare `:set` opens `qute://settings` in qutebrowser (`configcommands.py:95-99`, "Using :set
+    // without any arguments opens a page where settings can be changed interactively"). bru's is
+    // `bru://chrome/settings`, built from the live table at request time — see `settingspage.rs`.
+    // `config-cycle` has no such shape: it needs an option to cycle.
     let Some(option) = option else {
+        if name == "set" {
+            return Ok(Command::SettingsPage);
+        }
         return Ok(Command::Unimplemented(whole.trim().to_string()));
     };
+// --- end src/settingspage.rs ---------------------------------------------------------------
 
     if name == "config-cycle" {
         // An option bru does not implement leaves the binding inert rather than making it a key

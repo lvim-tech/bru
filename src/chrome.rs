@@ -107,6 +107,13 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/history" | "/history.html" => Some(("text/html", crate::history::history_page().into_bytes())),
         "/bookmarks" | "/bookmarks.html" => Some(("text/html", crate::history::marks_page().into_bytes())),
 // --- end src/history.rs ----------------------------------------------------
+// --- src/settingspage.rs ---------------------------------------------------
+        // What a bare `:set` opens. Generated per request from `settings::SETTINGS` and from what
+        // Chromium answers, for the same reason `/help` is. See src/settingspage.rs.
+        "/settings" | "/settings.html" => {
+            Some(("text/html", crate::settingspage::current_page().into_bytes()))
+        }
+// --- end src/settingspage.rs -----------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
         _ => None,
     }

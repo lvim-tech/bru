@@ -562,6 +562,11 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             // qutebrowser's own words, `utilcmds.py:198`.
             None => crate::message::error("You didn't do anything yet."),
         },
+
+        // `Ss`, and a bare `:set`. Same tab, as `configcommands.py:97` has it (`newtab=False`).
+        Command::SettingsPage => {
+            crate::open::open(state, browser, Some("bru://chrome/settings"), false, false)
+        }
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
@@ -750,6 +755,8 @@ pub fn is_live(command: &Command) -> bool {
         Command::Save { .. } => true,
         // `.` runs a command or says there is none to run; both are something happening.
         Command::CmdRepeatLast => true,
+        // `Ss` loads `bru://chrome/settings`, generated from the live table on every request.
+        Command::SettingsPage => true,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
         // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
@@ -1215,11 +1222,42 @@ mod tests {
         // denominator and the numerator move together — 241/262 to 245/264.
         //
         // 242 with `sf`, whose `save` writes the command line's history to `cmd-history` — the one
-        // saveable bru has that was not already on disk. 243 with `.`.
+        // saveable bru has that was not already on disk. 243 with `.`. 244 with `Ss`, a bare `set`,
+        // which opens `bru://chrome/settings`. The fourth of that group, `<Return>` in hint mode,
+        // stays inert on purpose and raises nothing — see the `HintFollow` arm in `run`.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 247, "the live-binding count moved");
+        assert_eq!(live, 248, "the live-binding count moved");
     }
+
+// --- src/settingspage.rs -------------------------------------------------------------------
+    /// The three bindings this workstream turned on, named, and the one it did not.
+    #[test]
+    fn the_last_four_single_bindings() {
+        for (keys, expected) in [("sf", "save"), ("Ss", "set"), (".", "cmd-repeat-last")] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            assert_eq!(*cmd, expected);
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // `<Return>` in hint mode is bound, parses, and does nothing — measured, not forgotten.
+        let (_, _, cmd) = DEFAULT_BINDINGS
+            .iter()
+            .find(|(mode, k, _)| *mode == "hint" && *k == "<Return>")
+            .expect("hint mode binds <Return>");
+        assert_eq!(*cmd, "hint-follow");
+        assert!(!is_live(&commands::parse(cmd).unwrap()));
+
+        // A bare `set` is the settings page; `set` with an option is still `settings.rs`'s.
+        assert_eq!(commands::parse("set").unwrap(), Command::SettingsPage);
+        assert!(is_live(&commands::parse("set content.images").unwrap()));
+        // `config-cycle` has nothing to cycle without an option and stays inert.
+        assert!(!is_live(&commands::parse("config-cycle").unwrap()));
+    }
+// --- end src/settingspage.rs ---------------------------------------------------------------
 
 // --- hint-follow -----------------------------------------------------------------------------
     /// Measurement 1 behind the inert `hint-follow`: no label is a prefix of another, so a complete
@@ -1460,9 +1498,10 @@ mod tests {
             "tph", "tPh", "tpH", "tPH", "tpu", "tPu",
             // content.cookies.accept — no-3rdparty is not expressible through set_content_setting
             "tch", "tCh", "tcH", "tCH", "tcu", "tCu",
-            // `set` with no option means qute://settings, and bru has no settings page
-            "Ss",
         ];
+        // `Ss` — a bare `set` — was in the list above until `bru://chrome/settings` existed to
+        // open. It is counted here so the arithmetic at the bottom still describes 25 bindings.
+        let live_now_too = ["Ss"];
         let command_for = |keys: &str| {
             DEFAULT_BINDINGS
                 .iter()
@@ -1471,7 +1510,7 @@ mod tests {
                 .2
         };
 
-        for keys in live_now {
+        for keys in live_now.iter().chain(live_now_too.iter()) {
             let cmd = command_for(keys);
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
@@ -1484,7 +1523,7 @@ mod tests {
                 "{keys} -> {cmd:?} claims to work; if that is true, say which setting it moves"
             );
         }
-        assert_eq!(live_now.len() + still_inert.len(), 25);
+        assert_eq!(live_now.len() + live_now_too.len() + still_inert.len(), 25);
     }
 
     /// `:set` answers for an option bru refuses; `config-cycle` on the same option does not.
@@ -1504,8 +1543,9 @@ mod tests {
             Command::Unimplemented("config-cycle -p -t -u *://x/* content.plugins".to_string())
         );
 
-        // And a bare `:set` — the `Ss` binding — is inert either way: it means qute://settings.
-        assert!(!is_live(&commands::parse("set").unwrap()));
+        // A bare `:set` — the `Ss` binding — is neither of these: it means "open the settings
+        // page", which is `Command::SettingsPage` and lives now. See `the_last_four_single_bindings`.
+        assert_eq!(commands::parse("set").unwrap(), Command::SettingsPage);
     }
 // --- end src/settings.rs ---------------------------------------------------
 
