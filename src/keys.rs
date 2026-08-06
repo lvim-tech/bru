@@ -137,6 +137,11 @@ wrap_client! {
             Some(BruDisplayHandler::new(self.state.clone()))
         }
 
+        // M11: where `/`'s match count comes from. src/find.rs owns what it does with it.
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(crate::find::BruFindHandler::new())
+        }
+
         // bru has a request handler only because the message router demands two of its callbacks.
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(BruRequestHandler::new())

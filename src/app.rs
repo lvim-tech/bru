@@ -218,6 +218,20 @@ wrap_browser_process_handler! {
                 .unwrap_or(1500);
                 crate::exec::schedule_cmd_script(&cmds, step_ms);
             }
+
+            // Debug hook, off unless asked for. See scroll::schedule_script.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("scroll-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("scroll-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(800);
+                crate::scroll::schedule_script(&script, step_ms);
+            }
         }
 
         fn default_client(&self) -> Option<Client> {

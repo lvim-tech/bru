@@ -11,12 +11,9 @@
 use cef::*;
 use std::sync::{Arc, Mutex};
 
-use crate::commands::{Command, ScrollDirection, TabIndex, TabMove};
+use crate::commands::{Command, TabIndex, TabMove};
 use crate::tabs::SharedState;
 
-/// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
-/// delivers per click, and near enough to qutebrowser's step for the two to be compared.
-const STEP: i32 = 120;
 
 /// A ceiling on `<count><command>`. qutebrowser has none, but a typo like `99999j` should not lock
 /// the UI thread up sending wheel events.
@@ -46,29 +43,17 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // --- scrolling ----------------------------------------------------------------------
         // The reason bru exists. Through `send_mouse_wheel_event`, never `window.scrollBy`: the
         // wheel path is Chromium's real input path, animation included.
-        Command::Scroll(direction) => {
-            let (dx, dy) = match direction {
-                ScrollDirection::Down => (0, -STEP),
-                ScrollDirection::Up => (0, STEP),
-                ScrollDirection::Left => (STEP, 0),
-                ScrollDirection::Right => (-STEP, 0),
-                // Top/Bottom/PageUp/PageDown need the page height — src/scroll.rs.
-                ScrollDirection::Top
-                | ScrollDirection::Bottom
-                | ScrollDirection::PageUp
-                | ScrollDirection::PageDown => return,
-            };
-            for _ in 0..repeat {
-                wheel(browser, dx, dy);
-            }
+        // All four go through `scroll.rs`, which knows two things this arm did not. A single wheel
+        // event moves at most one viewport whatever the delta says — measured 10,000,000 px moving
+        // 1,256 — so anything longer than a screen has to be several events or it is silently
+        // truncated. And both axes are negated, not just the vertical one: `scroll-px 2000 0` used
+        // to move *left*.
+        Command::Scroll(direction) => crate::scroll::scroll(state, browser, *direction, count),
+        Command::ScrollPx { dx, dy } => crate::scroll::scroll_px(state, browser, *dx, *dy, count),
+        Command::ScrollPage { x, y } => crate::scroll::scroll_page(state, browser, *x, *y, count),
+        Command::ScrollToPerc { perc, horizontal } => {
+            crate::scroll::scroll_to_perc(state, browser, *perc, *horizontal, count)
         }
-        Command::ScrollPx { dx, dy } => {
-            for _ in 0..repeat {
-                wheel(browser, *dx, -*dy);
-            }
-        }
-        // SLOT: src/scroll.rs — `scroll-page`, `scroll-to-perc`, and the four directions above.
-        Command::ScrollPage { .. } | Command::ScrollToPerc { .. } => {}
 
         // --- tabs ---------------------------------------------------------------------------
         Command::TabNext => {
@@ -288,15 +273,10 @@ pub fn is_live(command: &Command) -> bool {
         // not what the binding means.
         Command::Chain(parts) => parts.iter().all(is_live),
 
-        Command::Scroll(direction) => matches!(
-            direction,
-            ScrollDirection::Up
-                | ScrollDirection::Down
-                | ScrollDirection::Left
-                | ScrollDirection::Right
-        ),
-        Command::ScrollPx { .. } => true,
-        Command::ScrollPage { .. } | Command::ScrollToPerc { .. } => false,
+        // All four directions live now: `scroll.rs` reaches the top and the bottom by sending many
+        // wheel events rather than one impossible one.
+        Command::Scroll(_) => true,
+        Command::ScrollPx { .. } | Command::ScrollPage { .. } | Command::ScrollToPerc { .. } => true,
 
         Command::TabNext
         | Command::TabPrev
@@ -479,16 +459,6 @@ fn zoom_by(browser: &mut Browser, offset: i32) {
     set_zoom_percent(browser, ZOOM_LEVELS[index]);
 }
 
-/// Chromium delivers a wheel event to whatever sits under the cursor, so it needs a position inside
-/// the page rather than over a scrollable child.
-fn wheel(browser: &mut Browser, dx: i32, dy: i32) {
-    let Some(host) = browser.host() else {
-        return;
-    };
-    let mouse = MouseEvent { x: 10, y: 10, modifiers: 0 };
-    host.send_mouse_wheel_event(Some(&mouse), dx, dy);
-}
-
 /// Drop focus from whatever the page had focused. One-off script rather than a CEF call because
 /// CEF has no "blur the focused element" — and this runs on leaving insert mode, not on the key
 /// path proper.
@@ -659,9 +629,10 @@ mod tests {
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
         assert_eq!(DEFAULT_BINDINGS.len(), 226);
-        // M9's dispatcher work: 27 before it, 70 after. Raise this when a milestone raises the
-        // number, never to make a failing build pass.
-        assert_eq!(live, 70, "the live-binding count moved");
+        // Stage 2, as each workstream is wired in: 27 before any of it, 70 after the dispatcher,
+        // 76 once `scroll.rs` made `gg`, `G` and the page keys real. Raise this when a milestone
+        // raises the number, never to make a failing build pass.
+        assert_eq!(live, 76, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice

@@ -44,6 +44,11 @@ pub fn on_process_message_received(
     source_process: ProcessId,
     message: Option<&mut ProcessMessage>,
 ) -> ::std::os::raw::c_int {
+    // bru's own renderer→browser messages first. The router only recognises its own names, but
+    // handing it a message that is not a query is work on the path a scroll takes.
+    if crate::scroll::on_report(browser.as_deref(), message.as_deref()) {
+        return 1;
+    }
     browser_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
@@ -175,6 +180,7 @@ struct BarState {
     keystring: String,
     scroll: String,
     tabindex: String,
+    search: String,
 }
 
 fn bar() -> &'static Mutex<BarState> {
@@ -185,6 +191,7 @@ fn bar() -> &'static Mutex<BarState> {
         keystring: String::new(),
         scroll: String::new(),
         tabindex: String::new(),
+        search: String::new(),
     });
     &BAR
 }
@@ -226,6 +233,38 @@ pub fn set_keystring(keystring: String) {
     // Every keypress reaches here, and most leave the string as it was. Pushing regardless would
     // run a script in the chrome renderer on every `j` — on the one path this project exists to
     // keep fast.
+    if changed {
+        push();
+    }
+}
+
+/// The scroll percentage, spelled as qutebrowser's percentage widget spells it: `[top]`, `[42%]`,
+/// `[bot]`. Built by `scroll.rs` from what the page reports, and pushed only when it changes — a
+/// held `j` reaches this on every settled position and a push each time would run a script in the
+/// chrome renderer for a string that is already right.
+pub fn set_scroll(scroll: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.scroll != scroll => {
+            bar.scroll = scroll;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        push();
+    }
+}
+
+/// `Match [3/17]` from `find.rs`, or empty for no search. Chromium sends several updates per
+/// search as it scans the page, so this is filtered the same way.
+pub fn set_search_match(search: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.search != search => {
+            bar.search = search;
+            true
+        }
+        _ => false,
+    };
     if changed {
         push();
     }
@@ -279,13 +318,14 @@ fn bar_json() -> String {
         return "{}".to_string();
     };
     format!(
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\"}}",
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\"}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
         json_escape(&bar.keystring),
         json_escape(&bar.scroll),
         json_escape(&bar.tabindex),
+        json_escape(&bar.search),
     )
 }
 
@@ -349,6 +389,12 @@ pub fn renderer_on_process_message_received(
     source_process: ProcessId,
     message: Option<&mut ProcessMessage>,
 ) -> ::std::os::raw::c_int {
+    // The scroll probe is answered here rather than through the router, because the router's
+    // cefQuery is injected into every page and only `bru://` frames may use it — see the security
+    // check above. A process message the browser sent is not the page asking for anything.
+    if crate::scroll::renderer_on_query(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
     renderer_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
