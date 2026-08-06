@@ -6,6 +6,7 @@
 
 mod app;
 mod bindings;
+mod caret;
 mod chrome;
 mod clip;
 mod cmdline;

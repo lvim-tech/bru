@@ -282,20 +282,36 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
 
         // --- modes --------------------------------------------------------------------------
         Command::ModeEnter(mode) => {
+            // --- src/caret.rs ---------------------------------------------------------------
+            // The mode that is being left, read before the transition. Caret mode has a page half
+            // to set up and to tear down, and `mode-enter normal` (caret's `c`) is spelled as a
+            // *leave*, so both directions are visible only from the pair.
+            let before = state.lock().expect("state mutex poisoned").mode();
+            // --- end src/caret.rs -----------------------------------------------------------
             let entered = state
                 .lock()
                 .expect("state mutex poisoned")
                 .enter_mode(*mode, false);
             if entered {
                 crate::ipc::set_mode(mode.name().to_string());
+                // --- src/caret.rs -----------------------------------------------------------
+                let now = state.lock().expect("state mutex poisoned").mode();
+                crate::caret::on_mode_change(browser, before, now);
+                // --- end src/caret.rs -------------------------------------------------------
             }
         }
         Command::ModeLeave => {
             let mut guard = state.lock().expect("state mutex poisoned");
+            // --- src/caret.rs ---------------------------------------------------------------
+            let before = guard.mode();
+            // --- end src/caret.rs -----------------------------------------------------------
             if guard.leave_mode() {
                 let now = guard.mode();
                 drop(guard);
                 crate::ipc::set_mode(now.name().to_string());
+                // --- src/caret.rs -----------------------------------------------------------
+                crate::caret::on_mode_change(browser, before, now);
+                // --- end src/caret.rs -------------------------------------------------------
                 // Leaving insert mode should also give the page's text field up, or the next `j`
                 // is typed into it rather than scrolling.
                 blur(browser);
@@ -351,6 +367,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::navigate::navigate(state, browser, *to, *tab || *window, *bg, count)
         }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
+        // --- src/caret.rs -------------------------------------------------------------------
+        // Caret mode's movements and its selection. `v` moves a text cursor through the page's
+        // document, which CEF has no notion of, so the move itself is `Selection.modify` inside the
+        // page — but *what* to modify, how far, and what a line selection re-anchors to are all
+        // decided in `caret.rs` and sent as a list of primitives. `selection-follow` is normal
+        // mode's `<Return>` and needs no caret session.
+        Command::SelectionToggle { line } => crate::caret::selection_toggle(state, browser, *line),
+        Command::SelectionDrop => crate::caret::selection_drop(state, browser),
+        Command::SelectionReverse => crate::caret::selection_reverse(state, browser),
+        Command::SelectionFollow { tab } => crate::caret::selection_follow(state, browser, *tab),
+        Command::MoveTo(kind) => crate::caret::move_to(state, browser, *kind, count),
+        // --- end src/caret.rs ---------------------------------------------------------------
 
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
@@ -562,6 +591,15 @@ pub fn is_live(command: &Command) -> bool {
         // Every destination, in every tab flag: `-w` is folded into `-t` rather than ignored.
         Command::Navigate { .. } => true,
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
+
+        // --- src/caret.rs -------------------------------------------------------------------
+        Command::SelectionToggle { .. }
+        | Command::SelectionDrop
+        | Command::SelectionReverse
+        | Command::SelectionFollow { .. }
+        | Command::MoveTo(_) => true,
+        // --- end src/caret.rs ---------------------------------------------------------------
 
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
@@ -952,8 +990,10 @@ mod tests {
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
         // 226 through stage 1 and most of stage 2; 231 once hint mode existed and its five
-        // `hint:` bindings (configdata.yml:3884) had a mode to belong to.
-        assert_eq!(DEFAULT_BINDINGS.len(), 231);
+        // `hint:` bindings (configdata.yml:3884) had a mode to belong to; 262 once caret mode
+        // brought the 29 of `caret:` (3961) and the two mark modes each brought the one line of
+        // `register:` (3991).
+        assert_eq!(DEFAULT_BINDINGS.len(), 262);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
         // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints.
@@ -966,7 +1006,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 162, "the live-binding count moved");
+        assert_eq!(live, 196, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------

@@ -112,6 +112,16 @@ wrap_keyboard_handler! {
                 return swallow as ::std::os::raw::c_int;
             }
 
+            // --- src/caret.rs ---------------------------------------------------------------
+            // `set_mark` and `jump_mark` are the same shape: `RegisterKeyParser` consults the one
+            // binding those modes have (`<Escape>: mode-leave`) and then takes the next ordinary
+            // key as a register name rather than as the start of a chain. Answers None in every
+            // other mode, so the ordinary path below is untouched.
+            if let Some(swallow) = crate::caret::handle_mark_key(&self.state, target, info) {
+                return swallow as ::std::os::raw::c_int;
+            }
+            // --- end src/caret.rs -----------------------------------------------------------
+
             let Some(outcome) = self
                 .state
                 .lock()
