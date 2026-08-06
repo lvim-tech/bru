@@ -35,6 +35,37 @@
 //! component downloads, not what one run writes).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether this run is a `--private` one.
+///
+/// A process-wide flag rather than an argument threaded through every caller, because the answer is
+/// decided once, before `initialize`, and cannot change afterwards — and because the modules that
+/// have to obey it ([`crate::data`] and [`crate::cmdline`]) are reached from CEF callbacks that own
+/// no argument list of their own. It is set inside [`Profile::private`] rather than by `main`, so
+/// that the switch and the behaviour cannot drift apart: taking a throwaway Chromium profile and
+/// recording nothing of bru's own are one decision, not two.
+static PRIVATE: AtomicBool = AtomicBool::new(false);
+
+/// Whether nothing this run does may be written down.
+///
+/// **What it turns off is history, and only history:** bru's visit log, the completion table built
+/// from it, and the command line's own `cmd-history`. A quickmark, a bookmark or a session is a
+/// thing the user saved *by name*, and a browser that silently dropped a `:bookmark-add` because the
+/// run happened to be private would be surprising in the other direction — the user asked for that
+/// file to change. Chrome and Brave draw the line in the same place: an incognito window keeps no
+/// history and still keeps a bookmark made in it.
+///
+/// It is deliberately **not** consulted on the read side. A private run still completes from the
+/// history that is already there, still loads `cmd-history` into `<Ctrl-P>`, and still opens a
+/// quickmark by name. Reading writes nothing. Forgetting the user's own marks as well would be
+/// qutebrowser's `--temp-basedir`, which is a *debug* switch (`qutebrowser.py:115` registers `-T` in
+/// the debug argument group) and works by pointing the whole basedir at `mkdtemp` and `rmtree`ing it
+/// at exit (`app.py:68`, `quitter.py:247-250`) — so it throws the config away too and starts with no
+/// bookmarks at all. That is a different tool with a different purpose.
+pub fn is_private() -> bool {
+    PRIVATE.load(Ordering::Relaxed)
+}
 
 /// The symlink bru claims a profile directory with. Chromium's own singleton file in the same
 /// directory is `SingletonLock`; this one is deliberately a different name, because it has to be
@@ -87,21 +118,27 @@ impl Profile {
     /// history and its own `Login Data` into `<root_cache_path>/Default` on every run — measured
     /// 2026-08-06, and *not* switched off by leaving `Settings.cache_path` empty the way
     /// `cef_types.h` promises (see `main.rs`). This makes that directory a throwaway one, so
-    /// nothing Chromium wrote survives the run. Two honest limits:
+    /// nothing Chromium wrote survives the run.
     ///
-    /// - The bytes still reach the disk while bru is running, and a bru that is killed rather than
-    ///   closed leaves them until the next start sweeps them. This is a directory removed on exit,
-    ///   not an in-memory profile. A real off-the-record profile is a `RequestContext` per browser
-    ///   with an empty `cache_path`, which belongs to whoever owns browser creation.
-    /// - **bru's own `history.sqlite` is not affected.** `data.rs` writes it under
-    ///   `$XDG_DATA_HOME/bru` regardless, so a `--private` run still lands in the completion. That
-    ///   is why [`crate::main`] prints what this covers rather than leaving the name to imply it.
+    /// It also raises [`PRIVATE`], which is what stops **bru's own** history: `data.rs` records no
+    /// visit and `cmdline.rs` writes no `cmd-history`. See [`is_private`] for why quickmarks,
+    /// bookmarks and sessions are still written.
+    ///
+    /// One honest limit remains: Chromium's bytes still reach the disk while bru is running, and a
+    /// bru that is killed rather than closed leaves them until the next start sweeps them. This is a
+    /// directory removed on exit, not an in-memory profile. A real off-the-record profile is a
+    /// `RequestContext` per browser with an empty `cache_path`, which belongs to whoever owns
+    /// browser creation.
     ///
     /// The directory is the same `cef.<pid>` shape [`Profile::choose`] falls back to, so [`sweep`]
     /// already collects one left by a crash, and [`Profile::release`] already deletes it. It is
     /// emptied first: a pid is reused eventually, and a private run must not open a dead run's
     /// cookies.
     pub fn private() -> Option<Profile> {
+        // Before the directory, and unconditionally: if `data_dir` answers `None` there is nowhere
+        // to write anyway, but a later `is_private()` that answered `false` because this line was
+        // skipped would be the one failure mode worth ruling out by ordering.
+        PRIVATE.store(true, Ordering::Relaxed);
         throwaway(&crate::data::data_dir()?)
     }
 

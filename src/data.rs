@@ -18,6 +18,15 @@
 //! | `quickmarks` | `name url` per line |
 //! | `bookmarks` | `url title` per line |
 //!
+//! ## `--private`
+//!
+//! Under `--private` this module **reads** all three and **writes** only two of them. No visit
+//! reaches `history.sqlite`, in either table, and no title is corrected in it; a quickmark or a
+//! bookmark saved by name is written exactly as it would be otherwise. The argument for the split is
+//! in `profile::is_private`, and the flag arrives through [`Data::open`] once rather than being
+//! asked for per visit. `cmd-history`, which is the fourth file bru owns and lives in `cmdline.rs`,
+//! follows history rather than the marks.
+//!
 //! The two-table split is the reason completion stays fast. `History` is the raw visit log and
 //! grows without bound — one row per page load, forever. `CompletionHistory` holds the newest
 //! entry per URL, so the query behind every keystroke of `:open …` scans one row per *site* rather
@@ -176,6 +185,11 @@ pub struct Data {
     /// address, a same-document navigation — does not become two visits. qutebrowser's
     /// `WebHistory._last_url`, `browser/history.py`.
     last_url: Option<String>,
+    /// `--private`: read the history, never add to it. Read once at open from
+    /// [`crate::profile::is_private`] and carried here rather than asked for again per visit, so
+    /// that the answer cannot change halfway through a run and so that the tests below can build a
+    /// private `Data` without touching a process-wide flag the other tests share.
+    private: bool,
 }
 
 impl Data {
@@ -187,6 +201,16 @@ impl Data {
     /// Open an explicit directory. Tests use this; nothing else should, because there is exactly
     /// one such directory and `instance()` already knows where it is.
     pub fn open(dir: &Path) -> Result<Data> {
+        Data::open_with(dir, crate::profile::is_private())
+    }
+
+    /// [`Data::open`] with the private decision passed in rather than read from the process.
+    ///
+    /// The database is opened either way, because a private run still *reads* history — the
+    /// completion is the reason `--private` is usable at all. Only the writes are refused, and they
+    /// are refused in [`Data::record_visit_at`] and [`Data::update_title`], which is every path into
+    /// the two history tables.
+    fn open_with(dir: &Path, private: bool) -> Result<Data> {
         std::fs::create_dir_all(dir)?;
         let conn = Connection::open(dir.join("history.sqlite"))?;
         // Chromium is not gentle about how a browser exits, and the default rollback journal loses
@@ -198,7 +222,7 @@ impl Data {
 
         let quickmarks = read_quickmarks(&dir.join("quickmarks"))?;
         let bookmarks = read_bookmarks(&dir.join("bookmarks"))?;
-        Ok(Data { dir: dir.to_path_buf(), conn, quickmarks, bookmarks, last_url: None })
+        Ok(Data { dir: dir.to_path_buf(), conn, quickmarks, bookmarks, last_url: None, private })
     }
 
     /// The directory this `Data` owns. Only tests want it today; `:history-clear` and an import
@@ -218,7 +242,7 @@ impl Data {
     /// `WebHistory.add_url`.
     ///
     /// Returns `Ok(false)` when the visit was deliberately not recorded — an excluded scheme, an
-    /// empty URL, or the same URL as the visit before it.
+    /// empty URL, the same URL as the visit before it, or a `--private` run.
     pub fn record_visit(&mut self, url: &str, title: &str, redirect: bool) -> Result<bool> {
         self.record_visit_at(url, title, redirect, now())
     }
@@ -226,6 +250,13 @@ impl Data {
     /// [`Data::record_visit`] with the timestamp supplied rather than read from the clock. Tests
     /// need a history whose ordering is known, and an import command would need this too.
     pub fn record_visit_at(&mut self, url: &str, title: &str, redirect: bool, atime: i64) -> Result<bool> {
+        // `--private`. First, before anything else in the function, because everything after this
+        // line ends in an `INSERT`: a visit is a record of where the user went, and a run that
+        // announced it would keep no record and then wrote one would be worse than no switch. The
+        // completion still *reads* the table — see `profile::is_private`.
+        if self.private {
+            return Ok(false);
+        }
         if url.is_empty() || is_excluded(url) {
             return Ok(false);
         }
@@ -260,7 +291,10 @@ impl Data {
     /// `on_title_change` when the document has one — so the row written at navigation frequently
     /// holds the old page's title or none at all. This fixes it in place.
     pub fn update_title(&mut self, url: &str, title: &str) -> Result<()> {
-        if url.is_empty() || title.is_empty() {
+        // A private run wrote no row to correct, and an `UPDATE` that matched a row from an earlier
+        // ordinary run would move that row's title to the one this run saw — a write, and a
+        // detectable trace of the private visit, from the one history call that is not an insert.
+        if self.private || url.is_empty() || title.is_empty() {
             return Ok(());
         }
         self.conn.execute("UPDATE CompletionHistory SET title = ?2 WHERE url = ?1", (url, title))?;
@@ -632,7 +666,14 @@ mod tests {
         }
 
         fn open(&self) -> Data {
-            Data::open(&self.dir).expect("could not open the test data directory")
+            Data::open_with(&self.dir, false).expect("could not open the test data directory")
+        }
+
+        /// The same directory opened as a `--private` run would open it. Not through the process
+        /// flag: `cargo test` runs these in threads that share it, and one test switching it on
+        /// would silently stop every other test's history from being written.
+        fn open_private(&self) -> Data {
+            Data::open_with(&self.dir, true).expect("could not open the test data directory")
         }
     }
 
@@ -1013,6 +1054,59 @@ mod tests {
                 Bookmark { url: "https://b.com/".into(), title: String::new() },
             ]
         );
+    }
+
+    /// `--private` covers bru's own history, which is the whole point of this workstream: the switch
+    /// used to print a line saying it did not.
+    ///
+    /// Both halves matter. Take the `if self.private` out of `record_visit_at` and the first
+    /// assertion fails; make `--private` discard the marks as well — qutebrowser's `--temp-basedir`
+    /// behaviour — and the last two fail.
+    #[test]
+    fn a_private_run_records_no_history_and_still_saves_what_was_saved_by_name() {
+        let t = TempData::new("private");
+
+        // An ordinary run first, so there is something to read and something to leave alone.
+        {
+            let mut data = t.open();
+            data.record_visit_at("https://before.example/", "Before", false, 1000).unwrap();
+        }
+
+        let mut data = t.open_private();
+
+        assert!(
+            !data.record_visit_at("https://secret.example/", "Secret", false, 2000).unwrap(),
+            "a private run must record no visit"
+        );
+        assert!(
+            !data.record_visit_at("https://secret.example/", "", true, 2001).unwrap(),
+            "not even a redirect, which an ordinary run does log"
+        );
+        // The title correction is the other write into the two tables, and it is an UPDATE rather
+        // than an INSERT — so it would leave a trace on a row that already existed.
+        data.update_title("https://before.example/", "Retitled by the private run").unwrap();
+
+        assert_eq!(data.history_counts().unwrap(), (1, 1), "only the earlier run's visit is there");
+        assert_eq!(
+            data.history_completion("before", 10).unwrap()[0].title,
+            "Before",
+            "a private run must not rewrite a title it did not record"
+        );
+        // Reading is untouched: the completion is why --private is usable at all.
+        assert_eq!(data.history_completion("before", 10).unwrap().len(), 1);
+        assert!(data.history_completion("secret", 10).unwrap().is_empty());
+
+        // And the two things the user saved by name are saved, on disk, exactly as always.
+        data.quickmark_save("q", "https://kept.example/").unwrap();
+        data.bookmark_add("https://kept.example/", "Kept", true).unwrap();
+        assert_eq!(std::fs::read_to_string(t.dir.join("quickmarks")).unwrap(), "q https://kept.example/\n");
+        assert_eq!(std::fs::read_to_string(t.dir.join("bookmarks")).unwrap(), "https://kept.example/ Kept\n");
+
+        // They survive the private run, because they are not the private run's to throw away.
+        let after = t.open();
+        assert_eq!(after.quickmark_load("q").unwrap(), "https://kept.example/");
+        assert_eq!(after.bookmarks().len(), 1);
+        assert_eq!(after.history_counts().unwrap(), (1, 1));
     }
 
     #[test]

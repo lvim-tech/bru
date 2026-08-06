@@ -862,10 +862,22 @@ pub fn last_command() -> Option<(Command, Option<u32>)> {
 /// accepted `:open …` lived in a `Vec<String>` and went with the process. The file is
 /// `cmd-history` in bru's data directory, which is the name and the shape qutebrowser's
 /// `LimitLineParser(standarddir.data(), 'cmd-history')` uses (`cmdhistory.py:126-131`).
+///
+/// Under `--private` this one is refused. `cmd-history` is a list of the commands the user accepted,
+/// which for the command that matters is `open <url>` — the same fact the visit log holds, in the
+/// user's own words. It is history, not a mark saved by name, so it follows `history.sqlite` and not
+/// `quickmarks`; see `profile::is_private` for where that line is drawn and why.
 const SAVEABLES: &[&str] = &["command-history"];
 
 /// What `data.rs` writes without being asked, and therefore what `:save` has nothing to do for.
 const ALREADY_ON_DISK: &[&str] = &["quickmarks", "bookmarks", "history", "cookies"];
+
+/// The description [`save`] gives these instead, in a `--private` run, where "written when it
+/// changes" would be false for one of them and beside the point for the other.
+const PRIVATE_NOTES: &[(&str, &str)] = &[
+    ("history", "not written by a --private run, so there is nothing to flush"),
+    ("cookies", "Chromium's, in a profile deleted when bru exits, so there is nothing to flush"),
+];
 
 /// What bru refuses to write at all, and the reason, in the shape `settings::REFUSED` uses.
 const NOT_BRUS_TO_WRITE: &[(&str, &str)] = &[
@@ -905,6 +917,12 @@ pub fn save(what: &[String]) {
                 Ok((path, lines)) => done.push(format!("{lines} lines to {}", path.display())),
                 Err(error) => errors.push(format!("command-history: {error}")),
             },
+            name if crate::profile::is_private()
+                && PRIVATE_NOTES.iter().any(|(what, _)| *what == name) =>
+            {
+                let why = PRIVATE_NOTES.iter().find(|(what, _)| *what == name).map(|(_, why)| *why);
+                done.push(format!("{name} ({})", why.unwrap_or_default()))
+            }
             name if ALREADY_ON_DISK.contains(&name) => {
                 done.push(format!("{name} (written when it changes; nothing to flush)"))
             }
@@ -935,7 +953,18 @@ fn history_path() -> Option<PathBuf> {
 }
 
 /// Write the accepted lines out, newest last, and answer where they went and how many there were.
+///
+/// The `--private` refusal is here rather than in [`save`]'s match so that it is on the only path to
+/// the file: a later caller — a save on quit, a timer — gets it without having to remember it. The
+/// lines are still kept in memory and `<Ctrl-P>` still walks them; what a private run refuses is the
+/// disk.
 fn write_command_history() -> std::io::Result<(PathBuf, usize)> {
+    if crate::profile::is_private() {
+        return Err(std::io::Error::other(
+            "not saved: this is a --private run, and an accepted `:open …` names the page as \
+             plainly as the history would",
+        ));
+    }
     let Some(path) = history_path() else {
         return Err(std::io::Error::other(
             "neither XDG_DATA_HOME nor HOME is set, so there is nowhere to save",

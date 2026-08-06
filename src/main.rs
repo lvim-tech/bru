@@ -96,9 +96,14 @@ fn main() -> Result<(), &'static str> {
         profile::Profile::choose(Some(user_data_dir.as_str()))
     };
 
-    // Said out loud rather than left to the name. A user who types `--private` and then finds the
-    // site in the completion has been misled by one word; one line at startup is what keeps the
-    // switch's promise the size it actually is.
+    // Said out loud rather than left to the name, because the switch covers two different stores and
+    // a user is owed the boundary between them. The second line used to read "bru's own history,
+    // quickmarks and bookmarks are NOT affected", which was true and was the reason to finish the
+    // job: a switch that needs a disclaimer to be honest is not finished. `data.rs` now records no
+    // visit and `cmdline.rs` writes no `cmd-history` under `--private`, so the line describes what
+    // is kept rather than apologising for it — a quickmark, bookmark or session is a thing the user
+    // saved by name, and dropping one silently would be the opposite surprise
+    // (`profile::is_private`).
     if private {
         if let Some(profile) = profile.as_ref() {
             eprintln!(
@@ -106,7 +111,10 @@ fn main() -> Result<(), &'static str> {
                 profile.path().display()
             );
         }
-        eprintln!("bru: --private: bru's own history, quickmarks and bookmarks are NOT affected");
+        eprintln!(
+            "bru: --private: no page reaches bru's history and no command line is saved; \
+             a quickmark, bookmark or session you save by name still is"
+        );
     }
 
     let settings = Settings {
