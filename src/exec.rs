@@ -346,8 +346,33 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::hints::start(state, browser, group, target, *rapid, *first);
         }
 // --- end src/hints.rs -------------------------------------------------------------------
-        // `<Return>` in hint mode. Labels are prefix-free, so an exact match has already followed
-        // itself by the time this could run — it exists because the binding does.
+        // `<Return>` in hint mode, and it is inert on purpose. Three measurements, re-taken
+        // 2026-08-06 against every group and target the hint workstream added:
+        //
+        // 1. **bru's labels are prefix-free, so an exact match has already followed itself.**
+        //    `hints::hint_strings` gives the short labels the numbers `0..short_count` in
+        //    `needed - 1` digits and the long ones the numbers from `short_count * len(chars)` up
+        //    in `needed` digits, so a long label's leading `needed - 1` digits encode a number
+        //    **at least** `short_count` — never one a short label stands for. Asserted over 1..600
+        //    elements in `hint_labels_are_prefix_free` below. There is therefore no state in which
+        //    a complete label is sitting unfollowed waiting for Enter.
+        // 2. **`--rapid` does not change that.** A rapid session clears `sequence` after each
+        //    follow and keeps the same label set, so 1 holds for its second and later follows word
+        //    for word; `--first` (`gi`) fires label 0 before any key is pressed at all. The only
+        //    `--rapid` combination that behaves differently, `;R`, is refused before a session
+        //    starts (`hints::Target::allows_rapid`).
+        // 3. **The key is dead in qutebrowser 3.7.0 too, under its own defaults.** `<Return>` is
+        //    bound to a bare `hint-follow`, whose `keystring` is then `None`, so it follows
+        //    `_context.to_follow` (`hints.py:1008-1012`) — and `to_follow` is only ever assigned in
+        //    the `else` branch of `_handle_auto_follow` (`hints.py:833-836`), reached only when
+        //    `hints.auto_follow` is `never`. The default is `unique-match` (configdata.yml:1673),
+        //    so pressing Enter in stock qutebrowser raises `CommandError("No hint to follow")`.
+        //
+        // What *is* worth having is the gap between 1 and 3: qutebrowser follows on a **unique**
+        // match, bru on a **full** one, so bru can sit with one visible label and an incomplete
+        // chain — a state qutebrowser's default never reaches, and where Enter would have a job.
+        // Doing it means reading the session's labels and calling `hints::follow`, both private to
+        // `src/hints.rs`; it belongs in that module and to whoever owns it next, not here.
         Command::HintFollow => {}
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -1156,6 +1181,32 @@ mod tests {
         // Raise this when a milestone raises the number, never to make a failing build pass.
         assert_eq!(live, 245, "the live-binding count moved");
     }
+
+// --- hint-follow -----------------------------------------------------------------------------
+    /// Measurement 1 behind the inert `hint-follow`: no label is a prefix of another, so a complete
+    /// label can never be sitting unfollowed with Enter left to press.
+    ///
+    /// Over 1..600 elements rather than one page's worth, because the property is a claim about
+    /// `hint_strings`' arithmetic — the short/long split at `short_count * len(chars)` — and one
+    /// count would only prove it where it was easiest.
+    #[test]
+    fn hint_labels_are_prefix_free() {
+        for count in 1..600usize {
+            let labels = crate::hints::hint_strings(count);
+            assert_eq!(labels.len(), count);
+            for (i, a) in labels.iter().enumerate() {
+                for (j, b) in labels.iter().enumerate() {
+                    if i != j {
+                        assert!(
+                            !b.starts_with(a.as_str()),
+                            "{count} labels: {a:?} is a prefix of {b:?}, so Enter would have a job"
+                        );
+                    }
+                }
+            }
+        }
+    }
+// --- end hint-follow -------------------------------------------------------------------------
 
 // --- src/downloads.rs --------------------------------------------------------------------------
     /// The three bindings downloads turned on, named — and the one it deliberately did not.
