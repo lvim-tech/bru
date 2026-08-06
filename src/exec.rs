@@ -582,6 +582,52 @@ wrap_task! {
     }
 }
 
+/// What the command line runs when Enter is pressed. Installed once at startup by `app.rs`.
+///
+/// **It must not dispatch here.** This is reached from inside the message router's query handler —
+/// the chrome answers `bru.accept()` with the typed text — and CEF-NOTES trap 12 says no call that
+/// creates a browser or starts a navigation may run inside one: the router holds
+/// `browser_query_info_map` across the handler, and `on_before_browse`, which bru is obliged to
+/// forward to the router, wants that same lock. `:open` would deadlock bru with its window still
+/// painted. So the work is posted and happens on the next turn of the UI loop.
+pub fn run_from_cmdline(text: &str, count: Option<u32>) {
+    let mut task = CmdLineCommand::new(text.to_string(), count);
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct CmdLineCommand {
+        text: String,
+        count: Option<u32>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            let command = match crate::commands::parse(&self.text) {
+                Ok(command) => command,
+                Err(error) => {
+                    eprintln!("bru: {:?} does not parse: {error}", self.text);
+                    return;
+                }
+            };
+            if !is_live(&command) {
+                eprintln!("bru: {:?} is not implemented yet", self.text);
+                return;
+            }
+            let Some(mut browser) = state.lock().expect("state mutex poisoned").active_browser()
+            else {
+                return;
+            };
+            run(&state, &mut browser, &command, self.count);
+        }
+    }
+}
+
 /// One line per step: what the command was, and the state a screenshot would have to agree with.
 ///
 /// `order` is the strip, left to right, each tab shown by the tail of its URL — without it a

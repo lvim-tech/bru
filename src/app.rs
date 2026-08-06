@@ -139,6 +139,11 @@ wrap_browser_process_handler! {
             // above, which is what installs the search engines from config.lua.
             crate::completion::install(Box::new(crate::data::DataSources));
 
+            // What Enter in the command line actually runs. Without this the round trip completes
+            // and the command is dropped on the floor — `:open -t abv.bg` would print "no command
+            // runner installed" and do nothing.
+            crate::cmdline::set_runner(crate::exec::run_from_cmdline);
+
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state
             // rather than in this handler because CEF builds a new handler object per callback.
