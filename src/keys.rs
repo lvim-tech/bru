@@ -144,6 +144,10 @@ wrap_keyboard_handler! {
                 // atomic load, which is the whole of what `j` pays for macros existing.
                 crate::macros::record(&self.state, &command, count);
                 // --- end src/macros.rs ------------------------------------------------------
+                // What `.` repeats — `runners.py:184-185`, recorded under the mode the key was
+                // pressed in, and before the command runs so that the mode is the one it was run
+                // *from*. See `cmdline::record_last_command`; `cmd-repeat-last` excludes itself.
+                crate::cmdline::record_last_command(&command, count);
                 crate::exec::run(&self.state, target, &command, count);
             }
 

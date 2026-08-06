@@ -549,6 +549,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // `sf`. Not the page — see `Command::Save`: qutebrowser's `:save` walks its saveables, and
         // the one bru has that is not already on disk is the command line's history.
         Command::Save { what } => crate::cmdline::save(what),
+
+        // `.`. The count on the `.` beats the one the command was first given, which is
+        // `utilcmds.py:201` — `count if count is not None else cmd[1]`, so `3.` repeats a bare `j`
+        // three times and a plain `.` repeats `10j` as ten.
+        //
+        // This reaches `run` again, one level down, and that recursion is safe for the same reason
+        // a chain's is: `cmd-repeat-last` is never itself recorded (`runners.py:177-179`), so the
+        // command found here can never be another repeat.
+        Command::CmdRepeatLast => match crate::cmdline::last_command() {
+            Some((last, last_count)) => run(state, browser, &last, count.or(last_count)),
+            // qutebrowser's own words, `utilcmds.py:198`.
+            None => crate::message::error("You didn't do anything yet."),
+        },
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
@@ -735,6 +748,8 @@ pub fn is_live(command: &Command) -> bool {
 // --- src/settingspage.rs -------------------------------------------------------------------
         // `sf` writes a file, or says why there was nothing to write. See `cmdline::save`.
         Command::Save { .. } => true,
+        // `.` runs a command or says there is none to run; both are something happening.
+        Command::CmdRepeatLast => true,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
         // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
@@ -1024,6 +1039,11 @@ wrap_task! {
             if !is_live(&command) {
                 eprintln!("cmd: {text:?} is not implemented — the dispatcher will ignore it");
             }
+// --- src/settingspage.rs -------------------------------------------------------------------
+            // `--cmd` stands in for a person pressing keys, so it records what `.` repeats for the
+            // same reason `keys.rs` does — without it a `--cmd` script could never exercise `.`.
+            crate::cmdline::record_last_command(&command, count);
+// --- end src/settingspage.rs ---------------------------------------------------------------
             run(&state, &mut browser, &command, count);
         }
     }
@@ -1080,6 +1100,11 @@ wrap_task! {
             // the whole reason a macro can contain a URL that was typed after `q` was pressed.
             crate::macros::record(&state, &command, self.count);
 // --- end src/macros.rs ---------------------------------------------------------------------------
+// --- src/settingspage.rs -------------------------------------------------------------------
+            // A typed line is one of the two things `.` can repeat, and it is recorded here rather
+            // than in `run` because `run` recurses for a chain: `a ;; b` must be remembered whole.
+            crate::cmdline::record_last_command(&command, self.count);
+// --- end src/settingspage.rs ---------------------------------------------------------------
             run(&state, &mut browser, &command, self.count);
         }
     }
@@ -1190,10 +1215,10 @@ mod tests {
         // denominator and the numerator move together — 241/262 to 245/264.
         //
         // 242 with `sf`, whose `save` writes the command line's history to `cmd-history` — the one
-        // saveable bru has that was not already on disk.
+        // saveable bru has that was not already on disk. 243 with `.`.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 246, "the live-binding count moved");
+        assert_eq!(live, 247, "the live-binding count moved");
     }
 
 // --- hint-follow -----------------------------------------------------------------------------

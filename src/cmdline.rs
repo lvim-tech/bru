@@ -35,6 +35,7 @@
 use crate::commands::Command;
 use crate::modes::Mode;
 use cef::*;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -774,6 +775,67 @@ pub fn on_mode_changed(mode: &str) {
     if had_text {
         focus_page();
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// `.` — cmd-repeat-last
+// -----------------------------------------------------------------------------------------------
+
+/// The last command run in each mode, and the count it was given.
+///
+/// A direct port of `commands/runners.py:25` — `last_command: dict[KeyMode, tuple[str, int]]` — and
+/// it is keyed by mode for the reason qutebrowser keys it that way: `.` is a *normal-mode* binding,
+/// and a command typed at the command line while in command mode must not be what a later `.`
+/// repeats in normal mode. bru stores the parsed [`Command`] rather than the text because bru parses
+/// its bindings once at startup and a keypress never has a string to record; the two are the same
+/// thing one step apart, and re-parsing would only add a way for them to disagree.
+///
+/// `BTreeMap::new` is const and `HashMap::new` is not, which is the whole reason this is ordered.
+static LAST_COMMAND: Mutex<BTreeMap<Mode, (Command, Option<u32>)>> = Mutex::new(BTreeMap::new());
+
+/// Whether running `command` should make it the thing `.` repeats.
+///
+/// `runners.py:177-179`: the **only** exclusion is the repeat command itself, under either of its
+/// two names. Nothing else is filtered — a `:quit` that has just run is recorded like anything
+/// else, and there is no list of "dangerous" commands here, because qutebrowser has none and the
+/// point of `.` is that it repeats what was actually done.
+///
+/// The list four lines further down (`runners.py:181-182`) is a *different* one: `macro-record`,
+/// `macro-run`, `set-cmd-text` and `cmd-set-text` are excluded from **macro recording**, not from
+/// `.`. Two commands would recurse into themselves and two would record the opening of a command
+/// line rather than what was typed into it. bru has no macros yet, so that list has nothing to
+/// filter here — but it is not this list, and conflating them would quietly stop `.` repeating `o`.
+fn records_as_last(command: &Command) -> bool {
+    match command {
+        Command::CmdRepeatLast => false,
+        // `a ;; b` is recorded whole in qutebrowser, and skipped whole if any link is the repeat
+        // command — the flag is cleared inside the loop over the parsed chain.
+        Command::Chain(parts) => parts.iter().all(records_as_last),
+        _ => true,
+    }
+}
+
+/// Remember a command as the one `.` will repeat, under the mode it was run in.
+///
+/// Called from the two places a command enters the dispatcher from a person — `src/keys.rs`, for a
+/// binding, and `exec.rs`'s command-line task, for a typed line. Deliberately **not** from
+/// `exec::run` itself: that function recurses for a chain, so recording there would remember the
+/// last *link* rather than the chain, which is not what `a ;; b` means.
+pub fn record_last_command(command: &Command, count: Option<u32>) {
+    if !records_as_last(command) {
+        return;
+    }
+    // The mode as it was *before* the command ran, which is what `cur_mode` is in `runners.py:159`.
+    let mode = mode();
+    if let Ok(mut last) = LAST_COMMAND.lock() {
+        last.insert(mode, (command.clone(), count));
+    }
+}
+
+/// What `.` repeats in the mode bru is in now, if anything.
+pub fn last_command() -> Option<(Command, Option<u32>)> {
+    let last = LAST_COMMAND.lock().ok()?;
+    last.get(&mode()).cloned()
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -1597,6 +1659,31 @@ mod tests {
                 "{named:?} is bound in command mode and must stay in Rust"
             );
         }
+    }
+
+    /// `.` must not repeat itself, or one press is an infinite loop and every press after the first
+    /// repeats nothing. `runners.py:177-179` is the whole rule, and it is the whole rule here.
+    #[test]
+    fn the_repeat_command_is_the_only_thing_that_is_not_recorded() {
+        use crate::commands::parse;
+
+        assert!(records_as_last(&parse("tab-close").unwrap()));
+        assert!(records_as_last(&parse("scroll down").unwrap()));
+        // A `:quit` is recorded like anything else. qutebrowser excludes nothing but the repeat
+        // command, and inventing a second exclusion here would make `.` disagree with it.
+        assert!(records_as_last(&parse("quit").unwrap()));
+        // The four names at `runners.py:181-182` are excluded from *macro recording*, not from
+        // this — `cmd-set-text` is how `o` opens the command line, and `.` after `o` has to repeat
+        // it or the binding stops being repeatable.
+        assert!(records_as_last(&parse("cmd-set-text -s :open").unwrap()));
+
+        assert!(!records_as_last(&parse("cmd-repeat-last").unwrap()));
+        // The pre-2.0 spelling parses to the same variant, so it is excluded by the same arm.
+        assert!(!records_as_last(&parse("repeat-command").unwrap()));
+        // A chain is recorded whole or not at all: the flag is cleared inside the loop over the
+        // parsed chain, so one repeat command anywhere in it is enough.
+        assert!(!records_as_last(&parse("clear-keychain ;; cmd-repeat-last").unwrap()));
+        assert!(records_as_last(&parse("clear-keychain ;; search").unwrap()));
     }
 
     /// The file `:save` writes, and the cap it writes under.

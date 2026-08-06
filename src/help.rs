@@ -100,11 +100,30 @@ mod tests {
     fn the_page_says_which_keys_work() {
         let html = page(&bindings());
         // `j` scrolls today, and so does `yy` since src/clip.rs; `q` records a macro since
-        // src/macros.rs, and `.` is what is bound and waiting now.
+        // src/macros.rs.
         assert!(html.contains(r#"<tr class="live"><td class="keys">j</td><td class="cmd">scroll down</td>"#));
         assert!(html.contains(r#"<tr class="live"><td class="keys">yy</td><td class="cmd">yank</td>"#));
         assert!(html.contains(r#"<tr class="live"><td class="keys">q</td><td class="cmd">macro-record</td>"#));
-        assert!(html.contains(r#"<td class="cmd">cmd-repeat-last</td><td class="state">not yet</td>"#));
+
+        // The other half — a row that says "not yet" — is found rather than named. This assertion
+        // named `cmd-repeat-last`, which was implemented under it the same week; the page's job is
+        // to mark whatever is unimplemented today, not one particular command.
+        let waiting: Vec<&str> = crate::config::DEFAULT_BINDINGS
+            .iter()
+            .map(|(_mode, _keys, text)| *text)
+            // `is_live`, not "does it parse to a variant". `command-history-prev` and every `rl-*`
+            // parse to `Unimplemented` and are live all the same — they reach `cmdline.rs` by name
+            // rather than as a `Command`. Asking the parser here marked them "not yet" and is the
+            // same mistake that undercounted the live bindings by 17 for a whole stage.
+            .filter(|text| {
+                crate::commands::parse(text).is_ok_and(|cmd| !crate::exec::is_live(&cmd))
+            })
+            .collect();
+        assert!(!waiting.is_empty(), "nothing is unimplemented, so this half asserts nothing");
+        for text in waiting {
+            let row = format!(r#"<td class="cmd">{text}</td><td class="state">not yet</td>"#);
+            assert!(html.contains(&row), "the page must mark {text:?} as not yet");
+        }
     }
 
     /// A `config.lua` that rebinds a key must change the page, or it is documentation of something

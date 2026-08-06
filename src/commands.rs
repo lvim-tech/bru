@@ -295,6 +295,8 @@ pub enum Command {
     /// the document. See `src/cmdline.rs::save` for what bru's saveables are and which of them
     /// have anything to write.
     Save { what: Vec<String> },
+    /// `cmd-repeat-last` (`repeat-command` before 2.0) — `.`.
+    CmdRepeatLast,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
@@ -1324,6 +1326,9 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
             Command::Save { what: tokens[1..].to_vec() }
         }
+        // `repeat-command` is the pre-2.0 spelling, kept by `deprecated_name=` on the command
+        // (utilcmds.py:187). Both have to parse or a `config.lua` written against either breaks.
+        "cmd-repeat-last" | "repeat-command" => Command::CmdRepeatLast,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
         _ => Command::Unimplemented(s.trim().to_string()),
