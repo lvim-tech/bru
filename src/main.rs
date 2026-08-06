@@ -33,6 +33,7 @@ mod message;
 mod modes;
 mod navigate;
 mod open;
+mod popups;
 mod profile;
 mod scroll;
 mod spawn;
