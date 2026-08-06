@@ -327,6 +327,9 @@ pub enum YankWhat {
     Domain,
     /// `inline <text>`: the text itself, with `{title}` and `{url:yank}` filled in when it runs.
     Inline(String),
+    /// `selection`: the text caret mode has selected. `y`, `Y` and `<Return>` in the `caret:`
+    /// section, and the one spelling that means nothing outside that mode.
+    Selection,
 }
 // --- end src/clip.rs -------------------------------------------------------
 
@@ -982,14 +985,13 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
                 "pretty-url" => YankWhat::PrettyUrl,
                 "title" => YankWhat::Title,
                 "domain" => YankWhat::Domain,
+                "selection" => YankWhat::Selection,
                 "inline" => {
                     let Some(text) = args.arg(1).filter(|t| !t.is_empty()) else {
                         return Err(bad("inline needs a block of text"));
                     };
                     YankWhat::Inline(text.to_string())
                 }
-                // A real qutebrowser argument bru has no caret mode for — unbuilt, not invalid.
-                "selection" => return Ok(Command::Unimplemented(s.trim().to_string())),
                 other => return Err(bad(&format!("cannot yank {other:?}"))),
             };
             Command::Yank { what, sel: args.any(&["s", "sel"]) }
@@ -1682,10 +1684,15 @@ mod tests {
             assert_eq!(parse(cmd).unwrap(), want, "{cmd:?}");
         }
 
-        // `yank selection` is caret mode's, and bru has no caret mode.
+        // `yank selection` is caret mode's `y`, `Y` and `<Return>`. It parses like the rest now
+        // that caret mode exists and `clip.rs` knows how to ask it what is selected.
         assert_eq!(
             parse("yank selection").unwrap(),
-            Command::Unimplemented("yank selection".to_string())
+            Command::Yank { what: YankWhat::Selection, sel: false }
+        );
+        assert_eq!(
+            parse("yank selection -s").unwrap(),
+            Command::Yank { what: YankWhat::Selection, sel: true }
         );
         assert!(parse("yank sideways").is_err());
         assert!(parse("yank inline").is_err());

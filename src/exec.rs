@@ -623,7 +623,8 @@ pub fn is_live(command: &Command) -> bool {
         Command::CompletionItemFocus { .. } | Command::CompletionItemDel => true,
         // Bound and reachable, and it says what it would have copied — but there is no clipboard
         // in bru yet, so claiming it as live would be claiming `<Ctrl-C>` copies something.
-        Command::CompletionItemYank { .. } => false,
+        // `clip::yank_plain` is installed at startup, so `<Ctrl-C>` copies the selected cell.
+        Command::CompletionItemYank { .. } => true,
 // --- end src/completers.rs -----------------------------------------------------------------
 
 // --- src/hints.rs -----------------------------------------------------------------------
@@ -640,7 +641,8 @@ pub fn is_live(command: &Command) -> bool {
         Command::Hint { target, rapid, .. } => {
             use crate::commands::HintTarget;
             match target {
-                HintTarget::Yank | HintTarget::YankPrimary | HintTarget::Download => false,
+                // Introduced to `clip.rs` and `downloads.rs` at startup — `app.rs` installs both.
+                HintTarget::Yank | HintTarget::YankPrimary | HintTarget::Download => true,
                 HintTarget::Window | HintTarget::TabFg | HintTarget::Fill(_) => !rapid,
                 _ => true,
             }
@@ -1067,27 +1069,37 @@ mod tests {
     /// The three-way split of qutebrowser's 226 default bindings, printed rather than only
     /// asserted: the headline number of every stage-2 milestone is "how many are live", and a
     /// number that is not printed is a number nobody checks.
+    /// `(live, bound but inert, no command behind the name)`.
+    ///
+    /// **`is_live` is asked first, and that ordering is the whole point.** The obvious spelling —
+    /// "does it parse into a real variant, and only then, does it act" — undercounted by 17 for a
+    /// whole stage: the readline bindings (`<Ctrl-A>`, `<Ctrl-E>`, `<Ctrl-U>`, `<Ctrl-W>`, `<Alt-B>`
+    /// and the rest of `command:`) reach `cmdline.rs` **by name**, as `Command::Unimplemented`, and
+    /// they work. Classifying by shape put every one of them with the dead, and the headline number
+    /// this file exists to publish was quietly wrong.
+    ///
+    /// A binding is live if pressing it does something. Nothing else is the question.
     fn split() -> (usize, usize, usize) {
-        let (mut live, mut ignored, mut unparsed) = (0, 0, 0);
+        let (mut live, mut inert, mut nameless) = (0, 0, 0);
         for (_mode, _keys, cmd) in DEFAULT_BINDINGS {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
-            if !parsed.is_implemented() {
-                unparsed += 1;
-            } else if is_live(&parsed) {
+            if is_live(&parsed) {
                 live += 1;
+            } else if parsed.is_implemented() {
+                inert += 1;
             } else {
-                ignored += 1;
+                nameless += 1;
             }
         }
-        (live, ignored, unparsed)
+        (live, inert, nameless)
     }
 
     #[test]
     fn how_many_default_bindings_are_live() {
         let (live, ignored, unparsed) = split();
         println!(
-            "default bindings: {live} live, {ignored} parsed but ignored, {unparsed} unparsed, \
-             {} total",
+            "default bindings: {live} live, {ignored} bound but inert, {unparsed} with no command \
+             behind the name, {} total",
             live + ignored + unparsed
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
@@ -1096,19 +1108,23 @@ mod tests {
         // brought the 29 of `caret:` (3961) and the two mark modes each brought the one line of
         // `register:` (3991).
         assert_eq!(DEFAULT_BINDINGS.len(), 262);
-        // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
-        // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints.
+        // The number this project measures itself by: how many of qutebrowser's own default keys
+        // do something when pressed.
         //
-        // Stage 3, the same way: 109 once `gd`/`ad`/`cd` could save a file, 114 once quickmarks,
-        // bookmarks and `:history` had commands (`m`, `M`, `Sq`, `Sb`, `Sh`). `b`, `B`, `wb`, `gb`,
-        // `gB` and `wB` were already counted — every one is a `cmd-set-text`, which the command line
-        // has claimed since M10, and only what they prefill became real now. Each of those two sets
-        // is named binding by binding in its own test below, because a total cannot notice that one
-        // went live and its sibling did not.
+        // 27 before stage 2 began. 70 after the dispatcher, 76 once `scroll.rs` made `gg`/`G` and
+        // the page keys real, 100 once the command line claimed `cmd-set-text`, `command-accept`
+        // and the readline bindings, 106 with hints. Then stage 3: 109 with downloads, 114 with
+        // quickmarks and bookmarks, 124 with the clipboard, 138 with `n`/`N` and `navigate`, 152
+        // with settings, 162 with the completion's own keys, 196 with caret mode and marks, 207
+        // with hint groups and targets, 216 with the polish, 224 once hints, caret and the
+        // completion were introduced to the clipboard and the downloads.
+        //
+        // 241 is the same tree measured correctly: `split` used to ask "is this a real variant"
+        // before "does it act", which put the 17 readline bindings with the dead for a whole stage.
+        // Nothing was fixed to reach it — the ruler was.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 216, "the live-binding count moved");
+        assert_eq!(live, 241, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -1134,8 +1150,8 @@ mod tests {
         // `downloads::schedule_start`. When that lands, this flips to `assert!(is_live(...))` and
         // the count rises by one, in the same commit.
         assert!(
-            !is_live(&commands::parse("hint links download").unwrap()),
-            "`;d` cannot be live before hints and downloads are introduced to each other"
+            is_live(&commands::parse("hint links download").unwrap()),
+            "`;d` is live once `hints::install_downloads` has been called with downloads.rs"
         );
         // The two spellings that need a prompt or a page serialiser bru has not got.
         assert!(!is_live(&commands::parse("download --mhtml").unwrap()));
@@ -1405,18 +1421,18 @@ mod tests {
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
 
-        // And the four that are not, each for a reason written down in `is_live`.
-        for cmd in [
-            "hint links yank",          // ;y — no clipboard yet
-            "hint links yank-primary",  // ;Y
-            "hint links download",      // ;d — no download manager yet
-            "hint --rapid links window", // ;R — one window, so `window` is `tab-fg`
-        ] {
+        // Three of the four that were inert have somewhere to go now: `app.rs` installs
+        // `clip::HintClipboard` and `clip::HintDownloads` at startup.
+        for cmd in ["hint links yank", "hint links yank-primary", "hint links download"] {
             assert!(
-                !is_live(&commands::parse(cmd).unwrap()),
-                "{cmd:?} claims to be live and has nowhere to put its result"
+                is_live(&commands::parse(cmd).unwrap()),
+                "{cmd:?} has a clipboard and a download manager now"
             );
         }
+        // The fourth stays inert, and its reason is structural rather than a missing module: bru
+        // has one window, so `window` *is* a foreground tab, and a rapid session cannot survive
+        // the tab it is drawn on being switched away from. qutebrowser refuses the same pair.
+        assert!(!is_live(&commands::parse("hint --rapid links window").unwrap()));
         // …but the same targets without `--rapid`, and `--rapid` with a target that survives it,
         // are live. Otherwise the four above would pass with the whole feature switched off.
         assert!(is_live(&commands::parse("hint links window").unwrap()));
@@ -1494,9 +1510,9 @@ mod tests {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
-        // And the two that are deliberately still inert: there is no clipboard to yank into.
-        assert!(!is_live(&commands::parse("completion-item-yank").unwrap()));
-        assert!(!is_live(&commands::parse("completion-item-yank --sel").unwrap()));
+        // Both live now: `app.rs` installs `clip::yank_plain` as the completion's clipboard.
+        assert!(is_live(&commands::parse("completion-item-yank").unwrap()));
+        assert!(is_live(&commands::parse("completion-item-yank --sel").unwrap()));
     }
 // --- end src/completers.rs -----------------------------------------------------------------
 

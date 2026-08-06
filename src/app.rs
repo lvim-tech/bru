@@ -18,7 +18,7 @@ const TOP_URL: &str = "bru://chrome/top.html";
 const BOTTOM_URL: &str = "bru://chrome/bottom.html";
 
 /// Chrome strip heights, in logical pixels.
-const TOP_HEIGHT: i32 = 28;
+const TOP_HEIGHT: i32 = 40;
 const BOTTOM_HEIGHT: i32 = 24;
 
 /// TEMPORARY (M5): a page for a tab opened by the stand-in `t` key, distinct enough that a
@@ -151,6 +151,14 @@ wrap_browser_process_handler! {
             // The completion's four sources, bound to the modules that own them. After the line
             // above, which is what installs the search engines from config.lua.
             crate::completion::install(Box::new(crate::data::DataSources));
+
+            // Four modules that were built in parallel and each left a hole where another one
+            // belongs. Each hole was deliberate — a second `wl-copy` or a second download path
+            // would have been the wrong kind of duplication — so this is where they are introduced
+            // to each other, once, before any browser exists to press a key at.
+            crate::hints::install_clipboard(Box::new(crate::clip::HintClipboard));
+            crate::hints::install_downloads(Box::new(crate::clip::HintDownloads));
+            crate::completers::install_clipboard(crate::clip::yank_plain);
 
             // What Enter in the command line actually runs. Without this the round trip completes
             // and the command is dropped on the floor — `:open -t abv.bg` would print "no command

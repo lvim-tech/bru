@@ -1301,7 +1301,6 @@ mod tests {
         assert_eq!(cmd.cmd_set_text(" -t", false, true), Ok(":open -t".to_string()));
     }
 
-    #[test]
     /// `/` and `?` are searches. Without this bru ran a *command* named after the search term,
     /// which parses to `Unimplemented` and is dropped without a word — `/` did nothing at all.
     #[test]

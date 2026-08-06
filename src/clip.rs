@@ -221,6 +221,13 @@ pub fn yank(what: &YankWhat, sel: bool) {
         YankWhat::Title => (title.clone(), "title"),
         YankWhat::Domain => (domain(&url), "domain"),
         YankWhat::Inline(template) => (inline(template, &url, &title), "inline block"),
+        // Caret mode's `y` / `Y` / `<Return>`. The text belongs to the caret session, which is the
+        // only thing that knows what is selected; outside caret mode there is none, and the empty
+        // string below reports "Nothing to yank" rather than yanking the page's URL by accident.
+        YankWhat::Selection => (
+            crate::caret::selection().map(|(_, text)| text).unwrap_or_default(),
+            "selection",
+        ),
     };
 
     if text.is_empty() {
@@ -872,5 +879,68 @@ mod tests {
         assert_eq!(Selection::from_sel_flag(false), Selection::Clipboard);
         assert_eq!(Selection::Primary.name(), "primary selection");
         assert_eq!(Selection::Clipboard.name(), "clipboard");
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// What hint mode needs from the clipboard
+// -----------------------------------------------------------------------------------------------
+
+/// `;y` and `;Y`. `hints.rs` resolves the element's URL and hands it here.
+///
+/// The only piece hint mode knows and this module cannot work out is `first_run`: from the second
+/// follow of a `--rapid` session onwards qutebrowser *appends*, newline-joined, so `;r`-style
+/// repeated yanking collects a list rather than overwriting it each time
+/// (`hints.py:HintActions.yank`).
+pub struct HintClipboard;
+
+impl crate::hints::Clipboard for HintClipboard {
+    fn yank_url(&self, url: &str, selection: bool, first_run: bool) {
+        let target = Selection::from_sel_flag(selection);
+
+        let text = if first_run {
+            url.to_string()
+        } else {
+            // Reading back is what makes the append work, and it can fail — a selection can be
+            // taken away between two follows. Losing what was there is worse than losing the join,
+            // so a failed read starts a fresh list rather than aborting the yank.
+            match get(target) {
+                Ok(existing) if !existing.is_empty() => format!("{existing}\n{url}"),
+                _ => url.to_string(),
+            }
+        };
+
+        match set(target, &text) {
+            Ok(()) => message(format!("Yanked URL to {}: {url}", target.name())),
+            Err(error) => message(error),
+        }
+    }
+}
+
+/// `;d`. `hints.rs` resolves the element's URL and hands it here.
+pub struct HintDownloads;
+
+impl crate::hints::Downloads for HintDownloads {
+    fn download_url(&self, url: &str) {
+        // `schedule_start` posts to the UI thread, which is what CEF-NOTES trap 12 requires: this
+        // is reached from inside the message router's query handler, where starting a navigation
+        // deadlocks on a lock `on_before_browse` also wants.
+        crate::downloads::schedule_start(url.to_string());
+    }
+}
+
+/// `completion-item-yank` — `<Ctrl-C>` and `<Ctrl-Shift-C>` in command mode.
+///
+/// A plain `fn` rather than a trait object because that is the shape `completers.rs` asks for, and
+/// there is no state to carry: the completion has already decided which cell's text to copy.
+pub fn yank_plain(text: &str, selection: bool) {
+    let target = Selection::from_sel_flag(selection);
+    if text.is_empty() {
+        message("Nothing to yank".to_string());
+        return;
+    }
+    match set(target, text) {
+        Ok(()) => message(format!("Yanked to {}: {text}", target.name())),
+        Err(error) => message(error),
     }
 }
