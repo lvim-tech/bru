@@ -770,7 +770,18 @@ pub fn ask_cmdline(window: u32, what: &str) {
 }
 
 /// `--cmdline-script=…`, read once the bottom strip is up. See `cmdline::schedule_script`.
+///
+/// **Once for the process, not once per strip.** This is called from the `ready` answer of a bottom
+/// strip, and there is one of those per window — so a run that opens a second window scheduled the
+/// whole script a second time and every step ran twice. Measured 2026-08-06: `key:win1:g` delivered
+/// two `g`s, which completed `gg` on its own and made a two-window key-chain check report the very
+/// bug it was written to disprove. The script is one script; the strip that happens to come up first
+/// starts it.
 fn start_cmdline_script() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let Some(command_line) = command_line_get_global() else {
         return;
     };
