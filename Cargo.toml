@@ -23,3 +23,7 @@ cef = "151.2"
 # Reads ~/.config/bru/config.lua at startup and nothing else, ever — see src/config.rs. `vendored`
 # builds Lua 5.4 from source so there is no system liblua to keep in step with.
 mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
+
+# `~/.local/share/bru/history.sqlite` — see src/data.rs. `bundled` compiles SQLite from source, so
+# the schema bru writes cannot drift under it when the system libsqlite3 is upgraded.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
