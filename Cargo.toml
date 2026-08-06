@@ -1,0 +1,21 @@
+[package]
+name = "bru"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "bru"
+path = "src/main.rs"
+
+[dependencies]
+# From tauri-apps/cef-rs. The version tracks CEF itself: 151 is the Chromium
+# under Brave, which is the whole point of choosing CEF over WebKitGTK.
+#
+# Nothing here builds Chromium. cef-dll-sys downloads a prebuilt distribution,
+# and reuses ~/.local/share/cef when CEF_PATH points at it:
+#
+#   cargo run -p export-cef-dir -- --force ~/.local/share/cef   (in a cef-rs checkout)
+#   export CEF_PATH="$HOME/.local/share/cef"
+#   export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$CEF_PATH"
+cef = "151.2"
