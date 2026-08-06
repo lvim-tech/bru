@@ -881,6 +881,9 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
             ),
         }
     };
+    // Declared out here and filled in one arm, so that the `Browser` the `&mut` points at outlives
+    // the match. Holding it is also what stops that tab from closing for the length of this call
+    // (CEF-NOTES, Tabs) — one keystroke, and never across the session.
     let mut hinting;
     let browser: &mut Browser = match foreign {
         Foreign::Same => browser,
