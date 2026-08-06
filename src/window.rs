@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::state::BruState;
+use crate::tabs;
 
 /// A `CefString` that survives being written into a struct CEF reads back.
 ///
@@ -31,7 +32,6 @@ wrap_window_delegate! {
     pub struct BruWindowDelegate {
         state: Arc<Mutex<BruState>>,
         top_view: RefCell<Option<BrowserView>>,
-        page_view: RefCell<Option<BrowserView>>,
         bottom_view: RefCell<Option<BrowserView>>,
     }
 
@@ -45,18 +45,13 @@ wrap_window_delegate! {
 
     impl WindowDelegate {
         fn on_window_created(&self, window: Option<&mut Window>) {
-            let (top, page, bottom) = (
-                self.top_view.borrow(),
-                self.page_view.borrow(),
-                self.bottom_view.borrow(),
-            );
-            let (Some(window), Some(top), Some(page), Some(bottom)) =
-                (window, top.as_ref(), page.as_ref(), bottom.as_ref())
+            let (top, bottom) = (self.top_view.borrow(), self.bottom_view.borrow());
+            let (Some(window), Some(top), Some(bottom)) = (window, top.as_ref(), bottom.as_ref())
             else {
                 return;
             };
 
-            // A vertical stack: tab strip, page, status line. `horizontal: 0` is the vertical
+            // A vertical stack: tab strip, pages, status line. `horizontal: 0` is the vertical
             // orientation, and STRETCH on the cross axis is what makes each strip span the full
             // width — the default, START, would leave them at their preferred width instead.
             let settings = BoxLayoutSettings {
@@ -67,35 +62,38 @@ wrap_window_delegate! {
             let layout = window.set_to_box_layout(Some(&settings));
 
             let mut top = View::from(top);
-            let mut page = View::from(page);
-            let mut bottom = View::from(bottom);
             window.add_child_view(Some(&mut top));
-            window.add_child_view(Some(&mut page));
-            window.add_child_view(Some(&mut bottom));
 
-            // Flex 1 on the page alone: the two strips keep the height their delegates ask for and
-            // everything left over is the page's, at any window size.
-            if let Some(layout) = layout {
-                layout.set_flex_for_view(Some(&mut page), 1);
+            // Nothing else is ever handed the window or its layout; keep both where a tab opened
+            // later can find them. The lock is let go before any tab is placed — see tabs.rs.
+            {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                state.set_window(window.clone());
+                state.set_layout(layout);
             }
 
-            // Nothing else ever gets handed the window; keep it where views can be added later.
-            self.state
-                .lock()
-                .expect("state mutex poisoned")
-                .set_window(window.clone());
+            // Tabs that already exist: at startup, the one the command line asked for, created
+            // before there was a window to put it in.
+            tabs::attach_all(&self.state);
+
+            let mut bottom = View::from(bottom);
+            window.add_child_view(Some(&mut bottom));
 
             window.show();
 
-            // The first child added would otherwise hold focus, and that is the tab strip — keys
-            // would go to a chrome page instead of to the web page.
-            page.request_focus();
+            // Selecting shows the tab and takes focus. Without it the tab strip, as the first
+            // child added, keeps focus and every key goes to a chrome page.
+            let active = self
+                .state
+                .lock()
+                .expect("state mutex poisoned")
+                .active_tab();
+            tabs::select(&self.state, active);
         }
 
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
             // Drop the views here, or the window outlives the browsers it holds.
             *self.top_view.borrow_mut() = None;
-            *self.page_view.borrow_mut() = None;
             *self.bottom_view.borrow_mut() = None;
         }
 
@@ -137,10 +135,19 @@ wrap_window_delegate! {
             // Ask every browser first: each may need to run beforeunload handlers. try_close_browser
             // both answers and starts the close, so all three have to be asked — short-circuiting on
             // the first 0 would leave the others open.
+            // The views are collected under the lock and the lock is dropped before any of them is
+            // asked to close — try_close_browser reaches bru's own life-span handler.
+            let mut views = self
+                .state
+                .lock()
+                .expect("state mutex poisoned")
+                .tab_views();
+            views.extend(self.top_view.borrow().clone());
+            views.extend(self.bottom_view.borrow().clone());
+
             let mut closable = 1;
-            for view in [&self.top_view, &self.page_view, &self.bottom_view] {
-                let view = view.borrow();
-                let ready = match view.as_ref().and_then(BrowserView::browser) {
+            for view in views {
+                let ready = match view.browser() {
                     Some(browser) => match browser.host() {
                         Some(host) => host.try_close_browser(),
                         None => 1,
@@ -173,6 +180,7 @@ wrap_browser_view_delegate! {
         fn browser_runtime_style(&self) -> RuntimeStyle {
             VIEW_STYLE
         }
+
     }
 }
 

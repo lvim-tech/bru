@@ -14,6 +14,9 @@ use crate::state::BruState;
 /// delivers per click, and near enough to qutebrowser's step for the two to be compared.
 const STEP: i32 = 120;
 
+/// `EVENTFLAG_SHIFT_DOWN`. Key codes do not distinguish `j` from `J`; the modifier bits do.
+const SHIFT_DOWN: u32 = 1 << 1;
+
 wrap_keyboard_handler! {
     pub struct BruKeyboardHandler {
         state: Arc<Mutex<BruState>>,
@@ -55,6 +58,42 @@ wrap_keyboard_handler! {
             {
                 return 0;
             }
+
+            let shift = event.modifiers & SHIFT_DOWN != 0;
+
+            // ------------------------------------------------------------------------------
+            // TEMPORARY (M5). Four keys wired straight to their commands. M6's key-sequence
+            // parser and M7's binding table replace this whole block with a table lookup —
+            // delete it entire, nothing outside it knows these key codes.
+            // ------------------------------------------------------------------------------
+            if shift && event.windows_key_code == 0x4A {
+                crate::tabs::next_tab(&self.state);
+                return 1;
+            }
+            if shift && event.windows_key_code == 0x4B {
+                crate::tabs::prev_tab(&self.state);
+                return 1;
+            }
+            if !shift && event.windows_key_code == 0x44 {
+                // `d` — tab-close.
+                crate::tabs::close_current(&self.state);
+                return 1;
+            }
+            if !shift && event.windows_key_code == 0x54 {
+                // `t`. A stand-in for `:open -t`, which arrives with the command line in M9;
+                // without some way to make a second tab, none of the rest can be exercised. The
+                // page is a placeholder so that switching is visible before M4 draws the strip.
+                let index = self
+                    .state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .tab_count();
+                crate::tabs::new_tab(&self.state, &crate::app::placeholder_tab(index), false);
+                return 1;
+            }
+            // ------------------------------------------------------------------------------
+            // End of the temporary block.
+            // ------------------------------------------------------------------------------
 
             // Windows key codes: CEF normalises to them on every platform.
             let delta = match event.windows_key_code {

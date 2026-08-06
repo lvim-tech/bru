@@ -23,9 +23,16 @@ pub struct BruState {
     client: Option<Client>,
     /// The top-level window, kept from `on_window_created` so views can be added to it later.
     window: Option<Window>,
+    /// The window's vertical box layout, kept so a tab opened later can be given flex 1 like the
+    /// ones that were there when the window was built.
+    layout: Option<BoxLayout>,
     /// Identifiers of the browsers behind the two chrome strips. Keys that reach those must not be
     /// read as page movements — `j` in the command line is a letter, not a scroll.
     chrome_browsers: Vec<i32>,
+    /// The tabs, in strip order, and which one is showing. `tabs.rs` owns every operation on
+    /// these; the fields are visible to it and to nothing outside the crate.
+    pub(crate) tabs: Vec<crate::tabs::Tab>,
+    pub(crate) active: usize,
 }
 
 impl BruState {
@@ -46,7 +53,10 @@ impl BruState {
                 browsers: Vec::new(),
                 client: None,
                 window: None,
+                layout: None,
                 chrome_browsers: Vec::new(),
+                tabs: Vec::new(),
+                active: 0,
             })
         })
     }
@@ -69,6 +79,14 @@ impl BruState {
 
     pub fn window(&self) -> Option<Window> {
         self.window.clone()
+    }
+
+    pub fn set_layout(&mut self, layout: Option<BoxLayout>) {
+        self.layout = layout;
+    }
+
+    pub fn layout(&self) -> Option<BoxLayout> {
+        self.layout.clone()
     }
 
     /// Learned from the chrome views' own delegate, which CEF hands both the view and the browser
@@ -117,7 +135,9 @@ impl BruState {
 
         if self.browsers.is_empty() {
             self.window = None;
+            self.layout = None;
             self.client = None;
+            self.tabs.clear();
             quit_message_loop();
         }
     }
@@ -133,6 +153,54 @@ impl BruState {
 pub fn schedule_close(delay_ms: i64) {
     let mut task = CloseWindow::new();
     post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+}
+
+/// `--tab-script=t,t,J,K,d,d,d --tab-step-ms=3000` runs the tab commands from posted UI tasks,
+/// one every `tab-step-ms`, and reports the tab count and selection after each.
+///
+/// It is here for the same reason as `--close-after-ms`, and for one more: the only key-injection
+/// tool on this machine is `wtype`, which attaches a virtual keyboard, and CEF segfaults in
+/// `xkb_state_update_mask` when that arrives. Measured 2026-08-06 on a build predating all of the
+/// tab work: 3/3 clean exits with no wtype, 2/3 segfaults with a single keystroke. So keys cannot
+/// drive an unattended check here, and this drives the very functions the keys call instead. Inert
+/// unless the switch is passed. It becomes redundant once M7 has a command table and a general
+/// `--cmd=` hook can run real commands.
+pub fn schedule_tab_script(steps: &str, interval_ms: i64) {
+    for (i, step) in steps.split(',').filter(|s| !s.is_empty()).enumerate() {
+        let mut task = TabStep::new(step.to_string());
+        post_delayed_task(ThreadId::UI, Some(&mut task), interval_ms * (i as i64 + 1));
+    }
+}
+
+wrap_task! {
+    struct TabStep {
+        step: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            match self.step.as_str() {
+                "t" => {
+                    let index = state.lock().expect("state mutex poisoned").tab_count();
+                    crate::tabs::new_tab(&state, &crate::app::placeholder_tab(index), false);
+                }
+                "J" => crate::tabs::next_tab(&state),
+                "K" => crate::tabs::prev_tab(&state),
+                "d" => crate::tabs::close_current(&state),
+                other => eprintln!("tab-script: no step named {other}"),
+            }
+            let state = state.lock().expect("state mutex poisoned");
+            eprintln!(
+                "tab-script: after {} -> {} tabs, showing {}",
+                self.step,
+                state.tab_count(),
+                state.active_tab()
+            );
+        }
+    }
 }
 
 wrap_task! {

@@ -7,6 +7,7 @@
 mod app;
 mod keys;
 mod state;
+mod tabs;
 mod window;
 
 use cef::*;
