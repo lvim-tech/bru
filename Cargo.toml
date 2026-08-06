@@ -19,3 +19,7 @@ path = "src/main.rs"
 #   export CEF_PATH="$HOME/.local/share/cef"
 #   export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$CEF_PATH"
 cef = "151.2"
+
+# Reads ~/.config/bru/config.lua at startup and nothing else, ever — see src/config.rs. `vendored`
+# builds Lua 5.4 from source so there is no system liblua to keep in step with.
+mlua = { version = "0.12.0", features = ["lua54", "vendored"] }

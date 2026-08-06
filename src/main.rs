@@ -5,7 +5,11 @@
 //! before anything else and the non-browser cases must return without initialising CEF.
 
 mod app;
+mod bindings;
+mod commands;
+mod config;
 mod keys;
+mod modes;
 mod state;
 mod tabs;
 mod window;

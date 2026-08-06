@@ -1,0 +1,631 @@
+//! Commands, and the parser that turns qutebrowser command strings into them.
+//!
+//! Bindings are written the way qutebrowser writes them — `scroll down`, `tab-next`,
+//! `cmd-set-text -s :open` — because DESIGN.md settles that the command names stay identical.
+//! Parsing happens once, at startup, when the binding table is built; a keypress looks up an
+//! already-parsed [`Command`] and never sees a string.
+//!
+//! Not every command qutebrowser has is implemented in bru yet. Rather than dropping those
+//! bindings, which would change the *shape* of the trie and make `;b` report NoMatch on the `;`
+//! instead of PartialMatch, an unrecognised name parses to [`Command::Unimplemented`]. The binding
+//! stays, the chain still resolves, and `src/config.rs` warns once at startup about how many there
+//! were. A keypress never produces a parse error.
+//!
+//! Nothing in this file touches CEF or Lua.
+
+// M7 delivers this module and its tests; `src/keys.rs` starts dispatching these commands when the
+// two are merged. **Delete this line once keys.rs is wired** — after that, a `Command` variant
+// nothing constructs is a real finding.
+#![allow(dead_code)]
+
+use crate::modes::Mode;
+use std::fmt;
+
+/// A command bru can run.
+///
+/// Variants exist for what bru implements or is about to; everything else in qutebrowser's default
+/// bindings lands in [`Command::Unimplemented`] with its original string.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Command {
+    /// `a ;; b ;; c` — run each in turn.
+    Chain(Vec<Command>),
+    /// `nop` — bound to `<Ctrl-Shift-Tab>` in normal mode purely to shadow the browser default.
+    Nop,
+    /// `clear-keychain`
+    ClearKeychain,
+    /// `mode-enter <mode>`
+    ModeEnter(Mode),
+    /// `mode-leave`
+    ModeLeave,
+
+    /// `scroll <direction>`. The reason bru exists: this goes through `send_mouse_wheel_event`.
+    Scroll(ScrollDirection),
+    /// `scroll-px <dx> <dy>`
+    ScrollPx { dx: i32, dy: i32 },
+    /// `scroll-page <x> <y>` — pages, not pixels; the count multiplies.
+    ScrollPage { x: f64, y: f64 },
+    /// `scroll-to-perc [perc] [-x]`. No percentage means the end of the page.
+    ScrollToPerc { perc: Option<f64>, horizontal: bool },
+
+    /// `tab-next`
+    TabNext,
+    /// `tab-prev`
+    TabPrev,
+    /// `tab-close [-o] [-f]`
+    TabClose { opposite: bool, force: bool },
+    /// `tab-only [-f]`
+    TabOnly { force: bool },
+    /// `tab-focus [index]`
+    TabFocus { index: Option<TabIndex> },
+
+    /// `open [-t|-b|-w] [-p] [-r] [--] [url]`
+    Open {
+        url: Option<String>,
+        tab: bool,
+        bg: bool,
+        window: bool,
+        private: bool,
+        related: bool,
+    },
+    /// `back [-t|-b|-w]`
+    Back { tab: bool, bg: bool, window: bool },
+    /// `forward [-t|-b|-w]`
+    Forward { tab: bool, bg: bool, window: bool },
+    /// `reload [-f]`
+    Reload { force: bool },
+    /// `stop`
+    Stop,
+    /// `home`
+    Home,
+    /// `quit [--save]`
+    Quit { save: bool },
+    /// `close` — this window, not the application.
+    Close,
+
+    /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
+    CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
+    /// `command-accept [--rapid]`
+    CommandAccept { rapid: bool },
+
+    /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
+    /// still occupies its place in the trie.
+    Unimplemented(String),
+}
+
+/// The argument of `scroll`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    PageUp,
+    PageDown,
+}
+
+/// The argument of `tab-focus`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabIndex {
+    /// 1-based; negative counts from the end, so -1 is the last tab.
+    Number(i32),
+    /// The previously focused tab.
+    Last,
+}
+
+impl Command {
+    /// Whether this command (and every link of a chain) does something.
+    pub fn is_implemented(&self) -> bool {
+        match self {
+            Command::Unimplemented(_) => false,
+            Command::Chain(parts) => parts.iter().all(Command::is_implemented),
+            _ => true,
+        }
+    }
+}
+
+/// A command string that could not be parsed at all — a known command with an argument that makes
+/// no sense, or an empty string. An *unknown* command is not an error; it becomes
+/// [`Command::Unimplemented`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseError(pub String);
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Parse a qutebrowser command string.
+///
+/// Handles `;;` chaining, quoted arguments (`rl-rubout " "`), `--` as end-of-flags, and the short
+/// and long flags the implemented commands take.
+pub fn parse(s: &str) -> Result<Command, ParseError> {
+    let parts = split_chain(s);
+    if parts.len() > 1 {
+        let mut out = Vec::with_capacity(parts.len());
+        for part in parts {
+            out.push(parse_one(&part)?);
+        }
+        return Ok(Command::Chain(out));
+    }
+    parse_one(parts.first().map(String::as_str).unwrap_or(""))
+}
+
+/// Split on `;;`, ignoring separators inside quotes.
+fn split_chain(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    current.push(c);
+                } else if c == ';' && chars.peek() == Some(&';') {
+                    chars.next();
+                    parts.push(current.trim().to_string());
+                    current = String::new();
+                } else {
+                    current.push(c);
+                }
+            }
+        }
+    }
+    parts.push(current.trim().to_string());
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+}
+
+/// Split a single command into tokens, honouring `"` and `'`.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                has_token = true;
+            }
+            None if c.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            None => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Flags and positional arguments, separated the way qutebrowser's argparse does it.
+struct Args {
+    flags: Vec<String>,
+    positional: Vec<String>,
+}
+
+impl Args {
+    /// Split tokens into flags and positionals.
+    ///
+    /// A token is a flag if it starts with `-` and is neither a bare `-` (which `tab-move` takes
+    /// as an argument) nor a negative number (`scroll-page 0 -1`). `--` ends flag parsing.
+    fn new(tokens: &[String]) -> Args {
+        let mut flags = Vec::new();
+        let mut positional = Vec::new();
+        let mut end_of_flags = false;
+        for token in tokens {
+            if end_of_flags {
+                positional.push(token.clone());
+                continue;
+            }
+            if token == "--" {
+                end_of_flags = true;
+                continue;
+            }
+            if is_flag(token) {
+                if let Some(long) = token.strip_prefix("--") {
+                    flags.push(long.to_string());
+                } else {
+                    // `-tb` is two short flags, as in argparse.
+                    for c in token[1..].chars() {
+                        flags.push(c.to_string());
+                    }
+                }
+            } else {
+                positional.push(token.clone());
+            }
+        }
+        Args { flags, positional }
+    }
+
+    fn has(&self, flag: &str) -> bool {
+        self.flags.iter().any(|f| f == flag)
+    }
+
+    /// A short flag or its long spelling; qutebrowser accepts both (`-t` / `--tab`).
+    fn any(&self, names: &[&str]) -> bool {
+        names.iter().any(|n| self.has(n))
+    }
+
+    /// Flags, then everything from the first non-flag token on as a single verbatim argument.
+    ///
+    /// This is `maxsplit=0`, which `open` and `cmd-set-text` are registered with. It is why
+    /// `cmd-set-text :open -t -r {url:pretty}` sets the command line to `:open -t -r <url>` rather
+    /// than passing `-t -r` to `cmd-set-text` itself — `commands/parser.py:177-205` finds the
+    /// index of the first non-flag argument and re-splits with that as the limit.
+    fn maxsplit0(tokens: &[String]) -> Args {
+        let mut flags = Vec::new();
+        let mut end_of_flags = false;
+        for (i, token) in tokens.iter().enumerate() {
+            if !end_of_flags {
+                if token == "--" {
+                    end_of_flags = true;
+                    continue;
+                }
+                if is_flag(token) {
+                    if let Some(long) = token.strip_prefix("--") {
+                        flags.push(long.to_string());
+                    } else {
+                        for c in token[1..].chars() {
+                            flags.push(c.to_string());
+                        }
+                    }
+                    continue;
+                }
+            }
+            return Args { flags, positional: vec![tokens[i..].join(" ")] };
+        }
+        Args { flags, positional: Vec::new() }
+    }
+
+    fn arg(&self, i: usize) -> Option<&str> {
+        self.positional.get(i).map(String::as_str)
+    }
+}
+
+fn is_flag(token: &str) -> bool {
+    if !token.starts_with('-') || token == "-" || token == "--" {
+        return false;
+    }
+    let after = &token[1..];
+    let first = after.trim_start_matches('-').chars().next();
+    // -1, -0.5: an argument, not a flag.
+    !matches!(first, Some(c) if c.is_ascii_digit() || c == '.')
+}
+
+fn parse_one(s: &str) -> Result<Command, ParseError> {
+    let tokens = tokenize(s);
+    let Some(name) = tokens.first() else {
+        return Err(ParseError("empty command".to_string()));
+    };
+    let args = Args::new(&tokens[1..]);
+
+    let bad = |what: &str| ParseError(format!("{name}: {what}"));
+
+    let cmd = match name.as_str() {
+        "nop" => Command::Nop,
+        "clear-keychain" => Command::ClearKeychain,
+
+        "mode-enter" => {
+            let Some(mode) = args.arg(0) else {
+                return Err(bad("needs a mode"));
+            };
+            match Mode::from_name(mode) {
+                Some(mode) => Command::ModeEnter(mode),
+                // hint, caret, set_mark, … — real qutebrowser modes bru has not built yet.
+                None => Command::Unimplemented(s.trim().to_string()),
+            }
+        }
+        "mode-leave" => Command::ModeLeave,
+
+        "scroll" => {
+            let Some(dir) = args.arg(0) else {
+                return Err(bad("needs a direction"));
+            };
+            let dir = match dir {
+                "up" => ScrollDirection::Up,
+                "down" => ScrollDirection::Down,
+                "left" => ScrollDirection::Left,
+                "right" => ScrollDirection::Right,
+                "top" => ScrollDirection::Top,
+                "bottom" => ScrollDirection::Bottom,
+                "page-up" => ScrollDirection::PageUp,
+                "page-down" => ScrollDirection::PageDown,
+                other => return Err(bad(&format!("invalid direction {other:?}"))),
+            };
+            Command::Scroll(dir)
+        }
+        "scroll-px" => {
+            let (Some(dx), Some(dy)) = (args.arg(0), args.arg(1)) else {
+                return Err(bad("needs dx and dy"));
+            };
+            Command::ScrollPx {
+                dx: dx.parse().map_err(|_| bad("dx is not a number"))?,
+                dy: dy.parse().map_err(|_| bad("dy is not a number"))?,
+            }
+        }
+        "scroll-page" => {
+            let (Some(x), Some(y)) = (args.arg(0), args.arg(1)) else {
+                return Err(bad("needs x and y"));
+            };
+            Command::ScrollPage {
+                x: x.parse().map_err(|_| bad("x is not a number"))?,
+                y: y.parse().map_err(|_| bad("y is not a number"))?,
+            }
+        }
+        "scroll-to-perc" => Command::ScrollToPerc {
+            perc: match args.arg(0) {
+                Some(p) => Some(p.parse().map_err(|_| bad("perc is not a number"))?),
+                None => None,
+            },
+            horizontal: args.any(&["x", "horizontal"]),
+        },
+
+        "tab-next" => Command::TabNext,
+        "tab-prev" => Command::TabPrev,
+        "tab-close" => Command::TabClose {
+            opposite: args.any(&["o", "opposite"]),
+            force: args.any(&["f", "force"]),
+        },
+        "tab-only" => Command::TabOnly { force: args.any(&["f", "force"]) },
+        "tab-focus" => Command::TabFocus {
+            index: match args.arg(0) {
+                None => None,
+                Some("last") => Some(TabIndex::Last),
+                Some(n) => Some(TabIndex::Number(
+                    n.parse().map_err(|_| bad(&format!("invalid index {n:?}")))?,
+                )),
+            },
+        },
+
+        // maxsplit=0: the URL is whatever follows the flags, verbatim.
+        "open" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::Open {
+                url: args.arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+                private: args.any(&["p", "private"]),
+                related: args.any(&["r", "related"]),
+            }
+        }
+        "back" => Command::Back {
+            tab: args.any(&["t", "tab"]),
+            bg: args.any(&["b", "bg"]),
+            window: args.any(&["w", "window"]),
+        },
+        "forward" => Command::Forward {
+            tab: args.any(&["t", "tab"]),
+            bg: args.any(&["b", "bg"]),
+            window: args.any(&["w", "window"]),
+        },
+        "reload" => Command::Reload { force: args.any(&["f", "force"]) },
+        "stop" => Command::Stop,
+        "home" => Command::Home,
+        "quit" => Command::Quit { save: args.has("save") },
+        "close" => Command::Close,
+
+        // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
+        // `-t` belongs to the text and not to cmd-set-text.
+        "cmd-set-text" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            let Some(text) = args.arg(0).filter(|t| !t.is_empty()) else {
+                return Err(bad("needs text"));
+            };
+            Command::CmdSetText {
+                text: text.to_string(),
+                space: args.any(&["s", "space"]),
+                append: args.any(&["a", "append"]),
+                run_on_count: args.any(&["r", "run-on-count"]),
+            }
+        }
+        "command-accept" => Command::CommandAccept { rapid: args.has("rapid") },
+
+        _ => Command::Unimplemented(s.trim().to_string()),
+    };
+    Ok(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_keys_that_already_work() {
+        assert_eq!(parse("scroll down").unwrap(), Command::Scroll(ScrollDirection::Down));
+        assert_eq!(parse("scroll up").unwrap(), Command::Scroll(ScrollDirection::Up));
+        assert_eq!(parse("scroll left").unwrap(), Command::Scroll(ScrollDirection::Left));
+        assert_eq!(parse("scroll right").unwrap(), Command::Scroll(ScrollDirection::Right));
+        assert_eq!(parse("tab-next").unwrap(), Command::TabNext);
+        assert_eq!(parse("tab-prev").unwrap(), Command::TabPrev);
+        assert_eq!(
+            parse("tab-close").unwrap(),
+            Command::TabClose { opposite: false, force: false }
+        );
+        assert_eq!(
+            parse("tab-close -o").unwrap(),
+            Command::TabClose { opposite: true, force: false }
+        );
+    }
+
+    #[test]
+    fn flags_before_a_positional() {
+        // The exact string PLAN.md names. `-s` is a flag, `:open` is the text.
+        assert_eq!(
+            parse("cmd-set-text -s :open").unwrap(),
+            Command::CmdSetText {
+                text: ":open".to_string(),
+                space: true,
+                append: false,
+                run_on_count: false,
+            }
+        );
+        // `T: cmd-set-text -sr :tab-focus` — `-sr` is two short flags, as in argparse.
+        assert_eq!(
+            parse("cmd-set-text -sr :tab-focus").unwrap(),
+            Command::CmdSetText {
+                text: ":tab-focus".to_string(),
+                space: true,
+                append: false,
+                run_on_count: true,
+            }
+        );
+        // `gO: cmd-set-text :open -t -r {url:pretty}` — maxsplit=0 stops flag parsing at the first
+        // positional, so `-t -r` belong to the *text*. That matters: pressing gO must prefill the
+        // command line with ":open -t -r <url>", not run cmd-set-text with -r.
+        assert_eq!(
+            parse("cmd-set-text :open -t -r {url:pretty}").unwrap(),
+            Command::CmdSetText {
+                text: ":open -t -r {url:pretty}".to_string(),
+                space: false,
+                append: false,
+                run_on_count: false,
+            }
+        );
+        // `O: cmd-set-text -s :open -t` — a leading flag *and* text containing a flag.
+        assert_eq!(
+            parse("cmd-set-text -s :open -t").unwrap(),
+            Command::CmdSetText {
+                text: ":open -t".to_string(),
+                space: true,
+                append: false,
+                run_on_count: false,
+            }
+        );
+    }
+
+    #[test]
+    fn open_with_its_flags() {
+        assert_eq!(
+            parse("open -t").unwrap(),
+            Command::Open {
+                url: None,
+                tab: true,
+                bg: false,
+                window: false,
+                private: false,
+                related: false
+            }
+        );
+        assert_eq!(
+            parse("open -w").unwrap(),
+            Command::Open {
+                url: None,
+                tab: false,
+                bg: false,
+                window: true,
+                private: false,
+                related: false
+            }
+        );
+        // `pp: open -- {clipboard}` — `--` ends the flags so a URL starting with `-` survives.
+        assert_eq!(
+            parse("open -- {clipboard}").unwrap(),
+            Command::Open {
+                url: Some("{clipboard}".to_string()),
+                tab: false,
+                bg: false,
+                window: false,
+                private: false,
+                related: false
+            }
+        );
+    }
+
+    #[test]
+    fn negative_numbers_are_arguments_not_flags() {
+        // <Ctrl-B>: scroll-page 0 -1
+        assert_eq!(parse("scroll-page 0 -1").unwrap(), Command::ScrollPage { x: 0.0, y: -1.0 });
+        assert_eq!(parse("scroll-page 0 0.5").unwrap(), Command::ScrollPage { x: 0.0, y: 0.5 });
+        assert_eq!(parse("scroll-page 0 -0.5").unwrap(), Command::ScrollPage { x: 0.0, y: -0.5 });
+        // <Alt-9>: tab-focus -1
+        assert_eq!(
+            parse("tab-focus -1").unwrap(),
+            Command::TabFocus { index: Some(TabIndex::Number(-1)) }
+        );
+        assert_eq!(
+            parse("tab-focus last").unwrap(),
+            Command::TabFocus { index: Some(TabIndex::Last) }
+        );
+    }
+
+    #[test]
+    fn chains() {
+        // <Escape> in normal mode.
+        let cmd = parse("clear-keychain ;; search ;; fullscreen --leave").unwrap();
+        let Command::Chain(parts) = cmd else { panic!("expected a chain") };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], Command::ClearKeychain);
+        assert_eq!(parts[1], Command::Unimplemented("search".to_string()));
+        assert_eq!(parts[2], Command::Unimplemented("fullscreen --leave".to_string()));
+        assert!(!Command::Chain(parts).is_implemented());
+    }
+
+    #[test]
+    fn quoted_arguments_survive() {
+        // <Ctrl-W> in command mode: rl-rubout " " — the argument is one space.
+        assert_eq!(
+            parse("rl-rubout \" \"").unwrap(),
+            Command::Unimplemented("rl-rubout \" \"".to_string())
+        );
+        // A `;;` inside quotes is not a chain separator.
+        let cmd = parse("cmd-set-text \"a ;; b\"").unwrap();
+        let Command::CmdSetText { text, .. } = cmd else { panic!("expected cmd-set-text") };
+        assert_eq!(text, "a ;; b");
+    }
+
+    #[test]
+    fn modes() {
+        assert_eq!(parse("mode-enter insert").unwrap(), Command::ModeEnter(Mode::Insert));
+        assert_eq!(
+            parse("mode-enter passthrough").unwrap(),
+            Command::ModeEnter(Mode::Passthrough)
+        );
+        assert_eq!(parse("mode-leave").unwrap(), Command::ModeLeave);
+        // caret is a real qutebrowser mode bru has not built; it is not an error, it is unbuilt.
+        assert_eq!(
+            parse("mode-enter caret").unwrap(),
+            Command::Unimplemented("mode-enter caret".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_commands_are_kept_verbatim_not_rejected() {
+        let cmd = parse("hint all tab-bg").unwrap();
+        assert_eq!(cmd, Command::Unimplemented("hint all tab-bg".to_string()));
+        assert!(!cmd.is_implemented());
+    }
+
+    #[test]
+    fn malformed_arguments_are_errors() {
+        assert!(parse("scroll sideways").is_err());
+        assert!(parse("scroll").is_err());
+        assert!(parse("scroll-page 0 sideways").is_err());
+        assert!(parse("tab-focus middle").is_err());
+        assert!(parse("").is_err());
+    }
+}
