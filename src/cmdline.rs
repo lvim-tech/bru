@@ -409,13 +409,26 @@ impl CmdLine {
         self.browse = None;
 
         let mut chars = text.chars();
-        match chars.next() {
-            Some(first) if STARTCHARS.contains(first) => {
-                let rest: String = chars.collect();
-                (!rest.trim().is_empty()).then_some(rest)
-            }
-            _ => None,
+        let first = chars.next()?;
+        if !STARTCHARS.contains(first) {
+            return None;
         }
+        let rest: String = chars.collect();
+        if rest.trim().is_empty() {
+            return None;
+        }
+        // `/` and `?` are searches, not commands. qutebrowser makes the same split in
+        // `mainwindow/statusbar/command.py:83-87`, where those two emit `got_search` while `:`
+        // emits `got_cmd`. Without it `/Kestrel` runs a *command* named `Kestrel`, which parses to
+        // `Unimplemented` and is dropped in silence — measured 2026-08-06, and the reason `/` did
+        // nothing at all while `:search Kestrel` worked.
+        //
+        // `--` matters: `search` is maxsplit-0, so a term beginning with `-` stays a term.
+        Some(match first {
+            '/' => format!("search -- {rest}"),
+            '?' => format!("search -r -- {rest}"),
+            _ => rest,
+        })
     }
 
     // --- the small print ------------------------------------------------------------------------
@@ -1272,6 +1285,20 @@ mod tests {
         let mut cmd = CmdLine::new();
         cmd.set_text(":open");
         assert_eq!(cmd.cmd_set_text(" -t", false, true), Ok(":open -t".to_string()));
+    }
+
+    #[test]
+    /// `/` and `?` are searches. Without this bru ran a *command* named after the search term,
+    /// which parses to `Unimplemented` and is dropped without a word — `/` did nothing at all.
+    #[test]
+    fn slash_and_question_mark_search_rather_than_running_a_command() {
+        let mut cmd = CmdLine::new();
+        assert_eq!(cmd.accept("/Kestrel").as_deref(), Some("search -- Kestrel"));
+        assert_eq!(cmd.accept("?Kestrel").as_deref(), Some("search -r -- Kestrel"));
+        // `--` is why a term may begin with a dash: `search` is maxsplit-0.
+        assert_eq!(cmd.accept("/-v").as_deref(), Some("search -- -v"));
+        // `:` is still a command, and must not grow a `search` in front of it.
+        assert_eq!(cmd.accept(":open example.com").as_deref(), Some("open example.com"));
     }
 
     #[test]
