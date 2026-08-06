@@ -262,6 +262,15 @@ pub enum Command {
     AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------
 
+// --- src/greasemonkey.rs -----------------------------------------------------------------------
+    /// `greasemonkey-reload [--quiet]` — re-read `~/.local/share/bru/greasemonkey/` and tell every
+    /// renderer to do the same. qutebrowser's own command name.
+    ///
+    /// It has no `--force`: that flag re-*downloads* a script's `@require`s, and bru never fetches
+    /// a script or a resource by itself — see the head of `src/greasemonkey.rs`.
+    GreasemonkeyReload { quiet: bool },
+// --- end src/greasemonkey.rs -------------------------------------------------------------------
+
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
     /// `view-source` — the page's own source, in a tab of its own.
     ViewSource,
@@ -1252,6 +1261,21 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "adblock-toggle" => Command::AdblockToggle,
         "adblock-info" => Command::AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------
+
+// --- src/greasemonkey.rs -----------------------------------------------------------------------
+        "greasemonkey-reload" => {
+            // qutebrowser takes `--force` here to re-download every `@require`. bru never fetches
+            // one, so accepting the flag and doing nothing would be the lying kind of
+            // compatibility; it is refused by name and told where to put the file instead.
+            if args.any(&["f", "force"]) {
+                return Err(bad(
+                    "greasemonkey-reload has no --force: bru never fetches a @require. Put the \
+                     file in ~/.local/share/bru/greasemonkey/requires/ instead",
+                ));
+            }
+            Command::GreasemonkeyReload { quiet: args.any(&["q", "quiet"]) }
+        }
+// --- end src/greasemonkey.rs -------------------------------------------------------------------
 
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
         // `view-source --edit` hands the source to `$EDITOR`, which is a whole other mechanism;

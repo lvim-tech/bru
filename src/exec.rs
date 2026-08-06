@@ -603,6 +603,11 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 // --- end adblock -----------------------------------------------------------------------------
 
+// --- src/greasemonkey.rs -----------------------------------------------------------------------
+        // Not bound to a key here or in qutebrowser: it is typed, after a script has been edited.
+        Command::GreasemonkeyReload { quiet } => crate::greasemonkey::reload(*quiet),
+// --- end src/greasemonkey.rs -------------------------------------------------------------------
+
         // A command qutebrowser has and bru's parser does not know. It kept its place in the trie
         // so `;` still reports a partial match; running it does nothing.
         Command::Unimplemented(_) => {}
@@ -783,6 +788,11 @@ pub fn is_live(command: &Command) -> bool {
         // Live, and not part of the default-binding count: qutebrowser binds none of them either.
         Command::AdblockUpdate | Command::AdblockToggle | Command::AdblockInfo => true,
 // --- end adblock -----------------------------------------------------------------------------
+
+// --- src/greasemonkey.rs -----------------------------------------------------------------------
+        // Live, and not part of the default-binding count: qutebrowser binds no key to it either.
+        Command::GreasemonkeyReload { .. } => true,
+// --- end src/greasemonkey.rs -------------------------------------------------------------------
 
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
         Command::ViewSource | Command::Print => true,

@@ -82,7 +82,20 @@ wrap_render_process_handler! {
             frame: Option<&mut Frame>,
             context: Option<&mut V8Context>,
         ) {
+            // --- src/greasemonkey.rs ----------------------------------------------------------
+            // Kept before the router takes the frame, and *used* after it: userscripts must see
+            // the same window the page sees, `window.cefQuery` included, or the check that a
+            // userscript is refused exactly as a hostile page is would be testing nothing.
+            let gm_frame = frame.as_deref().cloned();
+            // --- end src/greasemonkey.rs ------------------------------------------------------
             crate::ipc::renderer_on_context_created(browser, frame, context);
+            // --- src/greasemonkey.rs ----------------------------------------------------------
+            // The one injection point for userscripts, and it is here rather than in a load
+            // handler because this is `@run-at document-start`: the document's V8 context exists
+            // and none of the page's own scripts have run. `document-end` and `document-idle` are
+            // waited for inside the wrapper, which is what makes them right in a subframe too.
+            crate::greasemonkey::renderer_on_context_created(gm_frame.as_ref());
+            // --- end src/greasemonkey.rs ------------------------------------------------------
         }
 
         fn on_context_released(
@@ -101,6 +114,15 @@ wrap_render_process_handler! {
             source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> ::std::os::raw::c_int {
+            // --- src/greasemonkey.rs ----------------------------------------------------------
+            // Two messages the browser process sends this renderer: drop the script cache, and
+            // evaluate a probe expression. Claimed here rather than in `ipc.rs` because neither is
+            // a query a page could have started, so neither goes near the message router or the
+            // `bru://`-only check that guards it.
+            if crate::greasemonkey::renderer_on_message(frame.as_deref(), message.as_deref()) {
+                return 1;
+            }
+            // --- end src/greasemonkey.rs ------------------------------------------------------
             crate::ipc::renderer_on_process_message_received(
                 browser,
                 frame,
@@ -413,6 +435,24 @@ wrap_browser_process_handler! {
                 crate::macros::schedule_macro_script(&script, step_ms);
             }
             // --- end src/macros.rs --------------------------------------------------------------
+
+            // --- src/greasemonkey.rs ------------------------------------------------------------
+            // Debug hook, off unless asked for. See greasemonkey::schedule_probe — it evaluates an
+            // expression in every tab and prints the answer, which is the only way to read what a
+            // userscript did to a page without a screenshot, and the only way to prove that the
+            // same script's `cefQuery` was refused.
+            let probe =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("gm-probe"))))
+                    .to_string();
+            if !probe.is_empty() {
+                let delays = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("gm-probe-after-ms"))),
+                )
+                .to_string();
+                let delays = if delays.is_empty() { "3000".to_string() } else { delays };
+                crate::greasemonkey::schedule_probe(&probe, &delays);
+            }
+            // --- end src/greasemonkey.rs --------------------------------------------------------
         }
 
         fn default_client(&self) -> Option<Client> {

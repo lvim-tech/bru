@@ -22,6 +22,7 @@ mod devtools;
 mod exec;
 mod favicon;
 mod find;
+mod greasemonkey;
 mod help;
 mod hints;
 mod history;
