@@ -14,6 +14,7 @@ mod find;
 mod ipc;
 mod keys;
 mod modes;
+mod open;
 mod scroll;
 mod state;
 mod tabs;

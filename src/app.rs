@@ -8,7 +8,9 @@ use crate::keys::BruClient;
 use crate::state::{schedule_close, BruState};
 use crate::window::{BruChromeViewDelegate, BruWindowDelegate};
 
-/// Where bru goes with no argument, and what `open` with no URL opens.
+/// Where bru goes with no argument, and what `open` with no URL opens, unless `config.lua` says
+/// otherwise — see `bru.set("start_page", ...)` and [`crate::open::start_page`], which is what
+/// everything should ask. This is qutebrowser's `url.default_page` default (configdata.yml :2569).
 pub const HOME: &str = "https://start.duckduckgo.com/";
 
 /// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
@@ -141,9 +143,12 @@ wrap_browser_process_handler! {
                 .expect("state mutex poisoned")
                 .set_client(BruClient::new(self.state.clone()));
 
+            // M9, DECISIONS item 7: the start page comes from config.lua when it sets one. It can
+            // only be asked for after the block above, which is what installs it.
             let url = CefString::from(&command_line.switch_value(Some(&CefString::from("url"))))
                 .to_string();
-            let url = CefString::from(if url.is_empty() { HOME } else { url.as_str() });
+            let start_page = crate::open::start_page();
+            let url = CefString::from(if url.is_empty() { start_page.as_str() } else { url.as_str() });
 
             let settings = BrowserSettings::default();
             let mut client = self.default_client();
@@ -189,6 +194,25 @@ wrap_browser_process_handler! {
                     .to_string();
             if let Ok(delay_ms) = close_after.parse::<i64>() {
                 schedule_close(delay_ms);
+            }
+
+            // Debug hook, off unless asked for. See state::schedule_open.
+            let open_text =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("open"))))
+                    .to_string();
+            if !open_text.is_empty() {
+                let after_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("open-after-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(2000);
+                crate::state::schedule_open(
+                    &open_text,
+                    command_line.has_switch(Some(&CefString::from("open-tab"))) == 1,
+                    command_line.has_switch(Some(&CefString::from("open-bg"))) == 1,
+                    after_ms,
+                );
             }
 
             // Debug hook, off unless asked for. See state::schedule_tab_script.

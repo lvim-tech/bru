@@ -159,16 +159,10 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // all, and `J`/`K`/`d` cannot be exercised. A URL only arrives here from a binding that
         // carries one; the interactive path is M9's.
         //
-        // SLOT: src/open.rs replaces the body of this arm with the URL-vs-search version.
+        // `open.rs` decides what the string *is* before anything is loaded: a URL, a file, or a
+        // search — and with which engine. `-w` still behaves as a tab, because bru has one window.
         Command::Open { url, tab, bg, window, .. } => {
-            let target = url.as_deref().unwrap_or(crate::app::HOME);
-            // `-w` has no window management behind it yet; treat it as a tab rather than silently
-            // doing nothing, and say so once M9 gives windows a meaning.
-            if *tab || *bg || *window {
-                crate::tabs::new_tab(state, target, *bg);
-            } else if let Some(frame) = browser.main_frame() {
-                frame.load_url(Some(&CefString::from(target)));
-            }
+            crate::open::open(state, browser, url.as_deref(), *tab || *window, *bg)
         }
 
         // --- navigation ---------------------------------------------------------------------
@@ -186,11 +180,9 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
         Command::Stop => browser.stop_load(),
-        Command::Home => {
-            if let Some(frame) = browser.main_frame() {
-                frame.load_url(Some(&CefString::from(crate::app::HOME)));
-            }
-        }
+        // Through `open` so that a `start_page` set in config.lua is honoured here too, and is
+        // fuzzy-parsed the same way — `bru.set("start_page", "example.com")` has to work.
+        Command::Home => crate::open::open(state, browser, None, false, false),
 
         // --- zoom ---------------------------------------------------------------------------
         // A count beats the argument, as everywhere else (`zoomcommands.py:64`).

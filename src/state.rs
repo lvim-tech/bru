@@ -252,6 +252,69 @@ pub fn schedule_tab_script(steps: &str, interval_ms: i64) {
     }
 }
 
+/// `--open="ddg python dict" [--open-tab] [--open-after-ms=N]` runs one `:open` from a posted UI
+/// task and then reports, twice, what came of it.
+///
+/// It exists because `:open` has no way in from a script otherwise: the command line is another
+/// milestone's, and the only key injector on this machine is `wtype`, which segfaults CEF (see
+/// `schedule_tab_script`). Without it the end-to-end claim for M9 would rest on a hand-typed URL,
+/// which is to say on nothing that runs twice.
+///
+/// Two reports, because they say different things: the first is bru's own decision, the second is
+/// the address **Chromium** ended up at, learned from `on_address_change`. A decision that is right
+/// and a navigation that fails look identical without the second.
+pub fn schedule_open(text: &str, tab: bool, bg: bool, delay_ms: i64) {
+    let mut task = OpenStep::new(text.to_string(), tab, bg);
+    post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+}
+
+wrap_task! {
+    struct OpenStep {
+        text: String,
+        tab: bool,
+        bg: bool,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            let engines = crate::open::engines();
+            eprintln!(
+                "open-script: {:?} -> {:?}",
+                self.text,
+                crate::open::decide(&self.text, &engines)
+            );
+
+            let browser = state.lock().expect("state mutex poisoned").active_browser();
+            let Some(mut browser) = browser else {
+                eprintln!("open-script: no tab to open into");
+                return;
+            };
+            crate::open::open(&state, &mut browser, Some(&self.text), self.tab, self.bg);
+
+            // Chromium has not navigated yet; ask again once it has.
+            let mut task = OpenReport::new();
+            post_delayed_task(ThreadId::UI, Some(&mut task), 3000);
+        }
+    }
+}
+
+wrap_task! {
+    struct OpenReport;
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            let state = state.lock().expect("state mutex poisoned");
+            eprintln!("open-script: chromium is at {}", state.tabs_json());
+        }
+    }
+}
+
 wrap_task! {
     struct TabStep {
         step: String,
