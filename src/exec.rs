@@ -535,6 +535,11 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // line, and a line a running userscript wrote back. A page reaches none of them.
         Command::Spawn { cmdline, userscript, detach, messages, verbose } => {
             crate::spawn::spawn(
+                // The browser, because a `--userscript` has to ask the page what it has selected
+                // before it can build `BRU_SELECTED_TEXT`. It is the tab the key was aimed at, not
+                // `active_browser()`, so a command dispatched at a background window reads that
+                // window's page.
+                browser,
                 cmdline,
                 crate::spawn::Opts {
                     userscript: *userscript,

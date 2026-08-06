@@ -50,6 +50,7 @@
 //! a navigation must not start on a thread that is not the UI thread, and a userscript's
 //! `open -t …` is exactly a navigation.
 
+use cef::*;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -364,7 +365,20 @@ fn wl_paste(primary: bool) -> String {
 /// `:spawn [-u] [-d] [-m] [-v] cmd [args…]`.
 ///
 /// UI thread. Everything that could block is on a thread of its own by the time this returns.
-pub fn spawn(cmdline: &str, opts: Opts, count: Option<u32>) {
+///
+/// A plain `:spawn` starts its program before this returns. **A `--userscript` does not**: it has
+/// to know what the page has selected, only the renderer knows that, and asking costs a round trip.
+/// See [`ask_for_selection`] — and note that this is not bru inventing an asynchronous spawn.
+/// qutebrowser's own `:spawn` does exactly the same thing and says why in a comment:
+///
+/// ```text
+/// # dirty hack for async call because of:
+/// # https://bugreports.qt.io/browse/QTBUG-53134
+/// caret.selection(callback=_selection_callback)
+/// ```
+///
+/// (`browser/commands.py:1118-1133`; the userscript is started from that callback.)
+pub fn spawn(browser: &mut Browser, cmdline: &str, opts: Opts, count: Option<u32>) {
     let parts = match shlex(cmdline) {
         Ok(parts) => parts,
         Err(problem) => {
@@ -383,10 +397,138 @@ pub fn spawn(cmdline: &str, opts: Opts, count: Option<u32>) {
     let args: Vec<String> = args.iter().map(|arg| replace_variables(arg)).collect();
 
     if opts.userscript {
-        run_userscript(command, &args, opts, count);
+        ask_for_selection(browser, command.clone(), args, opts, count);
     } else {
         run_plain(command, &args, opts);
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Waiting for the page's selection
+// -----------------------------------------------------------------------------------------------
+
+/// What `BRU_SELECTED_TEXT` is read with.
+///
+/// **`window.getSelection().toString()`, and nothing more**, because that is `funcs.getSelection`
+/// in qutebrowser's `javascript/caret.js:1425`, which is what `WebEngineCaret.selection` runs and
+/// therefore what `QUTE_SELECTED_TEXT` has always held for this user. Two things it does not see —
+/// a selection inside an `<input>` or `<textarea>`, and a selection in a subframe — it does not see
+/// in qutebrowser either, and matching a script's existing behaviour is worth more here than being
+/// right about a case nothing on this machine exercises. `webenginetab.py:387` even says it will
+/// not use Qt's own `selectedText()`, which *would* cover the input, because it is unreliable.
+const READ_SELECTION: &str = "window.getSelection().toString();";
+
+/// How long a `--userscript` waits for that answer before starting without a selection.
+///
+/// **The UI thread never blocks for any of it** — this is a delayed task, and the window keeps
+/// painting and keys keep working throughout. The number is a bound on how late a *broken* renderer
+/// can make a userscript start, not on the normal case: measured on this machine, the round trip
+/// took under a millisecond (`BRU_DEBUG_SPAWN=1` prints it on every run). Half a second is far
+/// longer than that and far shorter than a person notices as a hang.
+///
+/// qutebrowser has no bound at all here: if its callback never fires, its userscript never runs.
+const SELECTION_TIMEOUT_MS: i64 = 500;
+
+/// A userscript that has been asked for and is waiting on the renderer.
+struct Waiting {
+    command: String,
+    args: Vec<String>,
+    opts: Opts,
+    count: Option<u32>,
+    asked_at: std::time::Instant,
+}
+
+/// One entry per `:spawn --userscript` in flight, removed by whichever of the answer and the
+/// timeout gets there first. Both call [`start`]; the removal is what makes the second a no-op.
+fn waiting() -> &'static Mutex<Vec<(u64, Waiting)>> {
+    static WAITING: Mutex<Vec<(u64, Waiting)>> = Mutex::new(Vec::new());
+    &WAITING
+}
+
+/// Ask the page what it has selected and start the userscript when the answer comes — or when it
+/// does not.
+///
+/// The channel is `editor.rs`'s: a `ProcessMessage` to the renderer, evaluated there between
+/// `V8Context::enter` and `exit`, answered with another `ProcessMessage`. It is not the message
+/// router, so a page cannot send one and `ipc.rs`'s `bru://`-only check is untouched.
+fn ask_for_selection(
+    browser: &mut Browser,
+    command: String,
+    args: Vec<String>,
+    opts: Opts,
+    count: Option<u32>,
+) {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+
+    if let Ok(mut waiting) = waiting().lock() {
+        waiting.push((
+            id,
+            Waiting { command, args, opts, count, asked_at: std::time::Instant::now() },
+        ));
+    }
+    crate::editor::ask(browser, READ_SELECTION, move |text| start(id, Some(text)));
+
+    // The other half. Without it a renderer that died between the question and the answer would
+    // swallow the userscript silently — the script would simply never run and nothing would say so.
+    let mut task = SelectionTimeout::new(id);
+    post_delayed_task(ThreadId::UI, Some(&mut task), SELECTION_TIMEOUT_MS);
+}
+
+wrap_task! {
+    struct SelectionTimeout {
+        id: u64,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            start(self.id, None);
+        }
+    }
+}
+
+/// Start the userscript that was waiting under `id`, if it still is. UI thread, both ways in.
+fn start(id: u64, selection: Option<String>) {
+    let waiting = waiting().lock().ok().and_then(|mut waiting| {
+        waiting
+            .iter()
+            .position(|(pending, _)| *pending == id)
+            .map(|at| waiting.remove(at).1)
+    });
+    // Already started — the answer arrived after the timeout had run, or the other way round.
+    let Some(job) = waiting else {
+        return;
+    };
+
+    if std::env::var_os("BRU_DEBUG_SPAWN").is_some() {
+        eprintln!(
+            "bru[spawn]: selection after {:?}: page {:?}, caret session {:?}",
+            job.asked_at.elapsed(),
+            selection.as_deref().map(|text| text.chars().take(40).collect::<String>()),
+            // The other candidate source, and the measurement that ruled it out. `caret::selection`
+            // is `None` unless caret mode is *open on this tab*, and even then it holds what the
+            // page reported after the last movement rather than what is selected now — so it cannot
+            // answer for a selection made with the mouse, which is how this user makes one before
+            // pressing `<Ctrl+Shift+T>`. qutebrowser reached the same conclusion about its own
+            // cached value and re-runs the script every time (`webenginetab.py:387`).
+            crate::caret::selection().map(|(state, _)| state),
+        );
+    }
+
+    if selection.is_none() {
+        error(&format!(
+            "spawn: the page did not answer in {SELECTION_TIMEOUT_MS} ms; \
+             running {} with no selection",
+            job.command
+        ));
+    }
+    run_userscript(
+        &job.command,
+        &job.args,
+        job.opts,
+        job.count,
+        &selection.unwrap_or_default(),
+    );
 }
 
 /// A plain `:spawn`: no FIFO, no `BRU_*` environment, the process inherits bru's own.
@@ -410,7 +552,13 @@ fn run_plain(command: &str, args: &[String], opts: Opts) {
 }
 
 /// `:spawn --userscript`: the qutebrowser protocol, with bru's names.
-fn run_userscript(command: &str, args: &[String], opts: Opts, count: Option<u32>) {
+fn run_userscript(
+    command: &str,
+    args: &[String],
+    opts: Opts,
+    count: Option<u32>,
+    selection: &str,
+) {
     let path = match resolve_userscript(command) {
         Ok(path) => path,
         Err(problem) => {
@@ -451,7 +599,7 @@ fn run_userscript(command: &str, args: &[String], opts: Opts, count: Option<u32>
 
     let mut child = Command::new(&path);
     child.args(args);
-    for (key, value) in environment(&fifo, count) {
+    for (key, value) in environment(&fifo, count, selection) {
         child.env(key, value);
     }
     configure_stdio(&mut child, opts);
@@ -569,24 +717,34 @@ fn configure_stdio(command: &mut Command, opts: Opts) {
 
 /// Every variable a bru userscript is given.
 ///
-/// qutebrowser's names with `QUTE_` swapped for `BRU_`. Which of its variables are missing, and
-/// why, is in the report for this milestone rather than here — but the short version is that
-/// `BRU_SELECTED_TEXT`, `BRU_SELECTED_HTML`, `BRU_TEXT` and `BRU_HTML` all need the page's DOM,
-/// which is a renderer round trip that would have to delay the spawn, and `BRU_USER_AGENT`,
-/// `BRU_DOWNLOAD_DIR` and `BRU_COMMANDLINE_TEXT` name things bru either cannot ask CEF for or does
-/// not have yet. Setting a variable to a plausible wrong value is worse than not setting it: a
-/// script tests `if [ -n "$BRU_TEXT" ]`.
+/// qutebrowser's names with `QUTE_` swapped for `BRU_`.
+///
+/// `BRU_SELECTED_TEXT` is here and the round trip that fills it is [`ask_for_selection`], which is
+/// what delays the spawn. Its three neighbours are **not** here and are not an oversight:
+///
+/// | | |
+/// |---|---|
+/// | `BRU_SELECTED_HTML` | one more expression in the same round trip, and nothing on this machine reads it |
+/// | `BRU_TEXT`, `BRU_HTML` | the *whole document*. A news page is megabytes, and `execve` refuses an environment past `ARG_MAX`; a variable that makes a userscript fail to start on long pages is worse than an absent one |
+/// | `BRU_USER_AGENT`, `BRU_DOWNLOAD_DIR`, `BRU_COMMANDLINE_TEXT` | things bru either cannot ask CEF for or does not have yet |
+///
+/// Setting a variable to a plausible wrong value is worse than not setting it: a script tests
+/// `if [ -n "$BRU_TEXT" ]`.
 ///
 /// Every name here is also exported under qutebrowser's `QUTE_` prefix — see [`alias_as_qute`],
 /// which is what lets this user's existing userscripts run unmodified.
 ///
 /// UI thread — it reads `BruState` for the URL, the title and the tab index.
-fn environment(fifo: &Path, count: Option<u32>) -> Vec<(String, String)> {
+fn environment(fifo: &Path, count: Option<u32>, selection: &str) -> Vec<(String, String)> {
     let mut env = vec![
         ("BRU_FIFO".to_string(), fifo.display().to_string()),
         // qutebrowser's `QUTE_MODE` is `command` for `:spawn --userscript` and `hints` for a
         // userscript hint target. bru has no userscript hint target, so it is always `command`.
         ("BRU_MODE".to_string(), "command".to_string()),
+        // Set even when it is empty, exactly as qutebrowser sets `QUTE_SELECTED_TEXT` whatever the
+        // selection is (`browser/commands.py:1160`). An empty string is not a plausible wrong value
+        // here — it is the true one, and `[ -n "$QUTE_SELECTED_TEXT" ]` reads it correctly.
+        ("BRU_SELECTED_TEXT".to_string(), selection.to_string()),
         ("BRU_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string()),
     ];
 
@@ -713,11 +871,8 @@ fn qute_config_dir() -> Result<PathBuf, String> {
 /// | `QUTE_CONFIG_DIR` | `qutebrowser_dmenu`, `qutebrowser_tab_dmenu` |
 /// | `QUTE_SELECTED_TEXT` | `qutebrowser_translate`, and only in its `--text` mode |
 ///
-/// Four of the five are `BRU_*` already, so aliasing is the whole fix for four of the five scripts.
-/// The fifth — `QUTE_SELECTED_TEXT` — needs the page's DOM and is deliberately unset; see
-/// [`environment`]. `<Ctrl+Shift+T>` in this user's `config.py` is the one binding that wants it,
-/// and under bru it would translate an empty string. `<Ctrl+T>`, the same script without `--text`,
-/// reads `QUTE_URL` and works.
+/// All five are `BRU_*` names, so aliasing is the whole of what the environment needs.
+/// `<Ctrl+Shift+T>` in this user's `config.py` is the one binding that reads the fifth.
 ///
 /// Derived from the `BRU_*` list rather than written out again: a variable added to [`environment`]
 /// gets its alias for free, and there is no second list to forget to update. One name is held back:
@@ -1072,6 +1227,7 @@ mod tests {
             ("BRU_CONFIG_DIR".to_string(), "/home/x/.config/bru".to_string()),
             ("BRU_DATA_DIR".to_string(), "/home/x/.local/share/bru".to_string()),
             ("BRU_URL".to_string(), "https://example.com/a".to_string()),
+            ("BRU_SELECTED_TEXT".to_string(), "две думи".to_string()),
         ];
         alias_as_qute(&mut env, Some("/run/user/1000/bru/qute-config"));
         let get = |name: &str| {
@@ -1104,10 +1260,11 @@ mod tests {
         assert_eq!(get("QUTE_VERSION"), None);
         assert_eq!(get("BRU_VERSION").as_deref(), Some("0.1.0"));
 
-        // Nothing the page's DOM would be needed for is invented. `qutebrowser_translate --text`
-        // reads this one and gets nothing, which is the honest answer — not an empty string
-        // dressed up as a selection.
-        assert_eq!(get("QUTE_SELECTED_TEXT"), None);
+        // The fifth, and the one `qutebrowser_translate --text` is bound to `<Ctrl+Shift+T>` for.
+        // It costs a renderer round trip to fill; see `ask_for_selection`.
+        assert_eq!(get("QUTE_SELECTED_TEXT").as_deref(), Some("две думи"));
+        // Its three neighbours are still absent, and deliberately: nothing here reads them, and
+        // `QUTE_TEXT` would put a whole news page into an environment `execve` has a limit on.
         assert_eq!(get("QUTE_SELECTED_HTML"), None);
         assert_eq!(get("QUTE_TEXT"), None);
         assert_eq!(get("QUTE_HTML"), None);
