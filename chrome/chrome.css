@@ -171,7 +171,7 @@ body[data-view="bottom"] {
 
 /* Completion --------------------------------------------------------------
  *
- * Markup bottom.js is expected to produce inside #completion, categories in
+ * Markup completion.js produces inside #completion, categories in
  * qutebrowser's order (Search engines, Quickmarks, Bookmarks, History):
  *
  *   <div class="category">
@@ -181,6 +181,14 @@ body[data-view="bottom"] {
  *
  * Two or three .col per .item; the grid below takes whichever it is given.
  * <span class="match"> inside a column highlights the matched substring.
+ *
+ * Every row is --row-h tall, borders included — box-sizing is border-box
+ * above, so the selected row's two borders cost nothing in height and the
+ * list does not shift by 2px as the selection moves through it. That is what
+ * makes the open bar's height arithmetic exact:
+ *
+ *   24px + 1px + 20px × (categories + items), capped at
+ *   24px + --completion-max-h.
  */
 
 #completion {
@@ -231,6 +239,19 @@ body[data-view="bottom"] {
     background: var(--completion-item-selected-bg);
     border-top: 1px solid var(--completion-item-selected-border-top);
     border-bottom: 1px solid var(--completion-item-selected-border-bottom);
+}
+
+/* qutebrowser's own proportions for the URL completion — 40/50/10 in
+   urlmodel.py :52 — rather than equal shares, which would give a "5 days ago"
+   the same width as a URL. The first track is the same 40% whether a row has
+   two columns or three, so the quickmarks and the history under them line up
+   as one table instead of two. */
+#completion .item:has(> .col:nth-child(2)) {
+    grid-template-columns: 40% minmax(0, 1fr);
+}
+
+#completion .item:has(> .col:nth-child(3)) {
+    grid-template-columns: 40% minmax(0, 1fr) 10%;
 }
 
 #completion .col {
