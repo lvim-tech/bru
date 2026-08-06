@@ -68,5 +68,100 @@ wrap_client! {
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(BruKeyboardHandler::new())
         }
+
+        // --- M4 --------------------------------------------------------------------------------
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(BruDisplayHandler::new())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(BruRequestHandler::new())
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(BruLifeSpanHandler::new())
+        }
+
+        // One of the four calls the message router documents as mandatory.
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            crate::ipc::on_process_message_received(browser, frame, source_process, message)
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// Two of the four mandatory router forwards. They are the only reason bru has a request handler at
+// all; on_before_browse in particular must be called or pending queries leak with no error anywhere.
+wrap_request_handler! {
+    pub struct BruRequestHandler;
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // The router is told only about navigations that are allowed to proceed, so this call
+            // has to come before the return, and the return has to be "allow".
+            crate::ipc::on_before_browse(browser, frame);
+            0
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            _status: TerminationStatus,
+            _error_code: ::std::os::raw::c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            crate::ipc::on_render_process_terminated(browser);
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// The fourth mandatory forward. M1 gives BruClient a real life-span handler that also tracks
+// browsers and quits the message loop; when the two meet, this one line moves into that one and
+// this block goes away.
+wrap_life_span_handler! {
+    pub struct BruLifeSpanHandler;
+
+    impl LifeSpanHandler {
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            crate::ipc::on_before_close(browser);
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// Where the status line's URL and title come from. Chromium tells us; we keep it and push it.
+wrap_display_handler! {
+    pub struct BruDisplayHandler;
+
+    impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // Subframes navigate constantly and none of it is the page's address.
+            if frame.map(|frame| frame.is_main() != 0).unwrap_or(false) {
+                crate::ipc::set_url(url.map(CefString::to_string).unwrap_or_default());
+            }
+        }
+
+        fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            crate::ipc::set_title(title.map(CefString::to_string).unwrap_or_default());
+        }
     }
 }

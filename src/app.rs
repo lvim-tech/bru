@@ -23,6 +23,56 @@ wrap_app! {
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
             crate::chrome::register_scheme(registrar);
         }
+
+        // --- M4 --------------------------------------------------------------------------------
+        // Renderer process only. It must not touch browser-process state — same binary, different
+        // process — and everything it needs is the renderer half of the message router.
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(BruRenderProcessHandler::new())
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// The renderer side of the message router: three forwards, exactly as its trait documents. The
+// router is a per-process singleton inside ipc.rs, because CEF may ask for this handler more than
+// once and two routers in one renderer would each answer half the queries.
+wrap_render_process_handler! {
+    struct BruRenderProcessHandler;
+
+    impl RenderProcessHandler {
+        fn on_context_created(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            crate::ipc::renderer_on_context_created(browser, frame, context);
+        }
+
+        fn on_context_released(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            crate::ipc::renderer_on_context_released(browser, frame, context);
+        }
+
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            crate::ipc::renderer_on_process_message_received(
+                browser,
+                frame,
+                source_process,
+                message,
+            )
+        }
     }
 }
 

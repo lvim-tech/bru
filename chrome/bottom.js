@@ -62,15 +62,22 @@
       }
     });
 
-    // Round-trip probe. The real bottom.html has no such button; this is here
-    // so the router can be exercised by hand.
+    // Round-trip probe, for proving the router answers as well as receives.
+    // Reachable two ways because a keyboard-driven browser has no pointer to
+    // click with while it is being built: the button when there is one, and
+    // ?probe=1 on the URL, which needs no input at all.
+    function echo() {
+      query({ type: "echo", text: "hello from " + VIEW }, function (response) {
+        put("echo-result", response);
+      });
+    }
+
     var button = document.getElementById("echo");
     if (button) {
-      button.addEventListener("click", function () {
-        query({ type: "echo", text: "hello from " + VIEW }, function (response) {
-          put("echo-result", response);
-        });
-      });
+      button.addEventListener("click", echo);
+    }
+    if (window.location.search.indexOf("probe=1") !== -1) {
+      echo();
     }
   }
 

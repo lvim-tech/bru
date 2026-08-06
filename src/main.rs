@@ -6,6 +6,7 @@
 
 mod app;
 mod chrome;
+mod ipc;
 mod keys;
 mod window;
 
