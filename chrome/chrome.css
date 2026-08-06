@@ -44,7 +44,13 @@ html, body {
 #statusline #url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #statusline #keystring { color: var(--statusbar-keystring-fg); }
 
-#completion { display: none; }
+/* The only thing that collapses the bottom bar back to its closed height, which
+ * is why bottom.js clears #completion with textContent = "" — :empty counts a
+ * whitespace text node as content. */
+#completion:empty { display: none; }
+#completion .cat-header { color: var(--completion-category-fg); }
+#completion .item.selected { background: var(--completion-item-selected-bg); }
+#completion .match { color: var(--completion-match-fg); }
 
 #cmdline {
   display: none;
@@ -55,3 +61,6 @@ html, body {
   color: var(--statusbar-fg);
   font: inherit;
 }
+
+/* bottom.js owns body.className and writes only mode-<mode> into it. */
+body.mode-command #cmdline { display: block; }
