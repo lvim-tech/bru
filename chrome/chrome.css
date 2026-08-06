@@ -1,0 +1,66 @@
+/* Placeholder. The real chrome stylesheet is written against the same element
+ * ids; every colour here is a var() so theme.css can supply it. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/1.6 var(--font, monospace);
+}
+
+#tabs {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+}
+
+#tabs .tab {
+  padding: 0 8px;
+  background: var(--tabs-bg);
+  color: var(--tabs-fg);
+  border-right: 1px solid var(--tabs-separator);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#tabs .tab.active {
+  background: var(--tabs-selected-bg);
+  color: var(--tabs-selected-fg);
+}
+
+#statusline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: var(--statusbar-bg);
+  color: var(--statusbar-fg);
+  padding: 0 4px;
+}
+
+#statusline #url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#statusline #keystring { color: var(--statusbar-keystring-fg); }
+
+/* The only thing that collapses the bottom bar back to its closed height, which
+ * is why bottom.js clears #completion with textContent = "" — :empty counts a
+ * whitespace text node as content. */
+#completion:empty { display: none; }
+#completion .cat-header { color: var(--completion-category-fg); }
+#completion .item.selected { background: var(--completion-item-selected-bg); }
+#completion .match { color: var(--completion-match-fg); }
+
+#cmdline {
+  display: none;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: var(--statusbar-bg);
+  color: var(--statusbar-fg);
+  font: inherit;
+}
+
+/* bottom.js owns body.className and writes only mode-<mode> into it. */
+body.mode-command #cmdline { display: block; }

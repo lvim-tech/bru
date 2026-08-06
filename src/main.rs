@@ -6,8 +6,10 @@
 
 mod app;
 mod bindings;
+mod chrome;
 mod commands;
 mod config;
+mod ipc;
 mod keys;
 mod modes;
 mod state;

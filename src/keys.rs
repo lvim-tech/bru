@@ -129,6 +129,26 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(BruLifeSpanHandler::new(self.state.clone()))
         }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(BruDisplayHandler::new(self.state.clone()))
+        }
+
+        // bru has a request handler only because the message router demands two of its callbacks.
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(BruRequestHandler::new())
+        }
+
+        // One of the four calls the message router documents as mandatory.
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            crate::ipc::on_process_message_received(browser, frame, source_process, message)
+        }
     }
 }
 
@@ -155,10 +175,113 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
+            // The router has to hear about the close before the state does: this is one of its four
+            // mandatory forwards, and skipping it leaks that browser's pending queries silently.
+            // Once the state has removed the last browser it quits the message loop, so nothing
+            // after that call is guaranteed to run.
+            crate::ipc::on_before_close(browser.as_deref().cloned().as_mut());
+
             self.state
                 .lock()
                 .expect("state mutex poisoned")
                 .on_before_close(browser);
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// Two of the four mandatory router forwards. They are the only reason bru has a request handler at
+// all; on_before_browse in particular must be called or pending queries leak with no error anywhere.
+wrap_request_handler! {
+    pub struct BruRequestHandler;
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // The router is told only about navigations that are allowed to proceed, so this call
+            // has to come before the return, and the return has to be "allow".
+            crate::ipc::on_before_browse(browser, frame);
+            0
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            _status: TerminationStatus,
+            _error_code: ::std::os::raw::c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            crate::ipc::on_render_process_terminated(browser);
+        }
+    }
+}
+
+// Where the status line's URL and title come from. Chromium tells us; we keep it and push it.
+//
+// Both callbacks are keyed by browser identifier, and that is not a detail. Three browsers share one
+// Client — the page and the two chrome strips — so an unkeyed handler lets the tab strip's own
+// address overwrite the page's the moment it finishes loading, and the status line then reports
+// bru://chrome/top.html for every site visited. The state answers which tab a browser is, and
+// ignores anything that is not one.
+wrap_display_handler! {
+    pub struct BruDisplayHandler {
+        state: Arc<Mutex<BruState>>,
+    }
+
+    impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // Subframes navigate constantly and none of it is the page's address.
+            if !frame.map(|frame| frame.is_main() != 0).unwrap_or(false) {
+                return;
+            }
+            let Some(id) = browser.map(|browser| browser.identifier()) else {
+                return;
+            };
+            let url = url.map(CefString::to_string).unwrap_or_default();
+
+            let (is_tab, is_active, tabs) = {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                let is_tab = state.set_tab_url(id, url.clone());
+                (is_tab, state.is_active_browser(id), state.tabs_json())
+            };
+            if !is_tab {
+                return;
+            }
+            if is_active {
+                crate::ipc::set_url(url);
+            }
+            crate::ipc::set_tabs(tabs);
+        }
+
+        fn on_title_change(&self, browser: Option<&mut Browser>, title: Option<&CefString>) {
+            let Some(id) = browser.map(|browser| browser.identifier()) else {
+                return;
+            };
+            let title = title.map(CefString::to_string).unwrap_or_default();
+
+            let (is_tab, is_active, tabs) = {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                let is_tab = state.set_tab_title(id, title.clone());
+                (is_tab, state.is_active_browser(id), state.tabs_json())
+            };
+            if !is_tab {
+                return;
+            }
+            if is_active {
+                crate::ipc::set_title(title);
+            }
+            crate::ipc::set_tabs(tabs);
         }
     }
 }

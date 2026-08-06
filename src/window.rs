@@ -172,7 +172,9 @@ const VIEW_STYLE: RuntimeStyle = RuntimeStyle::ALLOY;
 wrap_browser_view_delegate! {
     // The empty-struct shorthand the other wrap_ macros accept is not a rule this one has; it needs
     // the braces even with no fields.
-    pub struct BruBrowserViewDelegate {}
+    pub struct BruBrowserViewDelegate {
+        state: Arc<Mutex<BruState>>,
+    }
 
     impl ViewDelegate {}
 
@@ -181,6 +183,23 @@ wrap_browser_view_delegate! {
             VIEW_STYLE
         }
 
+        // Which browser ended up behind this tab. Asked here rather than after
+        // `browser_view_create`, which returns before the browser exists at all, and rather than by
+        // matching the frame URL, which races the first load. Without it the status line cannot tell
+        // the page's address from a chrome strip's own bru:// URL.
+        fn on_browser_created(
+            &self,
+            browser_view: Option<&mut BrowserView>,
+            browser: Option<&mut Browser>,
+        ) {
+            let (Some(browser_view), Some(browser)) = (browser_view, browser) else {
+                return;
+            };
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .note_tab_browser(browser_view, browser.identifier());
+        }
     }
 }
 

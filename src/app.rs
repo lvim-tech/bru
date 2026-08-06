@@ -11,11 +11,9 @@ use crate::window::{BruChromeViewDelegate, BruWindowDelegate};
 /// Where bru goes with no argument.
 const HOME: &str = "https://start.duckduckgo.com/";
 
-// MERGE NOTE (M2): these two data: URIs are placeholders standing in for the bru:// scheme, which
-// M2 implements. When it lands they become "bru://chrome/top.html" and "bru://chrome/bottom.html"
-// and the two constants below go away with them.
-const TOP_PLACEHOLDER: &str = r#"<!doctype html><meta charset="utf-8"><body style="margin:0;height:100vh;display:flex;align-items:center;background:#1a6fb5;color:#fff;font:13px/1 monospace"><span style="padding:0 8px">top</span></body>"#;
-const BOTTOM_PLACEHOLDER: &str = r#"<!doctype html><meta charset="utf-8"><body style="margin:0;height:100vh;display:flex;align-items:center;background:#b5651a;color:#fff;font:13px/1 monospace"><span style="padding:0 8px">bottom</span></body>"#;
+/// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
+const TOP_URL: &str = "bru://chrome/top.html";
+const BOTTOM_URL: &str = "bru://chrome/bottom.html";
 
 /// Chrome strip heights, in logical pixels.
 const TOP_HEIGHT: i32 = 28;
@@ -51,6 +49,63 @@ wrap_app! {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(BruBrowserProcessHandler::new(self.state.clone()))
         }
+
+        // --- M2 --------------------------------------------------------------------------------
+        // Runs in every process: browser, renderer, GPU, zygote. Keep it pure — there is no state
+        // to reach for out here, and a renderer that missed this call refuses to load bru:// at all.
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            crate::chrome::register_scheme(registrar);
+        }
+
+        // --- M4 --------------------------------------------------------------------------------
+        // Renderer process only. It must not touch browser-process state — same binary, different
+        // process — and everything it needs is the renderer half of the message router.
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(BruRenderProcessHandler::new())
+        }
+    }
+}
+
+// --- M4 ----------------------------------------------------------------------------------------
+// The renderer side of the message router: three forwards, exactly as its trait documents. The
+// router is a per-process singleton inside ipc.rs, because CEF may ask for this handler more than
+// once and two routers in one renderer would each answer half the queries.
+wrap_render_process_handler! {
+    struct BruRenderProcessHandler;
+
+    impl RenderProcessHandler {
+        fn on_context_created(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            crate::ipc::renderer_on_context_created(browser, frame, context);
+        }
+
+        fn on_context_released(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            crate::ipc::renderer_on_context_released(browser, frame, context);
+        }
+
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            crate::ipc::renderer_on_process_message_received(
+                browser,
+                frame,
+                source_process,
+                message,
+            )
+        }
     }
 }
 
@@ -64,6 +119,10 @@ wrap_browser_process_handler! {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
             let command_line = command_line_get_global().expect("no global command line");
+
+            // The factory has to exist before anything can ask for a bru:// URL, and the two chrome
+            // views below are the first things to ask.
+            crate::chrome::register_factory();
 
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state
@@ -86,7 +145,7 @@ wrap_browser_process_handler! {
                 BruChromeViewDelegate::new(self.state.clone(), TOP_HEIGHT);
             let top_view = browser_view_create(
                 client.as_mut(),
-                Some(&data_uri(TOP_PLACEHOLDER, "text/html")),
+                Some(&CefString::from(TOP_URL)),
                 Some(&settings),
                 None,
                 None,
@@ -101,7 +160,7 @@ wrap_browser_process_handler! {
                 BruChromeViewDelegate::new(self.state.clone(), BOTTOM_HEIGHT);
             let bottom_view = browser_view_create(
                 client.as_mut(),
-                Some(&data_uri(BOTTOM_PLACEHOLDER, "text/html")),
+                Some(&CefString::from(BOTTOM_URL)),
                 Some(&settings),
                 None,
                 None,

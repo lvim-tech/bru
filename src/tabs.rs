@@ -21,12 +21,79 @@ pub type SharedState = Arc<Mutex<BruState>>;
 
 pub struct Tab {
     view: BrowserView,
+    /// Learned from `BrowserViewDelegate::on_browser_created`, not at creation: `browser_view_create`
+    /// returns before the browser exists, so this is `None` for the moment in between.
+    browser_id: Option<i32>,
+    title: String,
+    url: String,
 }
 
 /// The plain state operations. None of these touch CEF.
 impl BruState {
     pub fn tab_views(&self) -> Vec<BrowserView> {
         self.tabs.iter().map(|tab| tab.view.clone()).collect()
+    }
+
+    /// Ties a browser to the tab whose view it was made for. Called once per tab.
+    pub fn note_tab_browser(&mut self, view: &mut BrowserView, identifier: i32) {
+        for tab in &mut self.tabs {
+            if tab.view.is_same(Some(&mut View::from(&*view))) != 0 {
+                tab.browser_id = Some(identifier);
+                return;
+            }
+        }
+    }
+
+    fn tab_index_of(&self, identifier: i32) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.browser_id == Some(identifier))
+    }
+
+    /// True when `identifier` is the browser of the tab currently showing — which is the only tab
+    /// whose address and title belong in the status line.
+    pub fn is_active_browser(&self, identifier: i32) -> bool {
+        self.tab_index_of(identifier) == Some(self.active)
+    }
+
+    /// Records a tab's address. Returns false when the browser is not a tab at all, which is how a
+    /// chrome strip reporting its own bru:// URL is kept out of the status line.
+    pub fn set_tab_url(&mut self, identifier: i32, url: String) -> bool {
+        match self.tab_index_of(identifier) {
+            Some(index) => {
+                self.tabs[index].url = url;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_tab_title(&mut self, identifier: i32, title: String) -> bool {
+        match self.tab_index_of(identifier) {
+            Some(index) => {
+                self.tabs[index].title = title;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What the tab strip renders, in strip order.
+    pub fn tabs_json(&self) -> String {
+        let entries: Vec<String> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                format!(
+                    "{{\"title\":\"{}\",\"url\":\"{}\",\"active\":{}}}",
+                    crate::ipc::json_escape(&tab.title),
+                    crate::ipc::json_escape(&tab.url),
+                    index == self.active,
+                )
+            })
+            .collect();
+        format!("{{\"tabs\":[{}]}}", entries.join(","))
     }
 
     pub fn tab_count(&self) -> usize {
@@ -42,7 +109,12 @@ impl BruState {
     }
 
     pub fn push_tab(&mut self, view: BrowserView) -> usize {
-        self.tabs.push(Tab { view });
+        self.tabs.push(Tab {
+            view,
+            browser_id: None,
+            title: String::new(),
+            url: String::new(),
+        });
         self.tabs.len() - 1
     }
 
@@ -70,7 +142,7 @@ pub fn new_tab(state: &SharedState, url: &str, background: bool) {
         return;
     };
 
-    let mut delegate = BruBrowserViewDelegate::new();
+    let mut delegate = BruBrowserViewDelegate::new(state.clone());
     let settings = BrowserSettings::default();
     let Some(view) = browser_view_create(
         Some(&mut client),
