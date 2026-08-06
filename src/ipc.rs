@@ -74,7 +74,7 @@ struct BruQueryHandler;
 impl BrowserSideHandler for BruQueryHandler {
     fn on_query_str(
         &self,
-        _browser: Option<Browser>,
+        browser: Option<Browser>,
         frame: Option<Frame>,
         _query_id: i64,
         request: &str,
@@ -85,6 +85,22 @@ impl BrowserSideHandler for BruQueryHandler {
             .as_ref()
             .map(|frame| CefString::from(&frame.url()).to_string())
             .unwrap_or_default();
+
+        // --- M12 --------------------------------------------------------------------------------
+        // The one thing a web page is allowed to say, and only because bru injected the script that
+        // says it. `chrome/hints.js` runs in the page's own world to see the page's elements, so it
+        // cannot be a bru:// frame and cannot pass the check below. `hints::on_page_query` is what
+        // makes that safe: it answers false unless a hint session bru itself started is open, the
+        // query came from that session's browser, and it carries the token that session minted.
+        if json_field(request, "type").as_deref() == Some("hints") {
+            if crate::hints::on_page_query(browser.as_ref(), request) {
+                succeed(&callback, "");
+            } else {
+                eprintln!("bru: refused a hint answer from {url:?}");
+                fail(&callback, -6, "not an answer to a hint session bru started");
+            }
+            return true;
+        }
 
         // The security check, and it is the whole reason this function starts here. cefQuery is
         // registered on the window object of every V8 context the renderer creates, which includes

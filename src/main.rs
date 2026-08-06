@@ -9,6 +9,7 @@ mod bindings;
 mod chrome;
 mod commands;
 mod config;
+mod hints;
 mod ipc;
 mod keys;
 mod modes;

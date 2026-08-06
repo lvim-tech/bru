@@ -103,6 +103,14 @@ wrap_keyboard_handler! {
                 return 0;
             };
 
+            // --- M12 (merge: this is the mode-parser hook src/hints.rs asks for) -----------------
+            // Hint mode has its own parser, over a trie of hint labels rather than of commands
+            // (modeparsers.py:135). It answers None in every other mode, so the ordinary path below
+            // is untouched.
+            if let Some(swallow) = crate::hints::handle_key(&self.state, target, info) {
+                return swallow as ::std::os::raw::c_int;
+            }
+
             let Some(outcome) = self
                 .state
                 .lock()
@@ -219,6 +227,16 @@ fn run(
                 blur(browser);
             }
         }
+
+        // --- M12 (merge: this arm belongs in src/exec.rs) ---------------------------------------
+        Command::Hint { target } => {
+            let target = match target {
+                crate::commands::HintTarget::Normal => crate::hints::Target::Normal,
+                crate::commands::HintTarget::TabBg => crate::hints::Target::TabBg,
+            };
+            crate::hints::start(state, browser, target);
+        }
+        Command::HintFollow => {}
 
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.

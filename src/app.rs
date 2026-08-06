@@ -204,6 +204,21 @@ wrap_browser_process_handler! {
                 .unwrap_or(3000);
                 crate::state::schedule_tab_script(&script, step_ms);
             }
+
+            // --- M12 (merge: this block belongs to src/hints.rs's workstream) --------------------
+            // Debug hook, off unless asked for. See hints::schedule_hint_script.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("hint-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("hint-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(2000);
+                crate::hints::schedule_hint_script(&script, step_ms);
+            }
         }
 
         fn default_client(&self) -> Option<Client> {
