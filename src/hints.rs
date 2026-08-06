@@ -846,7 +846,28 @@ fn is_safe_colour(value: &str) -> bool {
 /// consumes everything — a key that reached the page here would be typed into whatever the last
 /// click focused.
 pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> Option<bool> {
-    if state.lock().expect("state mutex poisoned").mode() != Mode::Hint {
+    // The mode of the window the **session** is in, not of the window in front.
+    //
+    // These two used to be the same thing. Two workstreams landed in one round — a `ModeManager`
+    // per window, and `;R` surviving the window it opens — and each is right on its own: asking the
+    // current window is what "the mode" now means, and `;R` deliberately lets a key arrive at a
+    // window that is not the hinting one. Together they cancelled out. Measured on the merge, before
+    // this line: `;R` opened one window and stopped, because the window the follow had just created
+    // was in normal mode and this returned `None` before `Foreign::decide` was ever consulted — the
+    // exact behaviour the `;R` work exists to prevent, reintroduced by a file neither agent shared.
+    let hinting_browser = session()
+        .lock()
+        .expect("hint session mutex poisoned")
+        .as_ref()
+        .map(|open| open.browser_id);
+    let in_hint_mode = {
+        let state = state.lock().expect("state mutex poisoned");
+        match hinting_browser.and_then(|id| state.window_of_browser(id)) {
+            Some(window) => state.mode_in(window) == Mode::Hint,
+            None => state.mode() == Mode::Hint,
+        }
+    };
+    if !in_hint_mode {
         return None;
     }
     debug(&format!("key {info}"));
