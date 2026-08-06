@@ -1,0 +1,383 @@
+/* bru chrome — the tab strip (top.html) and the bottom bar (bottom.html).
+ *
+ * NOT ONE COLOUR IS WRITTEN HERE. Every colour is a var(--...) defined by
+ * theme.css, which bru serves from ~/.config/bru/theme.css and which
+ * lvim-colorscheme generates. That is the whole point: switching the theme is
+ * swapping one file, and nothing in this stylesheet has an opinion about it.
+ * The names are qutebrowser's own `c.colors.*` tree with the dots turned into
+ * dashes, so a rule here can be checked against qutebrowser's configdata.yml
+ * rather than against memory.
+ *
+ * Sizes, on the other hand, live here and only here, because they decide the
+ * two numbers the window layout needs:
+ *
+ *   top.html    — always 28px.
+ *   bottom.html — 24px with the completion closed; 24px + the completion's
+ *                 own height, capped at --completion-max-h, with it open.
+ *
+ * The bottom document's natural height is what Rust reads to size the view when
+ * the completion opens and closes, so nothing may pin a height on its <html> or
+ * <body>: they have to be free to be exactly as tall as their contents. The top
+ * document never changes height, so it states its 28px outright.
+ */
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    /* Monospace throughout, like qutebrowser's default family: the completion
+       is a table, and columns that do not line up read as a bug. */
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1;
+    /* Chrome is never scrolled or selected; only the page is. */
+    overflow: hidden;
+    user-select: none;
+    cursor: default;
+}
+
+:root {
+    --tab-h: 28px;
+    --bar-h: 24px;
+    --row-h: 20px;
+    --completion-max-h: 300px;
+    --pad-x: 8px;
+}
+
+/* ------------------------------------------------------------------ top.html
+ *
+ * Markup top.js is expected to produce inside #tabs, one element per tab:
+ *
+ *   <div class="tab active"><span class="favicon"></span><span class="title">…</span></div>
+ *
+ * `active` marks the current tab. Odd/even come from :nth-child, not from a
+ * class, so the JS never has to count.
+ */
+
+body[data-view="top"] {
+    height: var(--tab-h);
+    background: var(--tabs-bar-bg);
+    border-bottom: 1px solid var(--tabs-bar-border);
+}
+
+#tabs {
+    display: flex;
+    height: 100%;
+    align-items: stretch;
+}
+
+#tabs .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 240px;
+    flex: 1 1 auto;
+    padding: 0 var(--pad-x);
+    color: var(--tabs-even-fg);
+    background: var(--tabs-even-bg);
+    /* The indicator is qutebrowser's loading stripe down the tab's leading
+       edge; transparent until a tab is loading. */
+    border-left: 2px solid var(--tabs-indicator-system);
+}
+
+#tabs .tab:nth-child(odd) {
+    color: var(--tabs-odd-fg);
+    background: var(--tabs-odd-bg);
+}
+
+#tabs .tab.active {
+    color: var(--tabs-selected-even-fg);
+    background: var(--tabs-selected-even-bg);
+}
+
+#tabs .tab.active:nth-child(odd) {
+    color: var(--tabs-selected-odd-fg);
+    background: var(--tabs-selected-odd-bg);
+}
+
+#tabs .tab.pinned {
+    flex: 0 0 auto;
+    max-width: none;
+    color: var(--tabs-pinned-even-fg);
+    background: var(--tabs-pinned-even-bg);
+}
+
+#tabs .tab.pinned:nth-child(odd) {
+    color: var(--tabs-pinned-odd-fg);
+    background: var(--tabs-pinned-odd-bg);
+}
+
+#tabs .tab.pinned.active {
+    color: var(--tabs-pinned-selected-even-fg);
+    background: var(--tabs-pinned-selected-even-bg);
+}
+
+#tabs .tab.pinned.active:nth-child(odd) {
+    color: var(--tabs-pinned-selected-odd-fg);
+    background: var(--tabs-pinned-selected-odd-bg);
+}
+
+#tabs .tab.loading {
+    border-left-color: var(--tabs-indicator-start);
+}
+
+#tabs .tab.loaded {
+    border-left-color: var(--tabs-indicator-stop);
+}
+
+#tabs .tab.error {
+    border-left-color: var(--tabs-indicator-error);
+}
+
+#tabs .favicon {
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+#tabs .title {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* --------------------------------------------------------------- bottom.html
+ *
+ * Two grid rows. The first is the completion and is zero-high until there is
+ * something in it; the second is the bar, and holds the command line on the
+ * left and the status group on the right — one row, the way qutebrowser's
+ * statusbar is one row, not a bar that grows a second row in command mode.
+ */
+
+body[data-view="bottom"] {
+    display: grid;
+    grid-template-rows: auto var(--bar-h);
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    background: var(--statusbar-normal-bg);
+    color: var(--statusbar-normal-fg);
+}
+
+/* Completion --------------------------------------------------------------
+ *
+ * Markup bottom.js is expected to produce inside #completion, categories in
+ * qutebrowser's order (Search engines, Quickmarks, Bookmarks, History):
+ *
+ *   <div class="category">
+ *     <div class="cat-header">History</div>
+ *     <div class="item selected"><span class="col">…</span><span class="col">…</span></div>
+ *   </div>
+ *
+ * Two or three .col per .item; the grid below takes whichever it is given.
+ * <span class="match"> inside a column highlights the matched substring.
+ */
+
+#completion {
+    grid-row: 1;
+    grid-column: 1 / span 2;
+    max-height: var(--completion-max-h);
+    overflow-y: auto;
+    background: var(--completion-even-bg);
+    color: var(--completion-fg);
+    border-bottom: 1px solid var(--completion-border);
+}
+
+/* Closed is not "hidden by JS": it is a #completion with nothing in it. The
+   document is then exactly --bar-h tall and the window relayouts on its own. */
+#completion:empty {
+    display: none;
+}
+
+#completion .cat-header {
+    height: var(--row-h);
+    padding: 0 var(--pad-x);
+    display: flex;
+    align-items: center;
+    font-weight: bold;
+    color: var(--completion-category-fg);
+    background: var(--completion-category-bg);
+    border-top: 1px solid var(--completion-category-border-top);
+    border-bottom: 1px solid var(--completion-category-border-bottom);
+}
+
+#completion .item {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    align-items: center;
+    height: var(--row-h);
+    padding: 0 var(--pad-x);
+    gap: var(--pad-x);
+    background: var(--completion-even-bg);
+}
+
+#completion .item:nth-child(odd) {
+    background: var(--completion-odd-bg);
+}
+
+#completion .item.selected {
+    color: var(--completion-item-selected-fg);
+    background: var(--completion-item-selected-bg);
+    border-top: 1px solid var(--completion-item-selected-border-top);
+    border-bottom: 1px solid var(--completion-item-selected-border-bottom);
+}
+
+#completion .col {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+#completion .match {
+    color: var(--completion-match-fg);
+}
+
+#completion .item.selected .match {
+    color: var(--completion-item-selected-match-fg);
+}
+
+#completion::-webkit-scrollbar {
+    width: 6px;
+}
+
+#completion::-webkit-scrollbar-track {
+    background: var(--completion-scrollbar-bg);
+}
+
+#completion::-webkit-scrollbar-thumb {
+    background: var(--completion-scrollbar-fg);
+}
+
+/* Command line ------------------------------------------------------------- */
+
+#cmdline {
+    grid-row: 2;
+    grid-column: 1;
+    min-width: 0;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+    border: 0;
+    outline: 0;
+    font: inherit;
+    color: var(--statusbar-command-fg);
+    background: var(--statusbar-command-bg);
+    caret-color: var(--statusbar-command-fg);
+}
+
+/* Present only when `:` was pressed. Rust puts the mode on <body>, so the
+   command line's existence is a consequence of the mode and not a second
+   thing to remember to toggle. */
+body:not(.mode-command) #cmdline {
+    display: none;
+}
+
+#cmdline::selection {
+    color: var(--completion-item-selected-fg);
+    background: var(--completion-item-selected-bg);
+}
+
+/* Status group ------------------------------------------------------------- */
+
+#statusline {
+    grid-row: 2;
+    grid-column: 2;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--pad-x);
+    min-width: 0;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+}
+
+#statusline > span:empty {
+    display: none;
+}
+
+#keystring {
+    color: var(--statusbar-keystring-fg);
+}
+
+#url {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--statusbar-url-fg);
+}
+
+/* The scheme classes are qutebrowser's url widget states; Rust sets one. */
+#url.https {
+    color: var(--statusbar-url-success-https-fg);
+}
+
+#url.http {
+    color: var(--statusbar-url-success-http-fg);
+}
+
+#url.warn {
+    color: var(--statusbar-url-warn-fg);
+}
+
+#url.error {
+    color: var(--statusbar-url-error-fg);
+}
+
+#url.hover {
+    color: var(--statusbar-url-hover-fg);
+}
+
+#scroll {
+    color: var(--statusbar-percentage-fg);
+}
+
+#tabindex {
+    color: var(--statusbar-tabindex-fg);
+}
+
+/* Mode colouring ----------------------------------------------------------
+ *
+ * qutebrowser recolours the whole statusbar by mode; the same three keys are
+ * in the theme, so the same thing happens here.
+ */
+
+body.mode-insert {
+    color: var(--statusbar-insert-fg);
+    background: var(--statusbar-insert-bg);
+}
+
+body.mode-insert #url,
+body.mode-insert #scroll,
+body.mode-insert #tabindex,
+body.mode-insert #keystring {
+    color: var(--statusbar-insert-fg);
+}
+
+body.mode-passthrough {
+    color: var(--statusbar-passthrough-fg);
+    background: var(--statusbar-passthrough-bg);
+}
+
+body.mode-passthrough #url,
+body.mode-passthrough #scroll,
+body.mode-passthrough #tabindex,
+body.mode-passthrough #keystring {
+    color: var(--statusbar-passthrough-fg);
+}
+
+body.mode-caret {
+    color: var(--statusbar-caret-fg);
+    background: var(--statusbar-caret-bg);
+}

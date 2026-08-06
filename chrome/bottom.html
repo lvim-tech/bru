@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>bru bar</title>
+        <!-- chrome.css carries the layout and not one colour; theme.css carries
+             the colours and not one rule. bru serves theme.css from
+             ~/.config/bru/theme.css, so swapping the theme is swapping a file. -->
+        <link rel="stylesheet" href="chrome.css" />
+        <link rel="stylesheet" href="theme.css" />
+    </head>
+    <!-- data-view, not a class: bottom.js owns className — it puts the current
+         mode there as `mode-normal`, `mode-command`, … — and would overwrite a
+         class the layout depended on. -->
+    <body data-view="bottom">
+        <!-- Empty means closed. #completion:empty is display:none, so the
+             document is exactly as tall as the bar until there is something to
+             show; that height is what the window layout reads. -->
+        <div id="completion"></div>
+        <!-- One row, like qutebrowser's statusbar: the status group sits on the
+             right always, the command line takes the left when the mode is
+             command. They are grid-placed, so the row is theirs whichever way
+             round the source happens to read. -->
+        <div id="statusline">
+            <span id="keystring"></span>
+            <span id="url"></span>
+            <span id="scroll"></span>
+            <span id="tabindex"></span>
+        </div>
+        <input id="cmdline" type="text" spellcheck="false" autocomplete="off" />
+        <script src="bottom.js"></script>
+    </body>
+</html>
