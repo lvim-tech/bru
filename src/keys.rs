@@ -148,10 +148,14 @@ wrap_keyboard_handler! {
             // key arrived at*. CEF hands the event to the browser that has focus, and that browser
             // names its window — so the aim below resolves in the right one. Without this line
             // trap 11 sends a strip's key to whichever window was last made current.
-            let chrome_key = {
+            // The same call also names the window for the *mode*: bru keeps one `ModeManager` per
+            // window, and `BruState::mode` reads the current one by index because this line has
+            // already made it current. `None` is a browser that belongs to no window — nothing bru
+            // put in a window, and there is nothing to route.
+            let (window, chrome_key) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
-                state.focus_window_of_browser(browser_id);
-                state.is_chrome_browser(browser_id)
+                let window = state.focus_window_of_browser(browser_id);
+                (window, state.is_chrome_browser(browser_id))
             };
 
             let mut redirected;
@@ -174,14 +178,19 @@ wrap_keyboard_handler! {
             // A focused text field means insert mode, which is qutebrowser's
             // `input.insert_mode.auto_enter` and defaults to true. `only_if_normal` is what keeps a
             // page's focus event from stealing passthrough out from under the user.
+            // Insert mode is entered in the window the key arrived at, and nowhere else: a page in
+            // a background window focusing a field must not put the window being typed in into
+            // insert mode. `window` is `Some` for every browser bru placed in a window.
             if event.focus_on_editable_field != 0 {
-                let entered = self
-                    .state
-                    .lock()
-                    .expect("state mutex poisoned")
-                    .enter_mode(crate::modes::Mode::Insert, true);
-                if entered {
-                    crate::ipc::set_mode("insert".to_string());
+                if let Some(window) = window {
+                    let entered = self
+                        .state
+                        .lock()
+                        .expect("state mutex poisoned")
+                        .enter_mode_in(window, crate::modes::Mode::Insert, true);
+                    if entered {
+                        crate::ipc::set_mode_for(window, "insert".to_string());
+                    }
                 }
             }
 
@@ -247,12 +256,16 @@ wrap_keyboard_handler! {
             // — command mode only, the bottom strip only, and only keys that type — because
             // widening it is how Chromium's own shortcuts get to navigate bru's UI away (trap 11).
             if chrome_key {
-                let in_command_mode = self
-                    .state
-                    .lock()
-                    .expect("state mutex poisoned")
-                    .mode()
-                    == crate::modes::Mode::Command;
+                // The mode of the window this strip belongs to, asked by name rather than as "the
+                // current mode": window 1's bottom strip must take the letters when window 1 is the
+                // one with the command line open, whatever window 0 is doing.
+                let in_command_mode = window.is_some_and(|window| {
+                    self.state
+                        .lock()
+                        .expect("state mutex poisoned")
+                        .mode_in(window)
+                        == crate::modes::Mode::Command
+                });
                 let forward = in_command_mode
                     && crate::ipc::is_bottom_chrome_browser(browser_id)
                     && crate::cmdline::types_into_cmdline(&info);

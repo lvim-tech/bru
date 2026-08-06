@@ -464,18 +464,25 @@ impl Live {
     }
 }
 
-/// The `completion` field of the bottom view's state, and the only caller is `ipc::bar_json`.
+// --- per-window mode -----------------------------------------------------------------------
+/// The `completion` field of one window's bottom view state, and the only caller is
+/// `ipc::bar_json_for`.
 ///
 /// Answering `null` outside command mode is what collapses the bar: there is no line to complete.
-pub fn json() -> String {
-    if mode() != Mode::Command {
+///
+/// It takes the window because a push does. bru keeps a `ModeManager` per window, so a bar built
+/// for window 0 has to ask what *window 0* is in — asking "the current mode" meant that any push
+/// aimed at a background bar, a title change or a download tick, answered `null` for a window that
+/// had the table open, and took its height down with it on the way past.
+pub fn json_for(window: u32) -> String {
+    if mode_in(window) != Mode::Command {
         if let Ok(mut live) = live().lock() {
             *live = Live::default();
         }
-        resize_bar(&[]);
+        resize_bar(window, &[]);
         return "null".to_string();
     }
-    let (text, cursor, _) = crate::cmdline::state_for_completion();
+    let (text, cursor, _) = crate::cmdline::state_for_completion_in(window);
     let (json, cats) = {
         let Ok(mut guard) = live().lock() else {
             return "null".to_string();
@@ -486,19 +493,24 @@ pub fn json() -> String {
     };
     // Outside the lock: the relayout this asks for renders the strip, which pushes, which comes
     // back here.
-    resize_bar(&cats);
+    resize_bar(window, &cats);
     if let Ok(mut guard) = live().lock() {
         guard.cats = cats;
     }
     json
 }
+// --- end per-window mode -------------------------------------------------------------------
 
-/// Ask the bottom strip to be as tall as the table it is drawing.
+/// Ask one window's bottom strip to be as tall as the table it is drawing.
 ///
 /// The arithmetic is `chrome/chrome.css:186-191`'s, and it is the stylesheet's rather than a guess:
 /// `--row-h: 20px` per header and per row, one pixel for `#completion`'s bottom border, capped at
 /// `--completion-max-h: 300px` because past that the table scrolls inside itself.
-fn resize_bar(cats: &[Category]) {
+// --- per-window mode -----------------------------------------------------------------------
+// The window is named at every step now: the height is stored under it, the strip whose layout is
+// invalidated is that window's, and so is the `Window` handle the relayout is asked of. All three
+// used to mean "whichever window is current", which is not the window a push is for.
+fn resize_bar(window: u32, cats: &[Category]) {
     const ROW_H: i32 = 20;
     const MAX_H: i32 = 300;
 
@@ -509,13 +521,13 @@ fn resize_bar(cats: &[Category]) {
         (ROW_H * (rows + cats.len() as i32)).min(MAX_H) + 1
     };
 
-    let was = crate::window::COMPLETION_HEIGHT.swap(wanted, std::sync::atomic::Ordering::Relaxed);
+    let was = crate::window::set_completion_height(window, wanted);
     if was == wanted {
         // Every push reaches here and most leave the height alone; a relayout each time would
         // resize a Views tree on every scroll report.
         return;
     }
-    let Some(mut browser) = crate::ipc::bottom_chrome_browser() else {
+    let Some(mut browser) = crate::ipc::bottom_chrome_browser_for(window) else {
         return;
     };
     let Some(view) = browser_view_get_for_browser(Some(&mut browser)) else {
@@ -524,12 +536,13 @@ fn resize_bar(cats: &[Category]) {
     // `invalidate_layout` on the strip alone leaves the box layout that *placed* it holding the
     // old height, so the window is asked too — it is the panel that does the laying out.
     View::from(&view).invalidate_layout();
-    let window = crate::state::BruState::instance()
-        .and_then(|state| state.lock().ok().and_then(|state| state.window()));
-    if let Some(window) = window {
-        View::from(&window).invalidate_layout();
+    let handle = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.window_handle(window)));
+    if let Some(handle) = handle {
+        View::from(&handle).invalidate_layout();
     }
 }
+// --- end per-window mode -------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------------------------
 // The three commands
@@ -770,6 +783,17 @@ fn mode() -> Mode {
         .unwrap_or(Mode::Normal)
 }
 
+// --- per-window mode -----------------------------------------------------------------------
+/// A named window's mode. `mode()` above stays "the window a command was typed in", which is what
+/// the three completion commands mean; this is what a *push* means, and the two are not the same
+/// window once there is more than one.
+fn mode_in(window: u32) -> Mode {
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().map(|state| state.mode_in(window)))
+        .unwrap_or(Mode::Normal)
+}
+// --- end per-window mode -------------------------------------------------------------------
+
 // -----------------------------------------------------------------------------------------------
 // Driving it without a keyboard
 // -----------------------------------------------------------------------------------------------
@@ -841,7 +865,7 @@ wrap_task! {
                         .map(|c| c.len_utf16())
                         .sum();
                     // Exactly what `chrome/bottom.js` sends on an input event.
-                    crate::cmdline::on_text_changed(&text, Some(at));
+                    crate::cmdline::on_text_changed_here(&text, Some(at));
                     crate::ipc::push_bar();
                 }
                 "cmd" => match crate::commands::parse(arg) {

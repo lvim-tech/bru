@@ -225,20 +225,42 @@ impl BrowserSideHandler for BruQueryHandler {
             }
             Some("text-changed") => {
                 let text = json_field(request, "text").unwrap_or_default();
-                crate::cmdline::on_text_changed(&text, json_number_field(request, "cursor"));
+                // Which window's command line is reporting. Not "the current window": these three
+                // answers travel chrome → renderer → browser and can arrive after the focus has
+                // moved, and window 1's typing must not be written into window 0's line.
+                let Some(window) = window_of(browser.as_ref()) else {
+                    fail(&callback, -9, "a command line that belongs to no window");
+                    return true;
+                };
+                crate::cmdline::on_text_changed(
+                    window,
+                    &text,
+                    json_number_field(request, "cursor"),
+                );
                 // The completion is derived from the command line rather than pushed into: every
                 // push asks `completers::json` what the table is now. So this only has to push.
-                push();
+                push_for(window);
                 succeed(&callback, "");
             }
             // The authoritative text, in answer to `bru.accept()`. Nothing else may run a command
             // line: the mirror above is one IPC hop behind and Enter can overtake it.
             Some("accept") => {
-                crate::cmdline::on_accept(&json_field(request, "text").unwrap_or_default());
+                let Some(window) = window_of(browser.as_ref()) else {
+                    fail(&callback, -9, "a command line that belongs to no window");
+                    return true;
+                };
+                crate::cmdline::on_accept(
+                    window,
+                    &json_field(request, "text").unwrap_or_default(),
+                );
                 succeed(&callback, "");
             }
             Some("cancel") => {
-                crate::cmdline::on_cancel();
+                let Some(window) = window_of(browser.as_ref()) else {
+                    fail(&callback, -9, "a command line that belongs to no window");
+                    return true;
+                };
+                crate::cmdline::on_cancel(window);
                 succeed(&callback, "");
             }
 
@@ -322,6 +344,18 @@ struct BarState {
     download: String,
 }
 
+/// Which window a browser is in — for the chrome answers that arrive from a strip rather than from
+/// a keypress, and therefore name their own window instead of relying on the focus.
+///
+/// Takes the state lock inside a query handler, which CEF-NOTES trap 12 allows: it creates no
+/// browser and starts no navigation. The `ready` arm above asks the same question inline and
+/// predates this.
+fn window_of(browser: Option<&Browser>) -> Option<u32> {
+    let id = browser?.identifier();
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.window_of_browser(id)))
+}
+
 /// The window a command with nothing else to go on acts against. `None` in the renderer process and
 /// once the last window has closed.
 fn current_window() -> Option<u32> {
@@ -351,6 +385,9 @@ pub fn forget_window(window: u32) {
     if let Ok(mut chrome) = chrome().lock() {
         chrome.retain(|entry| entry.window != window);
     }
+    // The command line that window was holding goes with it — there is one per window now, and a
+    // closed window's half-typed text has nowhere left to be shown.
+    crate::cmdline::forget_window(window);
 }
 
 /// From `DisplayHandler::on_address_change` on the main frame, for the window the tab is in.
@@ -369,25 +406,33 @@ pub fn set_title_for(window: u32, title: String) {
     push_for(window);
 }
 
-/// The current mode, spelled as qutebrowser spells it. The chrome colours the bar by it, and
+/// One window's mode, spelled as qutebrowser spells it. The chrome colours the bar by it, and
 /// `body.mode-command` is what reveals `#cmdline`.
-pub fn set_mode(mode: String) {
+///
+/// Named for its window like `set_url_for`, `set_title_for` and `set_tabs_for`, and for the same
+/// reason: bru keeps a `ModeManager` per window, so `insert` in window 1 is not a fact about
+/// window 0 and must not be pushed into its bar.
+pub fn set_mode_for(window: u32, mode: String) {
     // Every route out of command mode passes through here — `mode-leave`, an accepted command, a
     // page focusing a field — so this is where the line is cleared and the page gets its focus
     // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
     // the command line out of `exec.rs`.
-    crate::cmdline::on_mode_changed(&mode);
+    crate::cmdline::on_mode_changed(window, &mode);
     // A message and a command line share one cell, so opening the line takes the message's turn
     // away. Dropping it rather than letting the stylesheet hide it is what stops a message from
     // three seconds ago reappearing the moment `:` is cancelled.
     if mode == "command" {
         crate::message::clear();
     }
-    // The mode is the process's, not the window's — bru has one `ModeManager` — but only the window
-    // being typed into needs to be told, and the others keep whatever they were last shown.
+    with_window(window, |entry| entry.bar.mode = mode);
+    push_for(window);
+}
+
+/// The current window's mode. The convenience half of [`set_mode_for`], the way `set_tabs` is of
+/// `set_tabs_for` — for the callers that are running a command in the window it was typed in.
+pub fn set_mode(mode: String) {
     if let Some(window) = current_window() {
-        with_window(window, |entry| entry.bar.mode = mode);
-        push_for(window);
+        set_mode_for(window, mode);
     }
 }
 
@@ -577,13 +622,16 @@ pub(crate) fn bar_json() -> String {
 }
 
 fn bar_json_for(window: u32) -> String {
-    // Built before the lock is taken: `cmdline::json` reads the mode out of `BruState`, and a bar
-    // lock held across that would order two mutexes against each other for no reason.
-    let cmdline = crate::cmdline::json();
-    // Derived from that line, and rebuilt only when it has moved — see `completers::json`. It is
-    // asked here rather than pushed in so that a table can never be one edit behind the text it
+    // Built before the lock is taken: `cmdline::json_for` reads the mode out of `BruState`, and a
+    // bar lock held across that would order two mutexes against each other for no reason.
+    // Both are asked about **this** window rather than the current one: a push aimed at a
+    // background bar used to hand it the foreground window's half-typed line, and to collapse the
+    // foreground window's completion table on the way past.
+    let cmdline = crate::cmdline::json_for(window);
+    // Derived from that line, and rebuilt only when it has moved — see `completers::json_for`. It
+    // is asked here rather than pushed in so that a table can never be one edit behind the text it
     // is completing.
-    let completion = crate::completers::json();
+    let completion = crate::completers::json_for(window);
     // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
     let message = crate::message::json();
     // Which tab of how many, asked of `BruState` rather than kept on `BarState` — see the note
@@ -646,10 +694,9 @@ fn tabindex_of(window: u32) -> String {
 // must not widen to the tab strip. `BruState::is_chrome_browser` cannot tell them apart — it holds
 // both identifiers in one list — but the frame that announced itself as `view: "bottom"` can.
 
-/// The current window's bottom frame. The command line is only ever open in one window at a time —
-/// bru has one `ModeManager` — and it is the one the user is typing into.
-fn bottom_frame() -> Option<Frame> {
-    let window = current_window()?;
+/// A named window's bottom frame. There is a `ModeManager` per window, so two windows can be in
+/// command mode at once and every call that drives a command line has to say which one it means.
+fn bottom_frame_for(window: u32) -> Option<Frame> {
     let chrome = chrome().lock().ok()?;
     chrome
         .iter()
@@ -657,9 +704,19 @@ fn bottom_frame() -> Option<Frame> {
         .and_then(|entry| entry.frames.bottom.clone())
 }
 
+/// The current window's bottom frame — for the callers reached from a command typed in it.
+fn bottom_frame() -> Option<Frame> {
+    bottom_frame_for(current_window()?)
+}
+
 /// The browser drawing the bottom strip, once it has announced itself.
 pub fn bottom_chrome_browser() -> Option<Browser> {
     bottom_frame().and_then(|frame| frame.browser())
+}
+
+/// The same for a named window.
+pub fn bottom_chrome_browser_for(window: u32) -> Option<Browser> {
+    bottom_frame_for(window).and_then(|frame| frame.browser())
 }
 
 /// Whether a key that arrived at `identifier` arrived at *a* bottom strip — any window's.
@@ -694,18 +751,18 @@ pub fn bottom_chrome_url() -> String {
 ///
 /// Two levels are needed and both are here: CEF's, so the key is delivered to this browser at all,
 /// and the DOM's, which the chrome does itself when the pushed state says `focus`.
-pub fn focus_bottom_chrome() {
-    if let Some(browser) = bottom_chrome_browser() {
+pub fn focus_bottom_chrome(window: u32) {
+    if let Some(browser) = bottom_chrome_browser_for(window) {
         if let Some(host) = browser.host() {
             host.set_focus(1);
         }
     }
 }
 
-/// Ask the chrome to send one of its messages back. The only caller is `command-accept`, which
-/// needs the text the DOM holds rather than the copy Rust has, one IPC hop behind.
-pub fn ask_cmdline(what: &str) {
-    let Some(frame) = bottom_frame() else {
+/// Ask a window's chrome to send one of its messages back. The only caller is `command-accept`,
+/// which needs the text the DOM holds rather than the copy Rust has, one IPC hop behind.
+pub fn ask_cmdline(window: u32, what: &str) {
+    let Some(frame) = bottom_frame_for(window) else {
         return;
     };
     let code = format!("window.bru && window.bru.{what} && window.bru.{what}();");

@@ -157,16 +157,59 @@ pub fn close_all(state: &SharedState) {
 }
 
 // --- src/completers.rs ---------------------------------------------------------------------
-/// How much taller than its own 24 px the **bottom** strip is asking to be, because the completion
-/// table is open above the command line.
+/// How much taller than its own 24 px each window's **bottom** strip is asking to be, because the
+/// completion table is open above that window's command line.
 ///
 /// The strip is a CEF view with a fixed preferred height, so however tall the table's HTML grows
 /// it is drawn inside 24 logical pixels and cannot be seen. Measured 2026-08-06 with a screenshot
 /// of `:open du`: the command line read `:open du`, the payload had three categories in it, and
 /// the bar was one row tall. `completers::resize_bar` writes here and invalidates the layout;
-/// `preferred_size` below adds it, and only for the strip built with `grows`, so the tab strip
+/// [`completion_height`] below adds it, and only for the strip built with `grows`, so the tab strip
 /// keeps its own height.
-pub static COMPLETION_HEIGHT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+///
+/// It was one `AtomicI32` for every strip in the process, which held only because a relayout was
+/// asked of the current window alone. Now that a window has its own mode, two of them can have a
+/// command line open at once, and the second one to open would have set the height the first is
+/// drawn at. A `Vec` behind a mutex rather than an atomic: this is read once per layout pass and
+/// written once per change of the table, and neither is anywhere near the key path.
+static COMPLETION_HEIGHTS: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Store a window's extra height and answer what it was. `completers::resize_bar` compares the two
+/// and relayouts only when they differ.
+pub fn set_completion_height(window: u32, height: i32) -> i32 {
+    let Ok(mut heights) = COMPLETION_HEIGHTS.lock() else {
+        return height;
+    };
+    match heights.iter_mut().find(|(id, _)| *id == window) {
+        Some(slot) => std::mem::replace(&mut slot.1, height),
+        None => {
+            heights.push((window, height));
+            0
+        }
+    }
+}
+
+fn completion_height(window: u32) -> i32 {
+    COMPLETION_HEIGHTS
+        .lock()
+        .ok()
+        .and_then(|heights| {
+            heights
+                .iter()
+                .find(|(id, _)| *id == window)
+                .map(|(_, height)| *height)
+        })
+        .unwrap_or(0)
+}
+
+/// Drop a window's entry, from `on_window_destroyed`. Without it the list grows by one row for
+/// every window ever opened, and a later window that happened to reuse the id — nothing does today,
+/// `next_window_id` only goes up — would inherit a height it never asked for.
+fn forget_completion_height(window: u32) {
+    if let Ok(mut heights) = COMPLETION_HEIGHTS.lock() {
+        heights.retain(|(id, _)| *id != window);
+    }
+}
 // --- end src/completers.rs -----------------------------------------------------------------
 
 /// A `CefString` that survives being written into a struct CEF reads back.
@@ -328,6 +371,7 @@ wrap_window_delegate! {
                 .expect("state mutex poisoned")
                 .forget_window(self.window_id);
             crate::ipc::forget_window(self.window_id);
+            forget_completion_height(self.window_id);
             // Drop the views here, or the window outlives the browsers it holds.
             *self.top_view.borrow_mut() = None;
             *self.bottom_view.borrow_mut() = None;
@@ -462,8 +506,11 @@ wrap_browser_view_delegate! {
             // Width is ignored: the box layout stretches the strip across the window. Only the
             // height is a real request.
 // --- src/completers.rs ---------------------------------------------------------------------
+            // This strip's own window, not whichever one is current: a layout pass runs for the
+            // window being relayouted, and reading a shared value would make window 0's bar as tall
+            // as window 1's table.
             let extra = if self.grows {
-                COMPLETION_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+                completion_height(self.window_id)
             } else {
                 0
             };

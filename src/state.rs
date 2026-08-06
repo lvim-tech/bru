@@ -41,6 +41,15 @@ pub struct WindowState {
     /// `<Ctrl-^>`) goes back to. An index, so it survives nothing — a tab closed in between leaves
     /// it pointing at whatever took that place, which is qutebrowser's behaviour too.
     pub(crate) last_active: Option<usize>,
+    /// Which mode keys pressed in *this* window are routed to.
+    ///
+    /// qutebrowser keeps one `ModeManager` per window and reaches it as `modeman.instance(win_id)`
+    /// (`keyinput/modeman.py:34-41`); its `entered`/`left` signals both carry the `win_id` they
+    /// happened in. bru had one for the process, which is why `:` opened the command line in
+    /// whichever window was in front and left the other window's bar showing `insert` from ten
+    /// minutes ago. The manager itself was already written as "one per window" — nothing in it is
+    /// shared — so this is where it always belonged.
+    modes: crate::modes::ModeManager,
 }
 
 pub struct BruState {
@@ -85,8 +94,6 @@ pub struct BruState {
     /// The same bindings the parsers were built from, kept whole so `bru://help` can list them.
     /// A trie answers "what does this key do"; the help page asks the opposite question.
     bindings: Option<crate::config::Bindings>,
-    /// Which mode bru is in. Normal until something says otherwise.
-    modes: crate::modes::ModeManager,
 }
 
 impl BruState {
@@ -113,7 +120,6 @@ impl BruState {
                 closed_windows: Vec::new(),
                 parsers: None,
                 bindings: None,
-                modes: crate::modes::ModeManager::new(),
             })
         })
     }
@@ -171,6 +177,7 @@ impl BruState {
             tabs: Vec::new(),
             active: 0,
             last_active: None,
+            modes: crate::modes::ModeManager::new(),
         });
         self.current = self.windows.len() - 1;
         id
@@ -214,13 +221,15 @@ impl BruState {
             .map(|slot| slot.id)
     }
 
-    /// Make the window a browser belongs to the current one. Called from `keys.rs` on every
-    /// keypress, before anything reads "the showing tab".
-    pub fn focus_window_of_browser(&mut self, identifier: i32) -> bool {
-        match self.window_of_browser(identifier) {
-            Some(id) => self.focus_window(id),
-            None => false,
-        }
+    /// Make the window a browser belongs to the current one, and answer which one that was.
+    ///
+    /// Called from `keys.rs` on every keypress, before anything reads "the showing tab" **or the
+    /// mode**. It answers the id rather than a bool so that the caller does not have to search the
+    /// window list a second time to ask which mode this key is in: after this call `self.current`
+    /// *is* that window, so [`BruState::mode`] is an index rather than a scan.
+    pub fn focus_window_of_browser(&mut self, identifier: i32) -> Option<u32> {
+        let id = self.window_of_browser(identifier)?;
+        self.focus_window(id).then_some(id)
     }
 
     pub fn set_window_for(&mut self, id: u32, window: Window, layout: Option<BoxLayout>) {
@@ -314,20 +323,43 @@ impl BruState {
         self.bindings.clone()
     }
 
-    /// Feed one keypress to the parser for the current mode. `None` before the bindings are loaded,
-    /// which is every process that is not the browser process.
+    /// Feed one keypress to the parser for the current window's mode. `None` before the bindings
+    /// are loaded, which is every process that is not the browser process.
+    ///
+    /// "The current window" is not a guess on this path: `keys.rs` calls
+    /// [`BruState::focus_window_of_browser`] with the browser CEF delivered the key to, under this
+    /// same lock, before anything below runs. So the mode read here is the mode of the window the
+    /// key was pressed in, and reading it costs one bounds-checked index — see [`BruState::mode`].
     pub fn handle_key(
         &mut self,
         info: crate::bindings::KeyInfo,
     ) -> Option<crate::bindings::KeyOutcome> {
-        let mode = self.modes.mode();
+        let mode = self.mode();
         self.parsers
             .as_mut()
             .map(|parsers| parsers.handle(mode, info))
     }
 
+    /// The mode of the window a command acts on.
+    ///
+    /// **This is on the key path**, so it is an index into `windows` and not a search of it: the
+    /// window a key belongs to has already been made current by `focus_window_of_browser`, which
+    /// pays for the one lookup either way. `Normal` when there is no window at all — every process
+    /// that is not the browser process, and the moment between the last window closing and the
+    /// message loop stopping.
     pub fn mode(&self) -> crate::modes::Mode {
-        self.modes.mode()
+        match self.windows.get(self.current) {
+            Some(slot) => slot.modes.mode(),
+            None => crate::modes::Mode::Normal,
+        }
+    }
+
+    /// The mode of a named window — for everything that arrives with a window rather than with the
+    /// focus: a chrome strip answering a query, a push aimed at a background bar.
+    pub fn mode_in(&self, window: u32) -> crate::modes::Mode {
+        self.slot(window)
+            .map(|slot| slot.modes.mode())
+            .unwrap_or(crate::modes::Mode::Normal)
     }
 
     /// The `Browser` of the tab currently showing.
@@ -337,6 +369,19 @@ impl BruState {
     /// still have to act on the page, so the strip's key is dispatched against this instead.
     pub fn active_browser(&mut self) -> Option<Browser> {
         let id = self.active_tab_browser_id()?;
+        self.browser_with_id(id)
+    }
+
+    /// The `Browser` of the tab showing in a named window.
+    ///
+    /// The same question as [`BruState::active_browser`] asked of a window that may not be the
+    /// current one — which is what the command line needs when the chrome answers `bru.accept()`
+    /// from a background window's strip: the focus has to go back to *that* window's page.
+    pub fn active_browser_in(&mut self, window: u32) -> Option<Browser> {
+        let id = self
+            .slot(window)
+            .and_then(|slot| slot.tabs.get(slot.active))
+            .and_then(|tab| tab.browser_id)?;
         self.browser_with_id(id)
     }
 
@@ -350,20 +395,54 @@ impl BruState {
             .cloned()
     }
 
-    /// Enter a mode, clearing the pending chain of the one left behind. `only_if_normal` is what
-    /// stops a page's focus event dragging you out of passthrough.
+    /// Enter a mode in the current window, clearing the pending chain of the one left behind.
+    /// `only_if_normal` is what stops a page's focus event dragging you out of passthrough.
     pub fn enter_mode(&mut self, mode: crate::modes::Mode, only_if_normal: bool) -> bool {
-        let transition = self.modes.enter(mode, only_if_normal);
+        match self.current_window_id() {
+            Some(window) => self.enter_mode_in(window, mode, only_if_normal),
+            None => false,
+        }
+    }
+
+    /// The same for a named window. Every mode change is one window's: a `:` in the window in front
+    /// must not put the window behind it into command mode, and an editable field focusing itself
+    /// in a background window must not drop the window being typed in out of passthrough.
+    pub fn enter_mode_in(
+        &mut self,
+        window: u32,
+        mode: crate::modes::Mode,
+        only_if_normal: bool,
+    ) -> bool {
+        let Some(slot) = self.slot_mut(window) else {
+            return false;
+        };
+        let transition = slot.modes.enter(mode, only_if_normal);
         self.apply(transition)
     }
 
     pub fn leave_mode(&mut self) -> bool {
-        match self.modes.leave_current() {
+        match self.current_window_id() {
+            Some(window) => self.leave_mode_in(window),
+            None => false,
+        }
+    }
+
+    pub fn leave_mode_in(&mut self, window: u32) -> bool {
+        let Some(slot) = self.slot_mut(window) else {
+            return false;
+        };
+        match slot.modes.leave_current() {
             Ok(transition) => self.apply(transition),
             Err(_) => false,
         }
     }
 
+    /// The half of a transition that is not the mode itself.
+    ///
+    /// `self.parsers` is still one set for the process, so the pending key chain a mode is holding
+    /// is shared between windows and this clears it for all of them. That is a smaller version of
+    /// the bug this workstream fixed and it is deliberately not fixed here: the chain lives inside
+    /// `bindings::KeyParser`, which is another workstream's file. See the report.
     fn apply(&mut self, transition: crate::modes::Transition) -> bool {
         if transition.clear_keychain {
             if let (Some(left), Some(parsers)) = (transition.left, self.parsers.as_mut()) {
@@ -563,5 +642,188 @@ wrap_task! {
                 window.close();
             }
         }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Tests — the window/mode bookkeeping only. Everything else here needs a live CEF.
+// -----------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::Mode;
+
+    /// A `BruState` with no CEF anywhere in it, and `n` empty windows.
+    ///
+    /// Built by hand rather than through `BruState::new`, which registers the process-wide
+    /// `INSTANCE` and asserts that no second one is alive — `cargo test` runs these on several
+    /// threads at once and they would fight over it. Nothing below has to be reachable from a
+    /// callback, so nothing below needs that registration.
+    fn bare(windows: u32) -> BruState {
+        let mut state = BruState {
+            browsers: Vec::new(),
+            client: None,
+            windows: Vec::new(),
+            current: 0,
+            next_window_id: 0,
+            closed: Vec::new(),
+            closed_windows: Vec::new(),
+            parsers: None,
+            bindings: None,
+        };
+        for _ in 0..windows {
+            state.open_window_slot();
+        }
+        // `open_window_slot` makes each new window current; start from the first, as a session does.
+        state.current = 0;
+        state
+    }
+
+    /// The whole of this workstream in one test: a mode is one window's.
+    ///
+    /// qutebrowser reaches its per-window manager as `modeman.instance(win_id)`
+    /// (`keyinput/modeman.py:34-41`); bru had one for the process, so `:` in the window in front
+    /// put the window behind it into command mode too, and every `mode-leave` took both out.
+    #[test]
+    fn a_mode_belongs_to_one_window() {
+        let mut state = bare(2);
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.mode_in(0), Mode::Normal);
+        assert_eq!(state.mode_in(1), Mode::Normal);
+
+        // `:` in window 0.
+        assert!(state.enter_mode_in(0, Mode::Command, false));
+        assert_eq!(state.mode_in(0), Mode::Command);
+        assert_eq!(state.mode_in(1), Mode::Normal, "window 1 keeps its own mode");
+
+        // An unnamed call means the current window, and follows the focus.
+        assert_eq!(state.mode(), Mode::Command);
+        assert!(state.focus_window(1));
+        assert_eq!(state.mode(), Mode::Normal);
+
+        // Both at once, in different modes. This is the case one manager could not hold.
+        assert!(state.enter_mode_in(1, Mode::Insert, false));
+        assert_eq!(state.mode_in(0), Mode::Command);
+        assert_eq!(state.mode_in(1), Mode::Insert);
+
+        // And leaving one leaves exactly one.
+        assert!(state.leave_mode_in(1));
+        assert_eq!(state.mode_in(1), Mode::Normal);
+        assert_eq!(state.mode_in(0), Mode::Command, "window 0 was not asked to leave");
+
+        // A window that is not there answers Normal rather than panicking: a push can outlive the
+        // window it was aimed at by one turn of the loop.
+        assert_eq!(state.mode_in(9), Mode::Normal);
+        assert!(!state.enter_mode_in(9, Mode::Insert, false));
+    }
+
+    /// The routing `keys.rs` depends on: the browser CEF delivered the key to names the window, and
+    /// the mode read afterwards is that window's.
+    ///
+    /// Chrome browsers rather than tabs because a strip is the case trap 11 is about — a key landing
+    /// on window 1's status bar must be answered with window 1's mode, whatever window 0 is doing.
+    #[test]
+    fn a_key_resolves_the_mode_of_the_window_it_arrived_at() {
+        let mut state = bare(2);
+        state.note_chrome_browser(0, 100);
+        state.note_chrome_browser(1, 200);
+        state.enter_mode_in(1, Mode::Command, false);
+
+        assert_eq!(state.focus_window_of_browser(100), Some(0));
+        assert_eq!(state.mode(), Mode::Normal, "window 0's key, window 0's mode");
+
+        assert_eq!(state.focus_window_of_browser(200), Some(1));
+        assert_eq!(state.mode(), Mode::Command, "window 1's key, window 1's mode");
+        assert_eq!(state.mode_in(0), Mode::Normal);
+
+        // A browser bru never put in a window names none, and the focus stays where it was.
+        assert_eq!(state.focus_window_of_browser(999), None);
+        assert_eq!(state.current_window_id(), Some(1));
+    }
+
+    /// A closed window's mode goes with it, so a later window cannot start life in `insert`.
+    #[test]
+    fn forgetting_a_window_forgets_its_mode() {
+        let mut state = bare(2);
+        state.enter_mode_in(1, Mode::Insert, false);
+        state.forget_window(1);
+        assert_eq!(state.mode_in(1), Mode::Normal);
+        assert_eq!(state.window_count(), 1);
+
+        // The next window gets a fresh id and a fresh mode.
+        let id = state.open_window_slot();
+        assert_eq!(id, 2);
+        assert_eq!(state.mode_in(id), Mode::Normal);
+    }
+
+    /// **What a per-window mode costs the key path**, measured rather than asserted, beside the one
+    /// `ModeManager` it replaced and beside the shape that would have been too slow.
+    ///
+    /// The rule this test exists to keep is DESIGN.md's: `j` goes through `on_pre_key_event` →
+    /// `BruState::handle_key` → this lookup, so anything that scans the window list on every
+    /// keystroke is the wrong answer however correct it reads. It does not scan: `keys.rs` calls
+    /// `focus_window_of_browser` first, which pays for the one lookup a key needs, and everything
+    /// after it is `windows[current]`.
+    ///
+    /// `mode_in` is timed as the counterexample — it is the same question asked by *id*, which is a
+    /// linear search of the window list, and it is deliberately not what the key path calls.
+    ///
+    /// The assertions are loose on purpose: this runs unoptimised under `cargo test`, on a machine
+    /// with five other agents on it. What they pin is the shape, not the clock.
+    #[test]
+    fn the_key_path_cost_of_a_per_window_mode() {
+        const ROUNDS: u32 = 1_000_000;
+
+        // Four windows, the mode being read belonging to the last of them — so a search would have
+        // the furthest to go and an index would not care.
+        let mut state = bare(4);
+        state.enter_mode_in(3, Mode::Insert, false);
+        state.focus_window(3);
+        let one = crate::modes::ModeManager::new();
+
+        for _ in 0..10_000 {
+            std::hint::black_box(std::hint::black_box(&state).mode());
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&state).mode());
+        }
+        let per_window = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // What it replaced: a field of `BruState`, one deref.
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&one).mode());
+        }
+        let process_wide = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // What it must not be: the same answer found by searching the window list for an id.
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&state).mode_in(3));
+        }
+        let by_search = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        println!(
+            "modes: reading the mode costs {per_window:.3} ns per window against \
+             {process_wide:.3} ns for the one this replaced, and {by_search:.3} ns if it is \
+             searched for by id instead"
+        );
+        assert!(
+            per_window < 40.0,
+            "the key path must stay free: {per_window:.3} ns"
+        );
+        assert!(
+            per_window < process_wide * 5.0,
+            "an indexed read must stay within a small constant of a plain field read: \
+             {per_window:.3} ns against {process_wide:.3} ns"
+        );
+        assert!(
+            per_window < by_search,
+            "if the indexed lookup is not faster than the search, it is not an index: \
+             {per_window:.3} ns vs {by_search:.3} ns"
+        );
     }
 }

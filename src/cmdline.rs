@@ -494,10 +494,49 @@ fn utf16_to_char_index(chars: &[char], units: usize) -> usize {
 // The live one
 // -----------------------------------------------------------------------------------------------
 
-/// The single command line. There is one window, so there is one of these.
-fn cmdline() -> &'static Mutex<CmdLine> {
-    static CMDLINE: Mutex<CmdLine> = Mutex::new(CmdLine::new());
-    &CMDLINE
+/// One command line per window, made the first time anything is said about that window.
+///
+/// It was a single `Mutex<CmdLine>` while bru had one `ModeManager`. Two windows then shared one
+/// text and one cursor: `:` in the window in front adopted whatever the window behind was half way
+/// through typing, and the accepted line was cleared out from under both. qutebrowser's
+/// `statusbar/command.py::Command` is a widget of the window's status bar and is per window for
+/// exactly this reason.
+///
+/// `BTreeMap::new` is const, which is what lets this be a plain `static` with no `LazyLock`.
+fn cmdlines() -> &'static Mutex<BTreeMap<u32, CmdLine>> {
+    static CMDLINES: Mutex<BTreeMap<u32, CmdLine>> = Mutex::new(BTreeMap::new());
+    &CMDLINES
+}
+
+/// The accepted lines, shared by every window — and the one part of a command line that is **not**
+/// per window.
+///
+/// qutebrowser splits it the same way: the `Command` widget is the window's, while
+/// `cmdhistory.History` is registered globally (`app.py`, `objreg.register('command-history')`), so
+/// `<Ctrl-P>` in a window opened a moment ago still reaches what was typed in the other one. It is
+/// also the only half that is written to disk, and one `cmd-history` file with two writers would be
+/// a worse answer than one list.
+static HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The window a call with nothing else to go on means. `u32::MAX` is "no window at all" — the
+/// renderer processes and the moment after the last window closes — and it gets a scratch line
+/// rather than a branch at every call site, because nothing can be typed into a window that is not
+/// there.
+const NO_WINDOW: u32 = u32::MAX;
+
+fn window() -> u32 {
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.current_window_id()))
+        .unwrap_or(NO_WINDOW)
+}
+
+/// Drop a window's command line. Called from `ipc::forget_window`, so a closed window does not keep
+/// a line — and its half-typed text cannot come back under a later window that reuses nothing but
+/// the map.
+pub fn forget_window(window: u32) {
+    if let Ok(mut lines) = cmdlines().lock() {
+        lines.remove(&window);
+    }
 }
 
 /// What an accepted command line is handed to.
@@ -526,8 +565,11 @@ fn run_text(text: &str, count: Option<u32>) {
     }
 }
 
-/// Whether a rapid accept is in flight, i.e. whether the mode should survive the answer.
-static PENDING_RAPID: Mutex<bool> = Mutex::new(false);
+/// Which windows have a rapid accept in flight, i.e. whose mode should survive the answer.
+///
+/// Per window like everything else here: `command-accept` and the `{"type":"accept"}` that answers
+/// it are a round trip through another process, and two windows can have one outstanding at once.
+static PENDING_RAPID: Mutex<BTreeMap<u32, bool>> = Mutex::new(BTreeMap::new());
 
 // --- the dispatcher's one arm -------------------------------------------------------------------
 
@@ -697,8 +739,11 @@ pub fn cmd_set_text(text: &str, space: bool, append: bool, run_on_count: bool, c
         }
     }
 
-    with(|cmd| cmd.set_text(&text));
-    enter_command_mode();
+    // The window the command was run in, which for every `cmd-set-text` binding is the window the
+    // key was pressed in — `keys.rs` has already made it current.
+    let window = window();
+    with_in(window, |cmd| cmd.set_text(&text));
+    enter_command_mode(window);
     push();
 }
 
@@ -707,41 +752,59 @@ pub fn cmd_set_text(text: &str, space: bool, append: bool, run_on_count: bool, c
 /// Nothing is read out of the mirror here: the chrome is asked what the input really holds and the
 /// work continues in [`on_accept`]. See the module comment for why.
 pub fn command_accept(rapid: bool) {
-    if mode() != Mode::Command {
+    let window = window();
+    if mode_in(window) != Mode::Command {
         return;
     }
     if let Ok(mut pending) = PENDING_RAPID.lock() {
-        *pending = rapid;
+        pending.insert(window, rapid);
     }
-    crate::ipc::ask_cmdline("accept");
+    crate::ipc::ask_cmdline(window, "accept");
 }
 
 // --- what the chrome sends back -------------------------------------------------------------
 
-/// `{"type":"text-changed","text":…,"cursor":…}` — the user typed into `#cmdline`.
-pub fn on_text_changed(text: &str, cursor: Option<usize>) {
-    with(|cmd| cmd.sync(text, cursor));
+/// `{"type":"text-changed","text":…,"cursor":…}` — the user typed into a window's `#cmdline`.
+///
+/// The window is the one whose strip sent it, resolved in `ipc.rs` from the answering browser
+/// rather than from the focus: these answers travel chrome → renderer → browser and can arrive
+/// after the focus has moved.
+pub fn on_text_changed(window: u32, text: &str, cursor: Option<usize>) {
+    with_in(window, |cmd| cmd.sync(text, cursor));
+}
+
+/// The same for the current window — the two debug scripts that stand in for typing, which are
+/// driving whichever window is in front because that is where their `cmd-set-text` went.
+pub fn on_text_changed_here(text: &str, cursor: Option<usize>) {
+    on_text_changed(window(), text, cursor);
 }
 
 /// `{"type":"accept","text":…}` — the authoritative text, in answer to `bru.accept()`.
-pub fn on_accept(text: &str) {
-    if mode() != Mode::Command {
-        // A stray accept, e.g. the second of a double Enter. The mode is the interlock.
+pub fn on_accept(window: u32, text: &str) {
+    if mode_in(window) != Mode::Command {
+        // A stray accept, e.g. the second of a double Enter. The mode is the interlock — and it is
+        // *that window's* mode, so a second window sitting in normal mode cannot refuse it.
         return;
     }
-    let rapid = PENDING_RAPID.lock().map(|pending| *pending).unwrap_or(false);
+    let rapid = PENDING_RAPID
+        .lock()
+        .ok()
+        .and_then(|pending| pending.get(&window).copied())
+        .unwrap_or(false);
 
     // Before the line is appended, or `:save` would write this session's history over last
     // session's rather than after it.
     ensure_history_loaded();
-    let to_run = with(|cmd| cmd.accept(text));
+    let to_run = with_in(window, |cmd| cmd.accept(text));
+    // The accepted line belongs to every window's `<Ctrl-P>`, not only to this one's.
+    sync_history(window);
 
     if rapid {
         // `command-accept --rapid` keeps the line open and its text, so several commands can be
         // run without retyping the prefix.
         push();
     } else {
-        leave_command_mode();
+        leave_command_mode(window);
     }
 
     if let Some(to_run) = to_run {
@@ -752,25 +815,25 @@ pub fn on_accept(text: &str) {
 /// `{"type":"cancel"}` — Escape reached the input. Rust normally handles Escape itself through the
 /// `mode-leave` binding, so this is the belt to that braces; leaving a mode we have already left
 /// is a no-op in `ModeManager`.
-pub fn on_cancel() {
-    leave_command_mode();
+pub fn on_cancel(window: u32) {
+    leave_command_mode(window);
 }
 
-/// Called from `ipc::set_mode` whenever the mode changes, so that leaving command mode by *any*
-/// route — `mode-leave`, an accept, a page focusing a field — clears the line and gives the page
-/// its focus back. Wiring it to the mode change rather than to the `mode-leave` command is what
-/// keeps this out of the dispatcher.
-pub fn on_mode_changed(mode: &str) {
+/// Called from `ipc::set_mode_for` whenever a window's mode changes, so that leaving command mode
+/// by *any* route — `mode-leave`, an accept, a page focusing a field — clears that window's line
+/// and gives that window's page its focus back. Wiring it to the mode change rather than to the
+/// `mode-leave` command is what keeps this out of the dispatcher.
+pub fn on_mode_changed(window: u32, mode: &str) {
     if mode == "command" {
         return;
     }
-    let had_text = with(|cmd| {
+    let had_text = with_in(window, |cmd| {
         let had_text = !cmd.is_empty();
         cmd.clear();
         had_text
     });
     if had_text {
-        focus_page();
+        focus_page(window);
     }
 }
 
@@ -787,8 +850,15 @@ pub fn on_mode_changed(mode: &str) {
 /// its bindings once at startup and a keypress never has a string to record; the two are the same
 /// thing one step apart, and re-parsing would only add a way for them to disagree.
 ///
+/// It is keyed by **window** as well, because qutebrowser's `CommandRunner` — which is what holds
+/// `last_command` — is created once per window in `mainwindow.py` and registered under that
+/// window's scope. So `.` in one window repeats what was done in that window, not what was last
+/// done anywhere; with two windows open and one shared slot, alt-tabbing between them made `.`
+/// repeat the other window's last command.
+///
 /// `BTreeMap::new` is const and `HashMap::new` is not, which is the whole reason this is ordered.
-static LAST_COMMAND: Mutex<BTreeMap<Mode, (Command, Option<u32>)>> = Mutex::new(BTreeMap::new());
+static LAST_COMMAND: Mutex<BTreeMap<(u32, Mode), (Command, Option<u32>)>> =
+    Mutex::new(BTreeMap::new());
 
 /// Whether running `command` should make it the thing `.` repeats.
 ///
@@ -822,17 +892,21 @@ pub fn record_last_command(command: &Command, count: Option<u32>) {
     if !records_as_last(command) {
         return;
     }
-    // The mode as it was *before* the command ran, which is what `cur_mode` is in `runners.py:159`.
-    let mode = mode();
+    // The mode as it was *before* the command ran, which is what `cur_mode` is in `runners.py:159`,
+    // and the window it was run in — `keys.rs` has made the key's window current before this.
+    let window = window();
+    let mode = mode_in(window);
     if let Ok(mut last) = LAST_COMMAND.lock() {
-        last.insert(mode, (command.clone(), count));
+        last.insert((window, mode), (command.clone(), count));
     }
 }
 
-/// What `.` repeats in the mode bru is in now, if anything.
+/// What `.` repeats in this window, in the mode it is in now, if anything.
 pub fn last_command() -> Option<(Command, Option<u32>)> {
+    let window = window();
+    let mode = mode_in(window);
     let last = LAST_COMMAND.lock().ok()?;
-    last.get(&mode()).cloned()
+    last.get(&(window, mode)).cloned()
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -967,7 +1041,12 @@ fn write_command_history() -> std::io::Result<(PathBuf, usize)> {
             "neither XDG_DATA_HOME nor HOME is set, so there is nowhere to save",
         ));
     };
-    let entries = with(|cmd| cmd.history().to_vec());
+    // The shared list rather than the current window's copy: `sync_history` writes every accepted
+    // line into it, so `:save` in a window that has typed nothing still writes the whole session.
+    let entries = HISTORY
+        .lock()
+        .map(|shared| shared.clone())
+        .unwrap_or_default();
     let lines = write_history(&path, &entries)?;
     Ok((path, lines))
 }
@@ -1027,55 +1106,77 @@ fn ensure_history_loaded() {
         if entries.is_empty() {
             return;
         }
-        cmdline()
-            .lock()
-            .expect("command line mutex poisoned")
-            .set_history(entries);
+        // Into the shared list and into every line that already exists. `cmdlines` first and
+        // `HISTORY` inside it, the same order as `with_in` and `sync_history`.
+        let mut lines = cmdlines().lock().expect("command line mutex poisoned");
+        for cmd in lines.values_mut() {
+            cmd.set_history(entries.clone());
+        }
+        if let Ok(mut shared) = HISTORY.lock() {
+            *shared = entries;
+        }
     });
 }
 
 // --- mode and focus ---------------------------------------------------------------------------
 
 fn mode() -> Mode {
+    mode_in(window())
+}
+
+/// A named window's mode. Every question this module asks about the mode is really about one
+/// window: `command-accept` is only a command in the window whose line is open, and a `text-changed`
+/// arriving from window 1's strip says nothing about window 0.
+fn mode_in(window: u32) -> Mode {
     crate::state::BruState::instance()
-        .and_then(|state| state.lock().ok().map(|state| state.mode()))
+        .and_then(|state| state.lock().ok().map(|state| state.mode_in(window)))
         .unwrap_or(Mode::Normal)
 }
 
-fn enter_command_mode() {
+fn enter_command_mode(window: u32) {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
     let entered = state
         .lock()
         .expect("state mutex poisoned")
-        .enter_mode(Mode::Command, false);
+        .enter_mode_in(window, Mode::Command, false);
     if entered {
         // This is what puts `body.mode-command` on the chrome; bottom.js reads the mode off the
         // pushed state and nothing else off it.
-        crate::ipc::set_mode("command".to_string());
+        crate::ipc::set_mode_for(window, "command".to_string());
     }
-    crate::ipc::focus_bottom_chrome();
+    crate::ipc::focus_bottom_chrome(window);
 }
 
-fn leave_command_mode() {
+fn leave_command_mode(window: u32) {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let left = state.lock().expect("state mutex poisoned").leave_mode();
+    let left = state
+        .lock()
+        .expect("state mutex poisoned")
+        .leave_mode_in(window);
     if left {
-        // `set_mode` calls back into `on_mode_changed`, which clears the line and refocuses.
-        crate::ipc::set_mode(Mode::Normal.name().to_string());
+        // `set_mode_for` calls back into `on_mode_changed`, which clears that window's line and
+        // refocuses that window's page.
+        crate::ipc::set_mode_for(window, Mode::Normal.name().to_string());
     }
 }
 
-/// Hand keyboard focus back to the tab that is showing. Without this the bottom strip keeps it and
-/// the next `j` is typed into an invisible input instead of scrolling.
-fn focus_page() {
+/// Hand keyboard focus back to the tab showing in a window. Without this the bottom strip keeps it
+/// and the next `j` is typed into an invisible input instead of scrolling.
+///
+/// `active_browser_in` rather than `active_browser`: an accept can be answered by a strip whose
+/// window is no longer the one in front, and the focus belongs to the page that was being typed at.
+fn focus_page(window: u32) {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let browser = state.lock().expect("state mutex poisoned").active_browser();
+    let browser = state
+        .lock()
+        .expect("state mutex poisoned")
+        .active_browser_in(window);
     if let Some(browser) = browser {
         if let Some(host) = browser.host() {
             host.set_focus(1);
@@ -1127,9 +1228,50 @@ pub fn types_into_cmdline(info: &crate::bindings::KeyInfo) -> bool {
 
 // --- pushing to the chrome ----------------------------------------------------------------------
 
+/// Run `f` against one window's command line, making it if this is the first thing said about that
+/// window. A new one starts with the shared history, so `<Ctrl-P>` works in a window opened a
+/// moment ago.
+fn with_in<T>(window: u32, f: impl FnOnce(&mut CmdLine) -> T) -> T {
+    let mut lines = cmdlines().lock().expect("command line mutex poisoned");
+    let entry = lines.entry(window).or_insert_with(|| {
+        let mut cmd = CmdLine::new();
+        // Taken *inside* the `cmdlines` lock, and every other pairing below is in the same order —
+        // `sync_history` and `ensure_history_loaded` both take `cmdlines` first. Two locks in one
+        // order are not a deadlock; two locks in two orders are.
+        if let Ok(shared) = HISTORY.lock() {
+            if !shared.is_empty() {
+                cmd.set_history(shared.clone());
+            }
+        }
+        cmd
+    });
+    f(entry)
+}
+
+/// The current window's command line — the callers reached from a command typed in it.
 fn with<T>(f: impl FnOnce(&mut CmdLine) -> T) -> T {
-    let mut guard = cmdline().lock().expect("command line mutex poisoned");
-    f(&mut guard)
+    with_in(window(), f)
+}
+
+/// Copy the history a window has just appended to into the shared list and into every other
+/// window's line.
+///
+/// One call per accepted command, over at most a handful of windows and at most `HISTORY_MAX`
+/// lines. The alternative — giving `CmdLine` a borrow of a shared history — would put a lifetime
+/// through the whole pure half for something that happens once per `<Return>`.
+fn sync_history(from: u32) {
+    let mut lines = cmdlines().lock().expect("command line mutex poisoned");
+    let Some(entries) = lines.get(&from).map(|cmd| cmd.history().to_vec()) else {
+        return;
+    };
+    for (id, cmd) in lines.iter_mut() {
+        if *id != from {
+            cmd.set_history(entries.clone());
+        }
+    }
+    if let Ok(mut shared) = HISTORY.lock() {
+        *shared = entries;
+    }
 }
 
 // --- src/completers.rs ---------------------------------------------------------------------
@@ -1141,18 +1283,28 @@ fn with<T>(f: impl FnOnce(&mut CmdLine) -> T) -> T {
 /// "previous command" or "previous item" — and it is rebuilt on pushes that never went through
 /// `on_text_changed`, so it cannot simply be handed them. Read-only; nothing here changes the line.
 pub fn state_for_completion() -> (String, usize, bool) {
-    with(|cmd| (cmd.text(), cmd.cursor(), cmd.browse.is_some()))
+    state_for_completion_in(window())
+}
+
+/// The same for a named window, for the one caller that is a *push* rather than a command: a bar
+/// being rendered for window 0 must be given window 0's line even while window 1 is in front.
+pub fn state_for_completion_in(window: u32) -> (String, usize, bool) {
+    with_in(window, |cmd| (cmd.text(), cmd.cursor(), cmd.browse.is_some()))
 }
 
 // --- end src/completers.rs -----------------------------------------------------------------
 
-/// The `cmdline` field of the bottom view's state. Called by `ipc::bar_json`.
+/// The `cmdline` field of one window's bottom view state. Called by `ipc::bar_json_for`.
+///
+/// Named for its window because a push is: window 0's bar must be handed window 0's line, and
+/// handing it the current window's was how a background bar came to show — and `focus` — a line
+/// being typed somewhere else.
 ///
 /// `rev` is what stops a push triggered by something else from rewriting a half-typed line: the
 /// chrome applies `text` only when the revision is one it has not seen.
-pub fn json() -> String {
-    let focus = mode() == Mode::Command;
-    with(|cmd| {
+pub fn json_for(window: u32) -> String {
+    let focus = mode_in(window) == Mode::Command;
+    with_in(window, |cmd| {
         format!(
             "{{\"text\":\"{}\",\"cursor\":{},\"rev\":{},\"focus\":{}}}",
             crate::ipc::json_escape(&cmd.text()),
@@ -1241,7 +1393,7 @@ wrap_task! {
                             .sum();
                         (text, at)
                     });
-                    on_text_changed(&text, Some(at));
+                    on_text_changed_here(&text, Some(at));
                     push();
                 }
                 "cmd" => match crate::commands::parse(arg) {
