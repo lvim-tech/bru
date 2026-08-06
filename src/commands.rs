@@ -248,6 +248,16 @@ pub enum Command {
     CompletionItemYank { sel: bool },
 // --- end src/completers.rs -----------------------------------------------------------------
 
+// --- adblock ---------------------------------------------------------------------------------
+    /// `adblock-update` — fetch the filter lists and recompile. qutebrowser's own command name.
+    AdblockUpdate,
+    /// `adblock-toggle` — blocking on or off for this session. bru's, not qutebrowser's, which
+    /// spells it `:set content.blocking.enabled false` and needs a settings system to do it.
+    AdblockToggle,
+    /// `adblock-info` — what is loaded, what it has blocked, and what it costs per request.
+    AdblockInfo,
+// --- end adblock -----------------------------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -1089,6 +1099,12 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "completion-item-del" => Command::CompletionItemDel,
         "completion-item-yank" => Command::CompletionItemYank { sel: args.has("sel") },
 // --- end src/completers.rs -----------------------------------------------------------------
+
+// --- adblock ---------------------------------------------------------------------------------
+        "adblock-update" => Command::AdblockUpdate,
+        "adblock-toggle" => Command::AdblockToggle,
+        "adblock-info" => Command::AdblockInfo,
+// --- end adblock -----------------------------------------------------------------------------
 
         _ => Command::Unimplemented(s.trim().to_string()),
     };

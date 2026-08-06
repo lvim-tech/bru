@@ -472,6 +472,20 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
 
+// --- adblock ---------------------------------------------------------------------------------
+        // None of the three is bound to a key, in qutebrowser or here: they are typed, rarely, and
+        // `:adblock-update` in particular is the one thing in bru that reaches the network of its
+        // own accord — it should take a decision, not a keystroke.
+        Command::AdblockUpdate => crate::adblock::update(),
+        Command::AdblockToggle => {
+            let on = crate::adblock::toggle();
+            eprintln!("bru[adblock]: blocking {}", if on { "on" } else { "off" });
+        }
+        Command::AdblockInfo => {
+            eprintln!("bru[adblock]: {}", crate::adblock::info(browser.identifier()));
+        }
+// --- end adblock -----------------------------------------------------------------------------
+
         // A command qutebrowser has and bru's parser does not know. It kept its place in the trie
         // so `;` still reports a partial match; running it does nothing.
         Command::Unimplemented(_) => {}
@@ -610,6 +624,11 @@ pub fn is_live(command: &Command) -> bool {
         // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
 
         Command::Nop | Command::ClearKeychain => true,
+
+// --- adblock ---------------------------------------------------------------------------------
+        // Live, and not part of the default-binding count: qutebrowser binds none of them either.
+        Command::AdblockUpdate | Command::AdblockToggle | Command::AdblockInfo => true,
+// --- end adblock -----------------------------------------------------------------------------
 
         // Almost all of these are still waiting for a milestone — but the readline and history
         // bindings reach `cmdline.rs` by name rather than as a variant, so it is the only thing

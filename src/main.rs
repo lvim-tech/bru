@@ -4,6 +4,7 @@
 //! GPU and zygote processes, distinguished by a `--type=` switch, so `execute_process` has to come
 //! before anything else and the non-browser cases must return without initialising CEF.
 
+mod adblock;
 mod app;
 mod bindings;
 mod caret;
