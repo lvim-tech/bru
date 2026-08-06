@@ -1060,7 +1060,10 @@ pub fn renderer_on_context_created(frame: Option<&Frame>) {
         // `enter()` refusing, and the script did not run at all. Logging only the exception left
         // that case silent, which reads on the terminal exactly like a script that ran and chose to
         // do nothing: the `injecting …` line above is printed either way.
-        match evaluate(frame, &code) {
+        // The script's own name, not `None`. See `script_name`: it is what a console message the
+        // script writes will carry as its source, and matching a *source* is what lets a handler
+        // tell a userscript's error from a page that merely typed the same words.
+        match evaluate(frame, &code, Some(&script_name(&name))) {
             Some(value) if value.starts_with("<exception:") => {
                 eprintln!("bru[greasemonkey]: {name} threw on injection: {value}");
             }
@@ -1095,7 +1098,9 @@ pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessag
             .map(|arguments| CefString::from(&arguments.string(0)).to_string())
             .unwrap_or_default();
         let url = CefString::from(&frame.url()).to_string();
-        match evaluate(frame, &expression) {
+        // `None`, deliberately: the probe is a measuring instrument and must keep behaving exactly
+        // as it did before injection was given a name.
+        match evaluate(frame, &expression, None) {
             Some(value) => eprintln!("gm-probe: {url} -> {value}"),
             None => eprintln!("gm-probe: {url} -> <the expression threw or has no value>"),
         }
@@ -1106,16 +1111,22 @@ pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessag
 
 /// Run an expression in the frame's own V8 context and bring it back as a string. The same shape as
 /// `scroll::evaluate` — `eval` is only legal between `enter` and `exit`.
-fn evaluate(frame: &Frame, code: &str) -> Option<String> {
+///
+/// `script_url` is `eval`'s second argument, and it is **what V8 attributes the code to**: the name
+/// in a stack frame, in `V8Exception::script_resource_name`, and in the source of any console
+/// message the code writes. Injection passes [`script_name`]; the probe passes `None`, which leaves
+/// its behaviour exactly as it was.
+fn evaluate(frame: &Frame, code: &str, script_url: Option<&str>) -> Option<String> {
     let context = frame.v8_context()?;
     if context.enter() == 0 {
         return None;
     }
+    let url = script_url.map(CefString::from);
     let mut value: Option<V8Value> = None;
     let mut exception: Option<V8Exception> = None;
     let ok = context.eval(
         Some(&CefString::from(code)),
-        None,
+        url.as_ref(),
         0,
         Some(&mut value),
         Some(&mut exception),
@@ -1123,10 +1134,36 @@ fn evaluate(frame: &Frame, code: &str) -> Option<String> {
     let text = if ok != 0 {
         value.map(|value| CefString::from(&value.string_value()).to_string())
     } else {
-        exception.map(|e| format!("<exception: {}>", CefString::from(&e.message()).to_string()))
+        exception.map(|e| {
+            // The resource name is the measuring instrument for the line above: it is the same
+            // attribution a console message's source comes from, read back off the exception.
+            log(&format!(
+                "exception attributed to {:?} at line {}",
+                CefString::from(&e.script_resource_name()).to_string(),
+                e.line_number()
+            ));
+            format!("<exception: {}>", CefString::from(&e.message()).to_string())
+        })
     };
     context.exit();
     text
+}
+
+/// What V8 will call an injected userscript.
+///
+/// A console message carries the URL of the script that wrote it, so a handler that wants to show
+/// only a *userscript's* errors can ask for this prefix instead of matching the message text — and
+/// matching the text means any page that writes the same words reaches bru's status bar.
+///
+/// **It is a large improvement and not a guarantee**, and the difference matters to whoever writes
+/// that handler. Measured 2026-08-06: a page can name its own script with `//# sourceURL=`, and the
+/// name it chooses is what its stack frames and console messages then carry — including this prefix
+/// if it picks it. What the prefix buys is that forging it now takes a deliberate act rather than a
+/// coincidence of wording, and that bru's own injected scripts are distinguishable from the page's
+/// ordinary output, which is the whole of what the handler needs to be *useful*. Anything that must
+/// be unforgeable cannot come from the console at all.
+pub fn script_name(full_name: &str) -> String {
+    format!("bru-userscript:{full_name}")
 }
 
 // ------------------------------------------------------------------------------------------------
