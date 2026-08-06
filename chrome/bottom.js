@@ -273,21 +273,18 @@
     });
 
     // Round-trip probe, for proving the router answers as well as receives.
-    // Reachable two ways because a keyboard-driven browser has no pointer to
-    // click with while it is being built: the button when there is one, and
-    // ?probe=1 on the URL, which needs no input at all.
-    function echo() {
-      query({ type: "echo", text: "hello from " + VIEW }, function (response) {
-        put("echo-result", response);
-      });
-    }
-
-    var button = document.getElementById("echo");
-    if (button) {
-      button.addEventListener("click", echo);
-    }
+    // Reached with ?probe=1 on the URL, which needs no input at all — this is a
+    // keyboard-driven browser and there is nothing here to click.
+    //
+    // The answer goes to the console, beside the onFailure above, and NOT into
+    // an element: it used to be written to #echo-result, which bottom.html has
+    // never had, so the one thing the probe exists to show landed nowhere and
+    // `?probe=1` looked exactly like a router that had not answered. There was
+    // an #echo button listener beside it for the same non-existent markup.
     if (window.location.search.indexOf("probe=1") !== -1) {
-      echo();
+      query({ type: "echo", text: "hello from " + VIEW }, function (response) {
+        console.log("bru: echo answered " + JSON.stringify(response));
+      });
     }
   }
 
