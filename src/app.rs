@@ -258,12 +258,6 @@ wrap_browser_process_handler! {
             crate::hints::install_clipboard(Box::new(crate::clip::HintClipboard));
             crate::hints::install_downloads(Box::new(crate::clip::HintDownloads));
             crate::completers::install_clipboard(crate::clip::yank_plain);
-            // The fifth hole, and the one that was still open: `spawn.rs` left a sink for whoever
-            // built the message line, and nobody ever called it — so `:spawn`'s "started …", its
-            // failures, and everything `-m` collected went to stderr, where nobody running a
-            // browser is looking. `message.rs` is that message line, and this is the one line that
-            // joins them.
-            crate::spawn::set_message_sink(crate::message::info);
             // A cancelled popup becomes a tab, and the window it lands in is the window of the page
             // that asked — not whichever window happens to be in front. `popups.rs` cannot ask that
             // question itself (it knows only the opener browser's id, and `state.rs` is not its),
@@ -290,6 +284,15 @@ wrap_browser_process_handler! {
             // and the command is dropped on the floor — `:open -t abv.bg` would print "no command
             // runner installed" and do nothing.
             crate::cmdline::set_runner(crate::exec::run_from_cmdline);
+
+// --- src/spawn.rs ----------------------------------------------------------
+            // `spawn.rs` has had a message hook since it was written and nothing ever filled it in,
+            // so every `:spawn` message went to stderr — its "started …", its failures, and
+            // everything `-m` collected — where nobody running a browser is looking. Two sinks
+            // rather than one: `userscript "x" not found` is the message a person pressing a key
+            // needs to see, and it should not arrive in the same colour as "started mpv (pid 1234)".
+            crate::spawn::set_message_sink(crate::message::info, crate::message::error);
+// --- end src/spawn.rs ------------------------------------------------------
 
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state

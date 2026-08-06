@@ -85,27 +85,45 @@ pub struct Opts {
 
 /// Where a message goes once something wants to show one.
 ///
-/// A hook rather than a call into `message.rs` by name, because this module was written before there
-/// was a message line and had to say something either way. `app.rs` installs `message::info` at
-/// startup; with nothing installed — every unit test, and the moment before
-/// `on_context_initialized` — messages go to stderr rather than nowhere.
-///
-/// One level, not three: `spawn::message` says "started …" and "could not run …" through the same
-/// call, so everything here arrives as info. Splitting the failures out to `message::error` means
-/// giving this module a second entry point, which is a change to make deliberately rather than
-/// while wiring the sink up.
+/// This was written before `src/message.rs` existed, as a hook for whoever built the message line
+/// to fill in — and nobody did, so until now every `:spawn` message went to stderr and a userscript
+/// that could not be found said so where a person running a browser was not looking. `app.rs`
+/// installs both sinks at startup now; see the block fenced with this module's name there. With
+/// nothing installed — every unit test, and the moment before `on_context_initialized` — messages
+/// still go to stderr rather than nowhere.
 static SINK: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
-/// Install the message sink. Called once, at startup, by `app.rs`.
-pub fn set_message_sink(sink: fn(&str)) {
+/// The same, for the half of these messages that are failures. Two sinks rather than one taking a
+/// level, because a level would be `message::Level` and this module deliberately does not name that
+/// module — the point of a hook is that neither end has to.
+static ERROR_SINK: Mutex<Option<fn(&str)>> = Mutex::new(None);
+
+/// Install the message sinks. Called once, at startup, by whoever owns the message line.
+pub fn set_message_sink(info: fn(&str), error: fn(&str)) {
     if let Ok(mut slot) = SINK.lock() {
-        *slot = Some(sink);
+        *slot = Some(info);
+    }
+    if let Ok(mut slot) = ERROR_SINK.lock() {
+        *slot = Some(error);
     }
 }
 
 /// Show a message. Safe from any thread — the waiter threads below are the main callers.
 pub fn message(text: &str) {
     let sink = SINK.lock().ok().and_then(|sink| *sink);
+    match sink {
+        Some(sink) => sink(text),
+        None => eprintln!("bru: {text}"),
+    }
+}
+
+/// Show a message about something that did not work.
+///
+/// The distinction is not decoration: `started mpv (pid 1234)` and `userscript "qute-pass" not
+/// found` were the same colour and the same three seconds, and the second is the one the user has
+/// to see.
+pub fn error(text: &str) {
+    let sink = ERROR_SINK.lock().ok().and_then(|sink| *sink);
     match sink {
         Some(sink) => sink(text),
         None => eprintln!("bru: {text}"),
@@ -332,8 +350,8 @@ fn wl_paste(primary: bool) -> String {
     }
     match command.output() {
         Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-        Err(error) => {
-            message(&format!("could not read the clipboard: {error}"));
+        Err(problem) => {
+            error(&format!("could not read the clipboard: {problem}"));
             String::new()
         }
     }
@@ -349,13 +367,13 @@ fn wl_paste(primary: bool) -> String {
 pub fn spawn(cmdline: &str, opts: Opts, count: Option<u32>) {
     let parts = match shlex(cmdline) {
         Ok(parts) => parts,
-        Err(error) => {
-            message(&format!("spawn: {error}"));
+        Err(problem) => {
+            error(&format!("spawn: {problem}"));
             return;
         }
     };
     let Some((command, args)) = parts.split_first() else {
-        message("spawn: nothing to run");
+        error("spawn: nothing to run");
         return;
     };
 
@@ -380,8 +398,8 @@ fn run_plain(command: &str, args: &[String], opts: Opts) {
 
     let child = match child.spawn() {
         Ok(child) => child,
-        Err(error) => {
-            message(&format!("spawn: could not run {}: {error}", path.display()));
+        Err(problem) => {
+            error(&format!("spawn: could not run {}: {problem}", path.display()));
             return;
         }
     };
@@ -395,16 +413,16 @@ fn run_plain(command: &str, args: &[String], opts: Opts) {
 fn run_userscript(command: &str, args: &[String], opts: Opts, count: Option<u32>) {
     let path = match resolve_userscript(command) {
         Ok(path) => path,
-        Err(error) => {
-            message(&format!("spawn: {error}"));
+        Err(problem) => {
+            error(&format!("spawn: {problem}"));
             return;
         }
     };
 
     let fifo = match make_fifo() {
         Ok(fifo) => fifo,
-        Err(error) => {
-            message(&format!("spawn: {error}"));
+        Err(problem) => {
+            error(&format!("spawn: {problem}"));
             return;
         }
     };
@@ -416,16 +434,16 @@ fn run_userscript(command: &str, args: &[String], opts: Opts, count: Option<u32>
     let handle = OpenOptions::new().read(true).write(true).open(&fifo);
     let handle = match handle {
         Ok(handle) => handle,
-        Err(error) => {
-            message(&format!("spawn: could not open {}: {error}", fifo.display()));
+        Err(problem) => {
+            error(&format!("spawn: could not open {}: {problem}", fifo.display()));
             let _ = std::fs::remove_file(&fifo);
             return;
         }
     };
     let waker = match handle.try_clone() {
         Ok(waker) => waker,
-        Err(error) => {
-            message(&format!("spawn: could not clone the fifo handle: {error}"));
+        Err(problem) => {
+            error(&format!("spawn: could not clone the fifo handle: {problem}"));
             let _ = std::fs::remove_file(&fifo);
             return;
         }
@@ -440,8 +458,8 @@ fn run_userscript(command: &str, args: &[String], opts: Opts, count: Option<u32>
 
     let child = match child.spawn() {
         Ok(child) => child,
-        Err(error) => {
-            message(&format!("spawn: could not run {}: {error}", path.display()));
+        Err(problem) => {
+            error(&format!("spawn: could not run {}: {problem}", path.display()));
             let _ = std::fs::remove_file(&fifo);
             return;
         }
@@ -518,10 +536,10 @@ fn watch(
                     }
                 }
                 if !output.status.success() && !opts.verbose {
-                    message(&format!("{what} exited with {}", output.status));
+                    error(&format!("{what} exited with {}", output.status));
                 }
             }
-            Err(error) => message(&format!("{what}: {error}")),
+            Err(problem) => error(&format!("{what}: {problem}")),
         }
     });
 }
