@@ -379,9 +379,8 @@ impl Data {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Forget one URL, from both tables. Behind the completion's delete key, and `:history-clear`
-    /// for one entry — neither of which exists yet, which is why nothing calls this.
-    #[allow(dead_code)]
+    /// Forget one URL, from both tables. Behind the completion's delete key —
+    /// `completers.rs`'s `History` category calls it, as `urlmodel.py:14-19` does.
     pub fn forget_url(&mut self, url: &str) -> Result<()> {
         self.conn.execute("DELETE FROM History WHERE url = ?1", (url,))?;
         self.conn.execute("DELETE FROM CompletionHistory WHERE url = ?1", (url,))?;

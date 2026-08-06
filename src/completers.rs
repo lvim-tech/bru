@@ -727,8 +727,7 @@ pub type Clipboard = fn(text: &str, selection: bool);
 
 static CLIPBOARD: Mutex<Option<Clipboard>> = Mutex::new(None);
 
-/// Install the clipboard, once, at startup.
-#[allow(dead_code)] // Until `src/clip.rs` is merged beside this.
+/// Install the clipboard, once, at startup. `app.rs` hands it `clip::yank_plain`.
 pub fn install_clipboard(clipboard: Clipboard) {
     if let Ok(mut slot) = CLIPBOARD.lock() {
         *slot = Some(clipboard);

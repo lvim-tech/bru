@@ -213,9 +213,8 @@ fn leave(browser: &mut Browser) {
 /// **This is the call the clipboard workstream needs.** `y` / `Y` / `<Return>` in caret mode are
 /// `yank selection` and `yank selection -s`, which are `Command::Unimplemented` here on purpose —
 /// adding a `Command::Yank` variant would collide with the module that owns `wl-copy`. That module
-/// asks here for the text and does the copying; nothing in this file touches a clipboard.
-// Unused inside this crate until that module lands, which is exactly the hole this documents.
-#[allow(dead_code)]
+/// asks here for the text and does the copying; nothing in this file touches a clipboard. That
+/// module is `src/clip.rs`, and it calls this.
 pub fn selection() -> Option<(SelectionState, String)> {
     let guard = session().lock().expect("caret session mutex poisoned");
     guard.as_ref().map(|s| (s.selection, s.text.clone()))

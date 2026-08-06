@@ -135,8 +135,6 @@ impl SearchEngines {
     /// `DEFAULT` is left out because it is not a name anyone types — it is what a search with no
     /// prefix falls through to, so offering it as a completion would be offering a prefix that
     /// changes nothing.
-    // Called by `data.rs`'s Sources impl once the completion workstream is merged.
-    #[allow(dead_code)]
     pub fn for_completion(&self) -> Vec<(String, String)> {
         self.engines
             .iter()

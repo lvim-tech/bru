@@ -592,11 +592,9 @@ pub fn start(state: &SharedState, browser: &mut Browser, url: Option<&str>) {
 /// same lock. This posts and starts the download on the next turn of the UI loop, the way
 /// `tabs::schedule_select` does.
 ///
-/// Dead until `src/hints.rs` implements the `links` group and the `download` target; the `allow`
-/// goes with the call that replaces it. Kept here rather than left to be invented there, so that the
-/// one thing `;d` must not do — reach a browser from inside the query handler — cannot be got wrong
-/// by someone who has not read trap 12.
-#[allow(dead_code)]
+/// Kept here rather than left to be invented in `hints.rs`, so that the one thing `;d` must not do —
+/// reach a browser from inside the query handler — cannot be got wrong by someone who has not read
+/// trap 12. Its callers are `clip::HintDownloads` and `popups.rs`'s `Where::Download`.
 pub fn schedule_start(url: String) {
     let mut task = StartDownload::new(url);
     post_task(ThreadId::UI, Some(&mut task));

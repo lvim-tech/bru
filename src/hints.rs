@@ -667,18 +667,14 @@ pub trait Downloads: Send + Sync {
 static CLIPBOARD: std::sync::OnceLock<Box<dyn Clipboard>> = std::sync::OnceLock::new();
 static DOWNLOADS: std::sync::OnceLock<Box<dyn Downloads>> = std::sync::OnceLock::new();
 
-/// Hands the clipboard workstream's implementation to hint mode, once, at startup.
-///
-/// `dead_code` because nothing calls it **yet** — that is the hole, and it is deliberate. Delete
-/// the attribute in the commit that adds the call, and raise the live count in the same one.
-#[allow(dead_code)]
+/// Hands the clipboard workstream's implementation to hint mode, once, at startup. `app.rs` calls
+/// it with `clip::HintClipboard`, which is what makes `;y` and `;Y` live.
 pub fn install_clipboard(clipboard: Box<dyn Clipboard>) {
     let _ = CLIPBOARD.set(clipboard);
 }
 
-/// Hands the download workstream's implementation to hint mode, once, at startup. See
-/// [`install_clipboard`] for why this is allowed to be dead.
-#[allow(dead_code)]
+/// Hands the download workstream's implementation to hint mode, once, at startup. `app.rs` calls it
+/// with `clip::HintDownloads`, which is what makes `;d` live.
 pub fn install_downloads(downloads: Box<dyn Downloads>) {
     let _ = DOWNLOADS.set(downloads);
 }

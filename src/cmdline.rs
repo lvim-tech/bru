@@ -510,9 +510,6 @@ pub type Runner = fn(&str, Option<u32>);
 static RUNNER: Mutex<Option<Runner>> = Mutex::new(None);
 
 /// Install what runs an accepted command. Called once, at startup.
-// Unused until the command-set workstream is merged in beside this one; until then an accepted
-// line prints what it would have run, which is what the `--cmdline-script` checks read.
-#[allow(dead_code)]
 pub fn set_runner(runner: Runner) {
     if let Ok(mut slot) = RUNNER.lock() {
         *slot = Some(runner);
