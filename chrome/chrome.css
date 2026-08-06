@@ -368,44 +368,24 @@ body:not(.mode-command) #cmdline {
     background: var(--completion-item-selected-bg);
 }
 
-/* Message (src/clip.rs) ----------------------------------------------------
+/* Messages (src/message.rs, and src/clip.rs through it) --------------------
  *
  * qutebrowser's message area, with one line in it: "Yanked URL to clipboard: …".
- * It takes the same grid cell as the command line, which is free in every mode
- * the command line is not — and the two are hidden in each other's mode, so
- * they never draw over one another. Empty means gone, so the bar is 24px and
- * the layout never hears about this element at all until something is said.
- */
-
-#message {
-    grid-row: 2;
-    grid-column: 1;
-    display: flex;
-    align-items: center;
-    min-width: 0;
-    height: var(--bar-h);
-    padding: 0 var(--pad-x);
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    color: var(--messages-info-fg);
-    background: var(--messages-info-bg);
-}
-
-#message:empty,
-body.mode-command #message {
-    display: none;
-}
-
-/* Messages ----------------------------------------------------------------
- *
- * The command line's cell, because a message and a command line are never both
- * wanted: qutebrowser puts its cmd and txt widgets in one QStackedLayout slot
- * (statusbar/bar.py:169) and swaps between them, and this is that stack written
- * as two grid items in one cell.
+ * It takes the same grid cell as the command line, because a message and a
+ * command line are never both wanted: qutebrowser puts its cmd and txt widgets
+ * in one QStackedLayout slot (statusbar/bar.py:169) and swaps between them, and
+ * this is that stack written as two grid items in one cell. The two are hidden
+ * in each other's mode, so they never draw over one another.
  *
  * Empty means gone — `#message:empty` — the same rule `#completion` follows, so
- * nothing has to remember to toggle a second thing. */
+ * nothing has to remember to toggle a second thing, and the bar is 24px until
+ * something is said.
+ *
+ * ONE block, not two. Two workstreams each wrote this section and both survived
+ * the merge, the first pinning --messages-info-* unconditionally and the second
+ * adding the three level classes. `#message.info` outranks `#message`, so the
+ * first block's colours could only ever be seen by a message renderMessage
+ * never produces — which made the duplicate invisible rather than harmless. */
 
 #message {
     grid-row: 2;
@@ -460,12 +440,36 @@ body.mode-command #message {
     overflow: hidden;
 }
 
+/* The whole reason the bar does not grow a field at a time. Every span in the
+   group is empty until Rust has something to put in it, and an empty one is not
+   laid out at all — no box, no width, and none of #statusline's `gap` either,
+   because gap is only drawn between boxes that exist. So `search` and
+   `download`, which are empty almost always, cost the bar nothing until the
+   moment they have something to say — #download's padding included, because
+   display:none is not a box to pad. Two things would break that and nothing
+   else: a `::before { content }` on one of these spans, which stops it being
+   :empty, and bottom.js writing a space where it means nothing. The latter is
+   why `put` writes `text || ""`. */
 #statusline > span:empty {
     display: none;
 }
 
 #keystring {
     color: var(--statusbar-keystring-fg);
+}
+
+/* src/find.rs's `Match [3/17]`, between the keystring and the URL — where
+   qutebrowser's `search_match` widget sits in the default `statusbar.widgets`
+   (configdata.yml:2212).
+
+   No colour of its own, and that is the theme's answer rather than a missing
+   one: qutebrowser's SearchMatch is a bare textbase.TextBase (searchmatch.py)
+   wearing the statusbar's palette, and there is no `c.colors.statusbar.search.*`
+   to generate a `--statusbar-search-fg` from. Inheriting is also what makes the
+   mode colouring below correct here for free — the insert and passthrough rules
+   set `color` on <body>, and a field with no colour of its own follows it. */
+#search {
+    white-space: nowrap;
 }
 
 #url {
@@ -503,6 +507,29 @@ body.mode-command #message {
 
 #tabindex {
     color: var(--statusbar-tabindex-fg);
+}
+
+/* src/downloads.rs::summary — `[dl 45%]`, `[dl 3 45%]`, or nothing. Last in the
+   group, where `progress` is last in qutebrowser's default widget list: it is
+   the one field here that is usually absent, and absent-most-of-the-time
+   belongs at the end, so its arrival never shifts the four fields DESIGN.md
+   names.
+ *
+ * qutebrowser has no download widget in the statusbar to copy — downloads get a
+ * second row of their own — but it has the colours for one, and this is what
+ * they mean: `c.colors.downloads.start.*` is the running part of a download's
+ * bar, fg on bg. So a running download reads here as the same small block of
+ * colour it reads as there, and it keeps that colour in insert and passthrough
+ * mode, because what it reports is the download's state and not the bar's.
+ *
+ * The padding is horizontal only and there is no height: the box is the line
+ * box, 13px × 1.4, inside a 24px row that centres it. The bar does not grow. */
+#download {
+    padding: 0 4px;
+    border-radius: 2px;
+    white-space: nowrap;
+    color: var(--downloads-start-fg);
+    background: var(--downloads-start-bg);
 }
 
 /* Mode colouring ----------------------------------------------------------
