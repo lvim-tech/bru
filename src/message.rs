@@ -152,6 +152,124 @@ fn to_one_line(text: &str) -> String {
     out
 }
 
+// -----------------------------------------------------------------------------------------------
+// The page's console
+// -----------------------------------------------------------------------------------------------
+
+/// The one line `chrome/greasemonkey.js:264` writes when a userscript throws:
+/// ``console.error(`bru: userscript ${bru_gm_name} threw: ${e}`)``.
+///
+/// Matched on the *text* rather than on the source, because bru's greasemonkey injection calls
+/// `V8Context::eval` with `None` for the script URL (`greasemonkey.rs::evaluate`), so the console
+/// reports the page's own address as the source and there is nothing there to match. See the
+/// report: giving that `eval` a `bru-userscript:<name>` URL is a one-line change in a file this
+/// workstream does not own, and it would make this match a source rather than a string.
+const USERSCRIPT_THREW: &str = "bru: userscript ";
+
+/// Where one console message goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route {
+    /// Into the bar, at this level. Rare on purpose — see [`route`].
+    Bar(Level),
+    /// stderr only, where a terminal keeps it and a browsing session never sees it.
+    Stderr,
+    /// Nowhere. `BRU_DEBUG_CONSOLE=1` still prints it.
+    Drop,
+}
+
+/// What to do with a `console.log`, `.warn` or `.error` from a page.
+///
+/// **The open web logs constantly, and a bar that flashes every warning is a bar the user learns
+/// to ignore.** So this is deliberately almost entirely `Drop`, and it is qutebrowser's own default
+/// rather than an invention: `content.javascript.log_message.levels` (configdata.yml:1011) ships as
+///
+/// ```text
+/// "qute:*":         ["error"]
+/// "userscript:GM-*": []
+/// "userscript:*":   ["error"]
+/// ```
+///
+/// — errors from qutebrowser's *own* pages and its *own* injected scripts reach the UI, a page's
+/// errors never do, and third-party greasemonkey scripts are excluded by name. `content.javascript.log`
+/// then sends all four levels to the `debug` logger, which is off screen.
+///
+/// bru transcribes that with two changes, both argued:
+///
+/// - `bru://*` stands for `qute:*`. If bru's own chrome throws, the bar is the only thing that can
+///   say so, and the thing that broke is the UI itself.
+/// - **The greasemonkey wrapper's own catch reaches the bar, where qutebrowser's `GM-*` line
+///   excludes it.** qutebrowser can afford to exclude it because every message it drops is still in
+///   `qute://log`, which `:messages` shows; bru has no log page and this module says so at the top,
+///   so "excluded from the UI" here means "gone". And the wrapper's line is not a page's
+///   `console.error`: it fires once, from a `try`/`catch` around a script the *user* installed, at
+///   exactly the moment that script stops working. Measured below: neither of the two busiest pages
+///   on this machine produced a single one.
+pub fn route(level: LogSeverity, text: &str, source: &str) -> Route {
+    // console.error and console.assert; FATAL is what an uncaught exception in a worker reports.
+    let severe = level == LogSeverity::ERROR || level == LogSeverity::FATAL;
+    if !severe {
+        return Route::Drop;
+    }
+    if text.starts_with(USERSCRIPT_THREW) || source.starts_with("bru://") {
+        return Route::Bar(Level::Error);
+    }
+    Route::Stderr
+}
+
+/// `DisplayHandler::on_console_message`. Called on the UI thread, for every frame of every tab.
+///
+/// Always returns 0 — "not handled", so CEF carries on with its own logging. Measured 2026-08-06
+/// with no handler at all: a full page load of vesti.bg put **zero** console lines on bru's stderr,
+/// so there is nothing to suppress and returning 1 would only risk the DevTools console, which is
+/// fed by a different path and is the one place a page's own log is worth reading in full.
+pub fn on_console_message(
+    level: LogSeverity,
+    message: Option<&CefString>,
+    source: Option<&CefString>,
+    line: ::std::os::raw::c_int,
+) -> ::std::os::raw::c_int {
+    let text = message.map(CefString::to_string).unwrap_or_default();
+    let source = source.map(CefString::to_string).unwrap_or_default();
+    let route = route(level, &text, &source);
+
+    if std::env::var_os("BRU_DEBUG_CONSOLE").is_some() {
+        eprintln!(
+            "bru[console]: {} {} [{source}:{line}] {}",
+            match route {
+                Route::Bar(_) => "bar",
+                Route::Stderr => "stderr",
+                Route::Drop => "drop",
+            },
+            severity_name(level),
+            to_one_line(&text),
+        );
+    }
+
+    match route {
+        // qutebrowser prefixes the same way — `func(f"JS: {logstring}")` in shared.py's
+        // `_js_log_to_ui` — so a message in the bar can never be mistaken for one of bru's own.
+        Route::Bar(level) => show(level, &format!("JS: [{source}:{line}] {text}")),
+        Route::Stderr => {
+            if std::env::var_os("BRU_DEBUG_CONSOLE").is_none() {
+                eprintln!("bru[console]: [{source}:{line}] {}", to_one_line(&text));
+            }
+        }
+        Route::Drop => {}
+    }
+    0
+}
+
+fn severity_name(level: LogSeverity) -> &'static str {
+    match level {
+        LogSeverity::VERBOSE => "verbose",
+        LogSeverity::INFO => "info",
+        LogSeverity::WARNING => "warning",
+        LogSeverity::ERROR => "error",
+        LogSeverity::FATAL => "fatal",
+        _ => "default",
+    }
+}
+
 wrap_task! {
     struct ClearMessage {
         sequence: u64,
@@ -211,6 +329,47 @@ mod tests {
         assert_eq!(
             to_one_line("could not open\n  because: no such file\n"),
             "could not open because: no such file"
+        );
+    }
+
+    /// The whole of the console policy, stated as the four cases it has.
+    #[test]
+    fn only_brus_own_javascript_reaches_the_bar() {
+        // A page's errors — the common case, and the one that must never flash the bar.
+        assert_eq!(
+            route(LogSeverity::ERROR, "Uncaught TypeError: x", "https://vesti.bg/ad.js"),
+            Route::Stderr
+        );
+        // Everything quieter than an error is gone, whoever logged it. This is the clause that
+        // makes the open web survivable: warnings outnumber errors on every page measured.
+        for level in [LogSeverity::VERBOSE, LogSeverity::INFO, LogSeverity::WARNING] {
+            assert_eq!(route(level, "third-party cookie", "https://vesti.bg/"), Route::Drop);
+            assert_eq!(route(level, "", "bru://chrome/bottom.html"), Route::Drop);
+        }
+        // bru's own chrome. If this throws the UI is what broke, and the bar is all there is.
+        assert_eq!(
+            route(LogSeverity::ERROR, "Uncaught ReferenceError", "bru://chrome/bottom.html"),
+            Route::Bar(Level::Error)
+        );
+        // The greasemonkey wrapper's catch, wherever the page it ran on was.
+        assert_eq!(
+            route(
+                LogSeverity::ERROR,
+                "bru: userscript example.user.js threw: TypeError: undefined",
+                "https://vesti.bg/"
+            ),
+            Route::Bar(Level::Error)
+        );
+    }
+
+    /// The prefix this file matches on is the one the wrapper actually writes. Without this the
+    /// two could drift apart in silence and a broken userscript would go back to being invisible.
+    #[test]
+    fn the_wrapper_still_writes_the_line_this_module_looks_for() {
+        let wrapper = include_str!("../chrome/greasemonkey.js");
+        assert!(
+            wrapper.contains("console.error(`bru: userscript ${bru_gm_name} threw:"),
+            "chrome/greasemonkey.js no longer starts its catch with {USERSCRIPT_THREW:?}"
         );
     }
 

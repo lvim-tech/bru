@@ -547,6 +547,21 @@ wrap_display_handler! {
         ) {
             crate::favicon::on_favicon_urls(browser, icon_urls);
         }
+
+// --- src/spawn.rs ----------------------------------------------------------
+        // Every `console.log`, `.warn` and `.error` in every frame of every tab. `message.rs`
+        // decides which of them is worth a line in the bar; almost none is.
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            level: LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            crate::message::on_console_message(level, message, source, line)
+        }
+// --- end src/spawn.rs ------------------------------------------------------
     }
 }
 
