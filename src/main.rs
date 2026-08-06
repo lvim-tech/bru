@@ -7,6 +7,7 @@
 mod app;
 mod bindings;
 mod commands;
+mod config;
 mod keys;
 mod modes;
 mod window;
