@@ -478,6 +478,13 @@ pub fn handle_mark_key(state: &SharedState, browser: &mut Browser, info: KeyInfo
     match mode {
         Mode::SetMark => request_mark(browser, AskWhat::SetMark(key)),
         Mode::JumpMark => request_mark(browser, AskWhat::JumpMark(key)),
+// --- src/macros.rs -------------------------------------------------------------------------------
+        // The other two modes `RegisterKeyParser` is built with (modeparsers.py:294-297). They are
+        // two arms here and not a parser of their own for the reason this function exists at all:
+        // "the next keystroke is a register name" is one behaviour, and four modes share it.
+        Mode::RecordMacro => crate::macros::name_recording(key),
+        Mode::RunMacro => crate::macros::run_named(state, browser, key),
+// --- end src/macros.rs ---------------------------------------------------------------------------
         _ => {}
     }
     Some(true)

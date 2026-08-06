@@ -524,6 +524,16 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
 
+// --- src/macros.rs -------------------------------------------------------------------------------
+        // `q` and `@`. Neither acts on the browser: one starts or stops a recording, the other
+        // replays one — and a replay is `run` again, once per recorded step, which is why this arm
+        // hands `browser` straight on.
+        Command::MacroRecord { register } => crate::macros::macro_record(state, *register),
+        Command::MacroRun { register } => {
+            crate::macros::macro_run(state, browser, *register, count)
+        }
+// --- end src/macros.rs ---------------------------------------------------------------------------
+
 // --- adblock ---------------------------------------------------------------------------------
         // None of the three is bound to a key, in qutebrowser or here: they are typed, rarely, and
         // `:adblock-update` in particular is the one thing in bru that reaches the network of its
@@ -697,6 +707,13 @@ pub fn is_live(command: &Command) -> bool {
         // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
 
         Command::Nop | Command::ClearKeychain => true,
+
+// --- src/macros.rs -------------------------------------------------------------------------------
+        // Both act in every spelling: bare (`q`, `@`) they open the mode that names a register,
+        // and with one they record or replay straight away. A register that holds nothing says so
+        // rather than doing nothing, which is still the key having an effect.
+        Command::MacroRecord { .. } | Command::MacroRun { .. } => true,
+// --- end src/macros.rs ---------------------------------------------------------------------------
 
 // --- adblock ---------------------------------------------------------------------------------
         // Live, and not part of the default-binding count: qutebrowser binds none of them either.
@@ -1019,6 +1036,14 @@ wrap_task! {
             else {
                 return;
             };
+// --- src/macros.rs -------------------------------------------------------------------------------
+            // What a macro keeps of `o example.com<Return>`. Command mode is left before the text
+            // runs (`cmdline::on_accept` → `leave_command_mode`, and `statusbar/command.py:193-198`
+            // in qutebrowser), so the mode `record` sees here is normal and the accepted command is
+            // recorded — while the `cmd-set-text` that opened the line was refused. That pairing is
+            // the whole reason a macro can contain a URL that was typed after `q` was pressed.
+            crate::macros::record(&state, &command, self.count);
+// --- end src/macros.rs ---------------------------------------------------------------------------
             run(&state, &mut browser, &command, self.count);
         }
     }
@@ -1106,8 +1131,8 @@ mod tests {
         // 226 through stage 1 and most of stage 2; 231 once hint mode existed and its five
         // `hint:` bindings (configdata.yml:3884) had a mode to belong to; 262 once caret mode
         // brought the 29 of `caret:` (3961) and the two mark modes each brought the one line of
-        // `register:` (3991).
-        assert_eq!(DEFAULT_BINDINGS.len(), 262);
+        // `register:` (3991); 264 once macros brought the other two modes that read it.
+        assert_eq!(DEFAULT_BINDINGS.len(), 264);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1123,8 +1148,13 @@ mod tests {
         // before "does it act", which put the 17 readline bindings with the dead for a whole stage.
         // Nothing was fixed to reach it — the ruler was.
         //
+        // 245 with macros, which is four and not the two `q` and `@` are worth on their own: adding
+        // `record_macro` and `run_macro` adds their `register:` `<Escape>` row apiece to the table
+        // as well, exactly as `set_mark` and `jump_mark` each did. Both new rows are live, so the
+        // denominator and the numerator move together — 241/262 to 245/264.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 241, "the live-binding count moved");
+        assert_eq!(live, 245, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------

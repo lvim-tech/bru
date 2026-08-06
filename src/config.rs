@@ -266,6 +266,12 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("set_mark", "<Escape>", "mode-leave"),
     ("jump_mark", "<Escape>", "mode-leave"),
 // --- end src/caret.rs ----------------------------------------------------------------------
+// --- src/macros.rs -------------------------------------------------------------------------------
+    // The other two modes built on `RegisterKeyParser`, and so the other two readers of the same
+    // one-line `register:` section at 3991. Written out per mode for the reason above.
+    ("record_macro", "<Escape>", "mode-leave"),
+    ("run_macro", "<Escape>", "mode-leave"),
+// --- end src/macros.rs ---------------------------------------------------------------------------
     // -- hint ----------------------------------------------------------------------------------
     ("hint", "<Return>", "hint-follow"),
     ("hint", "<Ctrl-R>", "hint --rapid links tab-bg"),
@@ -667,16 +673,16 @@ mod tests {
             }
         }
         // 189 normal + 4 insert + 5 hint + 32 command + 1 passthrough, from configdata.yml, plus
-        // stage 3's 29 caret rows and the one-line `register:` section under each of `set_mark` and
-        // `jump_mark`.
-        assert_eq!(total, 262, "the default table is not the one transcribed from configdata.yml");
+        // stage 3's 29 caret rows and the one-line `register:` section under each of the four modes
+        // that read it — `set_mark`, `jump_mark`, `record_macro` and `run_macro`.
+        assert_eq!(total, 264, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
     #[test]
     fn defaults_are_all_parseable_and_none_collide() {
         let bindings = Bindings::defaults();
-        // 262 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
+        // 264 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
         // mode, one would have silently overwritten the other and the counts would not add up.
         // <Ctrl-A> and <ctrl-a> are the same binding, so this really is checking something. Caret
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
@@ -690,6 +696,10 @@ mod tests {
         assert_eq!(bindings.len(Mode::Caret), 29);
         assert_eq!(bindings.len(Mode::SetMark), 1);
         assert_eq!(bindings.len(Mode::JumpMark), 1);
+// --- src/macros.rs -------------------------------------------------------------------------------
+        assert_eq!(bindings.len(Mode::RecordMacro), 1);
+        assert_eq!(bindings.len(Mode::RunMacro), 1);
+// --- end src/macros.rs ---------------------------------------------------------------------------
     }
 
     #[test]

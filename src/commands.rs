@@ -276,6 +276,16 @@ pub enum Command {
     Message { level: crate::message::Level, text: String },
 // --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
+// --- src/macros.rs -------------------------------------------------------------------------------
+    /// `macro-record [register]` — `q`. With no register the next keystroke names one
+    /// (`Mode::RecordMacro`); while a recording is in progress it stops instead, and the argument
+    /// is ignored, exactly as `macros.py:47-58` does.
+    MacroRecord { register: Option<char> },
+    /// `macro-run [register]` — `@`, with the count. With no register the next keystroke names one
+    /// (`Mode::RunMacro`); `@` as the register means the last one run.
+    MacroRun { register: Option<char> },
+// --- end src/macros.rs ---------------------------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -1269,6 +1279,30 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
 // --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
+// --- src/macros.rs -------------------------------------------------------------------------------
+        // A register is one character, because that is what names one: `RegisterKeyParser` passes
+        // `e.text()` (modeparsers.py:284), a single keystroke. qutebrowser's own signature says
+        // `register: str = None` and would take `:macro-record foo` as a three-letter key no
+        // keystroke can ever reach, which is a way to lose a macro rather than a feature.
+        "macro-record" | "macro-run" => {
+            let register = match args.arg(0) {
+                None => None,
+                Some(register) => {
+                    let mut chars = register.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Some(c),
+                        _ => return Err(bad(&format!("a register is one character, not {register:?}"))),
+                    }
+                }
+            };
+            if name == "macro-record" {
+                Command::MacroRecord { register }
+            } else {
+                Command::MacroRun { register }
+            }
+        }
+// --- end src/macros.rs ---------------------------------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
@@ -1637,19 +1671,40 @@ mod tests {
 
     #[test]
     fn unknown_commands_are_kept_verbatim_not_rejected() {
-        // `q` and `@` in the default table. Macros need a mode that records a key sequence and one
-        // that replays it, and neither is in any milestone — but the bindings still have to keep
-        // their place in the trie, or `q` would report NoMatch and eat a pending chain.
+        // `.` and `sf` in the default table. `cmd-repeat-last` needs the last command remembered
+        // per mode and `save` needs a config to write, and neither is in any milestone — but the
+        // bindings still have to keep their place in the trie, or `s` would report NoMatch and eat
+        // a pending chain.
         //
-        // (This test used to name `print`, which the polish workstream then implemented. If macros
-        // land too, move it again rather than deleting it: something is always unimplemented, and
-        // the behaviour it pins — unknown is kept, not rejected — is what makes that survivable.)
-        for name in ["macro-record", "macro-run"] {
+        // (This test used to name `print`, which the polish workstream implemented, and then
+        // `macro-record`/`macro-run`, which src/macros.rs implemented. Move it again rather than
+        // deleting it: something is always unimplemented, and the behaviour it pins — unknown is
+        // kept, not rejected — is what makes that survivable.)
+        for name in ["cmd-repeat-last", "save"] {
             let cmd = parse(name).unwrap();
             assert_eq!(cmd, Command::Unimplemented(name.to_string()));
             assert!(!cmd.is_implemented());
         }
     }
+
+// --- src/macros.rs -------------------------------------------------------------------------------
+    #[test]
+    fn macro_commands() {
+        // `q` and `@`, bare: no register, so the next keystroke names one.
+        assert_eq!(parse("macro-record").unwrap(), Command::MacroRecord { register: None });
+        assert_eq!(parse("macro-run").unwrap(), Command::MacroRun { register: None });
+        // `:macro-record a` skips the mode and starts recording straight away.
+        assert_eq!(
+            parse("macro-record a").unwrap(),
+            Command::MacroRecord { register: Some('a') }
+        );
+        assert_eq!(parse("macro-run @").unwrap(), Command::MacroRun { register: Some('@') });
+        // A register is one keystroke. Anything longer is a typo that would otherwise record into
+        // a register nothing can ever name.
+        assert!(parse("macro-record foo").is_err());
+        assert!(parse("macro-run foo").is_err());
+    }
+// --- end src/macros.rs ---------------------------------------------------------------------------
 
 // --- src/clip.rs -----------------------------------------------------------
     #[test]
