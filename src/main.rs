@@ -29,6 +29,7 @@ mod open;
 mod scroll;
 mod spawn;
 mod session;
+mod settings;
 mod state;
 mod tabs;
 mod window;

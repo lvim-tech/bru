@@ -139,6 +139,15 @@ wrap_browser_process_handler! {
                 state.set_parsers(config.into_parsers());
             }
 
+            // --- src/settings.rs (merge: this block belongs to the settings workstream) ---------
+            // What config.lua set, pushed into Chromium. `Config::into_parsers` above only stored
+            // it — that function is run by unit tests with no browser process behind them, and a
+            // content-settings call there would go through libcef before `initialize`. Here it is
+            // safe, it is the UI thread, and it is still before the first tab exists: a start page
+            // with JavaScript switched off has to load that way rather than load and be corrected.
+            crate::settings::apply_at_startup();
+            // --- end src/settings.rs ----------------------------------------------------------
+
             // The completion's four sources, bound to the modules that own them. After the line
             // above, which is what installs the search engines from config.lua.
             crate::completion::install(Box::new(crate::data::DataSources));
@@ -312,6 +321,24 @@ wrap_browser_process_handler! {
                 crate::session::schedule_script(&script, step_ms);
             }
             // --- end sessions -------------------------------------------------------------------
+
+            // --- src/settings.rs (merge: this block belongs to the settings workstream) ---------
+            // Debug hook, off unless asked for. See settings::schedule_probe — it reads what
+            // Chromium answers for a setting at a URL, which is the only evidence that a `:set`
+            // reached the engine rather than only bru's own store.
+            let probe =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("settings-probe"))))
+                    .to_string();
+            if !probe.is_empty() {
+                let after_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("settings-probe-after-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(5000);
+                crate::settings::schedule_probe(&probe, after_ms);
+            }
+            // --- end src/settings.rs ----------------------------------------------------------
 
             // --- M12 (merge: this block belongs to src/hints.rs's workstream) --------------------
             // Debug hook, off unless asked for. See hints::schedule_hint_script.

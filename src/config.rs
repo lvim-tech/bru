@@ -14,6 +14,9 @@ use crate::bindings::{BindingTrie, KeyInfo, KeyParsers, parse_key_sequence, sequ
 use crate::commands::{self, Command};
 use crate::modes::Mode;
 use crate::open::SearchEngines;
+/// The typed settings store lives in `settings.rs`, where the behaviour behind each name lives too.
+/// It is re-exported here because `bru.set` is a config-time entry point and `Config` carries it.
+pub use crate::settings::Settings;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -410,39 +413,6 @@ pub struct Config {
     pub settings: Settings,
 }
 
-/// The settings `bru.set` can name, and nothing else — an unknown key is an error the config author
-/// sees at startup rather than a line that silently does nothing.
-///
-/// One field today. It is a struct rather than a map so that adding a setting means adding a field
-/// and a match arm, and so that every reader gets a typed value.
-#[derive(Debug, Clone, Default)]
-pub struct Settings {
-    /// **DECISIONS.md item 7.** `None` leaves the compiled-in [`crate::app::HOME`] standing.
-    pub start_page: Option<String>,
-}
-
-impl Settings {
-    /// The keys `bru.set` accepts, for the error message that lists them.
-    const KEYS: &'static [&'static str] = &["start_page"];
-
-    /// Set one. The error string is what `bru.set` raises into Lua.
-    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
-        match key {
-            "start_page" => {
-                if value.trim().is_empty() {
-                    return Err("start_page cannot be empty".to_string());
-                }
-                self.start_page = Some(value.to_string());
-                Ok(())
-            }
-            other => Err(format!(
-                "unknown setting {other:?}; bru knows {}",
-                Settings::KEYS.join(", ")
-            )),
-        }
-    }
-}
-
 impl Config {
     /// Load the defaults, then `~/.config/bru/config.lua` if it exists.
     ///
@@ -489,8 +459,14 @@ impl Config {
     /// in `app.rs`, so that the one existing call site needs no second line — and so that it cannot
     /// be forgotten, because a `:open` against an empty engine table would silently search
     /// DuckDuckGo and look almost right.
+    ///
+    /// The settings go the same way, to `settings.rs`, so that `:set` at runtime is changing the
+    /// same store `config.lua` filled. That install is pure — pushing a value into Chromium is
+    /// `settings::apply_at_startup`, which `app.rs` calls once CEF is up, because this function is
+    /// also run by unit tests with no browser process behind them.
     pub fn into_parsers(self) -> KeyParsers {
-        crate::open::install(self.search, self.settings.start_page);
+        crate::open::install(self.search, self.settings.start_page());
+        crate::settings::install(self.settings);
         KeyParsers::new(self.bindings.into_tries())
     }
 }
@@ -520,7 +496,9 @@ pub fn config_path() -> Option<PathBuf> {
 ///
 /// - `bru.bind(mode, keys, command)` / `bru.unbind(mode, keys)`
 /// - `bru.search(name, url_template)` — `{}` in the template is the term, percent-encoded
-/// - `bru.set(key, value)`
+/// - `bru.set(key, value)` — one of `crate::settings::SETTINGS`, and nothing else; an unknown key
+///   raises with the list, so `start_pgae` is an error at startup rather than a line that does
+///   nothing. The same store is what `:set` and `config-cycle` change while bru runs.
 fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
     let shared = Arc::new(Mutex::new(config));
 
@@ -743,7 +721,10 @@ mod tests {
         assert_eq!(config.search.get("gh"), Some("https://github.com/search?q={}"));
         // DEFAULT is there whether or not the config mentioned it.
         assert_eq!(config.search.get("DEFAULT"), Some(crate::open::DEFAULT_ENGINE_URL));
-        assert_eq!(config.settings.start_page.as_deref(), Some("https://start.duckduckgo.com/"));
+        assert_eq!(
+            config.settings.start_page().as_deref(),
+            Some("https://start.duckduckgo.com/")
+        );
 
         // ...and the table survives all the way into the decision `:open` makes.
         assert_eq!(
@@ -783,7 +764,7 @@ mod tests {
         let config = Config::load_from(Some(&cfg.path()));
         // The call before the bad one took effect; the bad one raised; the one after did not run.
         assert_eq!(config.search.get("ok"), Some("https://x/?q={}"));
-        assert_eq!(config.settings.start_page, None);
+        assert_eq!(config.settings.start_page(), None);
         assert_eq!(config.search.get("never"), None);
 
         // A name with a space could never be typed at `:open`, so it is refused rather than kept.
