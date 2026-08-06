@@ -953,13 +953,18 @@ pub fn renderer_on_context_created(frame: Option<&Frame>) {
 
     for (name, code) in wrapped {
         log(&format!("injecting {name} into {url}"));
-        frame.execute_java_script(
-            Some(&CefString::from(code.as_str())),
-            // Where an exception in the script is reported from. Not a URL anything can be fetched
-            // from — nothing here ever fetches — just a name for the console.
-            Some(&CefString::from(format!("bru-greasemonkey:{name}").as_str())),
-            0,
-        );
+        // `V8Context::eval`, not `Frame::execute_java_script`. Measured 2026-08-06: from inside
+        // `on_context_created` the latter runs nothing at all — the six scripts below were handed
+        // to the frame, the log said so, and the page was untouched a full seven seconds later
+        // (`gm-probe: … order:["page-script"]`, banner unchanged). The renderer-side `CefFrameImpl`
+        // queues an `ExecuteJavaScript` until the frame is attached to the browser process, which
+        // for a context this new has not happened yet. `eval` runs in the context that was just
+        // created, synchronously, which is the whole point of injecting here.
+        if let Some(value) = evaluate(frame, &code) {
+            if value.starts_with("<exception:") {
+                eprintln!("bru[greasemonkey]: {name} threw on injection: {value}");
+            }
+        }
     }
 }
 
@@ -1391,6 +1396,29 @@ document.body.style.background = 'red';
         assert!(!wrapped.contains("cefQuery"));
         assert!(!wrapped.contains("__bru_hints"));
         assert!(!wrapped.contains("__bru_caret"));
+    }
+
+    /// The bug this test exists for cost an hour on 2026-08-06. Every sentinel was also *named* in
+    /// the wrapper's header comment, so `fill` substituted the header copy as well; the userscript
+    /// source landed in the middle of a `//` line and the generated file died with
+    /// `SyntaxError: Unexpected identifier 'userscript'`. `node --check chrome/greasemonkey.js`
+    /// passed the whole time — the template was valid, only what was *made* from it was not — and
+    /// the symptom was six scripts that were injected, logged, and did nothing.
+    #[test]
+    fn every_sentinel_appears_exactly_once_in_the_template() {
+        for sentinel in [
+            "@@BRU_SCRIPT_NAME@@",
+            "@@BRU_SCRIPT_INFO@@",
+            "@@BRU_RUN_AT@@",
+            "@@BRU_SOURCE@@",
+        ] {
+            assert_eq!(
+                WRAPPER_JS.matches(sentinel).count(),
+                1,
+                "{sentinel} must appear exactly once in chrome/greasemonkey.js — a second copy, \
+                 even inside a comment, is substituted too and breaks the generated script"
+            );
+        }
     }
 
     #[test]

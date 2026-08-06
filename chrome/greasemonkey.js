@@ -16,12 +16,16 @@
 //
 // ---------------------------------------------------------------------------------------------
 // Rust substitutes four sentinels into a copy of this text, once per script, in
-// `greasemonkey::wrap`:
+// `Script::wrapped`. Each is named `BRU_` + its role and appears **exactly once below**, and
+// nowhere in this header — a sentinel mentioned twice would be substituted twice, and the second
+// copy landing in the middle of a comment is a syntax error that only exists in the generated file.
+// `greasemonkey::tests::every_sentinel_appears_exactly_once_in_the_template` is what keeps that
+// from happening again:
 //
-//   @@BRU_SCRIPT_NAME@@   the namespace/name pair, already escaped for a JS string literal
-//   @@BRU_SCRIPT_INFO@@   GM_info as JSON, escaped for a JS string literal and JSON.parse'd
-//   @@BRU_RUN_AT@@        document-start | document-end | document-idle, already normalised
-//   /*@@BRU_SOURCE@@*/    the userscript's own source, verbatim
+//   SCRIPT_NAME   the namespace/name pair, already escaped for a JS string literal
+//   SCRIPT_INFO   GM_info as JSON, escaped for a JS string literal and JSON.parse'd
+//   RUN_AT        document-start | document-end | document-idle, already normalised
+//   SOURCE        the user's own script, verbatim, dropped into an empty block comment
 //
 // The sentinels are written so that this file parses as-is — `node --check chrome/greasemonkey.js`
 // is part of the check, and a template that only became valid after substitution could not have
