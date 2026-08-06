@@ -84,70 +84,17 @@
     return "warn";
   }
 
-  // <span class="col">…</span>, with the matched substring in <span class="match">.
-  // A column is either a plain string or {text, match}.
-  function column(spec) {
-    var el = document.createElement("span");
-    el.className = "col";
-
-    var text = typeof spec === "string" ? spec : (spec && spec.text) || "";
-    var match = typeof spec === "string" ? "" : (spec && spec.match) || "";
-    var at = match ? text.indexOf(match) : -1;
-
-    if (at === -1) {
-      el.textContent = text;
-      return el;
-    }
-
-    el.appendChild(document.createTextNode(text.slice(0, at)));
-    var hit = document.createElement("span");
-    hit.className = "match";
-    hit.textContent = text.slice(at, at + match.length);
-    el.appendChild(hit);
-    el.appendChild(document.createTextNode(text.slice(at + match.length)));
-    return el;
-  }
-
-  // state.completion = [{name, items: [{cols: [...], selected}]}, ...], in
-  // qutebrowser's order: Search engines, Quickmarks, Bookmarks, History.
-  // Nothing pushes this yet — the completion model is a later milestone — but
-  // the clear below runs on every render and is what keeps the bar at 24px.
+  // The completion table is completion.js's, not this file's. Stage 1 had a
+  // renderer here that read {text, match} substrings; the contract sends
+  // {cols: [...], match: [[start, len], …]}, and two renderers against two
+  // shapes is one silently drawing the wrong thing. This file no longer knows
+  // what a category looks like.
+  //
+  // Guarded because bottom.html gains its <script src="completion.js"> at merge:
+  // until then the bar still renders, with no completion.
   function renderCompletion(categories) {
-    var host = document.getElementById("completion");
-    if (!host) {
-      return;
-    }
-
-    host.textContent = "";
-    if (!categories || !categories.length) {
-      return;
-    }
-
-    for (var c = 0; c < categories.length; c++) {
-      var category = categories[c] || {};
-      var items = category.items || [];
-
-      var el = document.createElement("div");
-      el.className = "category";
-
-      var header = document.createElement("div");
-      header.className = "cat-header";
-      header.textContent = category.name || "";
-      el.appendChild(header);
-
-      for (var i = 0; i < items.length; i++) {
-        var item = items[i] || {};
-        var row = document.createElement("div");
-        row.className = item.selected ? "item selected" : "item";
-
-        var cols = item.cols || [];
-        for (var j = 0; j < cols.length; j++) {
-          row.appendChild(column(cols[j]));
-        }
-        el.appendChild(row);
-      }
-
-      host.appendChild(el);
+    if (window.bruCompletion) {
+      window.bruCompletion.render(categories);
     }
   }
 
