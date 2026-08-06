@@ -1260,6 +1260,16 @@ fn inject_key(spec: &str) {
         Some(spec) => (true, spec),
         None => (false, spec),
     };
+    // `key:char:x` sends the CHAR alone, at the bottom strip. That is not a press anyone can make —
+    // it is the *second half* of one. A real keystroke's four events are dispatched one at a time to
+    // whichever view holds focus at that instant, so a key whose command moves focus has its
+    // RAWKEYDOWN delivered to the page and its CHAR delivered to the strip that just took focus.
+    // `send_key_event` aims at one browser and cannot reproduce that split, which is why the bug
+    // this exists to measure was invisible to every harness bru had.
+    let (char_only, spec) = match spec.strip_prefix("char:") {
+        Some(spec) => (true, spec),
+        None => (false, spec),
+    };
 
     let Some(info) = crate::bindings::parse_key_sequence(spec)
         .ok()
@@ -1282,6 +1292,7 @@ fn inject_key(spec: &str) {
         return;
     };
 
+    let mut shift_for_the_key = false;
     let (code, character) = match info.key {
         // `Key::Char` is canonical — qutebrowser stores letters uppercase whether or not Shift was
         // held — so the character a real keyboard would have produced comes back from the modifier.
@@ -1291,7 +1302,25 @@ fn inject_key(spec: &str) {
             } else {
                 c.to_ascii_lowercase()
             };
-            (c.to_ascii_uppercase() as i32, typed as u16)
+            // The virtual key code names a *physical key*, not the character it types, so it cannot
+            // be the character's own value. For a letter the two happen to coincide — `'J'` is 74
+            // and so is `VKEY_J` — which is why this read correctly for every key anyone had
+            // injected until the first punctuation one. Measured 2026-08-06: `:` went in as code 58,
+            // which is no VKEY at all, `us_layout_char` answered None, and the press was dropped
+            // before it reached a binding — the injector reported success and nothing happened.
+            //
+            // So the US table is searched backwards for the physical key that types this character,
+            // which also says whether Shift is part of typing it: `:` is `VKEY_OEM_1` **shifted**.
+            let found = (0x08..=0xDF)
+                .flat_map(|vkey| [(vkey, false), (vkey, true)])
+                .find(|(vkey, shift)| crate::bindings::us_layout_char(*vkey, *shift) == Some(typed));
+            match found {
+                Some((vkey, shift)) => {
+                    shift_for_the_key = shift;
+                    (vkey, typed as u16)
+                }
+                None => (c.to_ascii_uppercase() as i32, typed as u16),
+            }
         }
         crate::bindings::Key::Named(_) => {
             eprintln!("cmdline-script: only character keys can be injected so far");
@@ -1312,12 +1341,23 @@ fn inject_key(spec: &str) {
             modifiers |= flag;
         }
     }
+    // Shift is part of typing the character on this layout even when the keystring does not spell
+    // it: `:` is Shift plus the `;` key, and `us_layout_char` is asked with Shift held on the way
+    // back in, so the flag has to be on the wire.
+    if shift_for_the_key {
+        modifiers |= 2;
+    }
 
     // All four, in the order a real press delivers them. CHAR is the one that inserts the character
     // into a focused field — trap 1 in CEF-NOTES.md is about not acting on it three times, and its
     // mirror image is that leaving CHAR out injects a key that types nothing. Measured 2026-08-06:
     // without CHAR, `d` reached `on_pre_key_event` and the input stayed empty.
-    for type_ in [KeyEventType::KEYDOWN, KeyEventType::CHAR, KeyEventType::KEYUP] {
+    let types: &[KeyEventType] = if char_only {
+        &[KeyEventType::CHAR]
+    } else {
+        &[KeyEventType::KEYDOWN, KeyEventType::CHAR, KeyEventType::KEYUP]
+    };
+    for &type_ in types {
         let event = KeyEvent {
             type_,
             modifiers,
@@ -1331,7 +1371,7 @@ fn inject_key(spec: &str) {
     }
     eprintln!(
         "cmdline-script: injected {spec} at the {}",
-        if at_page { "page" } else { "bottom chrome" }
+        if char_only { "bottom chrome, CHAR only" } else if at_page { "page" } else { "bottom chrome" }
     );
 }
 
