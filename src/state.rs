@@ -166,6 +166,13 @@ impl BruState {
     /// still have to act on the page, so the strip's key is dispatched against this instead.
     pub fn active_browser(&mut self) -> Option<Browser> {
         let id = self.active_tab_browser_id()?;
+        self.browser_with_id(id)
+    }
+
+    /// Any live browser by identifier. `active_browser` is the common case; saving a session needs
+    /// every tab's browser, because a navigation list can only be read from the browser that holds
+    /// it.
+    pub fn browser_with_id(&mut self, id: i32) -> Option<Browser> {
         self.browsers
             .iter_mut()
             .find(|browser| browser.identifier() == id)
@@ -346,7 +353,7 @@ wrap_task! {
                 }
                 "J" => crate::tabs::next_tab(&state),
                 "K" => crate::tabs::prev_tab(&state),
-                "d" => crate::tabs::close_current(&state),
+                "d" => crate::tabs::close_current(&state, false),
                 other => eprintln!("tab-script: no step named {other}"),
             }
             let state = state.lock().expect("state mutex poisoned");

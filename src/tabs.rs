@@ -26,6 +26,14 @@ pub struct Tab {
     browser_id: Option<i32>,
     title: String,
     url: String,
+    /// `<Ctrl-p>` — a tab that keeps its place and does not get closed by accident. It is bru's own
+    /// flag and nothing in CEF knows about it; what it changes is `close_current`, `close_others`
+    /// and the class the strip draws.
+    pinned: bool,
+    /// `<Alt-m>` — the mirror of `host.is_audio_muted()`. Kept here as well as asked of CEF because
+    /// the strip is rendered from this struct and a tab's browser may not exist yet, and because a
+    /// restored session has to re-apply it to a browser that has not been made.
+    muted: bool,
 }
 
 /// The plain state operations. None of these touch CEF.
@@ -91,14 +99,68 @@ impl BruState {
             .enumerate()
             .map(|(index, tab)| {
                 format!(
-                    "{{\"title\":\"{}\",\"url\":\"{}\",\"active\":{}}}",
+                    "{{\"title\":\"{}\",\"url\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
                     crate::ipc::json_escape(&tab.title),
                     crate::ipc::json_escape(&tab.url),
                     index == self.active,
+                    tab.pinned,
+                    tab.muted,
                 )
             })
             .collect();
         format!("{{\"tabs\":[{}]}}", entries.join(","))
+    }
+
+    /// Whether the tab at `index` keeps its place — what `tab-close` and `tab-only` consult before
+    /// they take a tab away.
+    pub fn tab_pinned(&self, index: usize) -> bool {
+        self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false)
+    }
+
+    pub fn tab_muted(&self, index: usize) -> bool {
+        self.tabs.get(index).map(|tab| tab.muted).unwrap_or(false)
+    }
+
+    /// Flip the pin on the tab at `index` and answer what it became. `tab-pin` is a toggle in
+    /// qutebrowser (`commands.py:278`), not a setter.
+    pub fn toggle_tab_pinned(&mut self, index: usize) -> bool {
+        match self.tabs.get_mut(index) {
+            Some(tab) => {
+                tab.pinned = !tab.pinned;
+                tab.pinned
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_tab_pinned(&mut self, index: usize, pinned: bool) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.pinned = pinned;
+        }
+    }
+
+    /// Flip the mute flag and answer what it became. The CEF call that acts on it is
+    /// [`toggle_mute`], outside the lock.
+    pub fn toggle_tab_muted(&mut self, index: usize) -> bool {
+        match self.tabs.get_mut(index) {
+            Some(tab) => {
+                tab.muted = !tab.muted;
+                tab.muted
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_tab_muted(&mut self, index: usize, muted: bool) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.muted = muted;
+        }
+    }
+
+    /// The browser identifier of each tab, in strip order. `None` for a tab whose browser CEF has
+    /// not made yet. Sessions need every tab's browser, not only the showing one's.
+    pub fn tab_browser_ids(&self) -> Vec<Option<i32>> {
+        self.tabs.iter().map(|tab| tab.browser_id).collect()
     }
 
     pub fn tab_count(&self) -> usize {
@@ -155,15 +217,24 @@ impl BruState {
     }
 
     /// Removes every tab but the showing one and hands their views back to be dropped.
-    pub fn take_other_tabs(&mut self) -> Vec<BrowserView> {
+    ///
+    /// A pinned tab survives unless `force`. qutebrowser's `:tab-only` takes `--pinned
+    /// prompt|close|keep` and defaults to `prompt` (`commands.py:780-826`); bru has no yes/no mode
+    /// to prompt in, so the default is the answer a prompt would most likely get — keep it — and
+    /// `-f` is the way to say otherwise.
+    pub fn take_other_tabs(&mut self, force: bool) -> Vec<BrowserView> {
         if self.tabs.is_empty() {
             return Vec::new();
         }
         let active = self.active;
         let mut taken = Vec::new();
         let mut kept = Vec::new();
+        let mut new_active = 0;
         for (index, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
             if index == active {
+                new_active = kept.len();
+                kept.push(tab);
+            } else if tab.pinned && !force {
                 kept.push(tab);
             } else {
                 self.closed.push(tab.url.clone());
@@ -171,7 +242,7 @@ impl BruState {
             }
         }
         self.tabs = kept;
-        self.active = 0;
+        self.active = new_active;
         self.last_active = None;
         taken
     }
@@ -182,6 +253,8 @@ impl BruState {
             browser_id: None,
             title: String::new(),
             url: String::new(),
+            pinned: false,
+            muted: false,
         });
         self.tabs.len() - 1
     }
@@ -333,11 +406,13 @@ pub fn prev_tab(state: &SharedState) {
 ///
 /// The views come out of the window and are dropped, exactly as [`close_current`] does it, and for
 /// the same reason: `host.close_browser` on a Views browser closes the window it is parented to.
-pub fn close_others(state: &SharedState) {
-    let (closed, window, tabs) = {
+///
+/// Pinned tabs stay unless `force` — see [`BruState::take_other_tabs`].
+pub fn close_others(state: &SharedState, force: bool) {
+    let (closed, window, tabs, active) = {
         let mut state = state.lock().expect("state mutex poisoned");
-        let closed = state.take_other_tabs();
-        (closed, state.window(), state.tabs_json())
+        let closed = state.take_other_tabs(force);
+        (closed, state.window(), state.tabs_json(), state.active_tab())
     };
     if closed.is_empty() {
         return;
@@ -350,7 +425,59 @@ pub fn close_others(state: &SharedState) {
     drop(closed);
 
     crate::ipc::set_tabs(tabs);
-    select(state, 0);
+    // Not 0: pinned tabs may have stayed in front of the one that is showing.
+    select(state, active);
+}
+
+/// `<Ctrl-p>` — pin or unpin the showing tab.
+///
+/// The flag is bru's; nothing in CEF has a concept of a pinned browser. What it buys is the two
+/// close paths refusing to take the tab away without `-f`, and the `pinned` class on the strip,
+/// which `chrome/chrome.css` already had colours for.
+pub fn toggle_pin(state: &SharedState) {
+    let tabs = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let index = state.active_tab();
+        state.toggle_tab_pinned(index);
+        state.tabs_json()
+    };
+    crate::ipc::set_tabs(tabs);
+}
+
+/// `<Alt-m>` — mute or unmute the showing tab.
+///
+/// `host.set_audio_muted` (bindings 12784) is the CEF side, and it is called after the lock is
+/// dropped like every other CEF call in this file.
+pub fn toggle_mute(state: &SharedState) {
+    let (muted, browser, tabs) = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let index = state.active_tab();
+        let muted = state.toggle_tab_muted(index);
+        let browser = state.active_browser();
+        (muted, browser, state.tabs_json())
+    };
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        host.set_audio_muted(i32::from(muted));
+    }
+    crate::ipc::set_tabs(tabs);
+}
+
+/// Re-apply a tab's mute flag to the browser CEF eventually made for it — the one thing a restored
+/// session cannot do at the moment it creates the tab, because `browser_view_create` returns before
+/// the browser exists.
+pub fn apply_mute(state: &SharedState, index: usize) {
+    let (muted, browser) = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let muted = state.tab_muted(index);
+        let id = state.tab_browser_ids().get(index).copied().flatten();
+        (muted, id.and_then(|id| state.browser_with_id(id)))
+    };
+    if !muted {
+        return;
+    }
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        host.set_audio_muted(1);
+    }
 }
 
 /// Moves the showing tab to `to` in the strip — `gm`, `gJ`, `gK`.
@@ -367,9 +494,16 @@ pub fn move_current(state: &SharedState, to: usize) {
 /// Closes the showing tab. Closing the last one closes the window, which is what the plan settled
 /// on — qutebrowser's `tabs.last_close` default keeps a blank tab instead, and that is
 /// DECISIONS.md item 6, still open.
-pub fn close_current(state: &SharedState) {
+pub fn close_current(state: &SharedState, force: bool) {
     let (closed, remaining, window, active) = {
         let mut state = state.lock().expect("state mutex poisoned");
+        // A pinned tab is not closed by a bare `d`. qutebrowser prompts here
+        // (`tabbedbrowser.py:431`); bru has no yes/no mode, so it says why and does nothing, and
+        // `:tab-close -f` is the way through.
+        if state.tab_pinned(state.active_tab()) && !force {
+            eprintln!("bru: tab is pinned — :tab-close -f to close it anyway");
+            return;
+        }
         let closed = state.take_active_tab();
         (
             closed,
