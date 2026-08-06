@@ -135,6 +135,19 @@ impl BruState {
         self.modes.mode()
     }
 
+    /// The `Browser` of the tab currently showing.
+    ///
+    /// Needed because a key does not always arrive at the page: CEF delivers it to whichever view
+    /// holds focus, and with `sloppyfocus` on this desktop that is easily a chrome strip. Commands
+    /// still have to act on the page, so the strip's key is dispatched against this instead.
+    pub fn active_browser(&mut self) -> Option<Browser> {
+        let id = self.active_tab_browser_id()?;
+        self.browsers
+            .iter_mut()
+            .find(|browser| browser.identifier() == id)
+            .cloned()
+    }
+
     /// Enter a mode, clearing the pending chain of the one left behind. `only_if_normal` is what
     /// stops a page's focus event dragging you out of passthrough.
     pub fn enter_mode(&mut self, mode: crate::modes::Mode, only_if_normal: bool) -> bool {

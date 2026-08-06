@@ -1205,3 +1205,35 @@ mod tests {
         assert_eq!(parsers.parser(Mode::Normal).keystring(), "");
     }
 }
+
+#[cfg(test)]
+mod merge_probe {
+    use super::*;
+
+    /// `<Ctrl-T>` must resolve from what CEF actually delivers. It is bound to `open -t`, and if it
+    /// does not match, normal mode does not swallow it (a Ctrl chord is `is_non_alnum`), Chromium
+    /// sees it, and opens `chrome://newtab/` inside bru — measured 2026-08-06 in a real session.
+    #[test]
+    fn ctrl_t_from_cef_matches_its_binding() {
+        const VKEY_T: i32 = 0x54;
+        const CTRL: u32 = 1 << 2; // EVENTFLAG_CONTROL_DOWN
+
+        let from_event = KeyInfo::from_cef(VKEY_T, CTRL, 0).expect("Ctrl-T is not a bare modifier");
+        let from_config = parse_key_sequence("<Ctrl-T>").expect("the default bindings parse");
+
+        assert_eq!(
+            vec![from_event], from_config,
+            "what CEF delivers for Ctrl-T must equal what <Ctrl-T> parses to"
+        );
+    }
+
+    /// Same question for a plain letter, which is known to work — so a failure above is about the
+    /// modifier path and not about letters in general.
+    #[test]
+    fn plain_j_from_cef_matches_its_binding() {
+        const VKEY_J: i32 = 0x4A;
+        let from_event = KeyInfo::from_cef(VKEY_J, 0, b'j' as u16).expect("j is not a modifier");
+        let from_config = parse_key_sequence("j").expect("j parses");
+        assert_eq!(vec![from_event], from_config);
+    }
+}

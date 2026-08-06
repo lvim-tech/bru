@@ -56,6 +56,11 @@ impl BruState {
         self.tab_index_of(identifier) == Some(self.active)
     }
 
+    /// The browser id of the showing tab, if it has one yet.
+    pub fn active_tab_browser_id(&self) -> Option<i32> {
+        self.tabs.get(self.active).and_then(|tab| tab.browser_id)
+    }
+
     /// Records a tab's address. Returns false when the browser is not a tab at all, which is how a
     /// chrome strip reporting its own bru:// URL is kept out of the status line.
     pub fn set_tab_url(&mut self, identifier: i32, url: String) -> bool {

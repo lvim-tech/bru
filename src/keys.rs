@@ -44,17 +44,40 @@ wrap_keyboard_handler! {
                 return 0;
             }
 
-            // A key that reached a chrome strip is a key meant for the chrome — the command line
-            // takes letters. Scrolling the tab strip with j would be nonsense anyway. (The command
-            // line's own keys arrive this way and are handled here from M9 onwards.)
-            if self
+            // CEF delivers a key to whichever view holds focus, and that is not always the page:
+            // this desktop runs `sloppyfocus`, so moving the pointer over a chrome strip is enough.
+            //
+            // A key arriving at a strip must never be *forwarded* to it. Chromium's own shortcuts
+            // are live inside any browser, so an unswallowed `<Ctrl-T>` there navigates the strip
+            // itself to `chrome://newtab/` — measured 2026-08-06: the status bar went blank and its
+            // renderer logged "Requested load of chrome://newtab/ for incorrect profile type". The
+            // chrome is not a page the user browses; nothing it holds should answer a keystroke.
+            //
+            // So the key is handled as usual and simply aimed at the tab that is showing. From M9
+            // command mode becomes the one exception, because then the bottom strip really does
+            // want the letters.
+            let chrome_key = self
                 .state
                 .lock()
                 .expect("state mutex poisoned")
-                .is_chrome_browser(browser.identifier())
-            {
-                return 0;
-            }
+                .is_chrome_browser(browser.identifier());
+
+            let mut redirected;
+            let target: &mut Browser = if chrome_key {
+                redirected = match self
+                    .state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .active_browser()
+                {
+                    Some(browser) => browser,
+                    // No tab to aim at. Swallow anyway: letting it through reaches Chromium.
+                    None => return 1,
+                };
+                &mut redirected
+            } else {
+                browser
+            };
 
             // A focused text field means insert mode, which is qutebrowser's
             // `input.insert_mode.auto_enter` and defaults to true. `only_if_normal` is what keeps a
@@ -94,9 +117,13 @@ wrap_keyboard_handler! {
             crate::ipc::set_keystring(outcome.keystring.clone());
 
             if let crate::bindings::KeyAction::Run { command, count } = outcome.action {
-                run(&self.state, browser, &command, count);
+                run(&self.state, target, &command, count);
             }
 
+            // A key that came in on a chrome strip is always swallowed, matched or not — see above.
+            if chrome_key {
+                return 1;
+            }
             outcome.swallow as ::std::os::raw::c_int
         }
     }
