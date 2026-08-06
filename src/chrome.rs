@@ -148,3 +148,241 @@ fn serve(mime: &str, bytes: Vec<u8>) -> Option<ResourceHandler> {
         stream,
     ))
 }
+
+// -----------------------------------------------------------------------------------------------
+// The split between the two stylesheets, checked rather than asserted
+// -----------------------------------------------------------------------------------------------
+//
+// `chrome/top.html` and `chrome/bottom.html` both carry the same comment — "chrome.css carries the
+// layout and not one colour; theme.css carries the colours and not one rule" — and DESIGN.md rests
+// on it: swapping a theme is swapping one file, which stays true only while no colour has leaked
+// into the stylesheet that is compiled into this binary. Nothing checked it until now; the rule was
+// six months of discipline with nothing underneath it, and one `color: #5a6158` typed in a hurry
+// would have made `~/.config/bru/theme.css` silently partial.
+//
+// The check is a small CSS reader rather than a grep, and the reason is in the file it reads:
+// `#completion` is a selector and `/* Chromium's #1f1f1f */` is prose, and a grep for `#` flags
+// both. Declarations are the only thing a colour can hide in.
+
+#[cfg(test)]
+mod tests {
+    /// One `(property, value)` per declaration, selectors and comments dropped.
+    ///
+    /// Depth counting is what separates the two: everything outside `{}` is a selector, everything
+    /// inside is a declaration list. bru's two stylesheets have no nested at-rule — no `@media`, no
+    /// `@supports` — so one counter is enough; a nested block would put its selector through
+    /// `split_once(':')` and be discarded for having no value, which fails safe rather than loudly.
+    fn declarations_in(css: &str) -> Vec<(String, String)> {
+        let css = strip_comments(css);
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut current = String::new();
+        for c in css.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    current.clear();
+                }
+                '}' => {
+                    push_declaration(&current, &mut out);
+                    depth = depth.saturating_sub(1);
+                    current.clear();
+                }
+                ';' if depth > 0 => {
+                    push_declaration(&current, &mut out);
+                    current.clear();
+                }
+                _ if depth > 0 => current.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn push_declaration(text: &str, out: &mut Vec<(String, String)>) {
+        let Some((prop, value)) = text.split_once(':') else {
+            return;
+        };
+        let (prop, value) = (prop.trim(), value.trim());
+        if prop.is_empty() || value.is_empty() {
+            return;
+        }
+        out.push((prop.to_string(), value.to_string()));
+    }
+
+    fn strip_comments(css: &str) -> String {
+        let mut out = String::with_capacity(css.len());
+        let mut rest = css;
+        while let Some(at) = rest.find("/*") {
+            out.push_str(&rest[..at]);
+            // An unterminated comment swallows the remainder, which is what a browser does too.
+            match rest[at + 2..].find("*/") {
+                Some(end) => rest = &rest[at + 2 + end + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The CSS colour functions. A bare `rgb(1,2,3)` is the spelling that would slip past a reader
+    /// looking only for `#`.
+    const COLOUR_FUNCTIONS: &[&str] = &[
+        "rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color", "color-mix",
+    ];
+
+    /// Every CSS named colour, and deliberately **not** `transparent` or `currentcolor`: those two
+    /// name a relationship rather than a colour — "paint nothing" and "whatever the cascade already
+    /// decided" — and `chrome/theme.css` itself uses `transparent` for qutebrowser's `none`.
+    const NAMED_COLOURS: &str = "\
+        aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue \
+        blueviolet brown burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk \
+        crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey darkkhaki \
+        darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen \
+        darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink deepskyblue \
+        dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite \
+        gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki \
+        lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan \
+        lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen \
+        lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen \
+        magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen \
+        mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream \
+        mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid \
+        palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum \
+        powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown \
+        seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen \
+        steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow \
+        yellowgreen";
+
+    /// Every colour written literally in `css`, in the order they appear.
+    ///
+    /// Three spellings, because all three are what a colour looks like: `#rgb`/`#rrggbb`, a
+    /// `rgb(`-shaped function, and a named colour. A `var(--…)` reference is none of them — it names
+    /// a colour the *theme* chose, which is the arrangement this is here to protect — so a custom
+    /// property name is consumed and discarded wherever it appears, on either side of the colon.
+    fn colours_in(css: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (_, value) in declarations_in(css) {
+            let chars: Vec<char> = value.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '#' {
+                    let mut end = i + 1;
+                    while end < chars.len() && chars[end].is_ascii_hexdigit() {
+                        end += 1;
+                    }
+                    // 3, 4, 6 and 8 are the legal hex-colour lengths; anything else is not one.
+                    if matches!(end - i - 1, 3 | 4 | 6 | 8) {
+                        found.push(chars[i..end].iter().collect());
+                    }
+                    i = end;
+                } else if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+                    i += 2;
+                    while i < chars.len() && is_ident(chars[i]) {
+                        i += 1;
+                    }
+                } else if chars[i].is_ascii_alphabetic() {
+                    let start = i;
+                    while i < chars.len() && is_ident(chars[i]) {
+                        i += 1;
+                    }
+                    let word: String = chars[start..i].iter().collect();
+                    let lower = word.to_ascii_lowercase();
+                    let mut after = i;
+                    while chars.get(after) == Some(&' ') {
+                        after += 1;
+                    }
+                    if chars.get(after) == Some(&'(') {
+                        if COLOUR_FUNCTIONS.contains(&lower.as_str()) {
+                            found.push(format!("{lower}("));
+                        }
+                    } else if NAMED_COLOURS.split_whitespace().any(|name| name == lower) {
+                        found.push(word);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        found
+    }
+
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    }
+
+    /// The rule itself, in the direction that matters: the stylesheet compiled into the binary must
+    /// name no colour, or a theme file cannot fully replace one.
+    #[test]
+    fn chrome_css_carries_not_one_colour() {
+        let css = std::str::from_utf8(super::CHROME_CSS).expect("chrome.css is UTF-8");
+        let found = colours_in(css);
+        assert!(
+            found.is_empty(),
+            "chrome/chrome.css writes {} colour(s) that theme.css can never override: {found:?}",
+            found.len(),
+        );
+    }
+
+    /// And the other direction, on the theme bru ships: colours and nothing else. This one is a
+    /// *report* rather than a rule bru enforces — `theme.css` is generated by lvim-colorscheme and
+    /// belongs to themer — but a generator that started emitting layout would break the split just
+    /// as thoroughly from the other side, and bru is where that would be noticed.
+    #[test]
+    fn theme_css_carries_not_one_rule() {
+        let stray: Vec<String> = declarations_in(super::DEFAULT_THEME_CSS)
+            .into_iter()
+            .filter(|(prop, _)| !prop.starts_with("--"))
+            .map(|(prop, value)| format!("{prop}: {value}"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "chrome/theme.css declares {} thing(s) that are not custom properties: {stray:?}",
+            stray.len(),
+        );
+    }
+
+    /// What the check is for. Each of these is a way a colour has actually got into a stylesheet.
+    #[test]
+    fn the_check_catches_every_spelling_of_a_colour() {
+        assert_eq!(colours_in("a { color: #ff0000; }"), ["#ff0000"]);
+        assert_eq!(colours_in("a { color: #F00; }"), ["#F00"]);
+        assert_eq!(colours_in("a { background: rgb(90, 97, 88); }"), ["rgb("]);
+        assert_eq!(colours_in("a { background: rgba(0,0,0,.5); }"), ["rgba("]);
+        assert_eq!(colours_in("a { background: hsl(120 50% 40%); }"), ["hsl("]);
+        assert_eq!(colours_in("a { color: rebeccapurple; }"), ["rebeccapurple"]);
+        // Case is not a hiding place, and neither is a shorthand: a colour in the third position of
+        // `border` is the one a reader scanning for `color:` walks straight past.
+        assert_eq!(colours_in("a { color: DarkRed; }"), ["DarkRed"]);
+        assert_eq!(
+            colours_in("a { border-bottom: 1px solid firebrick; }"),
+            ["firebrick"]
+        );
+    }
+
+    /// And what it must not catch, or it would be turned off within a week.
+    #[test]
+    fn the_check_passes_what_the_rule_allows() {
+        for value in [
+            "transparent",
+            "currentColor",
+            "inherit",
+            "var(--statusbar-url-fg)",
+            // The trap in the previous line, spelled out: `--red` is a theme name, not a colour
+            // written here, and a checker that tokenised it would flag every stylesheet that uses
+            // the palette directly.
+            "var(--red)",
+            "1px solid var(--completion-border)",
+        ] {
+            assert!(
+                colours_in(&format!("a {{ color: {value}; }}")).is_empty(),
+                "{value} is allowed and was flagged"
+            );
+        }
+        // A selector is not a declaration and a comment is not either: `#completion` is an id, and
+        // chrome.css's own prose quotes Chromium's `#1f1f1f` while explaining a failure signature.
+        assert!(colours_in("/* #1f1f1f, and the word red */\n#completion { display: none; }").is_empty());
+        // Nor is a hash of the wrong length: `#12345` is no colour.
+        assert!(colours_in("a { color: #12345; }").is_empty());
+    }
+}
