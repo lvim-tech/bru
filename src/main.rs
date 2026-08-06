@@ -12,6 +12,7 @@ mod config;
 mod ipc;
 mod keys;
 mod modes;
+mod scroll;
 mod state;
 mod tabs;
 mod window;

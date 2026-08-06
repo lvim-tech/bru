@@ -219,6 +219,11 @@ pub fn select(state: &SharedState, index: usize) {
     // Visibility alone does not move focus, and a hidden view that keeps it swallows every key —
     // the new tab would look right and answer nothing.
     View::from(&views[index]).request_focus();
+
+    // The bar's scroll percentage belongs to the page that was showing, and the new tab is
+    // somewhere else in a document of its own. Clearing it is what stops `[73%]` sitting over a tab
+    // that is at the top; the new tab's own position arrives as soon as it is scrolled.
+    crate::scroll::forget();
 }
 
 pub fn next_tab(state: &SharedState) {

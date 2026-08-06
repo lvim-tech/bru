@@ -44,6 +44,11 @@ pub fn on_process_message_received(
     source_process: ProcessId,
     message: Option<&mut ProcessMessage>,
 ) -> ::std::os::raw::c_int {
+    // bru's own renderer→browser messages first. The router only recognises its own names, but
+    // handing it a message that is not a query is work on the path a scroll takes.
+    if crate::scroll::on_report(browser.as_deref(), message.as_deref()) {
+        return 1;
+    }
     browser_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
@@ -231,6 +236,23 @@ pub fn set_keystring(keystring: String) {
     }
 }
 
+/// The scroll percentage, spelled as qutebrowser's percentage widget spells it: `[top]`, `[42%]`,
+/// `[bot]`. Built by `scroll.rs` from what the page reports, and pushed only when it changes — a
+/// held `j` reaches this on every settled position and a push each time would run a script in the
+/// chrome renderer for a string that is already right.
+pub fn set_scroll(scroll: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.scroll != scroll => {
+            bar.scroll = scroll;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        push();
+    }
+}
+
 /// Push the current state into whichever chrome frames have announced themselves.
 fn push() {
     let (top, bottom) = match chrome().lock() {
@@ -349,6 +371,12 @@ pub fn renderer_on_process_message_received(
     source_process: ProcessId,
     message: Option<&mut ProcessMessage>,
 ) -> ::std::os::raw::c_int {
+    // The scroll probe is answered here rather than through the router, because the router's
+    // cefQuery is injected into every page and only `bru://` frames may use it — see the security
+    // check above. A process message the browser sent is not the page asking for anything.
+    if crate::scroll::renderer_on_query(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
     renderer_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
