@@ -28,6 +28,8 @@
             <span id="tabindex"></span>
         </div>
         <input id="cmdline" type="text" spellcheck="false" autocomplete="off" />
+        <!-- Before bottom.js, which calls into window.bruCompletion when it renders. -->
+        <script src="completion.js"></script>
         <script src="bottom.js"></script>
     </body>
 </html>

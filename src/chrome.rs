@@ -27,6 +27,7 @@ const BOTTOM_HTML: &[u8] = include_bytes!("../chrome/bottom.html");
 const CHROME_CSS: &[u8] = include_bytes!("../chrome/chrome.css");
 const TOP_JS: &[u8] = include_bytes!("../chrome/top.js");
 const BOTTOM_JS: &[u8] = include_bytes!("../chrome/bottom.js");
+const COMPLETION_JS: &[u8] = include_bytes!("../chrome/completion.js");
 
 /// The theme bru ships with, used until themer has written one to `~/.config/bru/theme.css`.
 ///
@@ -96,6 +97,7 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/chrome.css" => Some(("text/css", CHROME_CSS.to_vec())),
         "/top.js" => Some(("text/javascript", TOP_JS.to_vec())),
         "/bottom.js" => Some(("text/javascript", BOTTOM_JS.to_vec())),
+        "/completion.js" => Some(("text/javascript", COMPLETION_JS.to_vec())),
         "/theme.css" => Some(("text/css", theme_css())),
         _ => None,
     }
