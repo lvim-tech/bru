@@ -109,10 +109,19 @@ pub enum Command {
     /// `command-accept [--rapid]`
     CommandAccept { rapid: bool },
 
-// --- src/message.rs (the polish workstream) ------------------------------------------------------
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+    /// `view-source` — the page's own source, in a tab of its own.
+    ViewSource,
+    /// `print` — hand the page to Chromium's print dialog.
+    Print,
+    /// `devtools [position]` — open the web inspector, or close it if it is open. Every position
+    /// opens a window; see `devtools.rs` for why CEF offers no docked one.
+    DevTools,
+    /// `devtools-focus` — bring the inspector forward.
+    DevToolsFocus,
     /// `message-info` / `message-warning` / `message-error <text>` — say something in the bar.
     Message { level: crate::message::Level, text: String },
-// --- end src/message.rs --------------------------------------------------------------------------
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
@@ -564,7 +573,33 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
         "command-accept" => Command::CommandAccept { rapid: args.has("rapid") },
 
-// --- src/message.rs (the polish workstream) ------------------------------------------------------
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        // `view-source --edit` hands the source to `$EDITOR`, which is a whole other mechanism;
+        // the bare form, which is what `gf` is, opens it in a tab.
+        "view-source" => {
+            if args.any(&["e", "edit", "pygments"]) {
+                Command::Unimplemented(s.trim().to_string())
+            } else {
+                Command::ViewSource
+            }
+        }
+        "print" => {
+            // `--pdf <file>` and `--preview` are separate CEF calls (`print_to_pdf`) and separate
+            // work; a bare `print` is the binding.
+            if args.flags.is_empty() {
+                Command::Print
+            } else {
+                Command::Unimplemented(s.trim().to_string())
+            }
+        }
+        // Every position is the same window — see `devtools.rs`. An unknown one is still an error,
+        // so a typo says so rather than opening the inspector somewhere unexpected.
+        "devtools" => match args.arg(0) {
+            None | Some("window" | "left" | "right" | "top" | "bottom") => Command::DevTools,
+            Some(other) => return Err(bad(&format!("invalid position {other:?}"))),
+        },
+        "devtools-focus" => Command::DevToolsFocus,
+
         // maxsplit=0: the whole rest of the line is the text, spaces and all.
         "message-info" | "message-warning" | "message-error" => {
             let level = match name.as_str() {
@@ -578,7 +613,7 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             };
             Command::Message { level, text: text.to_string() }
         }
-// --- end src/message.rs --------------------------------------------------------------------------
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
         _ => Command::Unimplemented(s.trim().to_string()),
     };

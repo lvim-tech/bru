@@ -272,7 +272,31 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
-// --- src/message.rs (the polish workstream) ------------------------------------------------------
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        // Chromium's own `view-source:` scheme, in a tab of its own — which is where qutebrowser's
+        // `gf` puts it too ("Show the source of the current page in a new tab",
+        // `commands.py:1423`).
+        //
+        // qutebrowser refuses to view the source of a source view (`commands.py:1440`); bru cannot,
+        // and says so here rather than pretending. **A `view-source:` tab does not report itself as
+        // one.** Measured 2026-08-06 on a tab showing the source of
+        // `http://127.0.0.1:18443/msg.html`: `on_address_change` reported that inner address, and
+        // so did `main_frame().url()` — the only place the prefix appeared was the *title*, which
+        // the toplevel duly wore as `view-source:127.0.0.1:18443/msg.html - bru`. qutebrowser's
+        // check works because the flag is its own (`tab.data.viewing_source`), and nothing bru can
+        // ask CEF is equivalent. So `gf` on a source view opens the same source again in another
+        // tab: a duplicate, never a nesting, because the URL it builds from is the inner one.
+        Command::ViewSource => match active_tab_url(state) {
+            Some(url) => crate::tabs::new_tab(state, &format!("view-source:{url}"), false),
+            None => crate::message::error("no page to view the source of"),
+        },
+        Command::Print => {
+            if let Some(host) = browser.host() {
+                host.print();
+            }
+        }
+        Command::DevTools => crate::devtools::toggle(browser),
+        Command::DevToolsFocus => crate::devtools::focus(browser),
         // Through the three named entry points rather than through `show`, because those are what
         // every other workstream will call — `message::info("yanked")` reads as what it does.
         Command::Message { level, text } => match level {
@@ -280,7 +304,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::message::Level::Warning => crate::message::warning(text),
             crate::message::Level::Error => crate::message::error(text),
         },
-// --- end src/message.rs --------------------------------------------------------------------------
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
@@ -343,11 +367,15 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::Nop | Command::ClearKeychain => true,
 
-// --- src/message.rs (the polish workstream) ------------------------------------------------------
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        Command::ViewSource | Command::Print => true,
+        // Every `devtools <position>` is live, and every one of them opens a window: CEF has no
+        // docked inspector to give a BrowserView. See `devtools.rs`.
+        Command::DevTools | Command::DevToolsFocus => true,
         // No default binding names these; they are here so a workstream can say something and so
         // `:message-error x` can be typed. They cost the live count nothing either way.
         Command::Message { .. } => true,
-// --- end src/message.rs --------------------------------------------------------------------------
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
         // Almost all of these are still waiting for a milestone — but the readline and history
         // bindings reach `cmdline.rs` by name rather than as a variant, so it is the only thing
@@ -726,9 +754,36 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Stage 3: 115
+        // once the inspector, `view-source` and `print` were real. Raise this when a milestone
+        // raises the number, never to make a failing build pass.
+        assert_eq!(live, 115, "the live-binding count moved");
+    }
+
+    /// The nine this workstream turned on, named — a total cannot tell you that `wIl` went live
+    /// and `wIk` did not.
+    #[test]
+    fn the_bindings_the_polish_workstream_turned_on() {
+        for keys in [
+            "gf",             // view-source
+            "<Ctrl-Alt-p>",   // print
+            "wi",             // devtools, the toggle
+            "wIh", "wIj", "wIk", "wIl", "wIw", // …and every position it can be asked for
+            "wIf",            // devtools-focus
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+
+        // `view-source --edit` opens $EDITOR, which is a mechanism bru does not have; it stays
+        // unimplemented rather than quietly opening a tab instead.
+        assert!(!is_live(&commands::parse("view-source --edit").unwrap()));
+        // And a position that is not one is an error, not a window in an unexpected place.
+        assert!(commands::parse("devtools sideways").is_err());
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice

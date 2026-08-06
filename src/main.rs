@@ -12,6 +12,7 @@ mod commands;
 mod completion;
 mod config;
 mod data;
+mod devtools;
 mod exec;
 mod favicon;
 mod find;
