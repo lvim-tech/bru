@@ -44,6 +44,20 @@ adblock = { version = "0.13.2", default-features = false, features = [
     "full-regex-handling",
 ] }
 
+# Greasemonkey's `/regex/` `@include`/`@exclude` rules — see src/greasemonkey.rs. **This costs no
+# build time and no new crate**: `adblock`'s `full-regex-handling` above already depends on
+# `regex 1.13.1` with its default features, so cargo compiles exactly the same rlib either way.
+# Measured 2026-08-06: `cargo tree --prefix none | sort -u | wc -l` is 149 with this line and 149
+# without it.
+#
+# The engine is deliberately linear-time and has no backreferences and no lookaround, so it is a
+# strict subset of the ECMAScript syntax a userscript's rule is written in. That is the right trade
+# for a pattern that arrives in a file the user dropped in a directory — a catastrophically
+# backtracking `@include` would hang the renderer on every page — and a pattern outside the subset
+# is refused *by name, with the reason*, which is what this module already does with everything else
+# it cannot honour.
+regex = "1.13"
+
 # The ad blocker is the one dependency bru runs *per network request*, and unoptimized it is not
 # slow, it is unusable. Measured 2026-08-06 against EasyList + EasyPrivacy and the 158 requests
 # https://www.vesti.bg/ makes, mean time to decide one request:

@@ -142,6 +142,7 @@ dependencies = [
  "adblock",
  "cef",
  "mlua",
+ "regex",
  "rusqlite",
 ]
 

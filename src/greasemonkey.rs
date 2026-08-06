@@ -35,10 +35,11 @@
 //!   script in, so honouring `user` or `application` is impossible. Running such a script in the
 //!   main world anyway would be quietly giving it *less* isolation than it asked for, so the
 //!   script is not loaded and the reason is printed.
-//! - **A `/regex/` `@include`/`@exclude` is refused, and takes its script with it.** bru has no
-//!   regular-expression engine. Dropping just the pattern would be worse than refusing the script:
-//!   a dropped `@exclude /bank/` would *widen* where the script runs, which is the exact failure
-//!   this module is written to avoid.
+//! - **A `/regex/` `@include`/`@exclude` whose pattern bru cannot compile is refused, and takes its
+//!   script with it.** See [`Rule`] for which patterns those are. Dropping just the pattern would be
+//!   worse than refusing the script: a dropped `@exclude /bank/` would *widen* where the script
+//!   runs, which is the exact failure this module is written to avoid. The refusal names the
+//!   pattern and quotes the engine's own reason.
 //!
 //! # Where the work happens
 //!
@@ -104,13 +105,15 @@ pub struct Script {
     pub name: String,
     pub namespace: Option<String>,
     pub description: Option<String>,
-    /// The raw `@include` strings, and the same again as globs. Both are kept: the strings go into
-    /// `GM_info`, the globs do the matching.
+    /// The raw `@include` strings. They go into `GM_info` verbatim; [`Script::include_rules`] is
+    /// the same list parsed, and is what does the matching.
     pub includes: Vec<String>,
+    pub include_rules: Vec<Rule>,
     /// The raw `@match` strings, beside the patterns parsed from them.
     pub match_strings: Vec<String>,
     pub matches: Vec<UrlPattern>,
     pub excludes: Vec<String>,
+    pub exclude_rules: Vec<Rule>,
     pub requires: Vec<String>,
     pub grants: Vec<String>,
     /// The declared value, `None` when the script did not say. The *effective* one is
@@ -186,9 +189,11 @@ impl Script {
             namespace: None,
             description: None,
             includes: Vec::new(),
+            include_rules: Vec::new(),
             match_strings: Vec::new(),
             matches: Vec::new(),
             excludes: Vec::new(),
+            exclude_rules: Vec::new(),
             requires: Vec::new(),
             grants: Vec::new(),
             run_at: None,
@@ -234,15 +239,13 @@ impl Script {
         }
 
         // Every pattern is checked now, so that a script that is loaded is a script that matches
-        // correctly. A `/regex/` rule takes the whole script with it — dropping an @exclude would
-        // widen where the script runs.
-        for pattern in script.includes.iter().chain(script.excludes.iter()) {
-            if is_regex_pattern(pattern) {
-                return Err(format!(
-                    "uses the regular-expression rule {pattern}; bru has no regex engine, and \
-                     dropping the rule could widen where the script runs, so it was not loaded"
-                ));
-            }
+        // correctly. A `/regex/` rule bru cannot compile takes the whole script with it — dropping
+        // an @exclude would widen where the script runs.
+        for pattern in &script.includes {
+            script.include_rules.push(Rule::parse(pattern)?);
+        }
+        for pattern in &script.excludes {
+            script.exclude_rules.push(Rule::parse(pattern)?);
         }
         for pattern in &script.match_strings {
             match UrlPattern::parse(pattern) {
@@ -366,9 +369,102 @@ fn indent(source: &str) -> String {
         .join("\n")
 }
 
-/// `/foo/` — an include/exclude written as an ECMAScript regular expression. bru refuses these.
-fn is_regex_pattern(pattern: &str) -> bool {
-    pattern.len() > 1 && pattern.starts_with('/') && pattern.ends_with('/')
+/// One `@include` or `@exclude`, in the form it will be matched in.
+///
+/// qutebrowser's `GreasemonkeyMatcher._match_pattern` (greasemonkey.py:262-270) is two lines and
+/// this is the same two: a pattern that **starts and ends with `/`** is an ECMAScript regular
+/// expression, searched case-insensitively (`re.search(pattern[1:-1], url, flags=re.I)`); anything
+/// else is an `fnmatch` glob. Note what that first test does *not* say — there is no minimum length,
+/// so a bare `/` is the empty regex, which matches every URL. Read as a glob it would match none,
+/// and an `@exclude /` that matched nothing would let the script run where it was told not to, so
+/// the empty case follows qutebrowser rather than looking sensible.
+///
+/// # What bru's engine will and will not compile
+///
+/// The `regex` crate is not JavaScript-compatible. It is a **strict subset**: deliberately
+/// linear-time, and therefore with no backreferences and no lookaround, because both are what make
+/// a backtracking engine super-linear. Measured on this machine 2026-08-06 against the shapes a
+/// real `@include /…/` is written in:
+///
+/// ```text
+/// OK    https?://(www\.)?example\.com/.*
+/// OK    ^https?:\/\/(www\.)?example\.com\/
+/// OK    https:\/\/[^\/]+\.example\.com\/watch\?v=.*
+/// OK    ^https?://(?:[a-z0-9-]+\.)*wikipedia\.org/wiki/[^?]+$
+/// OK    ^file:///.*\.html$        \bexample\b       a{2,}      \p{L}+
+/// ERR   ^http://(?!secure\.)example\.com     look-around ... is not supported
+/// ERR   .../r/(\w+)/comments/\1              backreferences are not supported
+/// ```
+///
+/// The line that mattered most is the second: **`\/` compiles**. A regex written as a JavaScript
+/// literal has to escape the delimiter, so `\/` is in almost every real rule, and a crate that
+/// rejected unknown escapes would have refused nearly all of them.
+///
+/// Two divergences from a JavaScript engine that are worth knowing rather than fixing:
+///
+/// - `\w`, `\d`, `\b` and `.` are **Unicode-aware** here and ASCII-only in a JavaScript regex
+///   without `/u`. On a URL, which is percent-encoded ASCII by the time it reaches
+///   [`Matcher::url_string`], the two agree.
+/// - A pattern outside the subset is **refused by name, with the engine's own message**, and takes
+///   its script with it — the same answer this module gives `@qute-js-world user` and a missing
+///   `@require`. That is the honest one: running the script with the rule dropped is what would be
+///   dangerous, and running it with the rule *approximated* would be worse still.
+#[derive(Clone, Debug)]
+pub enum Rule {
+    Glob(String),
+    Regex(regex::Regex),
+}
+
+impl Rule {
+    pub fn parse(pattern: &str) -> Result<Rule, String> {
+        let Some(source) = regex_source(pattern) else {
+            return Ok(Rule::Glob(pattern.to_string()));
+        };
+        // `re.I`, as qutebrowser passes. Nothing else: `.` must not cross a newline and `^`/`$` must
+        // mean the ends of the URL, which are this builder's defaults and JavaScript's too.
+        match regex::RegexBuilder::new(source).case_insensitive(true).build() {
+            Ok(compiled) => Ok(Rule::Regex(compiled)),
+            Err(e) => Err(format!(
+                "has the regular-expression rule {pattern}, which bru cannot compile: {}. Dropping \
+                 the rule could widen where the script runs, so it was not loaded",
+                first_line_of(&e.to_string())
+            )),
+        }
+    }
+
+    fn matches(&self, url_string: &str) -> bool {
+        match self {
+            Rule::Glob(pattern) => glob_match(url_string, pattern),
+            // `is_match` is unanchored, which is `re.search` and not `re.match`.
+            Rule::Regex(compiled) => compiled.is_match(url_string),
+        }
+    }
+}
+
+/// The inside of a `/…/`, or `None` when the pattern is a glob.
+fn regex_source(pattern: &str) -> Option<&str> {
+    if !(pattern.starts_with('/') && pattern.ends_with('/')) {
+        return None;
+    }
+    // A lone `/` is `pattern[1:-1]` == `""` in Python, not a slice that runs backwards.
+    match pattern.len() < 2 {
+        true => Some(""),
+        false => Some(&pattern[1..pattern.len() - 1]),
+    }
+}
+
+/// The regex crate's `Display` is a four-line block with the pattern and a caret rule in it; the
+/// error message is the last line. One line is what fits in `Greasemonkey scripts not loaded — …`,
+/// and the pattern is already named beside it.
+fn first_line_of(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or("the pattern is not valid")
+        .trim_start_matches("error: ")
+        .to_string()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -776,14 +872,14 @@ impl Matcher {
 
     pub fn matches(&self, script: &Script) -> bool {
         let including = script
-            .includes
+            .include_rules
             .iter()
-            .any(|pattern| glob_match(&self.url_string, pattern));
+            .any(|rule| rule.matches(&self.url_string));
         let matching = script.matches.iter().any(|pattern| pattern.matches(&self.url));
         let excluding = script
-            .excludes
+            .exclude_rules
             .iter()
-            .any(|pattern| glob_match(&self.url_string, pattern));
+            .any(|rule| rule.matches(&self.url_string));
         (including || matching) && !excluding
     }
 }
@@ -1233,12 +1329,68 @@ document.body.style.background = 'red';
     }
 
     #[test]
-    fn a_regex_rule_takes_the_whole_script_with_it() {
-        // The dangerous half: dropping this @exclude would make the script run on the bank.
-        let source =
-            "// ==UserScript==\n// @include *\n// @exclude /bank/\n// ==/UserScript==\nx();\n";
-        let error = Script::parse(source, "x.js", &mut no_requires).unwrap_err();
-        assert!(error.contains("regex"), "{error}");
+    fn a_regex_rule_is_honoured_rather_than_refused() {
+        // The dangerous half: dropping this @exclude would make the script run on the bank. It is
+        // now *obeyed*, which is stricter than dropping it and than refusing the script.
+        let script = parse(
+            "// ==UserScript==\n// @include *\n// @exclude /bank/\n// ==/UserScript==\nx();\n",
+        );
+        assert!(Matcher::new("https://example.com/x").unwrap().matches(&script));
+        assert!(!Matcher::new("https://my.bank.example/x").unwrap().matches(&script));
+        // `re.I` — qutebrowser passes it and so does bru, so the capitals do not get through.
+        assert!(!Matcher::new("https://my.BANK.example/x").unwrap().matches(&script));
+        // `re.search`, not `re.match`: the pattern is unanchored and may match anywhere.
+        assert!(!Matcher::new("https://x.example/my-BankING/page").unwrap().matches(&script));
+        // The raw string is what `GM_info` shows, unchanged.
+        assert_eq!(script.excludes, vec!["/bank/"]);
+    }
+
+    #[test]
+    fn a_regex_include_matches_the_way_a_javascript_literal_would() {
+        // Every `\/` in here is what a regex written as a JS literal has to do with the delimiter,
+        // and is the shape that would have made a stricter engine useless.
+        let script = parse(
+            "// ==UserScript==\n\
+             // @include /^https?:\\/\\/(www\\.)?example\\.com\\/watch\\?v=/\n\
+             // ==/UserScript==\n",
+        );
+        assert!(Matcher::new("https://example.com/watch?v=1").unwrap().matches(&script));
+        assert!(Matcher::new("http://www.example.com/watch?v=1").unwrap().matches(&script));
+        // `^` still anchors, so the same path under another host does not match.
+        assert!(!Matcher::new("https://evil.test/https://example.com/watch?v=1").unwrap().matches(&script));
+        assert!(!Matcher::new("https://example.com/other").unwrap().matches(&script));
+    }
+
+    #[test]
+    fn a_pattern_outside_the_engines_subset_is_refused_by_name_with_the_reason() {
+        for (pattern, wanted) in [
+            ("/^http://(?!secure\\.)example\\.com/", "look-around"),
+            ("/(\\w+)\\/comments\\/\\1/", "backreferences"),
+            ("/[/", "character class"),
+        ] {
+            let source =
+                format!("// ==UserScript==\n// @exclude {pattern}\n// ==/UserScript==\nx();\n");
+            let error = Script::parse(&source, "x.js", &mut no_requires).unwrap_err();
+            assert!(error.contains(pattern), "the pattern must be named: {error}");
+            assert!(error.contains(wanted), "the engine's reason must be quoted: {error}");
+            assert!(error.contains("not loaded"), "{error}");
+            // One line, because it lands in a one-line `Greasemonkey scripts not loaded — …`.
+            assert_eq!(error.lines().count(), 1, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_bare_slash_is_the_empty_regex_and_not_a_glob() {
+        // qutebrowser's test is `startswith('/') and endswith('/')` with no length rule, so `"/"`
+        // is `re.search("", url)` — true for every URL. As a glob it would match none, and an
+        // `@exclude /` that matched nothing would let the script run where it was told not to.
+        assert!(matches!(Rule::parse("/").unwrap(), Rule::Regex(_)));
+        assert!(Rule::parse("/").unwrap().matches("https://example.com/"));
+        // Two characters is a `/…/` with an empty inside, which is the same thing.
+        assert!(matches!(Rule::parse("//").unwrap(), Rule::Regex(_)));
+        // And nothing that merely *contains* a slash is a regex.
+        assert!(matches!(Rule::parse("https://example.com/*").unwrap(), Rule::Glob(_)));
+        assert!(matches!(Rule::parse("/only-at-the-front").unwrap(), Rule::Glob(_)));
     }
 
     #[test]
