@@ -248,7 +248,8 @@ pub fn on_console_message(
     match route {
         // qutebrowser prefixes the same way — `func(f"JS: {logstring}")` in shared.py's
         // `_js_log_to_ui` — so a message in the bar can never be mistaken for one of bru's own.
-        Route::Bar(level) => show(level, &format!("JS: [{source}:{line}] {text}")),
+        Route::Bar(level) if bar_is_free() => show(level, &format!("JS: [{source}:{line}] {text}")),
+        Route::Bar(_) => eprintln!("bru[console]: [{source}:{line}] {}", to_one_line(&text)),
         Route::Stderr => {
             if std::env::var_os("BRU_DEBUG_CONSOLE").is_none() {
                 eprintln!("bru[console]: [{source}:{line}] {}", to_one_line(&text));
@@ -257,6 +258,35 @@ pub fn on_console_message(
         Route::Drop => {}
     }
     0
+}
+
+/// True at most once per [`TIMEOUT_MS`], and the thing that stops a console message from being able
+/// to hang bru.
+///
+/// **`bru://` is both a source this routes to the bar and the page the bar is drawn by.** A message
+/// is shown by running `execute_java_script` in the chrome frame; if *that* script throws, the throw
+/// is a `bru://` console error, which asks for a message, which runs the script again — an
+/// unbounded loop with the UI thread in it. Nothing else in this file could break that cycle,
+/// because the two ends are in different processes and neither knows about the other.
+///
+/// A rate limit breaks it and costs nothing real: the bar shows one line for three seconds, so a
+/// second console message inside that window could only take the first one's place. It still goes
+/// to stderr, which keeps every one of them.
+fn bar_is_free() -> bool {
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let Ok(mut last) = LAST.lock() else {
+        return false;
+    };
+    let free = match *last {
+        Some(at) => at.elapsed() >= Duration::from_millis(TIMEOUT_MS as u64),
+        None => true,
+    };
+    if free {
+        *last = Some(Instant::now());
+    }
+    free
 }
 
 fn severity_name(level: LogSeverity) -> &'static str {
