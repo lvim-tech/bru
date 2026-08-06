@@ -49,6 +49,14 @@ pub fn on_process_message_received(
     if crate::scroll::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/editor.rs ----------------------------------------------------------------------
+    // The answer to a question `editor.rs` asked the page — what the focused field holds. Same
+    // shape as the scroll report above, and for the same reason: it is not a query the page could
+    // ever have started, so it stays clear of the `bru://`-only cefQuery check below.
+    if crate::editor::on_answer(message.as_deref()) {
+        return 1;
+    }
+    // --- end src/editor.rs ------------------------------------------------------------------
     browser_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
@@ -617,6 +625,13 @@ pub fn renderer_on_process_message_received(
     if crate::scroll::renderer_on_query(frame.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/editor.rs ----------------------------------------------------------------------
+    // The renderer half of the same channel: evaluate what the browser process asked for and send
+    // the result back. Only the browser process can address the renderer, so a page cannot ask.
+    if crate::editor::renderer_on_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/editor.rs ------------------------------------------------------------------
     renderer_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),

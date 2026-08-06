@@ -301,6 +301,23 @@ wrap_browser_process_handler! {
                 .unwrap_or(2000);
                 crate::hints::schedule_hint_script(&script, step_ms);
             }
+
+            // --- src/editor.rs --------------------------------------------------------------
+            // Debug hook, off unless asked for. See editor::schedule_ask_script — the only way to
+            // read a form field back and so the only way `edit-text` can be checked twice.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("ask-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("ask-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(1000);
+                crate::editor::schedule_ask_script(&script, step_ms);
+            }
+            // --- end src/editor.rs ----------------------------------------------------------
         }
 
         fn default_client(&self) -> Option<Client> {

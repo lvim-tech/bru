@@ -338,6 +338,28 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
+        // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
+        // The one place in bru that runs another program. Everything about *when* that is allowed
+        // is in `spawn.rs`'s module docs; what matters here is that a `Command::Spawn` can only be
+        // built by `commands::parse`, and the three things that call it are a binding, the command
+        // line, and a line a running userscript wrote back. A page reaches none of them.
+        Command::Spawn { cmdline, userscript, detach, messages, verbose } => {
+            crate::spawn::spawn(
+                cmdline,
+                crate::spawn::Opts {
+                    userscript: *userscript,
+                    detach: *detach,
+                    output_messages: *messages,
+                    verbose: *verbose,
+                },
+                count,
+            )
+        }
+        Command::EditText => crate::editor::edit_text(browser),
+        Command::InsertText { text } => crate::editor::insert_text(browser, text),
+        Command::FakeKey { keystring } => crate::editor::fake_key(browser, keystring),
+        // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -428,6 +450,11 @@ pub fn is_live(command: &Command) -> bool {
 
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
+
+        // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
+        Command::Spawn { .. } => true,
+        Command::EditText | Command::InsertText { .. } | Command::FakeKey { .. } => true,
+        // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
 
         Command::Nop | Command::ClearKeychain => true,
 
@@ -816,7 +843,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 124, "the live-binding count moved");
+        assert_eq!(live, 127, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
