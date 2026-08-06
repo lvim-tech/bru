@@ -20,6 +20,7 @@ mod ipc;
 mod keys;
 mod load;
 mod modes;
+mod navigate;
 mod open;
 mod scroll;
 mod state;

@@ -49,6 +49,11 @@ pub fn on_process_message_received(
     if crate::scroll::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // `]]`'s answer: the page's links, collected by a script bru evaluated itself. Claimed here, so
+    // the router never sees it and its `bru://`-only check has nothing to be exempted from.
+    if crate::navigate::on_report(browser.as_deref(), message.as_deref()) {
+        return 1;
+    }
     browser_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
@@ -571,6 +576,11 @@ pub fn renderer_on_process_message_received(
     // cefQuery is injected into every page and only `bru://` frames may use it — see the security
     // check above. A process message the browser sent is not the page asking for anything.
     if crate::scroll::renderer_on_query(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // Same reasoning for `:navigate prev/next`: the collector runs in the page's world, and its
+    // answer travels as a process message rather than as a query the page could have sent.
+    if crate::navigate::renderer_on_query(frame.as_deref(), message.as_deref()) {
         return 1;
     }
     renderer_router().on_process_message_received(

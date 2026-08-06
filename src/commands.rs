@@ -112,6 +112,8 @@ pub enum Command {
     SearchNext,
     /// `search-prev` — `N`.
     SearchPrev,
+    /// `navigate <where> [-t|-b|-w]` — `[[`, `]]`, `{{`, `}}`, `gu`, `gU`, `<Ctrl-A>`, `<Ctrl-X>`.
+    Navigate { to: NavigateTo, tab: bool, bg: bool, window: bool },
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
@@ -149,6 +151,26 @@ pub enum HintTarget {
     /// in the background, which is `tabs.background = true` and is what `F` does here today.
     TabBg,
 }
+
+// --- src/navigate.rs ------------------------------------------------------------------------------
+/// The argument of `navigate`. `commands.py:607` names all six and refuses anything else, so an
+/// unknown destination is a parse error rather than a binding that quietly does nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavigateTo {
+    /// A "previous page" link on the page.
+    Prev,
+    /// A "next page" link on the page.
+    Next,
+    /// One segment up the URL's path.
+    Up,
+    /// The last number in the URL, plus the count.
+    Increment,
+    /// The last number in the URL, minus the count.
+    Decrement,
+    /// The URL without its query and fragment.
+    Strip,
+}
+// --- end src/navigate.rs --------------------------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -563,6 +585,26 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
         "search-next" => Command::SearchNext,
         "search-prev" => Command::SearchPrev,
+
+        "navigate" => {
+            let Some(to) = args.arg(0) else {
+                return Err(bad("needs a destination"));
+            };
+            Command::Navigate {
+                to: match to {
+                    "prev" => NavigateTo::Prev,
+                    "next" => NavigateTo::Next,
+                    "up" => NavigateTo::Up,
+                    "increment" => NavigateTo::Increment,
+                    "decrement" => NavigateTo::Decrement,
+                    "strip" => NavigateTo::Strip,
+                    other => return Err(bad(&format!("invalid destination {other:?}"))),
+                },
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+            }
+        }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
@@ -822,6 +864,29 @@ mod tests {
         assert_eq!(parse("search-prev").unwrap(), Command::SearchPrev);
     }
 
+    #[test]
+    fn navigate_names_six_destinations_and_no_others() {
+        let plain = |to| Command::Navigate { to, tab: false, bg: false, window: false };
+        assert_eq!(parse("navigate prev").unwrap(), plain(NavigateTo::Prev));
+        assert_eq!(parse("navigate next").unwrap(), plain(NavigateTo::Next));
+        assert_eq!(parse("navigate up").unwrap(), plain(NavigateTo::Up));
+        assert_eq!(parse("navigate increment").unwrap(), plain(NavigateTo::Increment));
+        assert_eq!(parse("navigate decrement").unwrap(), plain(NavigateTo::Decrement));
+        assert_eq!(parse("navigate strip").unwrap(), plain(NavigateTo::Strip));
+        // `{{` and `}}`, and `gU`.
+        assert_eq!(
+            parse("navigate prev -t").unwrap(),
+            Command::Navigate { to: NavigateTo::Prev, tab: true, bg: false, window: false }
+        );
+        assert_eq!(
+            parse("navigate up -t").unwrap(),
+            Command::Navigate { to: NavigateTo::Up, tab: true, bg: false, window: false }
+        );
+        // `choices=[...]` in qutebrowser: a destination it does not know is an error, not a
+        // silently inert binding.
+        assert!(parse("navigate sideways").is_err());
+        assert!(parse("navigate").is_err());
+    }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     #[test]
