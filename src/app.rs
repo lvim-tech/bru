@@ -79,10 +79,26 @@ wrap_app! {
             let Some(command_line) = command_line else {
                 return;
             };
-            command_line.append_switch_with_value(
-                Some(&CefString::from("disable-features")),
-                Some(&CefString::from("SoftNavigationDetection")),
-            );
+            // Appended to whatever is already there, never over it. `--disable-features` is one
+            // comma-separated list and Chromium reads a single value for it, so a second
+            // `append_switch_with_value` replaces the first — and CEF sets this switch itself for
+            // some processes. Overwriting it would turn features back **on** in exactly the
+            // subprocesses that had them off for a reason, which is a failure that shows up as
+            // something else entirely, somewhere else entirely.
+            let name = CefString::from("disable-features");
+            let existing = CefString::from(&command_line.switch_value(Some(&name))).to_string();
+            let mut value = String::from("SoftNavigationDetection");
+            if !existing.is_empty() {
+                if existing.split(',').any(|feature| feature.trim() == value) {
+                    return;
+                }
+                value = format!("{existing},{value}");
+            }
+            if std::env::var_os("BRU_DEBUG_SWITCHES").is_some() {
+                eprintln!("bru[switches]: disable-features {existing:?} -> {value:?}");
+            }
+            command_line
+                .append_switch_with_value(Some(&name), Some(&CefString::from(value.as_str())));
         }
 
         // --- M2 --------------------------------------------------------------------------------
