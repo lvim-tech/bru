@@ -28,6 +28,17 @@ wrap_keyboard_handler! {
                 return 0;
             };
 
+            // --- src/editor.rs ------------------------------------------------------------------
+            // `fake-key` means "give this key to the page, not to bru". It arrives here because
+            // `send_key_event` is the real input path, so the one thing this handler may do with it
+            // is nothing — otherwise `<Shift-Escape>`, which is `fake-key <Escape>`, would run the
+            // `mode-leave` binding instead of reaching the page. True only while an injection is in
+            // flight; see `editor::fake_key`.
+            if crate::editor::is_faking() {
+                return 0;
+            }
+            // --- end src/editor.rs --------------------------------------------------------------
+
             // RAWKEYDOWN only. One press also delivers KEYDOWN and CHAR, and acting on all three
             // scrolls three times per keystroke — which reads as "too fast", not as a bug.
             if event.type_ != KeyEventType::RAWKEYDOWN {

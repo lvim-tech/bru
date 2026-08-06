@@ -109,6 +109,21 @@ pub enum Command {
     /// `command-accept [--rapid]`
     CommandAccept { rapid: bool },
 
+// --- src/spawn.rs, src/editor.rs -----------------------------------------------------------
+    /// `spawn [-u] [-d] [-m] [-v] cmd [args…]` — run a program, optionally as a userscript.
+    ///
+    /// `cmdline` is the whole rest of the line, unsplit: `spawn` is a `maxsplit=0` command and
+    /// `src/spawn.rs` splits it with its own `shlex`, because the quotes have to survive
+    /// (`spawn -u qute-pass -u "login: (.+)"` is three arguments, not four).
+    Spawn { cmdline: String, userscript: bool, detach: bool, messages: bool, verbose: bool },
+    /// `edit-text` (`<Ctrl-E>` in insert mode), and `open-editor`, its pre-1.0 spelling.
+    EditText,
+    /// `insert-text <text>` — `<Shift-Ins>` is `insert-text -- {primary}`.
+    InsertText { text: String },
+    /// `fake-key <keystring>` — `<Shift-Escape>` in insert mode is `fake-key <Escape>`.
+    FakeKey { keystring: String },
+// --- end src/spawn.rs, src/editor.rs -------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -559,10 +574,110 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
         "command-accept" => Command::CommandAccept { rapid: args.has("rapid") },
 
+// --- src/spawn.rs, src/editor.rs -----------------------------------------------------------
+        // `spawn` cannot use `Args::maxsplit0`: that joins already-tokenized words back together
+        // with spaces, and the quotes are gone by then. `spawn_tail` re-reads the original string.
+        "spawn" => {
+            let (flags, cmdline) = spawn_tail(s);
+            let has = |names: &[&str]| names.iter().any(|n| flags.iter().any(|f| f == n));
+            let userscript = has(&["u", "userscript"]);
+            let detach = has(&["d", "detach"]);
+            if cmdline.is_empty() {
+                return Err(bad("needs something to run"));
+            }
+            // `cmdutils.check_exclusive((userscript, detach), 'ud')`.
+            if userscript && detach {
+                return Err(bad("--userscript and --detach are mutually exclusive"));
+            }
+            // `-o` shows the output in a new tab, which needs a `bru://process/<pid>` page bru
+            // does not have. Unimplemented rather than silently dropped: a `:spawn -o` that ran
+            // the program and showed nothing would look like the program failed.
+            if has(&["o", "output"]) {
+                Command::Unimplemented(s.trim().to_string())
+            } else {
+                Command::Spawn {
+                    cmdline,
+                    userscript,
+                    detach,
+                    messages: has(&["m", "output-messages"]),
+                    verbose: has(&["v", "verbose"]),
+                }
+            }
+        }
+        // qutebrowser renamed `open-editor` to `edit-text` in 1.0 and kept no alias; bru answers to
+        // both, because both are in this user's fingers and neither can mean anything else.
+        "edit-text" | "open-editor" => Command::EditText,
+        // maxsplit=0: `insert-text -- {primary}` inserts the primary selection, `--` and all.
+        "insert-text" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            match args.arg(0).filter(|text| !text.is_empty()) {
+                Some(text) => Command::InsertText { text: text.to_string() },
+                None => return Err(bad("needs text")),
+            }
+        }
+        "fake-key" => {
+            let Some(keystring) = args.arg(0) else {
+                return Err(bad("needs a keystring"));
+            };
+            // `--global` posts to qutebrowser's own window rather than to the page. bru's UI *is*
+            // browsers, so "the focused window" is not a thing it can name yet.
+            if args.any(&["g", "global"]) {
+                Command::Unimplemented(s.trim().to_string())
+            } else {
+                Command::FakeKey { keystring: keystring.to_string() }
+            }
+        }
+// --- end src/spawn.rs, src/editor.rs -------------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
 }
+
+// --- src/spawn.rs, src/editor.rs -----------------------------------------------------------
+
+/// Split `spawn -u -m qute-pass -u "login: (.+)"` into its flags and everything after them,
+/// **verbatim from the original string**.
+///
+/// [`Args::maxsplit0`] cannot do this. It works from [`tokenize`]'s output, which has already
+/// thrown the quotes away, and rejoining with spaces turns one argument containing a space into
+/// two. `spawn` is the only command whose tail is re-split by something other than this file, so it
+/// is the only one that needs its quotes intact.
+///
+/// Returns the long spellings of the flags (`-u` as `u`, `--userscript` as `userscript`) and the
+/// untouched remainder.
+fn spawn_tail(s: &str) -> (Vec<String>, String) {
+    let mut flags = Vec::new();
+    let mut rest = s.trim_start();
+
+    // The command name.
+    rest = match rest.find(char::is_whitespace) {
+        Some(at) => &rest[at..],
+        None => "",
+    };
+
+    loop {
+        rest = rest.trim_start();
+        let word = match rest.find(char::is_whitespace) {
+            Some(at) => &rest[..at],
+            None => rest,
+        };
+        if word == "--" {
+            return (flags, rest[word.len()..].trim().to_string());
+        }
+        if word.is_empty() || !is_flag(word) {
+            return (flags, rest.to_string());
+        }
+        match word.strip_prefix("--") {
+            Some(long) => flags.push(long.to_string()),
+            // `-um` is two short flags, as in argparse.
+            None => flags.extend(word[1..].chars().map(|c| c.to_string())),
+        }
+        rest = &rest[word.len()..];
+    }
+}
+
+// --- end src/spawn.rs, src/editor.rs -------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -766,6 +881,109 @@ mod tests {
             );
         }
     }
+
+// --- src/spawn.rs, src/editor.rs -----------------------------------------------------------
+
+    /// The exact strings in this user's `~/.config/qutebrowser/config.py`, which is what `:spawn`
+    /// has to accept on the first day or the bindings that pay for this milestone do not move over.
+    #[test]
+    fn spawn_the_way_this_user_writes_it() {
+        assert_eq!(
+            parse("spawn --userscript ~/.config/bru/userscripts/qute-pass").unwrap(),
+            Command::Spawn {
+                cmdline: "~/.config/bru/userscripts/qute-pass".to_string(),
+                userscript: true,
+                detach: false,
+                messages: false,
+                verbose: false,
+            }
+        );
+        assert_eq!(
+            parse("spawn --userscript qute-pass --password-only").unwrap(),
+            Command::Spawn {
+                // `--password-only` is the *script's* flag: flag parsing stopped at the first
+                // non-flag word, so everything after it belongs to the tail.
+                cmdline: "qute-pass --password-only".to_string(),
+                userscript: true,
+                detach: false,
+                messages: false,
+                verbose: false,
+            }
+        );
+        // The quoted argument is the whole reason `spawn_tail` exists.
+        let Command::Spawn { cmdline, .. } =
+            parse(r#"spawn -u qute-pass -U secret -u "login: (.+)" -d dmenu"#).unwrap()
+        else {
+            panic!("expected a spawn")
+        };
+        assert_eq!(cmdline, r#"qute-pass -U secret -u "login: (.+)" -d dmenu"#);
+        assert_eq!(
+            crate::spawn::shlex(&cmdline).unwrap(),
+            ["qute-pass", "-U", "secret", "-u", "login: (.+)", "-d", "dmenu"]
+        );
+    }
+
+    #[test]
+    fn spawn_flags() {
+        let flags = |s: &str| {
+            let Command::Spawn { userscript, detach, messages, verbose, .. } = parse(s).unwrap()
+            else {
+                panic!("expected a spawn for {s:?}")
+            };
+            (userscript, detach, messages, verbose)
+        };
+        assert_eq!(flags("spawn echo hi"), (false, false, false, false));
+        assert_eq!(flags("spawn -d mpv x"), (false, true, false, false));
+        assert_eq!(flags("spawn -m echo hi"), (false, false, true, false));
+        assert_eq!(flags("spawn -mv echo hi"), (false, false, true, true));
+        assert_eq!(flags("spawn --detach --verbose mpv x"), (false, true, false, true));
+        // `--` ends bru's flags; what follows is the program's, whatever it looks like.
+        let Command::Spawn { cmdline, detach, .. } = parse("spawn -d -- mpv --no-video x").unwrap()
+        else {
+            panic!("expected a spawn")
+        };
+        assert_eq!((cmdline.as_str(), detach), ("mpv --no-video x", true));
+    }
+
+    #[test]
+    fn spawn_refuses_what_it_cannot_do() {
+        // qutebrowser's own `check_exclusive`.
+        assert!(parse("spawn -u -d qute-pass").is_err());
+        assert!(parse("spawn").is_err());
+        assert!(parse("spawn -u").is_err());
+        // `-o` opens the output in a tab, which needs a page bru has not got.
+        assert_eq!(
+            parse("spawn -o echo hi").unwrap(),
+            Command::Unimplemented("spawn -o echo hi".to_string())
+        );
+    }
+
+    #[test]
+    fn the_three_insert_mode_bindings() {
+        assert_eq!(parse("edit-text").unwrap(), Command::EditText);
+        assert_eq!(parse("open-editor").unwrap(), Command::EditText);
+        assert_eq!(
+            parse("insert-text -- {primary}").unwrap(),
+            Command::InsertText { text: "{primary}".to_string() }
+        );
+        assert_eq!(
+            parse("fake-key <Escape>").unwrap(),
+            Command::FakeKey { keystring: "<Escape>".to_string() }
+        );
+        assert_eq!(
+            parse("fake-key <Ctrl-x>").unwrap(),
+            Command::FakeKey { keystring: "<Ctrl-x>".to_string() }
+        );
+        // `--global` aims at qutebrowser's own window, which bru cannot name.
+        assert_eq!(
+            parse("fake-key --global <Escape>").unwrap(),
+            Command::Unimplemented("fake-key --global <Escape>".to_string())
+        );
+        assert!(parse("fake-key").is_err());
+        assert!(parse("insert-text").is_err());
+    }
+
+// --- end src/spawn.rs, src/editor.rs -------------------------------------------------------
 
     #[test]
     fn malformed_arguments_are_errors() {

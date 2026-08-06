@@ -272,6 +272,28 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
+        // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
+        // The one place in bru that runs another program. Everything about *when* that is allowed
+        // is in `spawn.rs`'s module docs; what matters here is that a `Command::Spawn` can only be
+        // built by `commands::parse`, and the three things that call it are a binding, the command
+        // line, and a line a running userscript wrote back. A page reaches none of them.
+        Command::Spawn { cmdline, userscript, detach, messages, verbose } => {
+            crate::spawn::spawn(
+                cmdline,
+                crate::spawn::Opts {
+                    userscript: *userscript,
+                    detach: *detach,
+                    output_messages: *messages,
+                    verbose: *verbose,
+                },
+                count,
+            )
+        }
+        Command::EditText => crate::editor::edit_text(browser),
+        Command::InsertText { text } => crate::editor::insert_text(browser, text),
+        Command::FakeKey { keystring } => crate::editor::fake_key(browser, keystring),
+        // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -330,6 +352,11 @@ pub fn is_live(command: &Command) -> bool {
         Command::Help { .. } => true,
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
+
+        // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
+        Command::Spawn { .. } => true,
+        Command::EditText | Command::InsertText { .. } | Command::FakeKey { .. } => true,
+        // --- end src/spawn.rs, src/editor.rs ------------------------------------------------
 
         Command::Nop | Command::ClearKeychain => true,
 
@@ -708,9 +735,10 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints, 109 once
+        // `edit-text`, `insert-text` and `fake-key` gave insert mode its three. Raise this when a
+        // milestone raises the number, never to make a failing build pass.
+        assert_eq!(live, 109, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
