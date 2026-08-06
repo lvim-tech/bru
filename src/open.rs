@@ -377,7 +377,10 @@ fn has_tld(host: &str) -> bool {
     })
 }
 
-/// `[ -,/:-`{-¶]` — everything a hostname has no business
+/// `[\x00-,/:-`{-¶]` — everything a hostname has no business
+/// (the first bound is written `\x00` rather than as the byte itself: a raw NUL makes
+/// `file` call this source `data` and makes plain `grep -rn` skip it without a word,
+/// which cost two people an afternoon each)
 /// holding. Note what is *not* in it: `.`, `-`, and the digits.
 fn is_forbidden_in_host(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{2c}' | '\u{2f}' | '\u{3a}'..='\u{60}' | '\u{7b}'..='\u{b6}')
@@ -1062,5 +1065,30 @@ mod tests {
         assert!(!has_tld("host.c-om"));
         assert!(!has_tld("host.c_om"));
         assert!(!has_tld(""));
+    }
+
+    /// A NUL byte in a source file makes `file` report `data` and makes plain `grep -rn` skip that
+    /// file **silently** — no warning, no non-zero exit, just no matches. This file carried one
+    /// inside a doc comment for weeks and cost two people an afternoon each, both of whom concluded
+    /// the code they were looking for did not exist. Written here rather than anywhere else because
+    /// this is the file that had it.
+    #[test]
+    fn no_source_file_carries_a_nul_byte() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&src).expect("src/ is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("a readable source file");
+            assert!(
+                !bytes.contains(&0),
+                "{} carries a NUL byte, so grep will skip it without saying so",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked > 20, "only {checked} source files were checked");
     }
 }
