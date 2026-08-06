@@ -967,7 +967,11 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
             open.sequence.pop();
         }
         drop(guard);
-        redraw(browser);
+        // Backspacing can leave one label showing as easily as typing forwards can, and
+        // qutebrowser fires `_handle_auto_follow` from the same `handle_partial_key` either way.
+        if let Some(index) = redraw(browser) {
+            follow(state, browser, index);
+        }
         return Some(true);
     }
 
@@ -992,7 +996,13 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
 
     match outcome {
         Outcome::Follow(index) => follow(state, browser, index),
-        Outcome::Pending | Outcome::NoMatch => redraw(browser),
+        // `hints.auto_follow` is asked here rather than only on an exact match — see [`auto_follow`]
+        // for what the difference is and for the measurement that says it is nothing today.
+        Outcome::Pending | Outcome::NoMatch => {
+            if let Some(index) = redraw(browser) {
+                follow(state, browser, index);
+            }
+        }
     }
     Some(true)
 }
@@ -1028,35 +1038,72 @@ impl Foreign {
     }
 }
 
-/// Push the current chain to the status bar and to the page's labels.
+/// `hints.auto_follow`, configdata.yml:1673, at its default **`unique-match`**: follow as soon as
+/// the chain leaves exactly one label showing, whether or not that label has been typed out.
+/// `visible` is the indices still showing and `typed` the chain that left them.
+///
+/// The other three values (`always`, `full-match`, `never`) are not implemented, because bru ships
+/// no configuration and [`SETTINGS`](crate::settings::SETTINGS) holds only what a user can change.
+/// Two of them are worth knowing about anyway:
+///
+/// - **`full-match` is the rule bru followed before this function existed** — `Match::Exact` on the
+///   whole label. It is *not* what qutebrowser does by default.
+/// - **`never` is the only value under which `<Return>` has a job**, which is why `hint-follow` is
+///   inert. See the `Command::HintFollow` arm of `exec::run`, which carries that measurement.
+///
+/// `always` also fires with an empty chain — `_handle_auto_follow` is called once from `_start_cb`
+/// (hints.py:657) "to make auto_follow == 'always' work", so a page with one link is followed
+/// before a key is pressed. `unique-match` is `bool(keystr or filterstr)`, so an empty chain never
+/// follows; that is what the `typed.is_empty()` arm is, and it is why `f` on a one-link page still
+/// waits for `a`.
+///
+/// **Measured 2026-08-06: with `hints.chars` and `hints.min_chars` at their defaults this can
+/// never fire before the full label is typed.** Over 1..1,000,000 elements there is no prefix that
+/// is not itself a label and yet leaves one label showing — the smallest such set has two in it.
+/// See `unique_match_cannot_beat_a_full_match_under_the_default_hints_chars`. So this replaces a
+/// rule that happens to agree with it, and the agreement is a property of `hint_strings`'
+/// arithmetic rather than of the rule: a `min_chars` of 2 breaks it on the first page with one
+/// link, which is what `unique_match_follows_a_label_that_was_never_typed_out` pins down.
+fn auto_follow(visible: &[usize], typed: &str) -> Option<usize> {
+    match visible {
+        [only] if !typed.is_empty() => Some(*only),
+        _ => None,
+    }
+}
+
+/// Push the current chain to the status bar and to the page's labels, and answer with the hint
+/// [`auto_follow`] wants followed, if any.
 ///
 /// The visible set is computed here, in Rust, and sent as a list of indices. The page is told which
-/// labels to show; it is never asked which ones match.
-fn redraw(browser: &mut Browser) {
+/// labels to show; it is never asked which ones match, and never which one to follow.
+fn redraw(browser: &mut Browser) -> Option<usize> {
     let (keystring, visible, matched_len) = {
         let guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_ref() else {
-            return;
-        };
+        let open = guard.as_ref()?;
         let typed = crate::bindings::sequence_to_string(&open.sequence);
-        let visible: Vec<String> = open
+        let visible: Vec<usize> = open
             .labels
             .iter()
             .enumerate()
             .filter(|(_, label)| label.starts_with(&typed))
-            .map(|(index, _)| index.to_string())
+            .map(|(index, _)| index)
             .collect();
         (typed.clone(), visible, typed.chars().count())
     };
 
-    crate::ipc::set_keystring(keystring);
+    crate::ipc::set_keystring(keystring.clone());
     show(
         browser,
         &format!(
             "window.__bru_hints && window.__bru_hints.filter([{}],{matched_len});",
-            visible.join(",")
+            visible
+                .iter()
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         ),
     );
+    auto_follow(&visible, &keystring)
 }
 
 /// A hint matched. The element's position is enough for `normal` and `hover`; every other target
@@ -1126,7 +1173,13 @@ fn finish(state: &SharedState, browser: &mut Browser, rapid: bool) {
         open.sequence.clear();
         open.first_run = false;
     }
-    redraw(browser);
+    // The chain has just been emptied, so `auto_follow` answers `None` by construction — a rapid
+    // session must not fire its next hint before a key is pressed. That is `always`'s behaviour and
+    // not `unique-match`'s; see [`auto_follow`].
+    // (Called for its effect, and bound first: `debug_assert!(redraw(..).is_none())` would put the
+    // only call to `redraw` inside a macro that is compiled out of a release build.)
+    let auto = redraw(browser);
+    debug_assert!(auto.is_none(), "a rapid reset must not auto-follow");
 }
 
 /// The follow, on Chromium's real input path.
@@ -1531,6 +1584,64 @@ mod tests {
         assert!(Target::Hover.allows_rapid());
         assert!(Target::Yank.allows_rapid());
         assert!(Target::Download.allows_rapid());
+    }
+
+    /// `unique-match` is a different rule from the full match bru followed on before it, and this
+    /// is the difference, in the one shape that can show it.
+    ///
+    /// Nothing `hint_strings` produces has this shape today — see the test below — so without this
+    /// one the whole of [`auto_follow`] could be deleted and every other test would still pass.
+    #[test]
+    fn unique_match_follows_a_label_that_was_never_typed_out() {
+        // What `hints.min_chars = 2` (configdata.yml:1752) does to a page with one link: the label
+        // is `aa`, and one keystroke leaves it alone on the page without having been typed.
+        assert_eq!(auto_follow(&[0], "a"), Some(0), "one label showing is a unique match");
+        // `always` would follow this; `unique-match` is `bool(keystr or filterstr)` and does not.
+        // It is what stops `f` on a one-link page from clicking before a key is pressed.
+        assert_eq!(auto_follow(&[0], ""), None);
+        // Two showing is not unique, whatever has been typed.
+        assert_eq!(auto_follow(&[3, 7], "l"), None);
+        // Nothing showing is not a match either — a chain that named no label.
+        assert_eq!(auto_follow(&[], "z"), None);
+        // The index answered is the label's, not its position in the visible list.
+        assert_eq!(auto_follow(&[41], "jk"), Some(41));
+    }
+
+    /// **The measurement `<Return>` rests on**, and the reason `unique-match` changes no behaviour
+    /// today: with `hints.chars` and `hints.min_chars` at their defaults, a chain that leaves one
+    /// label showing has always typed that label out in full.
+    ///
+    /// Checked over every prefix of every label for 1..1000 elements. The same sweep run in Python
+    /// to 1,000,000 found the same thing, and the smallest visible set a non-label prefix can leave
+    /// is two — so there is no state in which a hint is sitting followable with a key still to
+    /// press, which is what an inert `hint-follow` claims.
+    #[test]
+    fn unique_match_cannot_beat_a_full_match_under_the_default_hints_chars() {
+        use std::collections::HashMap;
+        for count in 1..1000usize {
+            let labels = hint_strings(count);
+            let mut showing: HashMap<String, usize> = HashMap::new();
+            for label in &labels {
+                for cut in 1..=label.chars().count() {
+                    *showing
+                        .entry(label.chars().take(cut).collect::<String>())
+                        .or_default() += 1;
+                }
+            }
+            let complete: std::collections::HashSet<&String> = labels.iter().collect();
+            for (prefix, visible) in &showing {
+                if complete.contains(prefix) {
+                    // Prefix-freedom, from the other direction: a whole label shows only itself.
+                    assert_eq!(*visible, 1, "{count} labels: {prefix:?} is a label and shows {visible}");
+                } else {
+                    assert!(
+                        *visible >= 2,
+                        "{count} labels: {prefix:?} shows one label and is not one — \
+                         unique-match would follow a key before a full match does"
+                    );
+                }
+            }
+        }
     }
 
     /// A key that arrives at the wrong browser ends the session — except for the one session whose

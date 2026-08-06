@@ -394,8 +394,10 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::hints::start(state, browser, group, target, *rapid, *first);
         }
 // --- end src/hints.rs -------------------------------------------------------------------
-        // `<Return>` in hint mode, and it is inert on purpose. Three measurements, re-taken
-        // 2026-08-06 against every group and target the hint workstream added:
+        // **`<Return>` in hint mode has no job, and this is where that was settled rather than
+        // deferred.** It is not "not yet" — `help.rs` marks it *refused*, with the reason below,
+        // because there is no version of bru in which pressing it does something. Four
+        // measurements, the last two taken 2026-08-06 by the workstream that closed it:
         //
         // 1. **bru's labels are prefix-free, so an exact match has already followed itself.**
         //    `hints::hint_strings` gives the short labels the numbers `0..short_count` in
@@ -406,21 +408,27 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         //    a complete label is sitting unfollowed waiting for Enter.
         // 2. **`--rapid` does not change that.** A rapid session clears `sequence` after each
         //    follow and keeps the same label set, so 1 holds for its second and later follows word
-        //    for word; `--first` (`gi`) fires label 0 before any key is pressed at all. The only
-        //    `--rapid` combination that behaves differently, `;R`, is refused before a session
-        //    starts (`hints::Target::allows_rapid`).
+        //    for word; `--first` (`gi`) fires label 0 before any key is pressed at all.
         // 3. **The key is dead in qutebrowser 3.7.0 too, under its own defaults.** `<Return>` is
         //    bound to a bare `hint-follow`, whose `keystring` is then `None`, so it follows
         //    `_context.to_follow` (`hints.py:1008-1012`) — and `to_follow` is only ever assigned in
         //    the `else` branch of `_handle_auto_follow` (`hints.py:833-836`), reached only when
         //    `hints.auto_follow` is `never`. The default is `unique-match` (configdata.yml:1673),
         //    so pressing Enter in stock qutebrowser raises `CommandError("No hint to follow")`.
+        // 4. **The gap between 1 and 3 was the one thing left, and it is empty.** qutebrowser
+        //    follows on a *unique* match and bru followed on a *full* one, so bru could in
+        //    principle sit with one visible label and an incomplete chain — a state qutebrowser's
+        //    default never reaches, and where Enter would have had a job. `hints::auto_follow` now
+        //    implements `unique-match` itself, and the state it was supposed to catch does not
+        //    exist: over 1..1,000,000 elements there is no prefix of a label that is not itself a
+        //    label and yet leaves exactly one label showing — the smallest such set has two in it.
+        //    `hints::tests::unique_match_cannot_beat_a_full_match_under_the_default_hints_chars`
+        //    asserts it to 1000, and the sweep to a million is in that workstream's report.
         //
-        // What *is* worth having is the gap between 1 and 3: qutebrowser follows on a **unique**
-        // match, bru on a **full** one, so bru can sit with one visible label and an incomplete
-        // chain — a state qutebrowser's default never reaches, and where Enter would have a job.
-        // Doing it means reading the session's labels and calling `hints::follow`, both private to
-        // `src/hints.rs`; it belongs in that module and to whoever owns it next, not here.
+        // What would give the key a job is `hints.auto_follow = never`, and bru does not have the
+        // option: DESIGN.md gives it no configuration of its own, and `settings::SETTINGS` holds
+        // only names a user can change *and* bru can honour. If that option is ever added, this arm
+        // and `hints::auto_follow` are the two places to change, and the row stops being refused.
         Command::HintFollow => {}
 
 // --- src/downloads.rs --------------------------------------------------------------------------
