@@ -8,6 +8,9 @@ mod app;
 mod bindings;
 mod chrome;
 mod commands;
+// Nothing calls into it until ipc.rs pushes a completion payload; the allow comes off then.
+#[allow(dead_code)]
+mod completion;
 mod config;
 mod ipc;
 mod keys;
