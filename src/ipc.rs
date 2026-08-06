@@ -180,6 +180,7 @@ struct BarState {
     keystring: String,
     scroll: String,
     tabindex: String,
+    search: String,
 }
 
 fn bar() -> &'static Mutex<BarState> {
@@ -190,6 +191,7 @@ fn bar() -> &'static Mutex<BarState> {
         keystring: String::new(),
         scroll: String::new(),
         tabindex: String::new(),
+        search: String::new(),
     });
     &BAR
 }
@@ -253,6 +255,21 @@ pub fn set_scroll(scroll: String) {
     }
 }
 
+/// `Match [3/17]` from `find.rs`, or empty for no search. Chromium sends several updates per
+/// search as it scans the page, so this is filtered the same way.
+pub fn set_search_match(search: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.search != search => {
+            bar.search = search;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        push();
+    }
+}
+
 /// Push the current state into whichever chrome frames have announced themselves.
 fn push() {
     let (top, bottom) = match chrome().lock() {
@@ -301,13 +318,14 @@ fn bar_json() -> String {
         return "{}".to_string();
     };
     format!(
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\"}}",
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\"}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
         json_escape(&bar.keystring),
         json_escape(&bar.scroll),
         json_escape(&bar.tabindex),
+        json_escape(&bar.search),
     )
 }
 

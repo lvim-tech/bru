@@ -490,6 +490,10 @@ fn perc_text(max: f64, now: f64) -> String {
 /// (`send_key_event`, kept only so the report's comparison can be re-run), and `pos`.
 ///
 /// A leading number is the count, so `10j` and `3C-d` are written as they are typed.
+///
+/// M11's search rides along on the same switch, because it is driven the same way and needs no
+/// second one: `/<text>` and `?<text>` start a search, `n` and `N` continue it, `clear` ends it.
+/// The steps are comma-separated, so search text with a comma in it cannot be written here.
 pub fn schedule_script(steps: &str, interval_ms: i64) {
     started();
     for (index, step) in steps.split(',').filter(|s| !s.is_empty()).enumerate() {
@@ -524,9 +528,10 @@ wrap_task! {
                 .map(|(w, h)| format!("view={w}x{h}"))
                 .unwrap_or_else(|| "view=?".to_string());
             let at = started().elapsed().as_millis();
+            let found = crate::find::matches();
             match position() {
                 Some(p) => eprintln!(
-                    "scroll-script: {at:>6}ms before {:<8} y={:.0}/{:.0} x={:.0}/{:.0} client={:.0}x{:.0} {view} {}",
+                    "scroll-script: {at:>6}ms before {:<8} y={:.0}/{:.0} x={:.0}/{:.0} client={:.0}x{:.0} {view} {} {found:?}",
                     self.step,
                     p.y,
                     p.max_y,
@@ -537,7 +542,7 @@ wrap_task! {
                     perc_text(p.max_y, p.y),
                 ),
                 None => eprintln!(
-                    "scroll-script: {at:>6}ms before {:<8} {view} (no position yet)",
+                    "scroll-script: {at:>6}ms before {:<8} {view} (no position yet) {found:?}",
                     self.step
                 ),
             }
@@ -560,6 +565,15 @@ wrap_task! {
                 "C-f" => scroll_page(&state, &mut browser, 0.0, 1.0, count),
                 "C-b" => scroll_page(&state, &mut browser, 0.0, -1.0, count),
                 "pos" => request_position(&mut browser),
+                "n" => crate::find::search_next(&mut browser, count),
+                "N" => crate::find::search_prev(&mut browser, count),
+                "clear" => crate::find::clear(&mut browser),
+                other if other.starts_with('/') => {
+                    crate::find::search(&mut browser, &other[1..], false)
+                }
+                other if other.starts_with('?') => {
+                    crate::find::search(&mut browser, &other[1..], true)
+                }
                 other if other.starts_with("perc:") || other.starts_with("percx:") => {
                     let horizontal = other.starts_with("percx:");
                     let argument = &other[if horizontal { 6 } else { 5 }..];
