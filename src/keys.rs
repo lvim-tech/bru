@@ -8,14 +8,16 @@
 use cef::*;
 use std::sync::{Arc, Mutex};
 
+use crate::commands::{Command, ScrollDirection};
 use crate::state::BruState;
 
 /// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
 /// delivers per click, and near enough to qutebrowser's step for the two to be compared.
 const STEP: i32 = 120;
 
-/// `EVENTFLAG_SHIFT_DOWN`. Key codes do not distinguish `j` from `J`; the modifier bits do.
-const SHIFT_DOWN: u32 = 1 << 1;
+/// A ceiling on `<count><command>`. qutebrowser has none, but a typo like `99999j` should not lock
+/// the UI thread up sending wheel events.
+const MAX_COUNT: u32 = 1000;
 
 wrap_keyboard_handler! {
     pub struct BruKeyboardHandler {
@@ -42,14 +44,9 @@ wrap_keyboard_handler! {
                 return 0;
             }
 
-            // Leave the page alone while a text field has focus, or j and k cannot be typed into a
-            // search box.
-            if event.focus_on_editable_field != 0 {
-                return 0;
-            }
-
             // A key that reached a chrome strip is a key meant for the chrome — the command line
-            // takes letters. Scrolling the tab strip with j would be nonsense anyway.
+            // takes letters. Scrolling the tab strip with j would be nonsense anyway. (The command
+            // line's own keys arrive this way and are handled here from M9 onwards.)
             if self
                 .state
                 .lock()
@@ -59,61 +56,160 @@ wrap_keyboard_handler! {
                 return 0;
             }
 
-            let shift = event.modifiers & SHIFT_DOWN != 0;
-
-            // ------------------------------------------------------------------------------
-            // TEMPORARY (M5). Four keys wired straight to their commands. M6's key-sequence
-            // parser and M7's binding table replace this whole block with a table lookup —
-            // delete it entire, nothing outside it knows these key codes.
-            // ------------------------------------------------------------------------------
-            if shift && event.windows_key_code == 0x4A {
-                crate::tabs::next_tab(&self.state);
-                return 1;
-            }
-            if shift && event.windows_key_code == 0x4B {
-                crate::tabs::prev_tab(&self.state);
-                return 1;
-            }
-            if !shift && event.windows_key_code == 0x44 {
-                // `d` — tab-close.
-                crate::tabs::close_current(&self.state);
-                return 1;
-            }
-            if !shift && event.windows_key_code == 0x54 {
-                // `t`. A stand-in for `:open -t`, which arrives with the command line in M9;
-                // without some way to make a second tab, none of the rest can be exercised. The
-                // page is a placeholder so that switching is visible before M4 draws the strip.
-                let index = self
+            // A focused text field means insert mode, which is qutebrowser's
+            // `input.insert_mode.auto_enter` and defaults to true. `only_if_normal` is what keeps a
+            // page's focus event from stealing passthrough out from under the user.
+            if event.focus_on_editable_field != 0 {
+                let entered = self
                     .state
                     .lock()
                     .expect("state mutex poisoned")
-                    .tab_count();
-                crate::tabs::new_tab(&self.state, &crate::app::placeholder_tab(index), false);
-                return 1;
+                    .enter_mode(crate::modes::Mode::Insert, true);
+                if entered {
+                    crate::ipc::set_mode("insert".to_string());
+                }
             }
-            // ------------------------------------------------------------------------------
-            // End of the temporary block.
-            // ------------------------------------------------------------------------------
 
-            // Windows key codes: CEF normalises to them on every platform.
-            let delta = match event.windows_key_code {
-                0x4A => -STEP, // j — down. Wheel deltas run the other way.
-                0x4B => STEP,  // k — up
-                _ => return 0,
-            };
-
-            let Some(host) = browser.host() else {
+            // Translate the CEF event into qutebrowser's own key spelling. `None` is a bare
+            // modifier press, which is never a binding on its own.
+            let Some(info) = crate::bindings::KeyInfo::from_cef(
+                event.windows_key_code,
+                event.modifiers,
+                event.character,
+            ) else {
                 return 0;
             };
 
-            // A wheel event carries a position, because Chromium delivers it to whatever sits under
-            // the cursor. (10, 10) is inside the page rather than over a scrollable child.
-            let mouse = MouseEvent { x: 10, y: 10, modifiers: 0 };
-            host.send_mouse_wheel_event(Some(&mouse), 0, delta);
+            let Some(outcome) = self
+                .state
+                .lock()
+                .expect("state mutex poisoned")
+                .handle_key(info)
+            else {
+                // No bindings loaded: not the browser process, or before startup finished.
+                return 0;
+            };
 
-            1 // handled — the page never sees the key
+            // The half-typed chain and count, the way qutebrowser's keystring widget shows them.
+            crate::ipc::set_keystring(outcome.keystring.clone());
+
+            if let crate::bindings::KeyAction::Run { command, count } = outcome.action {
+                run(&self.state, browser, &command, count);
+            }
+
+            outcome.swallow as ::std::os::raw::c_int
         }
     }
+}
+
+/// Run one command against the browser the key arrived at.
+///
+/// Everything stage 1 implements is here; the rest of qutebrowser's command set arrives with the
+/// command line in M9 and is deliberately inert rather than absent — an unimplemented command still
+/// occupies its place in the trie, so `gg` does not become a NoMatch that eats the pending `g`.
+fn run(
+    state: &Arc<Mutex<BruState>>,
+    browser: &mut Browser,
+    command: &Command,
+    count: Option<u32>,
+) {
+    // `3j` is three steps of `j`, not one big one — qutebrowser repeats the command.
+    let repeat = count.unwrap_or(1).clamp(1, MAX_COUNT);
+
+    match command {
+        Command::Chain(parts) => {
+            for part in parts {
+                run(state, browser, part, count);
+            }
+        }
+
+        // The reason bru exists. Through `send_mouse_wheel_event`, never `window.scrollBy`: the
+        // wheel path is Chromium's real input path, animation included.
+        Command::Scroll(direction) => {
+            let (dx, dy) = match direction {
+                ScrollDirection::Down => (0, -STEP),
+                ScrollDirection::Up => (0, STEP),
+                ScrollDirection::Left => (STEP, 0),
+                ScrollDirection::Right => (-STEP, 0),
+                // Top/Bottom/PageUp/PageDown need the page height, which is M11's work.
+                _ => return,
+            };
+            for _ in 0..repeat {
+                wheel(browser, dx, dy);
+            }
+        }
+        Command::ScrollPx { dx, dy } => {
+            for _ in 0..repeat {
+                wheel(browser, *dx, -*dy);
+            }
+        }
+
+        Command::TabNext => {
+            for _ in 0..repeat {
+                crate::tabs::next_tab(state);
+            }
+        }
+        Command::TabPrev => {
+            for _ in 0..repeat {
+                crate::tabs::prev_tab(state);
+            }
+        }
+        Command::TabClose { .. } => crate::tabs::close_current(state),
+
+        Command::ModeEnter(mode) => {
+            let entered = state
+                .lock()
+                .expect("state mutex poisoned")
+                .enter_mode(*mode, false);
+            if entered {
+                crate::ipc::set_mode(mode.name().to_string());
+            }
+        }
+        Command::ModeLeave => {
+            let mut guard = state.lock().expect("state mutex poisoned");
+            if guard.leave_mode() {
+                let now = guard.mode();
+                drop(guard);
+                crate::ipc::set_mode(now.name().to_string());
+                // Leaving insert mode should also give the page's text field up, or the next `j`
+                // is typed into it rather than scrolling.
+                blur(browser);
+            }
+        }
+
+        // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
+        // clear-keychain is already done by the parser reporting the key.
+        Command::Nop | Command::ClearKeychain => {}
+
+        // Parsed, bound, and waiting for the milestone that implements it.
+        _ => {}
+    }
+}
+
+/// Chromium delivers a wheel event to whatever sits under the cursor, so it needs a position inside
+/// the page rather than over a scrollable child.
+fn wheel(browser: &mut Browser, dx: i32, dy: i32) {
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let mouse = MouseEvent { x: 10, y: 10, modifiers: 0 };
+    host.send_mouse_wheel_event(Some(&mouse), dx, dy);
+}
+
+/// Drop focus from whatever the page had focused. One-off script rather than a CEF call because
+/// CEF has no "blur the focused element" — and this runs on leaving insert mode, not on the key
+/// path proper.
+fn blur(browser: &mut Browser) {
+    let Some(frame) = browser.main_frame() else {
+        return;
+    };
+    frame.execute_java_script(
+        Some(&CefString::from(
+            "document.activeElement && document.activeElement.blur();",
+        )),
+        None,
+        0,
+    );
 }
 
 wrap_client! {

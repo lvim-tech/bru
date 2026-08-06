@@ -33,6 +33,16 @@ pub struct BruState {
     /// these; the fields are visible to it and to nothing outside the crate.
     pub(crate) tabs: Vec<crate::tabs::Tab>,
     pub(crate) active: usize,
+    /// The binding tries, one per mode, built once at startup from the compiled-in qutebrowser
+    /// defaults and whatever `config.lua` changed. `None` until then — and permanently so in the
+    /// renderer and GPU processes, which construct this struct and never fill it in.
+    ///
+    /// Nothing Lua survives in here: `Config::into_parsers` returns plain tries of parsed
+    /// `Command`s, and the `Lua` state is dropped before this is set. Pressing `j` must not enter
+    /// an interpreter.
+    parsers: Option<crate::bindings::KeyParsers>,
+    /// Which mode bru is in. Normal until something says otherwise.
+    modes: crate::modes::ModeManager,
 }
 
 impl BruState {
@@ -57,6 +67,8 @@ impl BruState {
                 chrome_browsers: Vec::new(),
                 tabs: Vec::new(),
                 active: 0,
+                parsers: None,
+                modes: crate::modes::ModeManager::new(),
             })
         })
     }
@@ -99,6 +111,51 @@ impl BruState {
 
     pub fn is_chrome_browser(&self, identifier: i32) -> bool {
         self.chrome_browsers.contains(&identifier)
+    }
+
+    /// Installed once, from `on_context_initialized` — the browser process only, and after the Lua
+    /// state that may have edited the bindings has been dropped.
+    pub fn set_parsers(&mut self, parsers: crate::bindings::KeyParsers) {
+        self.parsers = Some(parsers);
+    }
+
+    /// Feed one keypress to the parser for the current mode. `None` before the bindings are loaded,
+    /// which is every process that is not the browser process.
+    pub fn handle_key(
+        &mut self,
+        info: crate::bindings::KeyInfo,
+    ) -> Option<crate::bindings::KeyOutcome> {
+        let mode = self.modes.mode();
+        self.parsers
+            .as_mut()
+            .map(|parsers| parsers.handle(mode, info))
+    }
+
+    pub fn mode(&self) -> crate::modes::Mode {
+        self.modes.mode()
+    }
+
+    /// Enter a mode, clearing the pending chain of the one left behind. `only_if_normal` is what
+    /// stops a page's focus event dragging you out of passthrough.
+    pub fn enter_mode(&mut self, mode: crate::modes::Mode, only_if_normal: bool) -> bool {
+        let transition = self.modes.enter(mode, only_if_normal);
+        self.apply(transition)
+    }
+
+    pub fn leave_mode(&mut self) -> bool {
+        match self.modes.leave_current() {
+            Ok(transition) => self.apply(transition),
+            Err(_) => false,
+        }
+    }
+
+    fn apply(&mut self, transition: crate::modes::Transition) -> bool {
+        if transition.clear_keychain {
+            if let (Some(left), Some(parsers)) = (transition.left, self.parsers.as_mut()) {
+                parsers.clear(left);
+            }
+        }
+        transition.entered.is_some()
     }
 
     /// A browser has come up. Every browser bru creates goes through here.

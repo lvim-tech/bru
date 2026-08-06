@@ -7,11 +7,6 @@
 //!
 //! Nothing in this file touches CEF or Lua. It is a state machine over an enum.
 
-// M6 delivers this module and its tests; `src/keys.rs` starts calling it when the two are merged.
-// Until then every item here is dead to the compiler. **Delete this line once keys.rs is wired** —
-// after that, an unused item is a real one.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// A keyboard mode.
@@ -140,6 +135,8 @@ impl Transition {
     pub const IGNORED: Transition = Transition { left: None, entered: None, clear_keychain: false };
 
     /// Whether the mode actually changed.
+    // The callers all read `entered` directly; this is the same question spelled for the tests.
+    #[allow(dead_code)]
     pub fn changed(&self) -> bool {
         self.entered.is_some()
     }
@@ -243,10 +240,6 @@ impl ModeManager {
         self.leave(self.mode, false)
     }
 
-    /// The mode a prompt would return to. Always `Normal` today.
-    pub fn prev_mode(&self) -> Mode {
-        self.prev_mode
-    }
 }
 
 #[cfg(test)]

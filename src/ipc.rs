@@ -205,6 +205,32 @@ pub fn set_title(title: String) {
     push();
 }
 
+/// The current mode, spelled as qutebrowser spells it. The chrome colours the bar by it.
+pub fn set_mode(mode: String) {
+    if let Ok(mut bar) = bar().lock() {
+        bar.mode = mode;
+    }
+    push();
+}
+
+/// The pending key chain and count — `g` after `g`, `3` after `3`, empty once something ran. This
+/// is qutebrowser's keystring widget, and it is what makes a half-typed `gg` visible.
+pub fn set_keystring(keystring: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.keystring != keystring => {
+            bar.keystring = keystring;
+            true
+        }
+        _ => false,
+    };
+    // Every keypress reaches here, and most leave the string as it was. Pushing regardless would
+    // run a script in the chrome renderer on every `j` — on the one path this project exists to
+    // keep fast.
+    if changed {
+        push();
+    }
+}
+
 /// Push the current state into whichever chrome frames have announced themselves.
 fn push() {
     let (top, bottom) = match chrome().lock() {

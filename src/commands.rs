@@ -13,11 +13,6 @@
 //!
 //! Nothing in this file touches CEF or Lua.
 
-// M7 delivers this module and its tests; `src/keys.rs` starts dispatching these commands when the
-// two are merged. **Delete this line once keys.rs is wired** — after that, a `Command` variant
-// nothing constructs is a real finding.
-#![allow(dead_code)]
-
 use crate::modes::Mode;
 use std::fmt;
 

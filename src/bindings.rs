@@ -12,11 +12,6 @@
 //! Nothing here touches CEF either. [`KeyInfo::from_cef`] takes the three plain integers a
 //! `cef::KeyEvent` carries and returns a value; `src/keys.rs` supplies them.
 
-// M6 delivers this module and its tests; `src/keys.rs` starts calling it when the two are merged.
-// Until then every item here is dead to the compiler. **Delete this line once keys.rs is wired** —
-// after that, an unused item is a real one.
-#![allow(dead_code)]
-
 use crate::commands::Command;
 use crate::modes::Mode;
 use std::collections::HashMap;
@@ -236,6 +231,8 @@ pub struct KeyInfo {
 }
 
 impl KeyInfo {
+    // Built from parsed config and by the tests; the CEF path uses `from_cef` instead.
+    #[allow(dead_code)]
     pub fn new(key: Key, mods: Modifiers) -> KeyInfo {
         KeyInfo { key, mods }
     }
@@ -631,6 +628,8 @@ impl<V> BindingTrie<V> {
     }
 
     /// Unbind a sequence, pruning the branch that is left empty.
+    // `bru.unbind`'s half of the trie. Reached through `Config`, not from the key path.
+    #[allow(dead_code)]
     pub fn remove(&mut self, sequence: &[KeyInfo]) -> Option<V> {
         let Some((first, rest)) = sequence.split_first() else {
             return self.value.take();
@@ -664,11 +663,14 @@ impl<V> BindingTrie<V> {
     }
 
     /// How many sequences are bound.
+    // Trie size, for the tests and for `:bind`'s listing.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         usize::from(self.value.is_some())
             + self.children.values().map(BindingTrie::len).sum::<usize>()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -714,10 +716,8 @@ impl KeyParser {
         KeyParser { mode, bindings, sequence: Vec::new(), count: String::new() }
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
+    // For inspecting a mode's table — the tests, and `:bind`'s listing when it lands.
+    #[allow(dead_code)]
     pub fn bindings(&self) -> &BindingTrie<Command> {
         &self.bindings
     }
@@ -863,6 +863,8 @@ impl KeyParsers {
         self.parser_mut(mode).clear();
     }
 
+    // Read-only counterpart of `parser_mut`; the key path only ever needs the mutable one.
+    #[allow(dead_code)]
     pub fn parser(&self, mode: Mode) -> &KeyParser {
         self.parsers.get(&mode).expect("a parser exists for every Mode::ALL")
     }

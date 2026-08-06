@@ -10,10 +10,6 @@
 //! (`bindings.default:` at line 3676) with no changes to either the keys or the command names —
 //! DESIGN.md: "same keys, same command names".
 
-// M7 delivers this module and its tests; `src/main.rs` calls `Config::load()` when the two are
-// merged. **Delete this line once that call exists** — after that, an unused item is a real one.
-#![allow(dead_code)]
-
 use crate::bindings::{BindingTrie, KeyInfo, KeyParsers, parse_key_sequence, sequence_to_string};
 use crate::commands::{self, Command};
 use crate::modes::Mode;
@@ -316,18 +312,19 @@ impl Bindings {
     }
 
     /// The command bound to `keys` in `mode`, if any.
+    // What a key is bound to, before the command string is parsed. The tests check the
+    // qutebrowser defaults through it; `:bind` will show it to the user.
+    #[allow(dead_code)]
     pub fn command_for(&self, mode: Mode, keys: &str) -> Option<&str> {
         let sequence = parse_key_sequence(keys).ok()?;
         self.per_mode.get(&mode)?.get(&sequence).map(String::as_str)
     }
 
     /// How many sequences are bound in `mode`.
+    // How many sequences a mode ended up with — what the tests assert against the 226 defaults.
+    #[allow(dead_code)]
     pub fn len(&self, mode: Mode) -> usize {
         self.per_mode.get(&mode).map_or(0, HashMap::len)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.per_mode.values().all(HashMap::is_empty)
     }
 
     /// Parse every command string and build one trie per mode.

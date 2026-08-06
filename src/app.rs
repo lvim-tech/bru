@@ -124,6 +124,15 @@ wrap_browser_process_handler! {
             // views below are the first things to ask.
             crate::chrome::register_factory();
 
+            // The bindings, before any browser exists to press a key at. `Config::load` compiles in
+            // qutebrowser's defaults, then runs ~/.config/bru/config.lua over them if it is there.
+            // The Lua state lives and dies inside that call: what comes back is plain tries of
+            // parsed commands, and nothing Lua-shaped survives into the key path.
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_parsers(crate::config::Config::load().into_parsers());
+
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state
             // rather than in this handler because CEF builds a new handler object per callback.
