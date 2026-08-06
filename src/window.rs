@@ -28,6 +28,47 @@ fn handover(text: &str) -> CefString {
     borrowed
 }
 
+/// What the toplevel is called when no tab has a title yet — at startup, and on a page that sets
+/// none. It is also the suffix of every other title.
+const APP_NAME: &str = "bru";
+
+/// Put the showing tab's title on the window.
+///
+/// `window.set_title` was never called, so the compositor showed an empty toplevel: measured
+/// 2026-08-06, `mmsg -g` reported `title ` with nothing after it. Wayland has no separate "browser
+/// name" field — the toplevel title is the only string a taskbar or a window switcher has — so bru's
+/// own name belongs in it, which is what every browser does and what qutebrowser's
+/// `window.title_format` default (`configdata.yml:2675`) says: `{current_title} - qutebrowser`.
+///
+/// qutebrowser's default also opens with `{perc}`, the scroll percentage. bru's does not, and
+/// deliberately: that would put a CEF call and a compositor round trip on every settled scroll
+/// position, which is the one path this project exists to keep fast.
+///
+/// The one caller is [`crate::ipc::set_title`], which is reached from exactly the two places that
+/// mean "the tab now showing has a title": the display handler, for a page that names itself, and
+/// `tabs::select`, for a switch — a switch is not a navigation and fires no display callback.
+pub fn set_title(title: &str) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+    let Some(state) = BruState::instance() else {
+        return;
+    };
+    // The handle is taken and the lock let go before the Views call, like every other CEF call in
+    // bru: a window callback taking the same mutex would deadlock.
+    let window = state.lock().expect("state mutex poisoned").window();
+    let Some(window) = window else {
+        return;
+    };
+
+    let title = title.trim();
+    let title = if title.is_empty() {
+        APP_NAME.to_string()
+    } else {
+        format!("{title} - {APP_NAME}")
+    };
+    window.set_title(Some(&CefString::from(title.as_str())));
+}
+
 wrap_window_delegate! {
     pub struct BruWindowDelegate {
         state: Arc<Mutex<BruState>>,
@@ -78,6 +119,11 @@ wrap_window_delegate! {
 
             let mut bottom = View::from(bottom);
             window.add_child_view(Some(&mut bottom));
+
+            // A name before the first page has one. Without it the toplevel is mapped with an empty
+            // title for as long as the first load takes, and a compositor that reads the title once
+            // keeps the empty one.
+            window.set_title(Some(&CefString::from(APP_NAME)));
 
             window.show();
 

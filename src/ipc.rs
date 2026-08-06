@@ -263,6 +263,10 @@ pub fn set_url(url: String) {
 
 /// From `DisplayHandler::on_title_change`.
 pub fn set_title(title: String) {
+    // And onto the toplevel, which is the only place the compositor can read a window's name from.
+    // Here rather than in the display handler because a tab *switch* also changes the title and
+    // fires no display callback — both routes already come through this function.
+    crate::window::set_title(&title);
     if let Ok(mut bar) = bar().lock() {
         bar.title = title;
     }
