@@ -130,10 +130,14 @@ wrap_browser_process_handler! {
             // qutebrowser's defaults, then runs ~/.config/bru/config.lua over them if it is there.
             // The Lua state lives and dies inside that call: what comes back is plain tries of
             // parsed commands, and nothing Lua-shaped survives into the key path.
-            self.state
-                .lock()
-                .expect("state mutex poisoned")
-                .set_parsers(crate::config::Config::load().into_parsers());
+            let config = crate::config::Config::load();
+            {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                // Kept whole as well as compiled into tries: `bru://help` lists what is bound, and
+                // a trie cannot be read backwards.
+                state.set_bindings(config.bindings.clone());
+                state.set_parsers(config.into_parsers());
+            }
 
             // The completion's four sources, bound to the modules that own them. After the line
             // above, which is what installs the search engines from config.lua.

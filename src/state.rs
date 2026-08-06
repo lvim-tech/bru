@@ -49,6 +49,9 @@ pub struct BruState {
     /// `Command`s, and the `Lua` state is dropped before this is set. Pressing `j` must not enter
     /// an interpreter.
     parsers: Option<crate::bindings::KeyParsers>,
+    /// The same bindings the parsers were built from, kept whole so `bru://help` can list them.
+    /// A trie answers "what does this key do"; the help page asks the opposite question.
+    bindings: Option<crate::config::Bindings>,
     /// Which mode bru is in. Normal until something says otherwise.
     modes: crate::modes::ModeManager,
 }
@@ -78,6 +81,7 @@ impl BruState {
                 last_active: None,
                 closed: Vec::new(),
                 parsers: None,
+                bindings: None,
                 modes: crate::modes::ModeManager::new(),
             })
         })
@@ -127,6 +131,16 @@ impl BruState {
     /// state that may have edited the bindings has been dropped.
     pub fn set_parsers(&mut self, parsers: crate::bindings::KeyParsers) {
         self.parsers = Some(parsers);
+    }
+
+    pub fn set_bindings(&mut self, bindings: crate::config::Bindings) {
+        self.bindings = Some(bindings);
+    }
+
+    /// For `bru://help`, which is built on a CEF IO thread and must not hold this lock while it
+    /// renders 231 rows.
+    pub fn bindings_snapshot(&self) -> Option<crate::config::Bindings> {
+        self.bindings.clone()
     }
 
     /// Feed one keypress to the parser for the current mode. `None` before the bindings are loaded,

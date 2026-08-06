@@ -262,6 +262,11 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // itself by the time this could run — it exists because the binding does.
         Command::HintFollow => {}
 
+        // Generated from the live binding table on every request — see src/help.rs.
+        Command::Help { tab } => {
+            crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
+        }
+
         // --- the command line ---------------------------------------------------------------
         // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
         // stay because the match has no `_`, and they document where the two actually go.
@@ -322,6 +327,7 @@ pub fn is_live(command: &Command) -> bool {
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
 
         Command::Hint { .. } => true,
+        Command::Help { .. } => true,
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 

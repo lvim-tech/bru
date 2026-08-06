@@ -101,6 +101,9 @@ pub enum Command {
     /// `hint-follow` — the `<Return>` binding in hint mode.
     HintFollow,
 
+    /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
+    Help { tab: bool },
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -536,6 +539,9 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "hint-follow" => Command::HintFollow,
+        // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
+        // the one generated from the bindings it is running on.
+        "help" => Command::Help { tab: args.has("t") || args.has("tab") },
 
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.

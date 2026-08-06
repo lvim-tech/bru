@@ -330,6 +330,27 @@ impl Bindings {
     /// How many sequences are bound in `mode`.
     // How many sequences a mode ended up with — what the tests assert against the 226 defaults.
     #[allow(dead_code)]
+    /// Every binding, as `(mode, keys, command)`, sorted — what `bru://help` lists.
+    ///
+    /// Built from the live table rather than from `DEFAULT_BINDINGS`, so a `config.lua` that
+    /// rebinds a key shows the user their key, not qutebrowser's. A help page that can disagree
+    /// with the browser is worse than none.
+    pub fn all(&self) -> Vec<(Mode, String, String)> {
+        let mut out: Vec<(Mode, String, String)> = self
+            .per_mode
+            .iter()
+            .flat_map(|(mode, table)| {
+                table
+                    .iter()
+                    .map(move |(seq, cmd)| (*mode, sequence_to_string(seq), cmd.clone()))
+            })
+            .collect();
+        out.sort_by(|a, b| (a.0, a.1.to_lowercase(), &a.1).cmp(&(b.0, b.1.to_lowercase(), &b.1)));
+        out
+    }
+
+    // How many sequences a mode ended up with — what the tests assert against the defaults.
+    #[allow(dead_code)]
     pub fn len(&self, mode: Mode) -> usize {
         self.per_mode.get(&mode).map_or(0, HashMap::len)
     }

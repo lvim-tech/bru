@@ -98,6 +98,9 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/top.js" => Some(("text/javascript", TOP_JS.to_vec())),
         "/bottom.js" => Some(("text/javascript", BOTTOM_JS.to_vec())),
         "/completion.js" => Some(("text/javascript", COMPLETION_JS.to_vec())),
+        // Generated per request from the live binding table, so it can never drift from the keys
+        // the browser is actually running on. See src/help.rs.
+        "/help" | "/help.html" => Some(("text/html", crate::help::current_page().into_bytes())),
         "/theme.css" => Some(("text/css", theme_css())),
         _ => None,
     }
