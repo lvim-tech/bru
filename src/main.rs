@@ -8,6 +8,10 @@ mod app;
 mod bindings;
 mod chrome;
 mod commands;
+// The allow comes off in the same commit that makes `ipc.rs` call `categories()` on a keystroke —
+// until then the model is built, tested and reachable by nothing.
+#[allow(dead_code)]
+mod completion;
 mod config;
 mod data;
 mod exec;

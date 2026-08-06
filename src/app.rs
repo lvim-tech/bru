@@ -135,6 +135,10 @@ wrap_browser_process_handler! {
                 .expect("state mutex poisoned")
                 .set_parsers(crate::config::Config::load().into_parsers());
 
+            // The completion's four sources, bound to the modules that own them. After the line
+            // above, which is what installs the search engines from config.lua.
+            crate::completion::install(Box::new(crate::data::DataSources));
+
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state
             // rather than in this handler because CEF builds a new handler object per callback.
