@@ -59,6 +59,27 @@ pub enum Command {
     /// `undo [-w]` — reopen the last closed tab.
     Undo { window: bool },
 
+// --- src/session.rs --------------------------------------------------------
+    /// `tab-pin` — toggle whether the showing tab keeps its place.
+    TabPin,
+    /// `tab-mute` — toggle the showing tab's audio.
+    TabMute,
+    /// `tab-give [win-id] [-p]` — move the tab to another window. bru has one window; the variant
+    /// exists so `gD` keeps its place in the trie and so the report can say what is missing.
+    TabGive,
+    /// `session-save [-f] [name]` — write the open tabs to `~/.local/share/bru/sessions/`.
+    SessionSave { name: Option<String>, force: bool },
+    /// `session-load [-c] [--history] <name>`.
+    ///
+    /// `--history` is bru's own flag and has no counterpart in qutebrowser, which always restores a
+    /// tab's whole navigation list because Qt serialises one. CEF does not, so replaying it means
+    /// re-fetching every page in it — see the head of `src/session.rs`. The default is one load per
+    /// tab, on the page it was showing.
+    SessionLoad { name: String, clear: bool, history: bool },
+    /// `session-delete [-f] <name>`.
+    SessionDelete { name: String },
+// --- end src/session.rs ----------------------------------------------------
+
     /// `open [-t|-b|-w] [-p] [-r] [--] [url]`
     Open {
         url: Option<String>,
@@ -580,6 +601,35 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             private: args.any(&["p", "private"]),
         },
         "undo" => Command::Undo { window: args.any(&["w", "window"]) },
+
+// --- src/session.rs --------------------------------------------------------
+        "tab-pin" => Command::TabPin,
+        "tab-mute" => Command::TabMute,
+        "tab-give" => Command::TabGive,
+        // The name is positional and optional; qutebrowser falls back to `session.default_name`
+        // and then to `default` (`sessions.py:_get_session_name`), and bru has only the last of
+        // those until there is a settings store to hold the first.
+        "session-save" => Command::SessionSave {
+            name: args.arg(0).filter(|n| !n.is_empty()).map(str::to_string),
+            force: args.any(&["f", "force"]),
+        },
+        "session-load" => {
+            let Some(name) = args.arg(0).filter(|n| !n.is_empty()) else {
+                return Err(bad("needs a session name"));
+            };
+            Command::SessionLoad {
+                name: name.to_string(),
+                clear: args.any(&["c", "clear"]),
+                history: args.has("history"),
+            }
+        }
+        "session-delete" => {
+            let Some(name) = args.arg(0).filter(|n| !n.is_empty()) else {
+                return Err(bad("needs a session name"));
+            };
+            Command::SessionDelete { name: name.to_string() }
+        }
+// --- end src/session.rs ----------------------------------------------------
 
         // maxsplit=0: the URL is whatever follows the flags, verbatim.
         "open" => {

@@ -179,9 +179,19 @@ wrap_browser_process_handler! {
                 Some(&mut top_delegate),
             );
 
+            // --- sessions (merge: this block belongs to src/session.rs's workstream) ------------
+            // `--restore=<name>` opens a saved session's tabs instead of the start page, the way
+            // `qutebrowser --restore` does. It is decided here, before the first tab is made:
+            // opening the start page and then closing it would flash the wrong site on every
+            // restore. `--restore-history` additionally replays each tab's navigation list, which
+            // costs one page load per entry — see the head of src/session.rs.
+            //
             // The page is tab zero. It is made before the window exists, and the window delegate
             // adds whatever tabs it finds when it is created.
-            crate::tabs::new_tab(&self.state, &url.to_string(), false);
+            if !crate::session::restore_at_startup(&self.state) {
+                crate::tabs::new_tab(&self.state, &url.to_string(), false);
+            }
+            // --- end sessions -------------------------------------------------------------------
 
             let mut bottom_delegate =
                 BruChromeViewDelegate::new(self.state.clone(), BOTTOM_HEIGHT);
@@ -286,6 +296,22 @@ wrap_browser_process_handler! {
                 crate::history::schedule_script(&script, step_ms);
             }
 // --- end src/history.rs ----------------------------------------------------
+
+            // --- sessions (merge: this block belongs to src/session.rs's workstream) ------------
+            // Debug hook, off unless asked for. See session::schedule_script.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("session-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("session-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(2000);
+                crate::session::schedule_script(&script, step_ms);
+            }
+            // --- end sessions -------------------------------------------------------------------
 
             // --- M12 (merge: this block belongs to src/hints.rs's workstream) --------------------
             // Debug hook, off unless asked for. See hints::schedule_hint_script.

@@ -46,7 +46,7 @@
   }
 
   window.bru = {
-    // state = {tabs: [{title, url, active}, ...]}
+    // state = {tabs: [{title, url, active, pinned, muted}, ...]}
     render: function (state) {
       var host = document.getElementById("tabs");
       if (!host) {
@@ -62,7 +62,13 @@
         var tab = tabs[i] || {};
 
         var el = document.createElement("div");
-        el.className = "tab " + (tab.active ? "active " : "") + loadClass(tab);
+        // `pinned` is src/session.rs's addition; chrome.css already had colours for it
+        // (--tabs-pinned-*) and drew nothing, because nothing set the class.
+        el.className =
+          "tab " +
+          (tab.active ? "active " : "") +
+          (tab.pinned ? "pinned " : "") +
+          loadClass(tab);
         el.title = tab.url || "";
         // The one place a pointer is worth having in a keyboard-driven browser:
         // the strip is the only chrome a mouse naturally goes for. The index is
@@ -75,7 +81,11 @@
 
         var title = document.createElement("span");
         title.className = "title";
-        title.textContent = tab.title || tab.url || "";
+        // qutebrowser puts the mute marker in the title, not in a colour:
+        // tabs.title.format is "{audio}{index}: {current_title}" and {audio} is
+        // "[M] " when muted (tabwidget.py:40). Same string here, so a muted tab
+        // reads the same in both browsers and needs no stylesheet of its own.
+        title.textContent = (tab.muted ? "[M] " : "") + (tab.title || tab.url || "");
         el.appendChild(title);
 
         host.appendChild(el);

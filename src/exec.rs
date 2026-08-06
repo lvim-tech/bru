@@ -74,8 +74,10 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 crate::tabs::prev_tab(state);
             }
         }
-        Command::TabClose { .. } => crate::tabs::close_current(state),
-        Command::TabOnly { .. } => crate::tabs::close_others(state),
+        // `-f` is what gets past a pinned tab — qutebrowser prompts instead, and bru has no yes/no
+        // mode to prompt in (src/tabs.rs).
+        Command::TabClose { force, .. } => crate::tabs::close_current(state, *force),
+        Command::TabOnly { force } => crate::tabs::close_others(state, *force),
 
         // `commands.py:978-1018`. A count beats the argument; a negative index counts from the end;
         // and asking for the tab you are already on hops to the last-focused one instead, which is
@@ -160,6 +162,35 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
 
+// --- src/session.rs --------------------------------------------------------
+        Command::TabPin => crate::tabs::toggle_pin(state),
+        Command::TabMute => crate::tabs::toggle_mute(state),
+        // `gD`. There is one window, and a tab cannot be given to a window that does not exist —
+        // see the report: this needs `window_create_top_level` a second time, a `Vec<Window>` in
+        // `BruState` where there is one `Option<Window>`, and a rule for which window a key
+        // belongs to. Faking it by cloning the tab would lose the original's history and look
+        // like a bug rather than a gap.
+        Command::TabGive => {}
+
+        Command::SessionSave { name, .. } => {
+            let name = name.as_deref().unwrap_or(crate::session::DEFAULT_NAME);
+            match crate::session::save(state, name) {
+                Ok(path) => eprintln!("bru: saved session to {}", path.display()),
+                Err(e) => eprintln!("bru: could not save session {name:?}: {e}"),
+            }
+        }
+        Command::SessionLoad { name, clear, history } => {
+            match crate::session::load(state, name, *clear, *history) {
+                Ok(opened) => eprintln!("bru: loaded {opened} tabs from session {name:?}"),
+                Err(e) => eprintln!("bru: could not load session {name:?}: {e}"),
+            }
+        }
+        Command::SessionDelete { name } => match crate::session::delete(name) {
+            Ok(path) => eprintln!("bru: deleted {}", path.display()),
+            Err(e) => eprintln!("bru: could not delete session {name:?}: {e}"),
+        },
+// --- end src/session.rs ----------------------------------------------------
+
         // --- opening ------------------------------------------------------------------------
         // `open` is M9's command, and most of it needs the command line to type a URL into. The
         // part that does not is worth having early: `ga` and `<Ctrl-T>` are bound to a bare
@@ -234,13 +265,20 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // --- lifetime -----------------------------------------------------------------------
         // Closing the window is the whole teardown: `can_close` → `do_close` → `on_before_close`
         // → `quit_message_loop`, the path `--close-after-ms` already exercises. There is one
-        // window, so `close` and `quit` do the same thing; `--save` waits for sessions.
-        Command::Quit { .. } | Command::Close => {
-            let window = state.lock().expect("state mutex poisoned").window();
-            if let Some(window) = window {
-                window.close();
+        // window, so `close` and `quit` do the same thing.
+        Command::Quit { save } => {
+            // `:quit --save` (qutebrowser's `wq` alias) writes the open tabs before the window
+            // goes. It has to happen here rather than in `on_before_close`: by the time that runs
+            // the browsers are being torn down and their navigation lists no longer read back.
+            if *save {
+                match crate::session::save(state, crate::session::DEFAULT_NAME) {
+                    Ok(path) => eprintln!("bru: saved session to {}", path.display()),
+                    Err(e) => eprintln!("bru: could not save the session: {e}"),
+                }
             }
+            close_window(state);
         }
+        Command::Close => close_window(state),
 
         // --- modes --------------------------------------------------------------------------
         Command::ModeEnter(mode) => {
@@ -410,6 +448,15 @@ pub fn is_live(command: &Command) -> bool {
         | Command::TabClone { .. } => true,
         // `undo -w` is the one spelling that does nothing: there is one window.
         Command::Undo { window } => !window,
+
+// --- src/session.rs --------------------------------------------------------
+        Command::TabPin | Command::TabMute => true,
+        // `gD` needs a second window to give the tab to, and bru has one. Inert on purpose.
+        Command::TabGive => false,
+        Command::SessionSave { .. } | Command::SessionLoad { .. } | Command::SessionDelete { .. } => {
+            true
+        }
+// --- end src/session.rs ----------------------------------------------------
 
         Command::Open { .. } => true,
 
@@ -586,6 +633,14 @@ wrap_navigation_entry_visitor! {
             // Keep going: the wanted entry may be further along than the current one.
             1
         }
+    }
+}
+
+/// Close the one window, which is bru's whole teardown.
+fn close_window(state: &SharedState) {
+    let window = state.lock().expect("state mutex poisoned").window();
+    if let Some(window) = window {
+        window.close();
     }
 }
 
@@ -867,7 +922,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 138, "the live-binding count moved");
+        assert_eq!(live, 140, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -1005,6 +1060,61 @@ mod tests {
         assert_eq!(sel, [true; 5], "an -s binding lost its primary selection");
     }
 // --- end src/clip.rs -------------------------------------------------------
+
+// --- src/session.rs --------------------------------------------------------
+    /// The two bindings sessions turned on, named — and the one it deliberately did not.
+    ///
+    /// `session-save`, `session-load` and `session-delete` are typed, not bound: qutebrowser reaches
+    /// them through the `w` and `wq` aliases (configdata.yml:5), and bru has no alias table. So they
+    /// are live commands that move no binding count, and this test says so rather than leaving the
+    /// unchanged number looking like nothing happened.
+    #[test]
+    fn the_bindings_sessions_turned_on() {
+        for keys in ["<Ctrl-p>", "<Alt-m>"] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // `gD` is tab-give, and bru has one window. It parses and stays inert deliberately.
+        assert_eq!(commands::parse("tab-give").unwrap(), Command::TabGive);
+        assert!(!is_live(&commands::parse("tab-give").unwrap()));
+
+        assert!(is_live(&commands::parse("session-save").unwrap()));
+        assert!(is_live(&commands::parse("session-load work").unwrap()));
+        assert!(is_live(&commands::parse("session-delete work").unwrap()));
+        // A session command with no name is a typo, not a default.
+        assert!(commands::parse("session-load").is_err());
+        assert!(commands::parse("session-delete").is_err());
+    }
+
+    #[test]
+    fn session_command_flags() {
+        use crate::commands::Command as C;
+        assert_eq!(
+            commands::parse("session-save").unwrap(),
+            C::SessionSave { name: None, force: false }
+        );
+        assert_eq!(
+            commands::parse("session-save -f work").unwrap(),
+            C::SessionSave { name: Some("work".to_string()), force: true }
+        );
+        assert_eq!(
+            commands::parse("session-load -c --history work").unwrap(),
+            C::SessionLoad { name: "work".to_string(), clear: true, history: true }
+        );
+        assert_eq!(
+            commands::parse("session-load work").unwrap(),
+            C::SessionLoad { name: "work".to_string(), clear: false, history: false }
+        );
+        // `:quit --save` is the one spelling that writes a session on the way out; `:quit` and
+        // `:close` must not.
+        assert_eq!(commands::parse("quit --save").unwrap(), C::Quit { save: true });
+        assert_eq!(commands::parse("quit").unwrap(), C::Quit { save: false });
+    }
+// --- end src/session.rs ----------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.
