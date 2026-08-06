@@ -147,6 +147,18 @@ pub enum Command {
     Yank { what: YankWhat, sel: bool },
 // --- end src/clip.rs -------------------------------------------------------
 
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    /// `search [-r] [text]` — `/text`, and `?text` with `-r`. No text clears the search, which is
+    /// what `<Escape>`'s `clear-keychain ;; search ;; fullscreen --leave` relies on.
+    Search { text: String, reverse: bool },
+    /// `search-next` — `n`, continuing in the direction the search was started in.
+    SearchNext,
+    /// `search-prev` — `N`.
+    SearchPrev,
+    /// `navigate <where> [-t|-b|-w]` — `[[`, `]]`, `{{`, `}}`, `gu`, `gU`, `<Ctrl-A>`, `<Ctrl-X>`.
+    Navigate { to: NavigateTo, tab: bool, bg: bool, window: bool },
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -217,6 +229,26 @@ pub enum YankWhat {
     Inline(String),
 }
 // --- end src/clip.rs -------------------------------------------------------
+
+// --- src/navigate.rs ------------------------------------------------------------------------------
+/// The argument of `navigate`. `commands.py:607` names all six and refuses anything else, so an
+/// unknown destination is a parse error rather than a binding that quietly does nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavigateTo {
+    /// A "previous page" link on the page.
+    Prev,
+    /// A "next page" link on the page.
+    Next,
+    /// One segment up the URL's path.
+    Up,
+    /// The last number in the URL, plus the count.
+    Increment,
+    /// The last number in the URL, minus the count.
+    Decrement,
+    /// The URL without its query and fragment.
+    Strip,
+}
+// --- end src/navigate.rs --------------------------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -672,6 +704,41 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
 // --- end src/clip.rs -------------------------------------------------------
 
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // maxsplit=0 (`commands.py:1621`), so the search text is everything after the flags,
+        // verbatim: `search -r foo bar` searches for "foo bar" backwards, and a `-` inside the text
+        // is text. A bare `search` has no text and clears.
+        "search" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::Search {
+                text: args.arg(0).unwrap_or("").to_string(),
+                reverse: args.any(&["r", "reverse"]),
+            }
+        }
+        "search-next" => Command::SearchNext,
+        "search-prev" => Command::SearchPrev,
+
+        "navigate" => {
+            let Some(to) = args.arg(0) else {
+                return Err(bad("needs a destination"));
+            };
+            Command::Navigate {
+                to: match to {
+                    "prev" => NavigateTo::Prev,
+                    "next" => NavigateTo::Next,
+                    "up" => NavigateTo::Up,
+                    "increment" => NavigateTo::Increment,
+                    "decrement" => NavigateTo::Decrement,
+                    "strip" => NavigateTo::Strip,
+                    other => return Err(bad(&format!("invalid destination {other:?}"))),
+                },
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+            }
+        }
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
@@ -984,11 +1051,13 @@ mod tests {
         let Command::Chain(parts) = cmd else { panic!("expected a chain") };
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], Command::ClearKeychain);
-        assert_eq!(parts[1], Command::Unimplemented("search".to_string()));
+        // A bare `search` is `search` with no text, which is how `<Escape>` clears one.
+        assert_eq!(parts[1], Command::Search { text: String::new(), reverse: false });
         assert_eq!(parts[2], Command::Fullscreen { enter: false, leave: true });
-        // Still not implemented as a whole: `search` is src/find.rs's, and a chain is only as
-        // implemented as its least-implemented link.
-        assert!(!Command::Chain(parts).is_implemented());
+        // Implemented as a whole now that the middle link is: a chain is only as implemented as its
+        // least-implemented link, and this one was held back by `search` until src/find.rs was
+        // wired to the dispatcher.
+        assert!(Command::Chain(parts).is_implemented());
     }
 
     #[test]
@@ -1303,6 +1372,59 @@ mod tests {
     }
 
 // --- end src/spawn.rs, src/editor.rs -------------------------------------------------------
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    #[test]
+    fn search_takes_its_text_verbatim() {
+        // `<Escape>`'s middle link, and `:search` with nothing to search for.
+        assert_eq!(
+            parse("search").unwrap(),
+            Command::Search { text: String::new(), reverse: false }
+        );
+        // maxsplit=0: several words are one search, not a command with arguments.
+        assert_eq!(
+            parse("search foo bar").unwrap(),
+            Command::Search { text: "foo bar".to_string(), reverse: false }
+        );
+        // `?text` — the command line's `?` prefix means `-r`.
+        assert_eq!(
+            parse("search -r foo").unwrap(),
+            Command::Search { text: "foo".to_string(), reverse: true }
+        );
+        // Past the first positional, a `-` is text. Losing this would make `:search -r` unable to
+        // find "-r" and `search foo -r` search backwards for "foo".
+        assert_eq!(
+            parse("search foo -r").unwrap(),
+            Command::Search { text: "foo -r".to_string(), reverse: false }
+        );
+        assert_eq!(parse("search-next").unwrap(), Command::SearchNext);
+        assert_eq!(parse("search-prev").unwrap(), Command::SearchPrev);
+    }
+
+    #[test]
+    fn navigate_names_six_destinations_and_no_others() {
+        let plain = |to| Command::Navigate { to, tab: false, bg: false, window: false };
+        assert_eq!(parse("navigate prev").unwrap(), plain(NavigateTo::Prev));
+        assert_eq!(parse("navigate next").unwrap(), plain(NavigateTo::Next));
+        assert_eq!(parse("navigate up").unwrap(), plain(NavigateTo::Up));
+        assert_eq!(parse("navigate increment").unwrap(), plain(NavigateTo::Increment));
+        assert_eq!(parse("navigate decrement").unwrap(), plain(NavigateTo::Decrement));
+        assert_eq!(parse("navigate strip").unwrap(), plain(NavigateTo::Strip));
+        // `{{` and `}}`, and `gU`.
+        assert_eq!(
+            parse("navigate prev -t").unwrap(),
+            Command::Navigate { to: NavigateTo::Prev, tab: true, bg: false, window: false }
+        );
+        assert_eq!(
+            parse("navigate up -t").unwrap(),
+            Command::Navigate { to: NavigateTo::Up, tab: true, bg: false, window: false }
+        );
+        // `choices=[...]` in qutebrowser: a destination it does not know is an error, not a
+        // silently inert binding.
+        assert!(parse("navigate sideways").is_err());
+        assert!(parse("navigate").is_err());
+    }
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     #[test]
     fn malformed_arguments_are_errors() {

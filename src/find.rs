@@ -123,9 +123,27 @@ pub fn clear(browser: &mut Browser) {
     crate::scroll::request_position(browser);
 }
 
-/// Forget the search because the page under it is gone — a load, or a tab switch. Chromium drops
-/// its own find session on navigation, so keeping ours would make `n` report matches that are not
-/// there.
+/// Forget the search because the page under it has been replaced — the load handler's call, and the
+/// only one with a browser to hand.
+///
+/// **Chromium does not drop its find session on a navigation, whatever this file used to say.**
+/// Measured 2026-08-06 on a `file://` page: with `search Kestrel` displayed, `:open` to a second
+/// page fired `on_find_result` three more times as the *new* document was scanned — `count=1`, then
+/// `count=2` — and the bar read `Match [1/2]` for a search the user never ran on that page, with
+/// those matches highlighted. Forgetting bru's own copy is therefore only half of it; the session
+/// has to be ended as well.
+///
+/// `stop_finding(0)` — the selection is left alone. On a document that has just started loading
+/// there is nothing of ours selected to clear, and clearing is `<Escape>`'s job, not a load's.
+pub fn forget_for(browser: &mut Browser) {
+    forget();
+    if let Some(host) = browser.host() {
+        host.stop_finding(0);
+    }
+}
+
+/// Forget the search because the page under it is gone — a tab switch, where the browser that owns
+/// the find session is the one being left and keeps it.
 pub fn forget() {
     if let Ok(mut cell) = cell().lock() {
         *cell = None;
@@ -172,7 +190,7 @@ wrap_find_handler! {
             browser: Option<&mut Browser>,
             _identifier: ::std::os::raw::c_int,
             count: ::std::os::raw::c_int,
-            _selection_rect: Option<&Rect>,
+            selection_rect: Option<&Rect>,
             active_match_ordinal: ::std::os::raw::c_int,
             _final_update: ::std::os::raw::c_int,
         ) {
@@ -191,7 +209,7 @@ wrap_find_handler! {
             if !is_active {
                 return;
             }
-            trace(count, active_match_ordinal, _final_update);
+            trace(count, active_match_ordinal, _final_update, selection_rect);
             report(match_text(count, active_match_ordinal));
         }
     }
@@ -200,10 +218,18 @@ wrap_find_handler! {
 /// Set `BRU_DEBUG_FIND=1` to see every update Chromium sends, the way `BRU_DEBUG_IPC` traces the
 /// router. It is what showed that a fresh `find` counts before it selects, and the next surprise in
 /// find-in-page should cost one environment variable rather than a rebuild.
-fn trace(count: i32, active: i32, final_update: i32) {
+///
+/// The selection rectangle is in it because it is the one thing here that says *where* the active
+/// match is, in the page's own coordinates and from Chromium rather than from bru. On a machine
+/// where twelve agents share one compositor and a screenshot may catch someone else's window, that
+/// is the measurement that shows `n` moved to a different match rather than re-finding the same one.
+fn trace(count: i32, active: i32, final_update: i32, rect: Option<&Rect>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_FIND").is_some()) {
-        eprintln!("bru[find]: count={count} active={active} final={final_update}");
+        let rect = rect
+            .map(|rect| format!("{},{} {}x{}", rect.x, rect.y, rect.width, rect.height))
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!("bru[find]: count={count} active={active} final={final_update} rect=[{rect}]");
     }
 }
 

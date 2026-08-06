@@ -299,6 +299,21 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::Yank { what, sel } => crate::clip::yank(what, *sel),
 // --- end src/clip.rs -------------------------------------------------------
 
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // `/`, `?`, `n`, `N`. The text is remembered in `find.rs` so `n` knows what to repeat, and
+        // the direction with it: `?foo` then `n` goes up. A count is a repeat of the step, which is
+        // what `3n` means.
+        Command::Search { text, reverse } => crate::find::search(browser, text, *reverse),
+        Command::SearchNext => crate::find::search_next(browser, count),
+        Command::SearchPrev => crate::find::search_prev(browser, count),
+
+        // `[[`, `]]`, `{{`, `}}`, `gu`, `gU`, `<Ctrl-A>`, `<Ctrl-X>`. `-w` folds into `-t`, as it
+        // does for `open`: bru has one window.
+        Command::Navigate { to, tab, bg, window } => {
+            crate::navigate::navigate(state, browser, *to, *tab || *window, *bg, count)
+        }
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
             crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
@@ -447,6 +462,15 @@ pub fn is_live(command: &Command) -> bool {
         // six paste bindings raise no number here even though they only now do the right thing.
         Command::Yank { .. } => true,
 // --- end src/clip.rs -------------------------------------------------------
+
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // All four spellings do something, including a bare `search`, which clears — that is what
+        // makes `<Escape>`'s chain live.
+        Command::Search { .. } | Command::SearchNext | Command::SearchPrev => true,
+        // Every destination, in every tab flag: `-w` is folded into `-t` rather than ignored.
+        Command::Navigate { .. } => true,
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
@@ -843,7 +867,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 127, "the live-binding count moved");
+        assert_eq!(live, 138, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------
@@ -1009,6 +1033,28 @@ mod tests {
         // `U` is `undo -w`, and bru has one window: it parses and stays inert deliberately.
         assert!(!is_live(&commands::parse("undo -w").unwrap()));
     }
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    /// The eleven bindings this milestone made live, named one by one. A total is not enough to
+    /// notice that `[[` went live and `{{` did not.
+    #[test]
+    fn the_bindings_search_and_navigate_turned_on() {
+        for keys in [
+            "n", "N",  // search-next, search-prev
+            "<Escape>", // clear-keychain ;; search ;; fullscreen --leave — held back by `search`
+            "[[", "]]", "{{", "}}", // navigate prev/next, in place and in a tab
+            "gu", "gU", // navigate up
+            "<Ctrl-A>", "<Ctrl-X>", // navigate increment/decrement
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+    }
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     #[test]
     fn tab_move_arguments() {
