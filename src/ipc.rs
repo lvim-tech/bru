@@ -311,6 +311,10 @@ struct Chrome {
     window: u32,
     frames: ChromeFrames,
     bar: BarState,
+    /// The message number this window's command line took the cell from. See
+    /// [`crate::message::sequence`] — while it equals the current one, this window draws no
+    /// message, and every other window still draws it.
+    message_taken: u64,
     /// The tab strip's payload, cached so a push triggered by something other than a tab change
     /// still has it. Held as JSON rather than as a borrow of the state so that a push never has to
     /// take the state mutex — pushes run on the UI thread, and so does everything holding that lock.
@@ -372,6 +376,10 @@ fn with_window<R>(window: u32, f: impl FnOnce(&mut Chrome) -> R) -> Option<R> {
             window,
             frames: ChromeFrames::default(),
             bar: BarState::default(),
+            // No message has been taken from a window that has just appeared, and `sequence` starts
+            // at 0 — so this has to be a number that cannot be the current one. `u64::MAX` is the
+            // only value `SEQUENCE` will never reach.
+            message_taken: u64::MAX,
             tabs: String::new(),
         });
     }
@@ -419,10 +427,14 @@ pub fn set_mode_for(window: u32, mode: String) {
     // the command line out of `exec.rs`.
     crate::cmdline::on_mode_changed(window, &mode);
     // A message and a command line share one cell, so opening the line takes the message's turn
-    // away. Dropping it rather than letting the stylesheet hide it is what stops a message from
-    // three seconds ago reappearing the moment `:` is cancelled.
+    // away — **in this window**. This used to call `message::clear()`, which dropped the message
+    // for the whole process, so `:` typed in one window emptied a message the other window was
+    // showing. Remembering the number instead keeps the message alive everywhere else and still
+    // stops the one from three seconds ago reappearing here the moment `:` is cancelled: a message
+    // that arrives *after* the line was opened has a higher number and is not suppressed.
     if mode == "command" {
-        crate::message::clear();
+        let taken = crate::message::sequence();
+        with_window(window, |entry| entry.message_taken = taken);
     }
     with_window(window, |entry| entry.bar.mode = mode);
     push_for(window);
@@ -633,7 +645,13 @@ fn bar_json_for(window: u32) -> String {
     // is completing.
     let completion = crate::completers::json_for(window);
     // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
-    let message = crate::message::json();
+    let message = if with_window(window, |entry| entry.message_taken)
+        == Some(crate::message::sequence())
+    {
+        "null".to_string()
+    } else {
+        crate::message::json()
+    };
     // Which tab of how many, asked of `BruState` rather than kept on `BarState` — see the note
     // there. Outside `with_window` for the same reason as the three above: the state mutex must
     // never be taken while the chrome mutex is held.

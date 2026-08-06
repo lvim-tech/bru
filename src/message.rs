@@ -63,6 +63,19 @@ fn shown() -> &'static Mutex<Option<Shown>> {
 /// message arriving after two seconds gets its own three and is not cut short by the first one's.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The number of the message showing now, for a window that wants to stop showing **this** one.
+///
+/// The message itself stays one for the process, which is what qutebrowser does: its
+/// `global_bridge.show_message` is connected by every `MainWindow` (`mainwindow.py:511`), so a
+/// message appears in all of them. What is per window is whether a window's bar has room for it —
+/// `#message` and `#cmdline` share one grid cell, so opening the command line takes the message's
+/// turn in that window and in no other. `ipc::set_mode_for` records this number and
+/// `ipc::bar_json_for` compares it, which is why `message::clear` is no longer called there: it
+/// dropped the message for **every** window, so `:` in one window emptied the other's bar.
+pub fn sequence() -> u64 {
+    SEQUENCE.load(Ordering::Relaxed)
+}
+
 pub fn info(text: &str) {
     show(Level::Info, text);
 }
