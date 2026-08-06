@@ -104,6 +104,16 @@ pub enum Command {
     /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
     Help { tab: bool },
 
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    /// `search [-r] [text]` — `/text`, and `?text` with `-r`. No text clears the search, which is
+    /// what `<Escape>`'s `clear-keychain ;; search ;; fullscreen --leave` relies on.
+    Search { text: String, reverse: bool },
+    /// `search-next` — `n`, continuing in the direction the search was started in.
+    SearchNext,
+    /// `search-prev` — `N`.
+    SearchPrev,
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -539,6 +549,21 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "hint-follow" => Command::HintFollow,
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // maxsplit=0 (`commands.py:1621`), so the search text is everything after the flags,
+        // verbatim: `search -r foo bar` searches for "foo bar" backwards, and a `-` inside the text
+        // is text. A bare `search` has no text and clears.
+        "search" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::Search {
+                text: args.arg(0).unwrap_or("").to_string(),
+                reverse: args.any(&["r", "reverse"]),
+            }
+        }
+        "search-next" => Command::SearchNext,
+        "search-prev" => Command::SearchPrev,
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
@@ -694,11 +719,13 @@ mod tests {
         let Command::Chain(parts) = cmd else { panic!("expected a chain") };
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], Command::ClearKeychain);
-        assert_eq!(parts[1], Command::Unimplemented("search".to_string()));
+        // A bare `search` is `search` with no text, which is how `<Escape>` clears one.
+        assert_eq!(parts[1], Command::Search { text: String::new(), reverse: false });
         assert_eq!(parts[2], Command::Fullscreen { enter: false, leave: true });
-        // Still not implemented as a whole: `search` is src/find.rs's, and a chain is only as
-        // implemented as its least-implemented link.
-        assert!(!Command::Chain(parts).is_implemented());
+        // Implemented as a whole now that the middle link is: a chain is only as implemented as its
+        // least-implemented link, and this one was held back by `search` until src/find.rs was
+        // wired to the dispatcher.
+        assert!(Command::Chain(parts).is_implemented());
     }
 
     #[test]
@@ -766,6 +793,36 @@ mod tests {
             );
         }
     }
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    #[test]
+    fn search_takes_its_text_verbatim() {
+        // `<Escape>`'s middle link, and `:search` with nothing to search for.
+        assert_eq!(
+            parse("search").unwrap(),
+            Command::Search { text: String::new(), reverse: false }
+        );
+        // maxsplit=0: several words are one search, not a command with arguments.
+        assert_eq!(
+            parse("search foo bar").unwrap(),
+            Command::Search { text: "foo bar".to_string(), reverse: false }
+        );
+        // `?text` — the command line's `?` prefix means `-r`.
+        assert_eq!(
+            parse("search -r foo").unwrap(),
+            Command::Search { text: "foo".to_string(), reverse: true }
+        );
+        // Past the first positional, a `-` is text. Losing this would make `:search -r` unable to
+        // find "-r" and `search foo -r` search backwards for "foo".
+        assert_eq!(
+            parse("search foo -r").unwrap(),
+            Command::Search { text: "foo -r".to_string(), reverse: false }
+        );
+        assert_eq!(parse("search-next").unwrap(), Command::SearchNext);
+        assert_eq!(parse("search-prev").unwrap(), Command::SearchPrev);
+    }
+
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     #[test]
     fn malformed_arguments_are_errors() {

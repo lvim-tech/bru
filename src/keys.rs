@@ -175,6 +175,12 @@ wrap_client! {
             Some(crate::find::BruFindHandler::new())
         }
 
+        // Where bru learns that the page under it is being replaced — see src/load.rs. One handler
+        // serves every workstream that needs it; a second would replace this one.
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(crate::load::BruLoadHandler::new(self.state.clone()))
+        }
+
         // bru has a request handler only because the message router demands two of its callbacks.
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(BruRequestHandler::new())

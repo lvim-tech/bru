@@ -18,6 +18,7 @@ mod help;
 mod hints;
 mod ipc;
 mod keys;
+mod load;
 mod modes;
 mod open;
 mod scroll;

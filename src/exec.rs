@@ -262,6 +262,15 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // itself by the time this could run — it exists because the binding does.
         Command::HintFollow => {}
 
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // `/`, `?`, `n`, `N`. The text is remembered in `find.rs` so `n` knows what to repeat, and
+        // the direction with it: `?foo` then `n` goes up. A count is a repeat of the step, which is
+        // what `3n` means.
+        Command::Search { text, reverse } => crate::find::search(browser, text, *reverse),
+        Command::SearchNext => crate::find::search_next(browser, count),
+        Command::SearchPrev => crate::find::search_prev(browser, count),
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
             crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
@@ -328,6 +337,13 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+        // All four spellings do something, including a bare `search`, which clears — that is what
+        // makes `<Escape>`'s chain live.
+        Command::Search { .. } | Command::SearchNext | Command::SearchPrev => true,
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 
@@ -708,9 +724,11 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints, 109 once
+        // `search`/`search-next`/`search-prev` reached the dispatcher — `n`, `N`, and `<Escape>`,
+        // whose chain was held back by its `search` link. Raise this when a milestone raises the
+        // number, never to make a failing build pass.
+        assert_eq!(live, 109, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
@@ -740,6 +758,25 @@ mod tests {
         // `U` is `undo -w`, and bru has one window: it parses and stays inert deliberately.
         assert!(!is_live(&commands::parse("undo -w").unwrap()));
     }
+
+// --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
+    /// The three bindings this milestone made live, named one by one. A total is not enough to
+    /// notice that `n` went live and `N` did not.
+    #[test]
+    fn the_bindings_search_turned_on() {
+        for keys in [
+            "n", "N",   // search-next, search-prev
+            "<Escape>", // clear-keychain ;; search ;; fullscreen --leave — held back by `search`
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+    }
+// --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
     #[test]
     fn tab_move_arguments() {
