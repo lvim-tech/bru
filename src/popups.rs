@@ -55,10 +55,11 @@
 //! shape cannot come back through this door when something upstream of it changes.
 //!
 //! **One window is an assumption this file does not make.** The tab is opened through
-//! [`install_opener`]'s hook, which is handed the *opener browser's* identifier. Today nothing
-//! installs one and the fallback calls `tabs::new_tab`, which has one window to put it in. The
-//! multi-window workstream calls `install_opener` once at startup with a function that finds the
-//! window holding that browser and opens the tab there; nothing else here changes.
+//! [`install_opener`]'s hook, which is handed the *opener browser's* identifier. `app.rs` installs
+//! one at startup that turns that identifier into a window with `BruState::window_of_browser` and
+//! calls `tabs::new_tab_in`, so a link clicked in a background window opens its tab **in that
+//! window** rather than in whichever one is in front. The fallback below is only reachable before
+//! that startup wiring runs.
 
 use cef::*;
 use std::sync::Mutex;
@@ -165,12 +166,9 @@ fn opener_hook() -> &'static Mutex<Option<OpenTab>> {
 
 /// Called once at startup by whoever owns windows, before any page can ask for one.
 ///
-/// Dead until `state.rs` / `window.rs` / `tabs.rs` know about more than one window; the `allow` goes
-/// with the call that installs the real one. It is here rather than left to be invented there so
-/// that the multi-window workstream has a named place to plug into and does not have to reach into
-/// `on_before_popup` — which must stay a decision and a `post_task`, for the reason at the head of
-/// this file.
-#[allow(dead_code)]
+/// Installed in `app.rs` with a function that turns the opener's browser id into its window through
+/// `BruState::window_of_browser`. It is here rather than reached into from `window.rs` so that
+/// `on_before_popup` stays a decision and a `post_task`, for the reason at the head of this file.
 pub fn install_opener(open: OpenTab) {
     *opener_hook().lock().expect("popup opener mutex poisoned") = Some(open);
 }
@@ -179,7 +177,7 @@ fn open_tab(state: &SharedState, opener: i32, url: &str, background: bool) {
     let hook = *opener_hook().lock().expect("popup opener mutex poisoned");
     match hook {
         Some(open) => open(state, opener, url, background),
-        // One window (DESIGN.md), so the opener cannot be anywhere else.
+        // No hook installed — only reachable before `app.rs` runs its startup wiring.
         None => crate::tabs::new_tab(state, url, background),
     }
 }

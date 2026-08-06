@@ -171,6 +171,27 @@ wrap_browser_process_handler! {
             crate::hints::install_clipboard(Box::new(crate::clip::HintClipboard));
             crate::hints::install_downloads(Box::new(crate::clip::HintDownloads));
             crate::completers::install_clipboard(crate::clip::yank_plain);
+            // A cancelled popup becomes a tab, and the window it lands in is the window of the page
+            // that asked — not whichever window happens to be in front. `popups.rs` cannot ask that
+            // question itself (it knows only the opener browser's id, and `state.rs` is not its),
+            // so it left this hook and `state.rs` left `window_of_browser`; this is the one line
+            // that joins them. Without it a link clicked in a background window opens its tab in
+            // the foreground one, which is the multi-window shape of the bug popups.rs just fixed.
+            crate::popups::install_opener(|state, opener, url, background| {
+                let window = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .window_of_browser(opener);
+                if std::env::var_os("BRU_DEBUG_POPUPS").is_some() {
+                    eprintln!("bru[popups]: opener browser {opener} is in window {window:?}");
+                }
+                match window {
+                    Some(window) => crate::tabs::new_tab_in(state, window, url, background),
+                    // The opener is gone — its window closed while the popup was in flight. The
+                    // current window is the only honest answer left, and losing the URL is worse.
+                    None => crate::tabs::new_tab(state, url, background),
+                }
+            });
 
             // What Enter in the command line actually runs. Without this the round trip completes
             // and the command is dropped on the floor — `:open -t abv.bg` would print "no command
