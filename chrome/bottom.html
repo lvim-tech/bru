@@ -35,6 +35,11 @@
             <span id="tabindex"></span>
         </div>
         <input id="cmdline" type="text" spellcheck="false" autocomplete="off" />
+        <!-- Whatever bru has been asked to say. It shares the command line's
+             cell, exactly as qutebrowser shares one QStackedLayout slot between
+             its cmd and txt widgets, so the bar is still one row: the line when
+             one is open, the message otherwise, and neither when neither. -->
+        <div id="message"></div>
         <!-- Before bottom.js, which calls into window.bruCompletion when it renders. -->
         <script src="completion.js"></script>
         <script src="bottom.js"></script>

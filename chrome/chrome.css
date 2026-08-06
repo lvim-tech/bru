@@ -169,6 +169,26 @@ body[data-view="bottom"] {
     color: var(--statusbar-normal-fg);
 }
 
+/* In command mode the row belongs to the command line, and the status group
+   gives up whatever it must.
+ *
+ * Without the cap the row is `minmax(0, 1fr)` against `minmax(0, auto)`, and an
+ * auto track is sized to its content before an fr track is given anything left
+ * over. In a narrow tile there is nothing left over: measured 2026-08-06 at
+ * 410px, the URL, the scroll percentage and the tab index filled the row and
+ * #cmdline was allotted zero width — `:` looked like it had done nothing.
+ *
+ * qutebrowser cannot have that problem, because its two widgets are not equals:
+ * the command line is a QLineEdit with a real minimum width, and the URL is a
+ * label at QSizePolicy.Preferred that elides itself instead
+ * (statusbar/textbase.py:30, :44). 40% is that same order of priority written
+ * as a track: the status group may never take more than that share of the row
+ * while the line is open, so the line always has at least 60%. Above about
+ * 900px the group's own content is the smaller of the two and nothing changes. */
+body.mode-command {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 40%);
+}
+
 /* Completion --------------------------------------------------------------
  *
  * Markup completion.js produces inside #completion, categories in
@@ -338,6 +358,49 @@ body.mode-command #message {
     display: none;
 }
 
+/* Messages ----------------------------------------------------------------
+ *
+ * The command line's cell, because a message and a command line are never both
+ * wanted: qutebrowser puts its cmd and txt widgets in one QStackedLayout slot
+ * (statusbar/bar.py:169) and swaps between them, and this is that stack written
+ * as two grid items in one cell.
+ *
+ * Empty means gone — `#message:empty` — the same rule `#completion` follows, so
+ * nothing has to remember to toggle a second thing. */
+
+#message {
+    grid-row: 2;
+    grid-column: 1;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+#message:empty,
+body.mode-command #message {
+    display: none;
+}
+
+#message.info {
+    color: var(--messages-info-fg);
+    background: var(--messages-info-bg);
+}
+
+#message.warning {
+    color: var(--messages-warning-fg);
+    background: var(--messages-warning-bg);
+}
+
+#message.error {
+    color: var(--messages-error-fg);
+    background: var(--messages-error-bg);
+}
+
 /* Status group ------------------------------------------------------------- */
 
 #statusline {
@@ -350,6 +413,12 @@ body.mode-command #message {
     min-width: 0;
     height: var(--bar-h);
     padding: 0 var(--pad-x);
+    /* Only #url shrinks; the percentage and the tab index are what they are. So
+       a group squeezed below the width of those two would spill left, over the
+       command line, rather than stop. It is clipped on the left because the
+       group is packed to the right — the URL, which is the one thing here that
+       has already given up as much as it can, is what goes first. */
+    overflow: hidden;
 }
 
 #statusline > span:empty {

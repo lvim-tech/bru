@@ -98,6 +98,24 @@
     }
   }
 
+  // {level: "info"|"warning"|"error", text} or null. The class is what picks the
+  // colours out of theme.css, and textContent is what makes `#message:empty`
+  // true again — the stylesheet, not this file, decides that an empty message
+  // is a hidden one.
+  function renderMessage(message) {
+    var el = document.getElementById("message");
+    if (!el) {
+      return;
+    }
+    if (!message || !message.text) {
+      el.className = "";
+      el.textContent = "";
+      return;
+    }
+    el.className = message.level || "info";
+    el.textContent = message.text;
+  }
+
   // --- the command line ---------------------------------------------------
 
   var cmdline = null;
@@ -201,6 +219,7 @@
       // The stylesheet reads the mode off className and nothing else off it.
       document.body.className = "mode-" + (state.mode || "normal");
 
+      renderMessage(state.message);
       renderCompletion(state.completion);
       renderCmdline(state.cmdline);
 

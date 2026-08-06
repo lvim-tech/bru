@@ -262,6 +262,20 @@ pub enum Command {
     AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------
 
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+    /// `view-source` — the page's own source, in a tab of its own.
+    ViewSource,
+    /// `print` — hand the page to Chromium's print dialog.
+    Print,
+    /// `devtools [position]` — open the web inspector, or close it if it is open. Every position
+    /// opens a window; see `devtools.rs` for why CEF offers no docked one.
+    DevTools,
+    /// `devtools-focus` — bring the inspector forward.
+    DevToolsFocus,
+    /// `message-info` / `message-warning` / `message-error <text>` — say something in the bar.
+    Message { level: crate::message::Level, text: String },
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -1211,6 +1225,48 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "adblock-info" => Command::AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------
 
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        // `view-source --edit` hands the source to `$EDITOR`, which is a whole other mechanism;
+        // the bare form, which is what `gf` is, opens it in a tab.
+        "view-source" => {
+            if args.any(&["e", "edit", "pygments"]) {
+                Command::Unimplemented(s.trim().to_string())
+            } else {
+                Command::ViewSource
+            }
+        }
+        "print" => {
+            // `--pdf <file>` and `--preview` are separate CEF calls (`print_to_pdf`) and separate
+            // work; a bare `print` is the binding.
+            if args.flags.is_empty() {
+                Command::Print
+            } else {
+                Command::Unimplemented(s.trim().to_string())
+            }
+        }
+        // Every position is the same window — see `devtools.rs`. An unknown one is still an error,
+        // so a typo says so rather than opening the inspector somewhere unexpected.
+        "devtools" => match args.arg(0) {
+            None | Some("window" | "left" | "right" | "top" | "bottom") => Command::DevTools,
+            Some(other) => return Err(bad(&format!("invalid position {other:?}"))),
+        },
+        "devtools-focus" => Command::DevToolsFocus,
+
+        // maxsplit=0: the whole rest of the line is the text, spaces and all.
+        "message-info" | "message-warning" | "message-error" => {
+            let level = match name.as_str() {
+                "message-warning" => crate::message::Level::Warning,
+                "message-error" => crate::message::Level::Error,
+                _ => crate::message::Level::Info,
+            };
+            let args = Args::maxsplit0(&tokens[1..]);
+            let Some(text) = args.arg(0).filter(|t| !t.is_empty()) else {
+                return Err(bad("needs a message"));
+            };
+            Command::Message { level, text: text.to_string() }
+        }
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
@@ -1579,11 +1635,18 @@ mod tests {
 
     #[test]
     fn unknown_commands_are_kept_verbatim_not_rejected() {
-        // `<Ctrl-Alt-p>` in the default table. Printing is in no milestone; the binding still has
-        // to keep its place in the trie.
-        let cmd = parse("print").unwrap();
-        assert_eq!(cmd, Command::Unimplemented("print".to_string()));
-        assert!(!cmd.is_implemented());
+        // `q` and `@` in the default table. Macros need a mode that records a key sequence and one
+        // that replays it, and neither is in any milestone — but the bindings still have to keep
+        // their place in the trie, or `q` would report NoMatch and eat a pending chain.
+        //
+        // (This test used to name `print`, which the polish workstream then implemented. If macros
+        // land too, move it again rather than deleting it: something is always unimplemented, and
+        // the behaviour it pins — unknown is kept, not rejected — is what makes that survivable.)
+        for name in ["macro-record", "macro-run"] {
+            let cmd = parse(name).unwrap();
+            assert_eq!(cmd, Command::Unimplemented(name.to_string()));
+            assert!(!cmd.is_implemented());
+        }
     }
 
 // --- src/clip.rs -----------------------------------------------------------

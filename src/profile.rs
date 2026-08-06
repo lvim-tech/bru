@@ -1,0 +1,284 @@
+//! Which directory Chromium keeps its own state in — CEF-NOTES trap 10.
+//!
+//! `Settings.root_cache_path` left empty means `~/.config/cef_user_data`, shared with every other
+//! CEF application on the machine, and Chromium says so on every start:
+//!
+//! ```text
+//! WARNING:cef/libcef/common/resource_util.cc:83] Please customize CefSettings.root_cache_path
+//! for your application. Use of the default value may lead to unintended process singleton
+//! behavior.
+//! ```
+//!
+//! "Unintended process singleton behavior" is not cosmetic. CEF takes a process-singleton lock on
+//! that directory, so the *second* process to start dies: measured 2026-08-06, `initialize`
+//! returned 0 with "Opening in existing browser session." on stderr and bru aborted on the assert
+//! in `main.rs`, exit 101.
+//!
+//! So bru names its own directory, `~/.local/share/bru/cef`, beside the history and the
+//! quickmarks — DESIGN.md's "bru owns its data" covers Chromium's half of it too.
+//!
+//! That alone would only move the collision: two brus would then fight over *that* directory
+//! instead. The lock below is what stops them. It is bru's own, not Chromium's:
+//!
+//! - The first bru claims `~/.local/share/bru/cef` by creating a symlink `bru.lock` inside it
+//!   pointing at its pid. `symlink(2)` fails with `EEXIST` rather than overwriting, so the claim is
+//!   atomic and two brus starting in the same millisecond cannot both win it.
+//! - A second bru finds the lock held by a live pid and takes `~/.local/share/bru/cef.<its pid>`
+//!   instead, which nothing else can be using. It says so on stderr, because a browser quietly
+//!   running on a different profile than the one you expect is worth a line.
+//! - A lock left behind by a bru that crashed names a pid that is gone; it is replaced rather than
+//!   obeyed. Chromium's own `SingletonLock` works the same way and for the same reason.
+//!
+//! A scratch directory is removed when that bru exits, and any belonging to a pid that no longer
+//! exists are swept at startup, so a crash costs 5.9 MB once rather than 5.9 MB per run (measured
+//! 2026-08-06 on a fresh profile — the shared 114 MB `cef_user_data` is years of accumulated
+//! component downloads, not what one run writes).
+
+use std::path::{Path, PathBuf};
+
+/// The symlink bru claims a profile directory with. Chromium's own singleton file in the same
+/// directory is `SingletonLock`; this one is deliberately a different name, because it has to be
+/// held from before `initialize` — which is exactly when Chromium's does not exist yet.
+const LOCK: &str = "bru.lock";
+
+/// The directory handed to `Settings.root_cache_path`, and whether bru made it up for this run.
+pub struct Profile {
+    path: PathBuf,
+    /// A directory that exists only because the shared one was taken. Removed by [`Profile::release`].
+    scratch: bool,
+}
+
+impl Profile {
+    /// Decide where this process keeps Chromium's state.
+    ///
+    /// `explicit` is `--user-data-dir`, which is honoured verbatim and neither locked nor swept: a
+    /// caller naming a directory has taken responsibility for it. Everything else gets the shared
+    /// directory, or a scratch one if the shared directory is in use.
+    ///
+    /// `None` means neither `$XDG_DATA_HOME` nor `$HOME` is set, and bru cannot name a directory at
+    /// all. The caller leaves `root_cache_path` empty in that case, which is where this started.
+    pub fn choose(explicit: Option<&str>) -> Option<Profile> {
+        if let Some(dir) = explicit.filter(|dir| !dir.is_empty()) {
+            return Some(Profile { path: PathBuf::from(dir), scratch: false });
+        }
+
+        let data_dir = crate::data::data_dir()?;
+        sweep(&data_dir);
+
+        let shared = data_dir.join("cef");
+        if claim(&shared) {
+            return Some(Profile { path: shared, scratch: false });
+        }
+
+        // `cef` → `cef.<pid>`. Nothing else on this machine can be using it, so no claim is needed.
+        let scratch = shared.with_extension(std::process::id().to_string());
+        std::fs::create_dir_all(&scratch).ok()?;
+        eprintln!(
+            "bru: another bru holds {}; this one is using {} and will remove it on exit",
+            shared.display(),
+            scratch.display()
+        );
+        Some(Profile { path: scratch, scratch: true })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Let the directory go: drop the lock this process holds, and delete a scratch directory
+    /// entirely. Called after `shutdown()`, when nothing is writing to it any more.
+    pub fn release(self) {
+        if holder(&self.path) == Some(std::process::id()) {
+            let _ = std::fs::remove_file(self.path.join(LOCK));
+        }
+        if self.scratch {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Try to become the one process using `dir`.
+///
+/// The symlink is the whole mechanism: `symlink(2)` is atomic and refuses to overwrite, so the
+/// success of that one call *is* the claim. Its target is the pid, so a lock nobody is behind can
+/// be told from one that is.
+fn claim(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let lock = dir.join(LOCK);
+    let me = std::process::id().to_string();
+    if std::os::unix::fs::symlink(&me, &lock).is_ok() {
+        return true;
+    }
+    match holder(dir) {
+        // Held, and by something that is still running.
+        Some(pid) if is_alive(pid) => false,
+        // A crash left it behind, or it is not a lock this code wrote. Either way nobody is behind
+        // it: take it. Losing the race to replace it just means taking a scratch directory.
+        _ => {
+            let _ = std::fs::remove_file(&lock);
+            std::os::unix::fs::symlink(&me, &lock).is_ok()
+        }
+    }
+}
+
+/// The pid named by `dir`'s lock, if it has one that reads as a pid.
+fn holder(dir: &Path) -> Option<u32> {
+    std::fs::read_link(dir.join(LOCK))
+        .ok()?
+        .to_str()?
+        .parse()
+        .ok()
+}
+
+/// Whether a pid is still running. `/proc/<pid>` rather than `kill(pid, 0)` so that no signal is
+/// sent and no `libc` call is needed; bru is Linux-only and `/proc` is not optional here.
+fn is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
+}
+
+/// Remove scratch profiles left behind by brus that are gone.
+///
+/// Deliberately narrow: only entries of `data_dir` itself, only real directories (never symlinks),
+/// only names of the exact form `cef.<digits>`, and only when no process holds that pid. The shared
+/// `cef` is named `cef` and can never match.
+fn sweep(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.strip_prefix("cef.")) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if is_alive(pid) {
+            continue;
+        }
+        // `file_type` does not follow symlinks, so a symlink named `cef.1` is not a directory here
+        // and is left alone rather than followed and emptied.
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A scratch directory of this test run's own, never the user's `~/.local/share/bru`.
+    struct TempDir {
+        dir: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("bru-profile-test-{}-{n}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("could not make the test directory");
+            TempDir { dir }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A pid that is certainly not running: one above the machine's maximum.
+    fn dead_pid() -> u32 {
+        std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|max| max.trim().parse::<u32>().ok())
+            .unwrap_or(4_194_304)
+            + 1
+    }
+
+    #[test]
+    fn the_first_claim_wins_and_the_second_does_not() {
+        let t = TempDir::new("claim");
+        let dir = t.dir.join("cef");
+        assert!(claim(&dir), "an unclaimed directory must be claimable");
+        assert_eq!(holder(&dir), Some(std::process::id()));
+        // The second call is this same process, but the lock does not know that: what it refuses is
+        // a *live* holder, which is exactly what a second bru would find.
+        assert!(
+            !claim(&dir),
+            "a directory locked by a live pid must not be claimable again"
+        );
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_process_is_taken_over() {
+        let t = TempDir::new("stale");
+        let dir = t.dir.join("cef");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = dead_pid();
+        std::os::unix::fs::symlink(dead.to_string(), dir.join(LOCK)).unwrap();
+        assert!(!is_alive(dead));
+
+        assert!(claim(&dir), "a lock nobody is behind must be replaceable");
+        assert_eq!(holder(&dir), Some(std::process::id()));
+    }
+
+    #[test]
+    fn releasing_drops_the_lock_and_deletes_only_a_scratch_directory() {
+        let t = TempDir::new("release");
+
+        let shared = t.dir.join("cef");
+        assert!(claim(&shared));
+        Profile { path: shared.clone(), scratch: false }.release();
+        assert!(shared.exists(), "the shared profile survives its process");
+        assert_eq!(holder(&shared), None, "and its lock is gone");
+
+        let scratch = t.dir.join("cef.999999");
+        std::fs::create_dir_all(&scratch).unwrap();
+        Profile { path: scratch.clone(), scratch: true }.release();
+        assert!(!scratch.exists(), "a scratch profile does not survive its process");
+    }
+
+    #[test]
+    fn sweeping_removes_only_dead_scratch_profiles() {
+        let t = TempDir::new("sweep");
+
+        let shared = t.dir.join("cef");
+        let dead = t.dir.join(format!("cef.{}", dead_pid()));
+        let live = t.dir.join(format!("cef.{}", std::process::id()));
+        let history = t.dir.join("history.sqlite");
+        let odd = t.dir.join("cef.notanumber");
+        for dir in [&shared, &dead, &live, &odd] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&history, b"not a directory").unwrap();
+
+        sweep(&t.dir);
+
+        assert!(!dead.exists(), "a scratch profile of a dead pid should be swept");
+        assert!(shared.exists(), "the shared profile is not a scratch profile");
+        assert!(live.exists(), "a scratch profile in use must survive");
+        assert!(odd.exists(), "only cef.<digits> is a scratch profile");
+        assert!(history.exists(), "nothing else in the data directory is touched");
+    }
+
+    #[test]
+    fn an_explicit_directory_is_taken_verbatim_and_never_swept() {
+        let t = TempDir::new("explicit");
+        let named = t.dir.join("somewhere/else");
+        let profile = Profile::choose(Some(named.to_str().unwrap())).expect("an explicit path");
+        assert_eq!(profile.path(), named);
+        // Not created, not locked, not scratch: --user-data-dir belongs to whoever passed it, and
+        // release must not delete it.
+        assert!(!named.exists());
+        profile.release();
+        assert!(!named.exists());
+    }
+}

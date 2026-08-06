@@ -486,6 +486,40 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 // --- end src/completers.rs -----------------------------------------------------------------
 
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        // Chromium's own `view-source:` scheme, in a tab of its own — which is where qutebrowser's
+        // `gf` puts it too ("Show the source of the current page in a new tab",
+        // `commands.py:1423`).
+        //
+        // qutebrowser refuses to view the source of a source view (`commands.py:1440`); bru cannot,
+        // and says so here rather than pretending. **A `view-source:` tab does not report itself as
+        // one.** Measured 2026-08-06 on a tab showing the source of
+        // `http://127.0.0.1:18443/msg.html`: `on_address_change` reported that inner address, and
+        // so did `main_frame().url()` — the only place the prefix appeared was the *title*, which
+        // the toplevel duly wore as `view-source:127.0.0.1:18443/msg.html - bru`. qutebrowser's
+        // check works because the flag is its own (`tab.data.viewing_source`), and nothing bru can
+        // ask CEF is equivalent. So `gf` on a source view opens the same source again in another
+        // tab: a duplicate, never a nesting, because the URL it builds from is the inner one.
+        Command::ViewSource => match active_tab_url(state) {
+            Some(url) => crate::tabs::new_tab(state, &format!("view-source:{url}"), false),
+            None => crate::message::error("no page to view the source of"),
+        },
+        Command::Print => {
+            if let Some(host) = browser.host() {
+                host.print();
+            }
+        }
+        Command::DevTools => crate::devtools::toggle(browser),
+        Command::DevToolsFocus => crate::devtools::focus(browser),
+        // Through the three named entry points rather than through `show`, because those are what
+        // every other workstream will call — `message::info("yanked")` reads as what it does.
+        Command::Message { level, text } => match level {
+            crate::message::Level::Info => crate::message::info(text),
+            crate::message::Level::Warning => crate::message::warning(text),
+            crate::message::Level::Error => crate::message::error(text),
+        },
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -666,6 +700,16 @@ pub fn is_live(command: &Command) -> bool {
         // Live, and not part of the default-binding count: qutebrowser binds none of them either.
         Command::AdblockUpdate | Command::AdblockToggle | Command::AdblockInfo => true,
 // --- end adblock -----------------------------------------------------------------------------
+
+// --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
+        Command::ViewSource | Command::Print => true,
+        // Every `devtools <position>` is live, and every one of them opens a window: CEF has no
+        // docked inspector to give a BrowserView. See `devtools.rs`.
+        Command::DevTools | Command::DevToolsFocus => true,
+        // No default binding names these; they are here so a workstream can say something and so
+        // `:message-error x` can be typed. They cost the live count nothing either way.
+        Command::Message { .. } => true,
+// --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
         // Almost all of these are still waiting for a milestone — but the readline and history
         // bindings reach `cmdline.rs` by name rather than as a variant, so it is the only thing
@@ -956,15 +1000,17 @@ wrap_task! {
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
+            // Both of these used to be an eprintln, where nobody running a browser was looking:
+            // a mistyped `:` command simply did nothing. They are the bar's first real caller.
             let command = match crate::commands::parse(&self.text) {
                 Ok(command) => command,
                 Err(error) => {
-                    eprintln!("bru: {:?} does not parse: {error}", self.text);
+                    crate::message::error(&format!("{}: {error}", self.text));
                     return;
                 }
             };
             if !is_live(&command) {
-                eprintln!("bru: {:?} is not implemented yet", self.text);
+                crate::message::warning(&format!("{}: not implemented yet", self.text));
                 return;
             }
             let Some(mut browser) = state.lock().expect("state mutex poisoned").active_browser()
@@ -1062,7 +1108,7 @@ mod tests {
         // went live and its sibling did not.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 207, "the live-binding count moved");
+        assert_eq!(live, 216, "the live-binding count moved");
     }
 
 // --- src/downloads.rs --------------------------------------------------------------------------

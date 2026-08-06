@@ -158,6 +158,10 @@ impl BrowserSideHandler for BruQueryHandler {
                 let response = match view.as_str() {
                     "top" => {
                         chrome().lock().ok().map(|mut c| c.top = Some(frame));
+                        // The strip keeps the favicons it has been given rather than being handed
+                        // them with every state push, so a strip that has just loaded — at startup,
+                        // or after a theme reload — has to be given the ones already downloaded.
+                        crate::favicon::push_all();
                         tabs_json()
                     }
                     "bottom" => {
@@ -270,8 +274,6 @@ struct BarState {
     /// `[dl 45%]` while a download is running, empty otherwise — `downloads::summary`. Pushed like
     /// the rest; the chrome has no element for it yet and ignores the key until it does.
     download: String,
-    /// src/clip.rs: what a yank has just said. qutebrowser's message area, with one line in it.
-    message: String,
 }
 
 fn bar() -> &'static Mutex<BarState> {
@@ -284,7 +286,6 @@ fn bar() -> &'static Mutex<BarState> {
         tabindex: String::new(),
         search: String::new(),
         download: String::new(),
-        message: String::new(),
     });
     &BAR
 }
@@ -299,6 +300,10 @@ pub fn set_url(url: String) {
 
 /// From `DisplayHandler::on_title_change`.
 pub fn set_title(title: String) {
+    // And onto the toplevel, which is the only place the compositor can read a window's name from.
+    // Here rather than in the display handler because a tab *switch* also changes the title and
+    // fires no display callback — both routes already come through this function.
+    crate::window::set_title(&title);
     if let Ok(mut bar) = bar().lock() {
         bar.title = title;
     }
@@ -313,6 +318,12 @@ pub fn set_mode(mode: String) {
     // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
     // the command line out of `exec.rs`.
     crate::cmdline::on_mode_changed(&mode);
+    // A message and a command line share one cell, so opening the line takes the message's turn
+    // away. Dropping it rather than letting the stylesheet hide it is what stops a message from
+    // three seconds ago reappearing the moment `:` is cancelled.
+    if mode == "command" {
+        crate::message::clear();
+    }
     if let Ok(mut bar) = bar().lock() {
         bar.mode = mode;
     }
@@ -335,16 +346,38 @@ pub fn current_title() -> String {
 /// Where qutebrowser's message area would be. The empty string is not a special case here — the
 /// chrome hides `#message` when it holds nothing, the same rule every other status field follows —
 /// and clearing it after a timeout is `clip.rs`'s business, not this file's.
+/// One line of message on the status bar.
+///
+/// Two workstreams arrived at this at once: a bare string here, and `message.rs` with a level and a
+/// three-second timeout. The richer one won and this is now its front door, so `clip.rs`'s "Yanked
+/// URL to clipboard" keeps working and gains a level and an expiry it did not have.
 pub fn set_message(message: String) {
-    if let Ok(mut bar) = bar().lock() {
-        bar.message = message;
+    if message.is_empty() {
+        crate::message::clear();
+    } else {
+        crate::message::info(&message);
     }
-    push();
 }
 
 /// Push the bar again. The command line calls it after every edit it makes.
 pub fn push_bar() {
     push();
+}
+
+/// Run one statement in the tab strip's frame.
+///
+/// The one caller is `favicon.rs`, and it is a separate call rather than another key in the pushed
+/// state on purpose: an icon is a kilobyte of base64 that never changes once it has arrived, and
+/// carrying every one of them in the object pushed on every keystring and scroll change would put
+/// tens of kilobytes of JavaScript on paths that run constantly. This hands the strip one icon,
+/// once, and the strip keeps it.
+pub fn top_chrome_eval(code: &str) {
+    let Ok(chrome) = chrome().lock() else {
+        return;
+    };
+    if let Some(frame) = chrome.top.clone() {
+        frame.execute_java_script(Some(&CefString::from(code)), None, 0);
+    }
 }
 
 /// The pending key chain and count — `g` after `g`, `3` after `3`, empty once something ran. This
@@ -465,15 +498,17 @@ pub(crate) fn bar_json() -> String {
     // asked here rather than pushed in so that a table can never be one edit behind the text it
     // is completing.
     let completion = crate::completers::json();
+    // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
+    let message = crate::message::json();
     let Ok(bar) = bar().lock() else {
         return "{}".to_string();
     };
     format!(
-        // Five workstreams have each added a key here, and every one of them is optional to the
-        // chrome, which ignores a key it has no element for: `search` is the find handler's match
-        // count, `download` a running download's progress, `message` one line after a yank,
-        // `cmdline` the command line's text and cursor, `completion` the table under it.
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"message\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
+        // Six workstreams have each added a key here, and every one is optional to the chrome,
+        // which ignores a key it has no element for: `search` is the find handler's match count,
+        // `download` a running download's progress, `message` one line with a level and its own
+        // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -482,7 +517,6 @@ pub(crate) fn bar_json() -> String {
         json_escape(&bar.tabindex),
         json_escape(&bar.search),
         json_escape(&bar.download),
-        json_escape(&bar.message),
     )
 }
 
