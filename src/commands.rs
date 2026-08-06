@@ -104,6 +104,21 @@ pub enum Command {
     /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
     Help { tab: bool },
 
+// --- src/downloads.rs --------------------------------------------------------------------------
+    /// `download [url]` — `gd`. No URL means the page that is showing.
+    Download { url: Option<String> },
+    /// `download-cancel [--all]` — `ad`. A count picks which one; none means the last.
+    DownloadCancel { all: bool },
+    /// `download-clear` — `cd`. Forgets the finished ones; touches no file.
+    DownloadClear,
+    /// `download-open [cmdline] [-d]` — open the finished download, or its directory.
+    DownloadOpen { cmdline: Option<String>, dir: bool },
+    /// `download-delete` — remove the file from disk and the row from the list.
+    DownloadDelete,
+    /// `download-retry` — start a failed download again.
+    DownloadRetry,
+// --- end src/downloads.rs ----------------------------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -539,6 +554,36 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "hint-follow" => Command::HintFollow,
+
+// --- src/downloads.rs --------------------------------------------------------------------------
+        // maxsplit=0, as `open` is: a URL is whatever follows the flags, verbatim. `--mhtml` and
+        // `--dest` stay unimplemented rather than becoming a near miss — one needs a page
+        // serialiser and the other needs the prompt bru does not have, and a `:download --dest x`
+        // that quietly saved somewhere else would be worse than one that does nothing.
+        "download" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            if args.any(&["m", "mhtml"]) || args.any(&["dest"]) {
+                Command::Unimplemented(s.trim().to_string())
+            } else {
+                Command::Download {
+                    url: args.arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+                }
+            }
+        }
+        "download-cancel" => Command::DownloadCancel { all: args.any(&["a", "all"]) },
+        "download-clear" => Command::DownloadClear,
+        // Also maxsplit=0 in qutebrowser, and for the same reason: the command to open with may
+        // carry its own flags.
+        "download-open" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::DownloadOpen {
+                cmdline: args.arg(0).filter(|c| !c.is_empty()).map(str::to_string),
+                dir: args.any(&["d", "dir"]),
+            }
+        }
+        "download-delete" => Command::DownloadDelete,
+        "download-retry" => Command::DownloadRetry,
+// --- end src/downloads.rs ----------------------------------------------------------------------
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },

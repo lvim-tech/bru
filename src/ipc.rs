@@ -234,6 +234,9 @@ struct BarState {
     scroll: String,
     tabindex: String,
     search: String,
+    /// `[dl 45%]` while a download is running, empty otherwise — `downloads::summary`. Pushed like
+    /// the rest; the chrome has no element for it yet and ignores the key until it does.
+    download: String,
     /// The completion payload, already JSON — `{categories, selected}` or `null`. Kept as a string
     /// because `completion::to_json` is what builds it and nothing here needs to look inside.
     completion: String,
@@ -248,6 +251,7 @@ fn bar() -> &'static Mutex<BarState> {
         scroll: String::new(),
         tabindex: String::new(),
         search: String::new(),
+        download: String::new(),
         completion: String::new(),
     });
     &BAR
@@ -363,6 +367,22 @@ pub fn set_search_match(search: String) {
     }
 }
 
+/// `[dl 45%]` from `downloads.rs`, or empty when nothing is running. Filtered like the two above:
+/// `on_download_updated` arrives several times a second and the string it produces does not change
+/// nearly that often.
+pub fn set_download(download: String) {
+    let changed = match bar().lock() {
+        Ok(mut bar) if bar.download != download => {
+            bar.download = download;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        push();
+    }
+}
+
 /// Push the current state into whichever chrome frames have announced themselves.
 fn push() {
     let (top, bottom) = match chrome().lock() {
@@ -406,7 +426,8 @@ fn forget_chrome_frames_of(browser: Option<&Browser>) {
     }
 }
 
-fn bar_json() -> String {
+/// `pub(crate)` so a check can read the exact JSON the chrome is handed rather than assert about it.
+pub(crate) fn bar_json() -> String {
     // Built before the lock is taken: `cmdline::json` reads the mode out of `BruState`, and a bar
     // lock held across that would order two mutexes against each other for no reason.
     let cmdline = crate::cmdline::json();
@@ -421,7 +442,7 @@ fn bar_json() -> String {
         // Three workstreams each added a key here: `search` is the find handler's match count,
         // `cmdline` the command line's text and cursor, `completion` the table under it. All three
         // are optional to the chrome, which ignores a key it does not draw.
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -429,6 +450,7 @@ fn bar_json() -> String {
         json_escape(&bar.scroll),
         json_escape(&bar.tabindex),
         json_escape(&bar.search),
+        json_escape(&bar.download),
     )
 }
 
