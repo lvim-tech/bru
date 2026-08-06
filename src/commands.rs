@@ -109,6 +109,11 @@ pub enum Command {
     /// `command-accept [--rapid]`
     CommandAccept { rapid: bool },
 
+// --- src/message.rs (the polish workstream) ------------------------------------------------------
+    /// `message-info` / `message-warning` / `message-error <text>` — say something in the bar.
+    Message { level: crate::message::Level, text: String },
+// --- end src/message.rs --------------------------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -558,6 +563,22 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "command-accept" => Command::CommandAccept { rapid: args.has("rapid") },
+
+// --- src/message.rs (the polish workstream) ------------------------------------------------------
+        // maxsplit=0: the whole rest of the line is the text, spaces and all.
+        "message-info" | "message-warning" | "message-error" => {
+            let level = match name.as_str() {
+                "message-warning" => crate::message::Level::Warning,
+                "message-error" => crate::message::Level::Error,
+                _ => crate::message::Level::Info,
+            };
+            let args = Args::maxsplit0(&tokens[1..]);
+            let Some(text) = args.arg(0).filter(|t| !t.is_empty()) else {
+                return Err(bad("needs a message"));
+            };
+            Command::Message { level, text: text.to_string() }
+        }
+// --- end src/message.rs --------------------------------------------------------------------------
 
         _ => Command::Unimplemented(s.trim().to_string()),
     };

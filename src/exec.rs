@@ -272,6 +272,16 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
+// --- src/message.rs (the polish workstream) ------------------------------------------------------
+        // Through the three named entry points rather than through `show`, because those are what
+        // every other workstream will call — `message::info("yanked")` reads as what it does.
+        Command::Message { level, text } => match level {
+            crate::message::Level::Info => crate::message::info(text),
+            crate::message::Level::Warning => crate::message::warning(text),
+            crate::message::Level::Error => crate::message::error(text),
+        },
+// --- end src/message.rs --------------------------------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -332,6 +342,12 @@ pub fn is_live(command: &Command) -> bool {
         Command::HintFollow => false,
 
         Command::Nop | Command::ClearKeychain => true,
+
+// --- src/message.rs (the polish workstream) ------------------------------------------------------
+        // No default binding names these; they are here so a workstream can say something and so
+        // `:message-error x` can be typed. They cost the live count nothing either way.
+        Command::Message { .. } => true,
+// --- end src/message.rs --------------------------------------------------------------------------
 
         // Almost all of these are still waiting for a milestone — but the readline and history
         // bindings reach `cmdline.rs` by name rather than as a variant, so it is the only thing
@@ -614,15 +630,17 @@ wrap_task! {
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
+            // Both of these used to be an eprintln, where nobody running a browser was looking:
+            // a mistyped `:` command simply did nothing. They are the bar's first real caller.
             let command = match crate::commands::parse(&self.text) {
                 Ok(command) => command,
                 Err(error) => {
-                    eprintln!("bru: {:?} does not parse: {error}", self.text);
+                    crate::message::error(&format!("{}: {error}", self.text));
                     return;
                 }
             };
             if !is_live(&command) {
-                eprintln!("bru: {:?} is not implemented yet", self.text);
+                crate::message::warning(&format!("{}: not implemented yet", self.text));
                 return;
             }
             let Some(mut browser) = state.lock().expect("state mutex poisoned").active_browser()

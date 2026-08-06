@@ -19,6 +19,7 @@ mod help;
 mod hints;
 mod ipc;
 mod keys;
+mod message;
 mod modes;
 mod open;
 mod profile;

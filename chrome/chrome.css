@@ -329,6 +329,49 @@ body:not(.mode-command) #cmdline {
     background: var(--completion-item-selected-bg);
 }
 
+/* Messages ----------------------------------------------------------------
+ *
+ * The command line's cell, because a message and a command line are never both
+ * wanted: qutebrowser puts its cmd and txt widgets in one QStackedLayout slot
+ * (statusbar/bar.py:169) and swaps between them, and this is that stack written
+ * as two grid items in one cell.
+ *
+ * Empty means gone — `#message:empty` — the same rule `#completion` follows, so
+ * nothing has to remember to toggle a second thing. */
+
+#message {
+    grid-row: 2;
+    grid-column: 1;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+#message:empty,
+body.mode-command #message {
+    display: none;
+}
+
+#message.info {
+    color: var(--messages-info-fg);
+    background: var(--messages-info-bg);
+}
+
+#message.warning {
+    color: var(--messages-warning-fg);
+    background: var(--messages-warning-bg);
+}
+
+#message.error {
+    color: var(--messages-error-fg);
+    background: var(--messages-error-bg);
+}
+
 /* Status group ------------------------------------------------------------- */
 
 #statusline {

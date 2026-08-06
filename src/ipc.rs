@@ -285,6 +285,12 @@ pub fn set_mode(mode: String) {
     // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
     // the command line out of `exec.rs`.
     crate::cmdline::on_mode_changed(&mode);
+    // A message and a command line share one cell, so opening the line takes the message's turn
+    // away. Dropping it rather than letting the stylesheet hide it is what stops a message from
+    // three seconds ago reappearing the moment `:` is cancelled.
+    if mode == "command" {
+        crate::message::clear();
+    }
     if let Ok(mut bar) = bar().lock() {
         bar.mode = mode;
     }
@@ -438,14 +444,17 @@ fn bar_json() -> String {
         Ok(bar) if !bar.completion.is_empty() => bar.completion.clone(),
         _ => "null".to_string(),
     };
+    // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
+    let message = crate::message::json();
     let Ok(bar) = bar().lock() else {
         return "{}".to_string();
     };
     format!(
-        // Three workstreams each added a key here: `search` is the find handler's match count,
-        // `cmdline` the command line's text and cursor, `completion` the table under it. All three
-        // are optional to the chrome, which ignores a key it does not draw.
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion}}}",
+        // Four workstreams each added a key here: `search` is the find handler's match count,
+        // `cmdline` the command line's text and cursor, `completion` the table under it, and
+        // `message` whatever the bar has been asked to say. All four are optional to the chrome,
+        // which ignores a key it does not draw.
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
