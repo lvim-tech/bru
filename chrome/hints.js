@@ -98,24 +98,35 @@ window.__bru_hints = (function () {
 
     const ROOT_ID = "__bru_hints_root";
 
-    // The style is qutebrowser's default hint appearance: colors.hints.fg = black,
-    // colors.hints.bg = the yellow gradient, hints.border = 1px solid #E3BE23, hints.radius = 3,
-    // hints.padding = 0/3/0/3, colors.hints.match.fg = green. `all: initial` first, so a page's own
-    // stylesheet cannot reach in; `pointer-events: none` so a label never eats the synthetic click
-    // that Rust aims at the element underneath it.
-    const LABEL_CSS =
-        "all: initial;" +
-        "position: fixed;" +
-        "z-index: 2147483647;" +
-        "pointer-events: none;" +
-        "font: bold 11px/1.2 monospace;" +
-        "color: #000;" +
-        "background: linear-gradient(rgba(255,247,133,0.9), rgba(255,197,66,0.9));" +
-        "border: 1px solid #E3BE23;" +
-        "border-radius: 3px;" +
-        "padding: 0 3px;" +
-        "white-space: nowrap;" +
-        "text-transform: uppercase;";
+    // qutebrowser's default hint appearance, and the fallback when Rust sends no colours:
+    // colors.hints.fg = black, colors.hints.bg = the yellow gradient, hints.border =
+    // 1px solid #E3BE23, hints.radius = 3, hints.padding = 0/3/0/3, colors.hints.match.fg = green.
+    const DEFAULT_STYLE = {
+        "fg": "#000",
+        "bg": "linear-gradient(rgba(255,247,133,0.9), rgba(255,197,66,0.9))",
+        "border": "#E3BE23",
+        "match": "#0f0",
+    };
+
+    // A label's style. The colours arrive from Rust, resolved out of `bru://chrome/theme.css`'s
+    // `--hints-*` custom properties — the page cannot fetch that sheet itself, because it is on a
+    // different origin and CORS is what stops it. `all: initial` first, so a page's own stylesheet
+    // cannot reach in; `pointer-events: none` so a label never eats the synthetic click that Rust
+    // aims at the element underneath it.
+    function label_css(style) {
+        return "all: initial;" +
+            "position: fixed;" +
+            "z-index: 2147483647;" +
+            "pointer-events: none;" +
+            "font: bold 11px/1.2 monospace;" +
+            `color: ${style.fg};` +
+            `background: ${style.bg};` +
+            `border: 1px solid ${style.border};` +
+            "border-radius: 3px;" +
+            "padding: 0 3px;" +
+            "white-space: nowrap;" +
+            "text-transform: uppercase;";
+    }
 
     const state = {
         token: null,
@@ -338,9 +349,11 @@ window.__bru_hints = (function () {
     }
 
     // Draw the labels Rust generated. One per collected element, in the same order.
-    function show(labels) {
+    function show(labels, style) {
         state.labels = labels;
         state.nodes = [];
+        style = Object.assign({}, DEFAULT_STYLE, style || {});
+        const css = label_css(style);
 
         const root = document.createElement("div");
         root.id = ROOT_ID;
@@ -350,12 +363,13 @@ window.__bru_hints = (function () {
         for (let i = 0; i < labels.length && i < state.rects.length; ++i) {
             const rect = state.rects[i];
             const node = document.createElement("span");
-            node.style.cssText = LABEL_CSS +
+            node.style.cssText = css +
                 `left: ${Math.round(Math.max(rect.left, 0))}px;` +
                 `top: ${Math.round(Math.max(rect.top, 0))}px;`;
             node.appendChild(document.createElement("span"));  // matched
             node.appendChild(document.createElement("span"));  // rest
-            node.childNodes[0].style.cssText = "all: initial; color: #0f0; font: inherit;";
+            node.childNodes[0].style.cssText =
+                `all: initial; color: ${style.match}; font: inherit;`;
             node.childNodes[1].style.cssText = "all: initial; color: inherit; font: inherit;";
             node.childNodes[1].textContent = labels[i];
             root.appendChild(node);
