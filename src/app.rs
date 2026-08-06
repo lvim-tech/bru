@@ -42,6 +42,49 @@ wrap_app! {
             Some(BruBrowserProcessHandler::new(self.state.clone()))
         }
 
+        // Chromium's own command line, before Chromium reads it. bru had no hook here at all until
+        // a crash needed one.
+        //
+        // **`--disable-features=SoftNavigationDetection`.** Measured 2026-08-06 on
+        // `youtube.com/watch?v=…`: clicking a link inside the page killed bru with SIGSEGV in **two
+        // of three runs**, and the core shows the fault is entirely inside libcef, with no bru frame
+        // above the message loop:
+        //
+        // ```
+        // tabs::TabInterface::GetFromContents(content::WebContents*)   <- SEGV_MAPERR
+        //   <- ReadAnythingSoftNavigationObserver::OnSoftNavigation()
+        //   <- page_load_metrics::PageLoadTracker::OnSoftNavigation()
+        //   <- MetricsWebContentsObserver::OnTimingUpdated
+        // ```
+        //
+        // `tabs::TabInterface` is a *Chrome browser* concept — a WebContents owned by a
+        // `TabStripModel`. CEF's browsers are not in one, so `GetFromContents` answers null and the
+        // observer dereferences it. It needs a soft navigation to fire, which is why only a
+        // single-page app reaches it: loading a watch page directly is a full navigation and
+        // survived 2/2, and it was clicking a link *within* the page that crashed. YouTube is simply
+        // the SPA this user opens; the bug is not YouTube's and not the ad blocker's — bru has no
+        // filter lists on this machine and `adblock` appears nowhere in the trace.
+        //
+        // Disabling the detection is the narrowest lever bru has: the observer is what is broken,
+        // but it is Chromium's, and the feature that wakes it is the only end reachable from here.
+        // What it costs is a metric nothing in bru reads.
+        //
+        // The switch belongs on every process, so no `process_type` test: the renderer computes the
+        // soft-navigation metrics that the browser process then dispatches into the crash.
+        fn on_before_command_line_processing(
+            &self,
+            _process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            let Some(command_line) = command_line else {
+                return;
+            };
+            command_line.append_switch_with_value(
+                Some(&CefString::from("disable-features")),
+                Some(&CefString::from("SoftNavigationDetection")),
+            );
+        }
+
         // --- M2 --------------------------------------------------------------------------------
         // Runs in every process: browser, renderer, GPU, zygote. Keep it pure — there is no state
         // to reach for out here, and a renderer that missed this call refuses to load bru:// at all.
