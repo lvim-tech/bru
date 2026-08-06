@@ -25,6 +25,31 @@
 //!
 //! `start_page` has no Chromium side at all (`chromium_value` answers `None` for it), so its row
 //! carries [`crate::open::start_page`], which is the value `:open` with no argument would use.
+//!
+//! ## The one thing that cannot happen at request time, and why
+//!
+//! **`RequestContext::get_content_setting` must be called on the browser process UI thread**
+//! (`cef_request_context_capi.h:287-291`) and **a scheme handler factory's functions "will always
+//! be called on the IO thread"** (`cef_scheme_capi.h:86-88`). So the one thing this page cannot do
+//! where it is built is ask Chromium.
+//!
+//! It does not fail loudly. Measured 2026-08-06, on a tab on `https://example.com/` after
+//! `config-cycle -u *://*.example.com/* content.images` had written the rule: `--settings-probe`,
+//! which runs the *same* `chromium_value` from a posted UI task, answered `block`, and this page —
+//! calling it from the resource handler — printed `default` for the same setting at the same URL.
+//! The wrong answer is the enum's "nothing is configured", which is exactly the answer a reader
+//! would believe.
+//!
+//! So the reading is taken on the UI thread and kept in [`SNAPSHOT`]: synchronously by
+//! [`refresh`], which `exec.rs` calls in the `SettingsPage` arm *before* it navigates, and again
+//! from a task this module posts each time the page is built, so that a reload is never more than
+//! one build behind. The page prints how long ago its reading was taken rather than implying it is
+//! this instant's.
+
+use std::sync::Mutex;
+use std::time::Instant;
+
+use cef::*;
 
 use crate::settings::{Kind, Scopes, REFUSED, SETTINGS};
 
@@ -36,8 +61,60 @@ use crate::settings::{Kind, Scopes, REFUSED, SETTINGS};
 /// Chromium's own rule table, not a request.
 const NO_PAGE: &str = "https://example.com/";
 
-/// The page, as HTML. `probe` is the URL the "in force" column is read at.
-pub fn page(probe: &str) -> String {
+/// What Chromium last answered, the URL it was asked at, and when.
+#[derive(Debug)]
+pub struct Snapshot {
+    url: String,
+    at: Instant,
+    values: Vec<(&'static str, String)>,
+}
+
+impl Snapshot {
+    fn value(&self, name: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// Ask Chromium what every content setting is, and keep the answer.
+///
+/// **UI thread only** — see the module docs for the two header lines that make that true and for
+/// the measurement of what happens when it is not.
+///
+/// The URL asked about is the tab that is showing, unless that is the settings page itself, in
+/// which case the previous reading's URL is kept: `bru://` is not a URL Chromium's content-settings
+/// patterns can name (measured in `settings.rs`), and switching the probe to `example.com` on a
+/// reload would make the column change under a reader who had only pressed `r`.
+pub fn refresh() {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+    let mut guard = SNAPSHOT.lock().expect("the settings page mutex is never poisoned");
+    let page = crate::ipc::current_url();
+    let url = if page.starts_with("http://") || page.starts_with("https://") {
+        page
+    } else {
+        guard
+            .as_ref()
+            .map(|snapshot| snapshot.url.clone())
+            .unwrap_or_else(|| NO_PAGE.to_string())
+    };
+
+    let values = SETTINGS
+        .iter()
+        .filter_map(|def| crate::settings::chromium_value(def.name, &url).map(|v| (def.name, v)))
+        .collect();
+
+    *guard = Some(Snapshot { url, at: Instant::now(), values });
+}
+
+/// The page, as HTML, against a reading Chromium has already given — `None` before any has been
+/// taken, which is what a unit test and a browser that has not started yet both look like.
+pub fn page(snapshot: Option<&Snapshot>) -> String {
+    let probe = snapshot.map_or(NO_PAGE, |snapshot| snapshot.url.as_str());
     let mut out = String::with_capacity(8 * 1024);
     out.push_str(
         r#"<!doctype html>
@@ -53,12 +130,17 @@ pub fn page(probe: &str) -> String {
     out.push_str(&format!(
         "<h1>bru</h1>\n<p class=\"summary\">{} settings, {} refused. bru writes no configuration \
          file: <code>:set</code> changes the running browser and nothing on disk. The last column \
-         is what <em>Chromium</em> answers for <code>{}</code>, not what bru's own store holds — a \
-         store that agrees with itself proves nothing. A rule written with <code>-u</code> for some \
-         other host does not show here.</p>\n",
+         is what <em>Chromium</em> answered for <code>{}</code> {}, not what bru's own store holds \
+         — a store that agrees with itself proves nothing. It is read on the UI thread and this \
+         page is built on the IO thread, which is why it carries an age. A rule written with \
+         <code>-u</code> for some other host does not show here.</p>\n",
         SETTINGS.len(),
         REFUSED.len(),
         escape(probe),
+        match snapshot {
+            Some(snapshot) => format!("{} ms ago", snapshot.at.elapsed().as_millis()),
+            None => "— nothing has been read yet".to_string(),
+        },
     ));
 
     out.push_str("<h2>settings</h2>\n<table>\n");
@@ -70,7 +152,7 @@ pub fn page(probe: &str) -> String {
             escape(kind(def.kind)),
             escape(def.default.unwrap_or("unset")),
             escape(scope(def.scopes)),
-            escape(&in_force(def.name, probe)),
+            escape(&in_force(def.name, snapshot)),
         ));
     }
     out.push_str("</table>\n");
@@ -88,22 +170,19 @@ pub fn page(probe: &str) -> String {
     out
 }
 
-/// What the setting is right now, in one cell.
-fn in_force(name: &str, probe: &str) -> String {
-    // No Chromium side at all. `open.rs` resolves it through the same fuzzy parse `:open` uses, so
-    // a `start_page` written `example.com` reads back here as the URL it will actually load.
+/// What the setting is, in one cell.
+fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
+    // No Chromium side at all, and no thread problem either: `open.rs` resolves it in Rust, through
+    // the same fuzzy parse `:open` uses, so a `start_page` written `example.com` reads back here as
+    // the URL it will actually load.
     if name == "start_page" {
         return crate::open::start_page();
     }
-    // `chromium_value` calls `request_context_get_global_context()`, which is a call into libcef
-    // and has no answer before `initialize` — a unit test, or the window between `initialize` and
-    // the first tab. `BruState::instance()` is `None` in exactly that window, and asking it first
-    // is what keeps this file testable without a browser behind it.
-    if crate::state::BruState::instance().is_none() {
-        return "not readable without a browser".to_string();
+    match snapshot.and_then(|snapshot| snapshot.value(name)) {
+        Some(value) => value.to_string(),
+        // Before the first reading — a unit test, or a browser that has not run `refresh` yet.
+        None => "not read yet".to_string(),
     }
-    crate::settings::chromium_value(name, probe)
-        .unwrap_or_else(|| "Chromium has no value for this".to_string())
 }
 
 fn kind(kind: Kind) -> &'static str {
@@ -143,21 +222,32 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// The page for whatever the browser is on right now. `chrome.rs` calls this on every request.
+/// The page as it stands. `chrome.rs` calls this on every request, **on the IO thread**.
 ///
-/// The probe URL is the tab bru was showing when the request arrived: the resource handler runs
-/// before the navigation commits, so `ipc::current_url` still holds the page `Ss` was pressed on,
-/// which is the page whose per-URL settings a reader wants. A `bru://` URL is not probeable —
-/// Chromium's content-settings patterns cannot name a custom scheme, measured in `settings.rs` —
-/// so it falls back to [`NO_PAGE`].
+/// The table is built here and now, from `settings.rs`'s own statics, so it can no more drift from
+/// them than `bru://chrome/help` can from the binding table. The one column that cannot be read
+/// here is Chromium's, so this serves the last reading and posts a task to take the next one — see
+/// the module docs. `exec.rs` refreshes synchronously before it navigates, so the first view after
+/// `Ss` is a reading taken microseconds earlier; a reload is at most one build behind, and the page
+/// says how old it is either way.
 pub fn current_page() -> String {
-    let url = crate::ipc::current_url();
-    let probe = if url.starts_with("http://") || url.starts_with("https://") {
-        url
-    } else {
-        NO_PAGE.to_string()
+    let html = {
+        let guard = SNAPSHOT.lock().expect("the settings page mutex is never poisoned");
+        page(guard.as_ref())
     };
-    page(&probe)
+    let mut task = RefreshSnapshot::new();
+    post_task(ThreadId::UI, Some(&mut task));
+    html
+}
+
+wrap_task! {
+    struct RefreshSnapshot;
+
+    impl Task {
+        fn execute(&self) {
+            refresh();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,9 +256,22 @@ mod tests {
 
     /// One row per setting and one per refusal, and no more: the page is the table, not a copy of
     /// it that someone has to remember to update.
+    /// A reading of the kind `refresh` takes, without a browser to take it from.
+    fn snapshot(url: &str) -> Snapshot {
+        Snapshot {
+            url: url.to_string(),
+            at: Instant::now(),
+            values: vec![
+                ("content.javascript.enabled", "allow".to_string()),
+                ("content.images", "block".to_string()),
+            ],
+        }
+    }
+
     #[test]
     fn every_setting_and_every_refusal_has_a_row() {
-        let html = page("https://example.com/");
+        let taken = snapshot("https://example.com/");
+        let html = page(Some(&taken));
         let rows = html.matches("<tr class=").count();
         assert_eq!(rows, SETTINGS.len() + REFUSED.len());
         for def in SETTINGS {
@@ -186,16 +289,36 @@ mod tests {
     /// global `content.javascript.enabled false` that `settings.rs` will refuse.
     #[test]
     fn the_page_says_which_settings_take_a_pattern() {
-        let html = page("https://example.com/");
+        let html = page(Some(&snapshot("https://example.com/")));
         assert!(html.contains("-u &lt;pattern&gt; only"));
         assert!(html.contains("global only"));
+    }
+
+    /// The column Chromium answers, and the two states it can be in. It is the reason this module
+    /// keeps a snapshot at all — see the module docs and the measurement in them.
+    #[test]
+    fn the_last_reading_chromium_gave_is_what_the_column_shows() {
+        let taken = snapshot("https://example.com/");
+        let html = page(Some(&taken));
+        assert!(html.contains("https://example.com/"), "the URL it was read at is named");
+        assert!(html.contains("<td class=\"state\">block</td>"), "content.images was blocked");
+        assert!(html.contains("<td class=\"state\">allow</td>"));
+        assert!(html.contains("ms ago"), "the reading carries its age");
+
+        // Before any reading, and that is what a browser that has not opened this page yet looks
+        // like. It must not print a default and call it what Chromium is enforcing.
+        let html = page(None);
+        assert!(html.contains("nothing has been read yet"));
+        assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 2);
+        // `start_page` is answered in Rust and needs no reading, so it is never one of them.
+        assert!(html.contains(&escape(&crate::open::start_page())));
     }
 
     /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this
     /// module's to police. Nothing it holds may reach the page as markup.
     #[test]
     fn nothing_from_the_settings_table_can_escape_its_cell() {
-        let html = page("<script>alert(1)</script>");
+        let html = page(Some(&snapshot("<script>alert(1)</script>")));
         assert!(!html.contains("<script>alert(1)"), "the probe URL is text");
         assert!(html.contains("&lt;script&gt;alert(1)"));
         // Every reason arrives through `escape`. None of the two currently written happens to
@@ -208,13 +331,4 @@ mod tests {
         assert_eq!(escape("\"x\""), "&quot;x&quot;");
     }
 
-    /// Outside a running browser there is no Chromium to ask, and the cell says that rather than
-    /// printing the compiled-in default as though it were in force.
-    #[test]
-    fn a_value_that_cannot_be_read_says_so() {
-        let html = page("https://example.com/");
-        assert!(html.contains("not readable without a browser"));
-        // `start_page` never had a Chromium side, so it answers from `open.rs` even here.
-        assert!(html.contains(&escape(&crate::open::start_page())));
-    }
 }

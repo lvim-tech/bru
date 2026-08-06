@@ -564,7 +564,13 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         },
 
         // `Ss`, and a bare `:set`. Same tab, as `configcommands.py:97` has it (`newtab=False`).
+        //
+        // The reading has to be taken *here*, before the navigation: this is the UI thread, which
+        // is the only thread `RequestContext::get_content_setting` may be called on, and the page
+        // is built on the IO thread where the same call silently answers "default" for everything.
+        // Measured — see `settingspage`'s module docs.
         Command::SettingsPage => {
+            crate::settingspage::refresh();
             crate::open::open(state, browser, Some("bru://chrome/settings"), false, false)
         }
 // --- end src/settingspage.rs ---------------------------------------------------------------
