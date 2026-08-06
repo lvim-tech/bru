@@ -615,8 +615,88 @@ fn environment(fifo: &Path, count: Option<u32>) -> Vec<(String, String)> {
         }
     }
 
-    alias_as_qute(&mut env);
+    // Built before `BruState` is locked above would matter, and read from `data.rs` rather than from
+    // a file, so this never holds two of bru's mutexes at once.
+    let qute_config = match qute_config_dir() {
+        Ok(dir) => Some(dir.display().to_string()),
+        Err(problem) => {
+            // Loud, not silent. The script this breaks — `qutebrowser_dmenu`, which is this user's
+            // `o` — does not set `-e`, so a failed `cat` leaves it running with a shorter menu and
+            // no explanation. That is the exact "why are my quickmarks gone" this whole detour is
+            // about, so bru says it here rather than letting the script fail quietly.
+            error(&format!(
+                "spawn: {problem}; a userscript reading $QUTE_CONFIG_DIR/quickmarks will find none"
+            ));
+            None
+        }
+    };
+
+    alias_as_qute(&mut env, qute_config.as_deref());
     env
+}
+
+/// The directory a **qutebrowser** userscript is told is its config directory, laid out the way
+/// qutebrowser lays one out, and rebuilt from bru's own data on every `:spawn --userscript`.
+///
+/// # The disagreement this settles
+///
+/// qutebrowser keeps quickmarks in the **config** directory —
+/// `os.path.join(standarddir.config(), 'quickmarks')`, `browser/urlmarks.py:128` — and bookmarks
+/// beside them at `bookmarks/urls` (:243). bru keeps both in the **data** directory, and DESIGN.md
+/// settled that: a file bru rewrites is not a file a person edits, and `~/.config/bru/` is
+/// configer's. Both are right about their own browser and they cannot both be right about one
+/// environment variable, so `qutebrowser_dmenu` and `qutebrowser_tab_dmenu` — which are `o` and `O`
+/// on this machine — ran `cat "$QUTE_CONFIG_DIR/quickmarks"` and got nothing.
+///
+/// Three ways out were weighed:
+///
+/// | | |
+/// |---|---|
+/// | point `QUTE_CONFIG_DIR` at bru's data directory | makes it identical to `QUTE_DATA_DIR`, so a script that writes a config file writes into bru's data, and nothing in the name says why |
+/// | write a `quickmarks` file into `~/.config/bru/` | forbidden: that directory is configer's and bru must not create anything in it |
+/// | say loudly that the `cat` failed | tells the user their menu is short without giving them their quickmarks back |
+///
+/// This is the fourth: **a directory bru owns, in the runtime directory, holding exactly what a
+/// qutebrowser config directory holds that bru has an answer for.** `BRU_CONFIG_DIR` still names
+/// `~/.config/bru` and is still true; `QUTE_CONFIG_DIR` names this, and is true as well — it *is*
+/// the directory where the things a qutebrowser userscript looks for in a config directory are.
+/// Nothing of bru's data moves, nothing is written under `~/.config/bru/`, and nothing of
+/// qutebrowser's is read.
+///
+/// # Why a copy and not a symlink
+///
+/// A symlink to `~/.local/share/bru/quickmarks` would always be fresh and would not duplicate
+/// anything — but `:quickmark-add` in qutebrowser *appends* to that file, and a userscript that
+/// does the same through the link would write behind `data.rs`'s back, which holds the list in
+/// memory and rewrites the whole file on the next `:quickmark-save`. A copy costs one small write
+/// per userscript run, is rendered from `Data::quickmarks()` rather than from a file that may not
+/// exist yet, and absorbs a write that bru never asked for into something the next reboot deletes.
+///
+/// Only `quickmarks` is written. `bookmarks/urls` would be the same three lines, and nothing on
+/// this machine reads it; a file in a directory scripts `cat` things out of is not free.
+fn qute_config_dir() -> Result<PathBuf, String> {
+    let dir = runtime_dir().join("qute-config");
+    std::fs::create_dir_all(&dir)
+        .map_err(|problem| format!("could not create {}: {problem}", dir.display()))?;
+
+    // qutebrowser's format and bru's are the same line — `name url` — so this is `data.rs`'s own
+    // `write_quickmarks` body, and `sed -E 's/[^ ]+ +//g'` in the dmenu scripts leaves the URL.
+    let body: String = match crate::data::instance().and_then(|data| data.lock().ok()) {
+        Some(data) => data
+            .quickmarks()
+            .iter()
+            .map(|mark| format!("{} {}\n", mark.name, mark.url))
+            .collect(),
+        // No data directory this session — `data::instance` has already said why on stderr. An
+        // empty file is the honest answer and is still better than a missing one: `cat` succeeds
+        // and the menu is history plus the current URL, which is what it would have been anyway.
+        None => String::new(),
+    };
+
+    let path = dir.join("quickmarks");
+    std::fs::write(&path, body)
+        .map_err(|problem| format!("could not write {}: {problem}", path.display()))?;
+    Ok(dir)
 }
 
 /// Add a `QUTE_…` twin for every `BRU_…` variable, so this user's existing qutebrowser userscripts
@@ -646,19 +726,23 @@ fn environment(fifo: &Path, count: Option<u32>) -> Vec<(String, String)> {
 /// against one would be misled. That is this module's own rule — a plausible wrong value is worse
 /// than no value — applied to the one variable it bites.
 ///
-/// **What aliasing does not fix.** `qutebrowser_dmenu` and `qutebrowser_tab_dmenu` read
-/// `$QUTE_CONFIG_DIR/quickmarks`, which is where *qutebrowser* keeps quickmarks; bru keeps them in
-/// its data directory (DESIGN.md), so that `cat` fails and prints to stderr. Neither script sets
-/// `-e`, so the rest of the pipeline still runs and the menu is history plus the current URL —
-/// degraded, not broken. `$QUTE_DATA_DIR/history.sqlite` needs no such caveat: bru's schema is
-/// qutebrowser's, `CompletionHistory(url, title, last_atime)` included (`data.rs`), so their
-/// `sqlite3` query runs verbatim.
-fn alias_as_qute(env: &mut Vec<(String, String)>) {
+/// **`QUTE_CONFIG_DIR` is the one alias that is not a copy.** `qutebrowser_dmenu` and
+/// `qutebrowser_tab_dmenu` read `$QUTE_CONFIG_DIR/quickmarks`, which is where *qutebrowser* keeps
+/// quickmarks and is not where bru keeps them; the `qute_config_dir` argument is
+/// [`qute_config_dir`]'s answer to that, and the whole argument for it is there.
+/// `$QUTE_DATA_DIR/history.sqlite` needs no such treatment: bru's schema is qutebrowser's,
+/// `CompletionHistory(url, title, last_atime)` included (`data.rs`), so their `sqlite3` query runs
+/// verbatim.
+fn alias_as_qute(env: &mut Vec<(String, String)>, qute_config_dir: Option<&str>) {
     let aliases: Vec<(String, String)> = env
         .iter()
         .filter_map(|(key, value)| {
             let rest = key.strip_prefix("BRU_").filter(|rest| *rest != "VERSION")?;
-            Some((format!("QUTE_{rest}"), value.clone()))
+            let value = match (rest, qute_config_dir) {
+                ("CONFIG_DIR", Some(dir)) => dir.to_string(),
+                _ => value.clone(),
+            };
+            Some((format!("QUTE_{rest}"), value))
         })
         .collect();
     env.extend(aliases);
@@ -989,7 +1073,7 @@ mod tests {
             ("BRU_DATA_DIR".to_string(), "/home/x/.local/share/bru".to_string()),
             ("BRU_URL".to_string(), "https://example.com/a".to_string()),
         ];
-        alias_as_qute(&mut env);
+        alias_as_qute(&mut env, Some("/run/user/1000/bru/qute-config"));
         let get = |name: &str| {
             env.iter()
                 .find(|(key, _)| key == name)
@@ -1002,7 +1086,14 @@ mod tests {
         assert_eq!(get("QUTE_URL").as_deref(), Some("https://example.com/a"));
         // The two dmenu scripts, and qute-keepassxc for its key file.
         assert_eq!(get("QUTE_DATA_DIR").as_deref(), Some("/home/x/.local/share/bru"));
-        assert_eq!(get("QUTE_CONFIG_DIR").as_deref(), Some("/home/x/.config/bru"));
+        // The one alias that is not a copy: bru's config directory holds no quickmarks and never
+        // will, so a qutebrowser userscript is pointed at the directory that does. `BRU_CONFIG_DIR`
+        // is untouched and still names the real one.
+        assert_eq!(
+            get("QUTE_CONFIG_DIR").as_deref(),
+            Some("/run/user/1000/bru/qute-config")
+        );
+        assert_eq!(get("BRU_CONFIG_DIR").as_deref(), Some("/home/x/.config/bru"));
         assert_eq!(get("QUTE_MODE").as_deref(), Some("command"));
 
         // bru's own names are untouched: a bru userscript is not asked to learn qutebrowser's.
@@ -1031,7 +1122,7 @@ mod tests {
             ("EDITOR".to_string(), "nvim".to_string()),
             ("QUTE_URL".to_string(), "https://already".to_string()),
         ];
-        alias_as_qute(&mut env);
+        alias_as_qute(&mut env, None);
         assert_eq!(env.len(), 4, "one alias added, and only one");
         assert!(env.contains(&("QUTE_TAB_INDEX".to_string(), "3".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "QUTE_EDITOR"));
