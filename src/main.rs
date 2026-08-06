@@ -20,6 +20,7 @@ mod ipc;
 mod keys;
 mod modes;
 mod open;
+mod profile;
 mod scroll;
 mod state;
 mod tabs;
@@ -58,10 +59,26 @@ fn main() -> Result<(), &'static str> {
     }
     assert_eq!(ret, -1, "browser process could not execute");
 
+    // Where Chromium keeps its own state. Left empty this is `~/.config/cef_user_data`, shared with
+    // every other CEF application on the machine and singleton-locked, so the second bru to start
+    // died on the assert below with "Opening in existing browser session." — CEF-NOTES trap 10.
+    // `profile.rs` names bru's own directory and, when another bru already holds it, one that
+    // nothing else can be using.
+    let user_data_dir =
+        CefString::from(&cmd_line.switch_value(Some(&CefString::from("user-data-dir")))).to_string();
+    let profile = profile::Profile::choose(Some(user_data_dir.as_str()));
+
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.
         no_sandbox: 1,
+        // `cache_path` is deliberately still empty: that is the profile, and an empty one keeps
+        // browsers in-memory the way they already were. This is the *root*, which is what the
+        // singleton lock is taken on.
+        root_cache_path: profile
+            .as_ref()
+            .map(|profile| CefString::from(profile.path().to_string_lossy().as_ref()))
+            .unwrap_or_default(),
         ..Default::default()
     };
 
@@ -78,5 +95,10 @@ fn main() -> Result<(), &'static str> {
 
     run_message_loop();
     shutdown();
+
+    // After shutdown, so nothing is still writing to the directory being let go of.
+    if let Some(profile) = profile {
+        profile.release();
+    }
     Ok(())
 }
