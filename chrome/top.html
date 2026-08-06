@@ -1,7 +1,17 @@
 <!doctype html>
-<meta charset="utf-8">
-<title>bru tabs</title>
-<link rel="stylesheet" href="chrome.css">
-<link rel="stylesheet" href="theme.css">
-<div id="tabs"></div>
-<script src="top.js"></script>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>bru tabs</title>
+        <!-- chrome.css carries the layout and not one colour; theme.css carries
+             the colours and not one rule. bru serves theme.css from
+             ~/.config/bru/theme.css, so swapping the theme is swapping a file. -->
+        <link rel="stylesheet" href="chrome.css" />
+        <link rel="stylesheet" href="theme.css" />
+    </head>
+    <!-- data-view, not a class: top.js owns className and may overwrite it. -->
+    <body data-view="top">
+        <div id="tabs"></div>
+        <script src="top.js"></script>
+    </body>
+</html>
