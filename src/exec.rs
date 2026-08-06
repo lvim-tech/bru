@@ -900,7 +900,14 @@ pub fn refusal(command: &Command) -> Option<&'static str> {
         // All twelve are `config-cycle … ;; reload`, so they arrive as a chain and never as the
         // bare command. `is_live` on a chain is "every part acts", so one refused part is enough
         // to refuse the whole row — and it is the part the reader pressed the key for.
-        Command::Chain(parts) => parts.iter().find_map(refusal),
+        //
+        // The live parts are filtered out before the recursion rather than skipped inside it, and
+        // that is not tidiness: without it the `debug_assert` above fires on `reload`. It did —
+        // `every_binding_appears` aborted with "a live command cannot also be refused" the moment
+        // `settings::refusal_in` was stubbed out and `find_map` walked past the `config-cycle` to
+        // the second half of the chain. A `config.lua` writing `reload ;; config-cycle …` would
+        // have reached it with nothing stubbed at all.
+        Command::Chain(parts) => parts.iter().filter(|part| !is_live(part)).find_map(refusal),
         _ => None,
     }
 }

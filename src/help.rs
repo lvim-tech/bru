@@ -236,6 +236,15 @@ mod tests {
 
         // A refused row is not a "not yet" row, or the third state is decoration.
         assert!(!html.contains(r#"<td class="cmd">hint-follow</td><td class="state">not yet</td>"#));
+
+        // The twelve are chains — `config-cycle … ;; reload` — and the reason must come from the
+        // half that is refused whichever half is written first. Asking `exec::refusal` for the
+        // reversed spelling is what proves it does not depend on the order, which it did until a
+        // deliberate break walked it past the `config-cycle` and into `reload`.
+        let forwards = "config-cycle -p -u *://x/* content.plugins ;; reload";
+        let backwards = "reload ;; config-cycle -p -u *://x/* content.plugins";
+        assert!(matches!(State::of(forwards), State::Refused(_)));
+        assert_eq!(State::of(forwards), State::of(backwards));
     }
 
     /// A reason is prose written by a person and lands inside a table cell. It goes through the
