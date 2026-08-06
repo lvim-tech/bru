@@ -960,10 +960,18 @@ pub fn renderer_on_context_created(frame: Option<&Frame>) {
         // queues an `ExecuteJavaScript` until the frame is attached to the browser process, which
         // for a context this new has not happened yet. `eval` runs in the context that was just
         // created, synchronously, which is the whole point of injecting here.
-        if let Some(value) = evaluate(frame, &code) {
-            if value.starts_with("<exception:") {
+        // A `None` here is not "nothing to report" — it is `v8_context()` answering nothing or
+        // `enter()` refusing, and the script did not run at all. Logging only the exception left
+        // that case silent, which reads on the terminal exactly like a script that ran and chose to
+        // do nothing: the `injecting …` line above is printed either way.
+        match evaluate(frame, &code) {
+            Some(value) if value.starts_with("<exception:") => {
                 eprintln!("bru[greasemonkey]: {name} threw on injection: {value}");
             }
+            Some(_) => {}
+            None => eprintln!(
+                "bru[greasemonkey]: {name} did not run — the frame gave up no V8 context to run it in"
+            ),
         }
     }
 }
