@@ -20,80 +20,116 @@ use crate::window::BruBrowserViewDelegate;
 pub type SharedState = Arc<Mutex<BruState>>;
 
 pub struct Tab {
-    view: BrowserView,
+    pub(crate) view: BrowserView,
     /// Learned from `BrowserViewDelegate::on_browser_created`, not at creation: `browser_view_create`
     /// returns before the browser exists, so this is `None` for the moment in between.
-    browser_id: Option<i32>,
-    title: String,
-    url: String,
+    pub(crate) browser_id: Option<i32>,
+    pub(crate) title: String,
+    pub(crate) url: String,
     /// `<Ctrl-p>` — a tab that keeps its place and does not get closed by accident. It is bru's own
     /// flag and nothing in CEF knows about it; what it changes is `close_current`, `close_others`
     /// and the class the strip draws.
-    pinned: bool,
+    pub(crate) pinned: bool,
     /// `<Alt-m>` — the mirror of `host.is_audio_muted()`. Kept here as well as asked of CEF because
     /// the strip is rendered from this struct and a tab's browser may not exist yet, and because a
     /// restored session has to re-apply it to a browser that has not been made.
-    muted: bool,
+    pub(crate) muted: bool,
 }
 
 /// The plain state operations. None of these touch CEF.
+///
+/// Every one of them that names no window acts on the **current** one — `state.rs` keeps which that
+/// is. That is what let a second window arrive without `session.rs`, `hints.rs`, `completers.rs`,
+/// `spawn.rs`, `settings.rs`, `scroll.rs` or `history.rs` changing a line: they all ask about "the
+/// tabs" and mean the ones in front of the user. The three that key off a *browser* instead —
+/// [`BruState::set_tab_url`], [`BruState::set_tab_title`] and [`BruState::is_active_browser`] —
+/// search every window, because a page in a background window still reports its title.
 impl BruState {
+    /// The current window's tab views.
     pub fn tab_views(&self) -> Vec<BrowserView> {
-        self.tabs.iter().map(|tab| tab.view.clone()).collect()
+        self.current_slot()
+            .map(|slot| slot.tabs.iter().map(|tab| tab.view.clone()).collect())
+            .unwrap_or_default()
     }
 
-    /// Ties a browser to the tab whose view it was made for. Called once per tab.
+    pub fn tab_views_in(&self, window: u32) -> Vec<BrowserView> {
+        self.slot(window)
+            .map(|slot| slot.tabs.iter().map(|tab| tab.view.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Ties a browser to the tab whose view it was made for. Called once per tab, and across every
+    /// window: a view knows nothing about which window it was created for.
     pub fn note_tab_browser(&mut self, view: &mut BrowserView, identifier: i32) {
-        for tab in &mut self.tabs {
-            if tab.view.is_same(Some(&mut View::from(&*view))) != 0 {
-                tab.browser_id = Some(identifier);
-                return;
+        for slot in &mut self.windows {
+            for tab in &mut slot.tabs {
+                if tab.view.is_same(Some(&mut View::from(&*view))) != 0 {
+                    tab.browser_id = Some(identifier);
+                    return;
+                }
             }
         }
     }
 
-    fn tab_index_of(&self, identifier: i32) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.browser_id == Some(identifier))
+    /// Which window a browser's tab is in, and where in that window's strip. Searches every window.
+    fn locate_tab(&self, identifier: i32) -> Option<(u32, usize)> {
+        self.windows.iter().find_map(|slot| {
+            slot.tabs
+                .iter()
+                .position(|tab| tab.browser_id == Some(identifier))
+                .map(|index| (slot.id, index))
+        })
     }
 
-    /// True when `identifier` is the browser of the tab currently showing — which is the only tab
-    /// whose address and title belong in the status line.
+    /// True when `identifier` is the browser of the tab showing **in its own window** — which is the
+    /// only tab whose address and title belong in that window's status line. A background window's
+    /// showing tab answers true, and rightly: it is what that window's bar has to say.
     pub fn is_active_browser(&self, identifier: i32) -> bool {
-        self.tab_index_of(identifier) == Some(self.active)
+        match self.locate_tab(identifier) {
+            Some((window, index)) => {
+                self.slot(window).map(|slot| slot.active) == Some(index)
+            }
+            None => false,
+        }
     }
 
     /// The browser id of the showing tab, if it has one yet.
     pub fn active_tab_browser_id(&self) -> Option<i32> {
-        self.tabs.get(self.active).and_then(|tab| tab.browser_id)
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(slot.active))
+            .and_then(|tab| tab.browser_id)
     }
 
-    /// Records a tab's address. Returns false when the browser is not a tab at all, which is how a
-    /// chrome strip reporting its own bru:// URL is kept out of the status line.
-    pub fn set_tab_url(&mut self, identifier: i32, url: String) -> bool {
-        match self.tab_index_of(identifier) {
-            Some(index) => {
-                self.tabs[index].url = url;
-                true
-            }
-            None => false,
-        }
+    /// Records a tab's address. Answers **which window** the tab is in, and `None` when the browser
+    /// is not a tab at all — which is how a chrome strip reporting its own bru:// URL is kept out of
+    /// the status line, and how the display handler knows whose bar to push into.
+    pub fn set_tab_url(&mut self, identifier: i32, url: String) -> Option<u32> {
+        let (window, index) = self.locate_tab(identifier)?;
+        self.slot_mut(window)?.tabs[index].url = url;
+        Some(window)
     }
 
-    pub fn set_tab_title(&mut self, identifier: i32, title: String) -> bool {
-        match self.tab_index_of(identifier) {
-            Some(index) => {
-                self.tabs[index].title = title;
-                true
-            }
-            None => false,
-        }
+    pub fn set_tab_title(&mut self, identifier: i32, title: String) -> Option<u32> {
+        let (window, index) = self.locate_tab(identifier)?;
+        self.slot_mut(window)?.tabs[index].title = title;
+        Some(window)
     }
 
-    /// What the tab strip renders, in strip order.
+    /// What the current window's tab strip renders, in strip order.
     pub fn tabs_json(&self) -> String {
-        let entries: Vec<String> = self
+        match self.current_window_id() {
+            Some(window) => self.tabs_json_in(window),
+            None => "{\"tabs\":[]}".to_string(),
+        }
+    }
+
+    /// The same for a named window. Two windows draw two strips, and a push into the wrong one is
+    /// how a background window ends up listing the tabs of the one in front of it.
+    pub fn tabs_json_in(&self, window: u32) -> String {
+        let Some(slot) = self.slot(window) else {
+            return "{\"tabs\":[]}".to_string();
+        };
+        let entries: Vec<String> = slot
             .tabs
             .iter()
             .enumerate()
@@ -102,7 +138,7 @@ impl BruState {
                     "{{\"title\":\"{}\",\"url\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
                     crate::ipc::json_escape(&tab.title),
                     crate::ipc::json_escape(&tab.url),
-                    index == self.active,
+                    index == slot.active,
                     tab.pinned,
                     tab.muted,
                 )
@@ -114,17 +150,23 @@ impl BruState {
     /// Whether the tab at `index` keeps its place — what `tab-close` and `tab-only` consult before
     /// they take a tab away.
     pub fn tab_pinned(&self, index: usize) -> bool {
-        self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false)
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.pinned)
+            .unwrap_or(false)
     }
 
     pub fn tab_muted(&self, index: usize) -> bool {
-        self.tabs.get(index).map(|tab| tab.muted).unwrap_or(false)
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.muted)
+            .unwrap_or(false)
     }
 
     /// Flip the pin on the tab at `index` and answer what it became. `tab-pin` is a toggle in
     /// qutebrowser (`commands.py:278`), not a setter.
     pub fn toggle_tab_pinned(&mut self, index: usize) -> bool {
-        match self.tabs.get_mut(index) {
+        match self.current_slot_mut().and_then(|slot| slot.tabs.get_mut(index)) {
             Some(tab) => {
                 tab.pinned = !tab.pinned;
                 tab.pinned
@@ -134,7 +176,7 @@ impl BruState {
     }
 
     pub fn set_tab_pinned(&mut self, index: usize, pinned: bool) {
-        if let Some(tab) = self.tabs.get_mut(index) {
+        if let Some(tab) = self.current_slot_mut().and_then(|slot| slot.tabs.get_mut(index)) {
             tab.pinned = pinned;
         }
     }
@@ -142,7 +184,7 @@ impl BruState {
     /// Flip the mute flag and answer what it became. The CEF call that acts on it is
     /// [`toggle_mute`], outside the lock.
     pub fn toggle_tab_muted(&mut self, index: usize) -> bool {
-        match self.tabs.get_mut(index) {
+        match self.current_slot_mut().and_then(|slot| slot.tabs.get_mut(index)) {
             Some(tab) => {
                 tab.muted = !tab.muted;
                 tab.muted
@@ -152,7 +194,7 @@ impl BruState {
     }
 
     pub fn set_tab_muted(&mut self, index: usize, muted: bool) {
-        if let Some(tab) = self.tabs.get_mut(index) {
+        if let Some(tab) = self.current_slot_mut().and_then(|slot| slot.tabs.get_mut(index)) {
             tab.muted = muted;
         }
     }
@@ -160,37 +202,66 @@ impl BruState {
     /// The browser identifier of each tab, in strip order. `None` for a tab whose browser CEF has
     /// not made yet. Sessions need every tab's browser, not only the showing one's.
     pub fn tab_browser_ids(&self) -> Vec<Option<i32>> {
-        self.tabs.iter().map(|tab| tab.browser_id).collect()
+        self.current_slot()
+            .map(|slot| slot.tabs.iter().map(|tab| tab.browser_id).collect())
+            .unwrap_or_default()
     }
 
     pub fn tab_count(&self) -> usize {
-        self.tabs.len()
+        self.current_slot().map(|slot| slot.tabs.len()).unwrap_or(0)
+    }
+
+    pub fn tab_count_in(&self, window: u32) -> usize {
+        self.slot(window).map(|slot| slot.tabs.len()).unwrap_or(0)
     }
 
     pub fn active_tab(&self) -> usize {
-        self.active
+        self.current_slot().map(|slot| slot.active).unwrap_or(0)
     }
 
-    pub fn set_active(&mut self, index: usize) {
-        if index != self.active {
-            self.last_active = Some(self.active);
+    pub fn active_tab_in(&self, window: u32) -> usize {
+        self.slot(window).map(|slot| slot.active).unwrap_or(0)
+    }
+
+    pub fn set_active_in(&mut self, window: u32, index: usize) {
+        if let Some(slot) = self.slot_mut(window) {
+            if index != slot.active {
+                slot.last_active = Some(slot.active);
+            }
+            slot.active = index;
         }
-        self.active = index;
     }
 
     /// Where `tab-focus last` goes. `None` until a second tab has been shown.
     pub fn last_active_tab(&self) -> Option<usize> {
-        self.last_active.filter(|index| *index < self.tabs.len())
+        self.current_slot()
+            .and_then(|slot| slot.last_active.filter(|index| *index < slot.tabs.len()))
     }
 
     /// The address of a tab, as the display handler last reported it.
     /// The title of the tab at `index`, for the status line on a switch.
     pub fn tab_title(&self, index: usize) -> Option<String> {
-        self.tabs.get(index).map(|tab| tab.title.clone())
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.title.clone())
     }
 
     pub fn tab_url(&self, index: usize) -> Option<String> {
-        self.tabs.get(index).map(|tab| tab.url.clone())
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.url.clone())
+    }
+
+    pub fn tab_url_in(&self, window: u32, index: usize) -> Option<String> {
+        self.slot(window)
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.url.clone())
+    }
+
+    pub fn tab_title_in(&self, window: u32, index: usize) -> Option<String> {
+        self.slot(window)
+            .and_then(|slot| slot.tabs.get(index))
+            .map(|tab| tab.title.clone())
     }
 
     /// The `depth`-th most recently closed tab's URL, removed from the undo stack. Depth 1 is the
@@ -207,13 +278,16 @@ impl BruState {
     /// not need to. One tab is visible at a time, so the window stacks nothing — what the strip
     /// draws comes from [`BruState::tabs_json`], which reads this vector.
     pub fn move_tab(&mut self, from: usize, to: usize) {
-        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+        let Some(slot) = self.current_slot_mut() else {
+            return;
+        };
+        if from >= slot.tabs.len() || to >= slot.tabs.len() || from == to {
             return;
         }
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active = to;
-        self.last_active = None;
+        let tab = slot.tabs.remove(from);
+        slot.tabs.insert(to, tab);
+        slot.active = to;
+        slot.last_active = None;
     }
 
     /// Removes every tab but the showing one and hands their views back to be dropped.
@@ -223,32 +297,40 @@ impl BruState {
     /// to prompt in, so the default is the answer a prompt would most likely get — keep it — and
     /// `-f` is the way to say otherwise.
     pub fn take_other_tabs(&mut self, force: bool) -> Vec<BrowserView> {
-        if self.tabs.is_empty() {
+        let Some(slot) = self.current_slot_mut() else {
+            return Vec::new();
+        };
+        if slot.tabs.is_empty() {
             return Vec::new();
         }
-        let active = self.active;
+        let active = slot.active;
         let mut taken = Vec::new();
         let mut kept = Vec::new();
+        let mut closed = Vec::new();
         let mut new_active = 0;
-        for (index, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+        for (index, tab) in std::mem::take(&mut slot.tabs).into_iter().enumerate() {
             if index == active {
                 new_active = kept.len();
                 kept.push(tab);
             } else if tab.pinned && !force {
                 kept.push(tab);
             } else {
-                self.closed.push(tab.url.clone());
+                closed.push(tab.url.clone());
                 taken.push(tab.view.clone());
             }
         }
-        self.tabs = kept;
-        self.active = new_active;
-        self.last_active = None;
+        slot.tabs = kept;
+        slot.active = new_active;
+        slot.last_active = None;
+        self.closed.extend(closed);
         taken
     }
 
-    pub fn push_tab(&mut self, view: BrowserView) -> usize {
-        self.tabs.push(Tab {
+    /// Appends a tab to a named window and answers its index in that window's strip. `None` when
+    /// there is no such window — a `:tab-give 7` typed at a window that has since closed.
+    pub fn push_tab_in(&mut self, window: u32, view: BrowserView) -> Option<usize> {
+        let slot = self.slot_mut(window)?;
+        slot.tabs.push(Tab {
             view,
             browser_id: None,
             title: String::new(),
@@ -256,31 +338,67 @@ impl BruState {
             pinned: false,
             muted: false,
         });
-        self.tabs.len() - 1
+        Some(slot.tabs.len() - 1)
     }
 
     /// Removes the showing tab and moves the selection to the one that takes its place.
     pub fn take_active_tab(&mut self) -> Option<BrowserView> {
-        if self.tabs.is_empty() {
-            return None;
-        }
-        let tab = self.tabs.remove(self.active);
+        let tab = self.detach_active_tab()?;
         // Kept so `u` can open it again. Only the URL — see `BruState::closed`.
         self.closed.push(tab.url.clone());
-        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
-            self.active = self.tabs.len() - 1;
-        }
-        self.last_active = None;
         Some(tab.view)
+    }
+
+    /// The same removal without the undo entry: the tab is not being closed, it is being handed to
+    /// another window. Whole, because `tab-give` has to put it back somewhere — a `BrowserView`
+    /// alone would lose the pin, the mute and the browser id.
+    pub(crate) fn detach_active_tab(&mut self) -> Option<Tab> {
+        let slot = self.current_slot_mut()?;
+        if slot.tabs.is_empty() {
+            return None;
+        }
+        let tab = slot.tabs.remove(slot.active);
+        if slot.active >= slot.tabs.len() && !slot.tabs.is_empty() {
+            slot.active = slot.tabs.len() - 1;
+        }
+        slot.last_active = None;
+        Some(tab)
+    }
+
+    /// Puts a whole tab into a named window, keeping everything it carried, and answers its index.
+    pub(crate) fn attach_tab_in(&mut self, window: u32, tab: Tab) -> Option<usize> {
+        let slot = self.slot_mut(window)?;
+        slot.tabs.push(tab);
+        Some(slot.tabs.len() - 1)
     }
 }
 
 /// Opens a tab on `url`. `background` leaves the current one showing, the way qutebrowser's
 /// `:open -b` does.
 pub fn new_tab(state: &SharedState, url: &str, background: bool) {
+    let target = state
+        .lock()
+        .expect("state mutex poisoned")
+        .current_window_id();
+    if let Some(target) = target {
+        new_tab_in(state, target, url, background);
+    }
+}
+
+/// Opens a tab on `url` in a named window.
+///
+/// This is the entry point the popup workstream wants: a `on_before_popup` that has decided which
+/// window a `target="_blank"` belongs to says so here rather than assuming the current one. It is
+/// safe to call from a posted UI task and **not** from inside a message-router query handler — it
+/// creates a browser (CEF-NOTES trap 12).
+pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bool) {
     let (client, window, layout) = {
         let state = state.lock().expect("state mutex poisoned");
-        (state.client(), state.window(), state.layout())
+        (
+            state.client(),
+            state.window_handle(window_id),
+            state.layout_handle(window_id),
+        )
     };
     let Some(mut client) = client else {
         return;
@@ -299,27 +417,34 @@ pub fn new_tab(state: &SharedState, url: &str, background: bool) {
         return;
     };
 
-    let index = state
+    let Some(index) = state
         .lock()
         .expect("state mutex poisoned")
-        .push_tab(view.clone());
+        .push_tab_in(window_id, view.clone())
+    else {
+        return;
+    };
 
-    // At startup the first tab is made before there is a window to put it in; `attach_all` picks
+    // At startup the first tab is made before there is a window to put it in; `attach_all_in` picks
     // it up once the window exists.
     if let Some(window) = window {
         attach(&window, layout.as_ref(), &view, index);
     }
 
     if !background {
-        select(state, index);
+        select_in(state, window_id, index);
     }
 }
 
-/// Puts every tab into the window. Called once, from `on_window_created`.
-pub fn attach_all(state: &SharedState) {
+/// Puts every tab of one window into it. Called once per window, from `on_window_created`.
+pub fn attach_all_in(state: &SharedState, window_id: u32) {
     let (views, window, layout) = {
         let state = state.lock().expect("state mutex poisoned");
-        (state.tab_views(), state.window(), state.layout())
+        (
+            state.tab_views_in(window_id),
+            state.window_handle(window_id),
+            state.layout_handle(window_id),
+        )
     };
     let Some(window) = window else {
         return;
@@ -329,8 +454,10 @@ pub fn attach_all(state: &SharedState) {
     }
 }
 
-/// Child order in the window is: tab strip, one view per tab, status bar. Offsetting by one keeps
-/// the strip on top and the bar at the bottom whatever happens to the tabs in between.
+/// Child order in each window is: tab strip, one view per tab of *that window*, status bar.
+/// Offsetting by one keeps the strip on top and the bar at the bottom whatever happens to the tabs
+/// in between. Every window has its own strip as child 0, so the `+ 1` still holds once there is
+/// more than one — the index is into that window's tabs, not into a global list.
 fn attach(window: &Window, layout: Option<&BoxLayout>, view: &BrowserView, index: usize) {
     let mut view = View::from(view);
     window.add_child_view_at(Some(&mut view), index as i32 + 1);
@@ -340,15 +467,27 @@ fn attach(window: &Window, layout: Option<&BoxLayout>, view: &BrowserView, index
     view.set_visible(0);
 }
 
-/// Shows one tab and hides the rest.
+/// Shows one tab of the current window and hides the rest.
 pub fn select(state: &SharedState, index: usize) {
+    let target = state
+        .lock()
+        .expect("state mutex poisoned")
+        .current_window_id();
+    if let Some(target) = target {
+        select_in(state, target, index);
+    }
+}
+
+/// Shows one tab of a named window. It does **not** make that window current: a background window
+/// finishing a load and choosing a tab must not steal the keyboard from the one in front.
+pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
     let views = {
         let mut state = state.lock().expect("state mutex poisoned");
-        if index >= state.tab_count() {
+        if index >= state.tab_count_in(window_id) {
             return;
         }
-        state.set_active(index);
-        state.tab_views()
+        state.set_active_in(window_id, index);
+        state.tab_views_in(window_id)
     };
 
     for (i, view) in views.iter().enumerate() {
@@ -369,15 +508,19 @@ pub fn select(state: &SharedState, index: usize) {
     // handler fires on navigation, and switching tabs is not one. Without this the status line keeps
     // the URL of the tab you just left — measured after the stage-2 merge, with the bar reading
     // example.com over a vesti.bg page.
-    let (url, title) = {
+    let (url, title, tabs) = {
         let state = state.lock().expect("state mutex poisoned");
         (
-            state.tab_url(index).unwrap_or_default(),
-            state.tab_title(index).unwrap_or_default(),
+            state.tab_url_in(window_id, index).unwrap_or_default(),
+            state.tab_title_in(window_id, index).unwrap_or_default(),
+            state.tabs_json_in(window_id),
         )
     };
-    crate::ipc::set_url(url);
-    crate::ipc::set_title(title);
+    crate::ipc::set_url_for(window_id, url);
+    crate::ipc::set_title_for(window_id, title);
+    // Which tab the strip draws as selected is per window too, and a switch fires no display
+    // callback to push it.
+    crate::ipc::set_tabs_for(window_id, tabs);
 }
 
 pub fn next_tab(state: &SharedState) {
@@ -409,10 +552,19 @@ pub fn prev_tab(state: &SharedState) {
 ///
 /// Pinned tabs stay unless `force` — see [`BruState::take_other_tabs`].
 pub fn close_others(state: &SharedState, force: bool) {
-    let (closed, window, tabs, active) = {
+    let (closed, window, tabs, active, window_id) = {
         let mut state = state.lock().expect("state mutex poisoned");
+        let Some(window_id) = state.current_window_id() else {
+            return;
+        };
         let closed = state.take_other_tabs(force);
-        (closed, state.window(), state.tabs_json(), state.active_tab())
+        (
+            closed,
+            state.window(),
+            state.tabs_json(),
+            state.active_tab(),
+            window_id,
+        )
     };
     if closed.is_empty() {
         return;
@@ -424,9 +576,9 @@ pub fn close_others(state: &SharedState, force: bool) {
     }
     drop(closed);
 
-    crate::ipc::set_tabs(tabs);
+    crate::ipc::set_tabs_for(window_id, tabs);
     // Not 0: pinned tabs may have stayed in front of the one that is showing.
-    select(state, active);
+    select_in(state, window_id, active);
 }
 
 /// `<Ctrl-p>` — pin or unpin the showing tab.
@@ -495,7 +647,7 @@ pub fn move_current(state: &SharedState, to: usize) {
 /// on — qutebrowser's `tabs.last_close` default keeps a blank tab instead, and that is
 /// DECISIONS.md item 6, still open.
 pub fn close_current(state: &SharedState, force: bool) {
-    let (closed, remaining, window, active) = {
+    let (closed, remaining, window, active, window_id) = {
         let mut state = state.lock().expect("state mutex poisoned");
         // A pinned tab is not closed by a bare `d`. qutebrowser prompts here
         // (`tabbedbrowser.py:431`); bru has no yes/no mode, so it says why and does nothing, and
@@ -504,12 +656,16 @@ pub fn close_current(state: &SharedState, force: bool) {
             eprintln!("bru: tab is pinned — :tab-close -f to close it anyway");
             return;
         }
+        let Some(window_id) = state.current_window_id() else {
+            return;
+        };
         let closed = state.take_active_tab();
         (
             closed,
             state.tab_count(),
             state.window(),
             state.active_tab(),
+            window_id,
         )
     };
     let Some(closed) = closed else {
@@ -528,6 +684,8 @@ pub fn close_current(state: &SharedState, force: bool) {
     }
     drop(closed);
 
+    // The last tab of *this* window closes *this* window. The process only ends when the last
+    // window's last browser does — `BruState::on_before_close` counts browsers, not tabs.
     if remaining == 0 {
         if let Some(window) = window {
             window.close();
@@ -535,7 +693,128 @@ pub fn close_current(state: &SharedState, force: bool) {
         return;
     }
 
-    select(state, active);
+    select_in(state, window_id, active);
+}
+
+/// `gD` — take the showing tab out of its window and put it in another one, whole.
+///
+/// `to` is `None` for qutebrowser's bare `:tab-give`, which detaches into a **new** window
+/// (`commands.py:460-500`), and `Some(id)` for `:tab-give <win-id>`.
+///
+/// The move is a re-parent, not a clone: the same `BrowserView`, and therefore the same browser,
+/// the same renderer and the same navigation history. Cloning the URL instead would silently lose
+/// `H`/`L` on the moved tab, which reads as a bug rather than as a gap.
+///
+/// **The reference is held across the re-parent, and that is the whole trick.** CEF-NOTES says a
+/// tab is closed by `remove_child_view` *and then dropping the view*; here the view is removed and
+/// immediately added to another window while `tab` still owns it, so the drop that would close the
+/// browser never happens. Measured — see the report.
+pub fn give_tab(state: &SharedState, to: Option<u32>) {
+    let (from_window, count) = {
+        let state = state.lock().expect("state mutex poisoned");
+        match state.current_window_id() {
+            Some(id) => (id, state.tab_count()),
+            None => return,
+        }
+    };
+
+    if to == Some(from_window) {
+        crate::message::error("tab-give: that is the window the tab is already in");
+        return;
+    }
+
+    // qutebrowser refuses to detach the only tab of a window (`commands.py:483`): the window it
+    // came from would close as the new one opened, which is a no-op with a flicker in it.
+    if to.is_none() && count < 2 {
+        crate::message::error("tab-give: cannot detach from a window with only one tab");
+        return;
+    }
+
+    let target = match to {
+        Some(id) => {
+            if state.lock().expect("state mutex poisoned").slot(id).is_none() {
+                crate::message::error(&format!("tab-give: there is no window with id {id}"));
+                return;
+            }
+            id
+        }
+        // A window with no tab in it yet: the tab about to be handed over is its first, so opening
+        // it on a URL would load a page only to hide it a moment later.
+        None => crate::window::create(state, crate::window::FirstTab::None),
+    };
+
+    // Out of bru's book-keeping first, and out of the old window's children second. The `Tab` is
+    // ours for the whole of the rest of this function, so the view's last reference is never
+    // dropped and the browser is never closed.
+    let (tab, old_window, remaining, old_active) = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let tab = state.detach_active_tab();
+        (
+            tab,
+            state.window_handle(from_window),
+            state.tab_count_in(from_window),
+            state.active_tab_in(from_window),
+        )
+    };
+    let Some(tab) = tab else {
+        return;
+    };
+
+    if let Some(old_window) = &old_window {
+        old_window.remove_child_view(Some(&mut View::from(&tab.view)));
+    }
+
+    let view = tab.view.clone();
+    let (index, new_window, layout) = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        let index = state.attach_tab_in(target, tab);
+        (
+            index,
+            state.window_handle(target),
+            state.layout_handle(target),
+        )
+    };
+    let Some(index) = index else {
+        return;
+    };
+
+    // Adding a browser view that already has a browser does *not* create a second one — the browser
+    // follows its view to the new window. Nothing else in bru re-parents a view, so this is the one
+    // `add_child_view_at` whose browser already exists.
+    if let Some(new_window) = &new_window {
+        attach(new_window, layout.as_ref(), &view, index);
+    }
+
+    select_in(state, target, index);
+    // The window it came from is still showing the tab that took its place — unless it has none
+    // left, which only happens with `--keep`-less detaching from a window bru has just emptied.
+    if remaining > 0 {
+        select_in(state, from_window, old_active);
+        let tabs = state
+            .lock()
+            .expect("state mutex poisoned")
+            .tabs_json_in(from_window);
+        crate::ipc::set_tabs_for(from_window, tabs);
+    }
+
+    // And the receiving window comes to the front, which is what "give" means when you are the one
+    // pressing `gD`.
+    focus(state, target);
+}
+
+/// Bring a window to the front and make it the one commands act on.
+pub fn focus(state: &SharedState, window_id: u32) {
+    let window = {
+        let mut state = state.lock().expect("state mutex poisoned");
+        if !state.focus_window(window_id) {
+            return;
+        }
+        state.window_handle(window_id)
+    };
+    if let Some(window) = window {
+        window.show();
+        window.activate();
+    }
 }
 
 /// Select a tab on the next turn of the UI loop.
@@ -544,21 +823,35 @@ pub fn close_current(state: &SharedState, force: bool) {
 /// handler — and CEF-NOTES trap 12 forbids touching a browser from there: `select` focuses a view,
 /// the router holds `browser_query_info_map` across the handler, and `on_before_browse` wants that
 /// same lock. Posting steps outside it.
-pub fn schedule_select(index: usize) {
-    let mut task = SelectTab::new(index);
+///
+/// `from_browser` is the chrome browser the click came from, and it is what says *which window's*
+/// strip was clicked. It is resolved in the posted task rather than in the handler, so the handler
+/// takes no lock at all.
+pub fn schedule_select(from_browser: Option<i32>, index: usize) {
+    let mut task = SelectTab::new(from_browser, index);
     post_task(ThreadId::UI, Some(&mut task));
 }
 
 wrap_task! {
     struct SelectTab {
+        from_browser: Option<i32>,
         index: usize,
     }
 
     impl Task {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
-            if let Some(state) = BruState::instance() {
-                select(&state, self.index);
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            let window = {
+                let guard = state.lock().expect("state mutex poisoned");
+                self.from_browser
+                    .and_then(|id| guard.window_of_browser(id))
+                    .or_else(|| guard.current_window_id())
+            };
+            if let Some(window) = window {
+                select_in(&state, window, self.index);
             }
         }
     }

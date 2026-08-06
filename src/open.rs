@@ -670,6 +670,27 @@ pub fn start_page() -> String {
 ///
 /// Quickmarks are looked up *before* this in qutebrowser (commands.py :348) — that lookup belongs to
 /// `data.rs` and to the dispatcher, not here.
+/// The address `:open` would load for `url`, decided but not opened: the engine chosen, the file
+/// resolved, the search built. `None` is the same refusal `open` prints.
+///
+/// `-w` needs this and `open` cannot give it: a window is *created around* a URL — the first tab is
+/// made before the window exists, so there is no browser to hand to `open` — where a tab or an
+/// in-place load is told to go somewhere. One decision function, so `:open -w ddg rust` searches
+/// exactly as `:open ddg rust` does.
+pub fn resolve(url: Option<&str>) -> Option<String> {
+    let engines = engines();
+    match url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => match decide(url, &engines) {
+            Some(target) => Some(target.url().to_string()),
+            None => {
+                eprintln!("bru: open: nothing to open in {url:?}");
+                None
+            }
+        },
+        None => Some(start_page()),
+    }
+}
+
 pub fn open(state: &SharedState, browser: &mut Browser, url: Option<&str>, tab: bool, bg: bool) {
     let engines = engines();
     let target = match url.map(str::trim).filter(|url| !url.is_empty()) {

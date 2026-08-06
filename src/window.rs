@@ -1,14 +1,144 @@
-//! The top-level window.
+//! Top-level windows.
 //!
 //! Built through CEF's Views framework rather than a native X11/Wayland surface: Views gives a
-//! window CEF owns and lays out itself, which is what a tab strip will eventually be added to.
+//! window CEF owns and lays out itself, and that is what the tab strip and the status bar are added
+//! to.
+//!
+//! There is more than one of them. [`create`] is the only way to make one, and it is the same
+//! function at startup and at `:open -w`, so a second window is not a special case of the first —
+//! which is what stops the two drifting apart. Everything a window owns lives in
+//! `state::WindowState`; nothing here keeps a window in a field.
+//!
+//! **The order in [`create`] is not arbitrary.** The slot is allocated first, because the two chrome
+//! delegates and the window delegate all need its id before they are constructed. The chrome views
+//! are made next, and the first tab after them, because `browser_view_create` makes no browser —
+//! `window.add_child_view` does, synchronously, reaching `LifeSpanHandler::on_after_created` before
+//! it returns (CEF-NOTES). So no lock is held across any call below.
 
 use cef::*;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::state::BruState;
-use crate::tabs;
+use crate::tabs::{self, SharedState};
+
+/// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
+const TOP_URL: &str = "bru://chrome/top.html";
+const BOTTOM_URL: &str = "bru://chrome/bottom.html";
+
+/// Chrome strip heights, in logical pixels.
+const TOP_HEIGHT: i32 = 40;
+const BOTTOM_HEIGHT: i32 = 24;
+
+/// What a new window opens with.
+pub enum FirstTab<'a> {
+    /// Exactly this page — `:open -w`, `gD`'s receiving window when it is given a URL, `U`.
+    Url(&'a str),
+    /// Whatever `--restore` says, and this page when it says nothing. The first window only.
+    Startup(&'a str),
+    /// Nothing at all. `tab-give` uses it: the tab about to be handed over is the window's first,
+    /// and loading a page only to hide it a moment later would be a flash of the wrong site.
+    None,
+}
+
+/// Make a window, and answer bru's own identifier for it.
+///
+/// Runs on the UI thread, holds no lock across a CEF call, and must not be called from inside a
+/// message-router query handler — it creates browsers (CEF-NOTES trap 12).
+pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+    // Before anything else: the three delegates below all carry this id, and the first tab needs
+    // somewhere to be pushed.
+    let window_id = state
+        .lock()
+        .expect("state mutex poisoned")
+        .open_window_slot();
+
+    let settings = BrowserSettings::default();
+    let mut client = state.lock().expect("state mutex poisoned").client();
+
+    // All three views share one Client, so one set of handlers serves the page and the chrome.
+    // Which browser an event came from is answered by its identifier, not by its handler. The last
+    // argument is `grows` — see `COMPLETION_HEIGHT`. Only the bottom strip does; the tab strip's
+    // height is its own.
+    let mut top_delegate =
+        BruChromeViewDelegate::new(state.clone(), window_id, TOP_HEIGHT, false);
+    let top_view = browser_view_create(
+        client.as_mut(),
+        Some(&CefString::from(TOP_URL)),
+        Some(&settings),
+        None,
+        None,
+        Some(&mut top_delegate),
+    );
+
+    match first {
+        // --- sessions (merge: this arm belongs to src/session.rs's workstream) ------------------
+        // `--restore=<name>` opens a saved session's tabs instead of the start page, the way
+        // `qutebrowser --restore` does. It is decided here, before the first tab is made: opening
+        // the start page and then closing it would flash the wrong site on every restore.
+        FirstTab::Startup(url) => {
+            if !crate::session::restore_at_startup(state) {
+                tabs::new_tab_in(state, window_id, url, false);
+            }
+        }
+        // --- end sessions -----------------------------------------------------------------------
+        FirstTab::Url(url) => tabs::new_tab_in(state, window_id, url, false),
+        FirstTab::None => {}
+    }
+
+    let mut bottom_delegate =
+        BruChromeViewDelegate::new(state.clone(), window_id, BOTTOM_HEIGHT, true);
+    let bottom_view = browser_view_create(
+        client.as_mut(),
+        Some(&CefString::from(BOTTOM_URL)),
+        Some(&settings),
+        None,
+        None,
+        Some(&mut bottom_delegate),
+    );
+
+    let mut window_delegate = BruWindowDelegate::new(
+        state.clone(),
+        window_id,
+        RefCell::new(top_view),
+        RefCell::new(bottom_view),
+    );
+    window_create_top_level(Some(&mut window_delegate));
+
+    window_id
+}
+
+/// Open a window on `url` and bring it to the front — every `-w` spelling, and `U`.
+pub fn open(state: &SharedState, url: &str) -> u32 {
+    let window_id = create(state, FirstTab::Url(url));
+    tabs::focus(state, window_id);
+    window_id
+}
+
+/// Close one window. `:close` (`<Ctrl-Shift-W>`) — the window, not the application.
+pub fn close(state: &SharedState, window_id: u32) {
+    let window = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_handle(window_id);
+    if let Some(window) = window {
+        window.close();
+    }
+}
+
+/// Close every window, which is what ends the process: `BruState::on_before_close` stops the message
+/// loop when the last browser in the last window has gone.
+pub fn close_all(state: &SharedState) {
+    let windows = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_handles();
+    for window in windows {
+        window.close();
+    }
+}
 
 // --- src/completers.rs ---------------------------------------------------------------------
 /// How much taller than its own 24 px the **bottom** strip is asking to be, because the completion
@@ -57,10 +187,14 @@ const APP_NAME: &str = "bru";
 /// deliberately: that would put a CEF call and a compositor round trip on every settled scroll
 /// position, which is the one path this project exists to keep fast.
 ///
-/// The one caller is [`crate::ipc::set_title`], which is reached from exactly the two places that
-/// mean "the tab now showing has a title": the display handler, for a page that names itself, and
-/// `tabs::select`, for a switch — a switch is not a navigation and fires no display callback.
-pub fn set_title(title: &str) {
+/// The one caller is [`crate::ipc::set_title_for`], which is reached from exactly the two places
+/// that mean "the tab now showing has a title": the display handler, for a page that names itself,
+/// and `tabs::select_in`, for a switch — a switch is not a navigation and fires no display callback.
+///
+/// `window_id` is not optional, and that is the point: a page loading in a background window used to
+/// have nowhere else to put its title but the one toplevel, so a download finishing in window 2
+/// renamed window 1.
+pub fn set_title(window_id: u32, title: &str) {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
     let Some(state) = BruState::instance() else {
@@ -68,7 +202,10 @@ pub fn set_title(title: &str) {
     };
     // The handle is taken and the lock let go before the Views call, like every other CEF call in
     // bru: a window callback taking the same mutex would deadlock.
-    let window = state.lock().expect("state mutex poisoned").window();
+    let window = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_handle(window_id);
     let Some(window) = window else {
         return;
     };
@@ -85,6 +222,11 @@ pub fn set_title(title: &str) {
 wrap_window_delegate! {
     pub struct BruWindowDelegate {
         state: Arc<Mutex<BruState>>,
+        // Which of bru's windows this delegate belongs to. Allocated by `create` *before* any of
+        // the three views is made, because the two chrome delegates need it too — a strip has to be
+        // able to say which window a key landed in (CEF-NOTES trap 11). A `///` here does not
+        // compile: the wrap_ macros have no rule for `#[doc]` (trap 8).
+        window_id: u32,
         top_view: RefCell<Option<BrowserView>>,
         bottom_view: RefCell<Option<BrowserView>>,
     }
@@ -120,15 +262,15 @@ wrap_window_delegate! {
 
             // Nothing else is ever handed the window or its layout; keep both where a tab opened
             // later can find them. The lock is let go before any tab is placed — see tabs.rs.
-            {
-                let mut state = self.state.lock().expect("state mutex poisoned");
-                state.set_window(window.clone());
-                state.set_layout(layout);
-            }
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_window_for(self.window_id, window.clone(), layout);
 
-            // Tabs that already exist: at startup, the one the command line asked for, created
-            // before there was a window to put it in.
-            tabs::attach_all(&self.state);
+            // Tabs that already exist in *this* window: at startup, the one the command line asked
+            // for, created before there was a window to put it in; at runtime, whatever `create`
+            // opened before handing the slot over.
+            tabs::attach_all_in(&self.state, self.window_id);
 
             let mut bottom = View::from(bottom);
             window.add_child_view(Some(&mut bottom));
@@ -146,11 +288,30 @@ wrap_window_delegate! {
                 .state
                 .lock()
                 .expect("state mutex poisoned")
-                .active_tab();
-            tabs::select(&self.state, active);
+                .active_tab_in(self.window_id);
+            tabs::select_in(&self.state, self.window_id, active);
+        }
+
+        // Focus follows the compositor. `keys.rs` also names the window from the browser a key
+        // arrived at, and the two agree — but a click on a page, or a `:` typed straight after
+        // alt-tabbing, reaches this first.
+        fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
+            if active != 0 {
+                self.state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .focus_window(self.window_id);
+            }
         }
 
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
+            // The slot goes with the window, and the URLs it held go onto the closed-window stack
+            // for `U`. Before the views are dropped, while the tabs are still listed.
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .forget_window(self.window_id);
+            crate::ipc::forget_window(self.window_id);
             // Drop the views here, or the window outlives the browsers it holds.
             *self.top_view.borrow_mut() = None;
             *self.bottom_view.borrow_mut() = None;
@@ -200,7 +361,7 @@ wrap_window_delegate! {
                 .state
                 .lock()
                 .expect("state mutex poisoned")
-                .tab_views();
+                .tab_views_in(self.window_id);
             views.extend(self.top_view.borrow().clone());
             views.extend(self.bottom_view.borrow().clone());
 
@@ -268,6 +429,10 @@ wrap_browser_view_delegate! {
 wrap_browser_view_delegate! {
     pub struct BruChromeViewDelegate {
         state: Arc<Mutex<BruState>>,
+        // Which window this strip draws. Without it a key landing on a strip could only be aimed
+        // at "the showing tab", and with two windows that is a guess — trap 11 resolved against the
+        // wrong window.
+        window_id: u32,
         height: i32,
         // --- src/completers.rs ---------------------------------------------------------------
         // Whether this strip grows with the completion table. The bottom one does; the tab strip
@@ -303,7 +468,7 @@ wrap_browser_view_delegate! {
             self.state
                 .lock()
                 .expect("state mutex poisoned")
-                .note_chrome_browser(browser.identifier());
+                .note_chrome_browser(self.window_id, browser.identifier());
         }
 
         fn browser_runtime_style(&self) -> RuntimeStyle {

@@ -31,21 +31,22 @@ const NAVIGATE_JS: &str = include_str!("../chrome/navigate.js");
 
 /// `navigate <where> [-t|-b|-w]`.
 ///
-/// `tab` already carries `-w`: bru has one window, and the dispatcher folds `-w` into `-t` the way
-/// `open` does.
+/// `window` is a destination of its own now rather than a spelling of `-t`: `wu` puts the parent
+/// directory in a window of its own, which is what qutebrowser's `wu` does.
 pub fn navigate(
     state: &SharedState,
     browser: &mut Browser,
     to: NavigateTo,
     tab: bool,
     bg: bool,
+    window: bool,
     count: Option<u32>,
 ) {
     let count = count.unwrap_or(1).max(1);
 
     if matches!(to, NavigateTo::Prev | NavigateTo::Next) {
         // The page has to be asked first; the navigation happens in `on_report`, a round trip later.
-        request_links(browser, matches!(to, NavigateTo::Prev), tab, bg);
+        request_links(browser, matches!(to, NavigateTo::Prev), tab, bg, window);
         return;
     }
 
@@ -61,6 +62,9 @@ pub fn navigate(
     match next {
         // qutebrowser opens with `related=True`; bru has no tab ordering to relate to yet, so the
         // flags are the ones `:open` already understands.
+        Ok(url) if window => {
+            crate::window::open(state, &url);
+        }
         Ok(url) => crate::open::open(state, browser, Some(&url), tab, bg),
         // qutebrowser raises a CommandError, which its message line shows. bru has no message line
         // yet — stderr is where every other refusal in the dispatcher goes.
@@ -449,6 +453,7 @@ struct Pending {
     prev: bool,
     tab: bool,
     bg: bool,
+    window: bool,
     asked: std::time::Instant,
 }
 
@@ -460,7 +465,7 @@ fn pending() -> &'static Mutex<Option<Pending>> {
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// `[[` / `]]` / `{{` / `}}` — ask the page for its links.
-fn request_links(browser: &mut Browser, prev: bool, tab: bool, bg: bool) {
+fn request_links(browser: &mut Browser, prev: bool, tab: bool, bg: bool, window: bool) {
     let Some(frame) = browser.main_frame() else {
         return;
     };
@@ -473,6 +478,7 @@ fn request_links(browser: &mut Browser, prev: bool, tab: bool, bg: bool) {
             prev,
             tab,
             bg,
+            window,
             asked: std::time::Instant::now(),
         });
     }
@@ -607,7 +613,7 @@ pub fn on_report(browser: Option<&Browser>, message: Option<&ProcessMessage>) ->
 
     // CEF-NOTES trap 12: this is a message callback, and a navigation started from inside one can
     // deadlock against the router's lock. The wait is one turn of the UI loop.
-    let mut task = NavOpen::new(link.href.clone(), request.tab, request.bg);
+    let mut task = NavOpen::new(link.href.clone(), request.tab, request.bg, request.window);
     post_task(ThreadId::UI, Some(&mut task));
     true
 }
@@ -617,6 +623,7 @@ wrap_task! {
         url: String,
         tab: bool,
         bg: bool,
+        window: bool,
     }
 
     impl Task {
@@ -626,6 +633,13 @@ wrap_task! {
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
+            // `]]` with `-w`. Decided here rather than at the keypress because the link is only
+            // known a round trip later, and a window is created around a URL rather than told to
+            // load one.
+            if self.window {
+                crate::window::open(&state, &self.url);
+                return;
+            }
             let Some(mut browser) = state.lock().expect("state mutex poisoned").active_browser()
             else {
                 return;

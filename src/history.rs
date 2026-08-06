@@ -202,12 +202,17 @@ pub fn quickmark_load(
     name: Option<&str>,
     tab: bool,
     bg: bool,
+    window: bool,
 ) {
     let Some(name) = name else {
         eprintln!("bru: quickmark-load: which quickmark?");
         return;
     };
     match with_data(|data| data.quickmark_load(name)) {
+        // `wb` — a window of its own, not the tab it stood in for while bru had one window.
+        Some(Ok(url)) if window => {
+            crate::window::open(state, &url);
+        }
         Some(Ok(url)) => crate::open::open(state, browser, Some(&url), tab, bg),
         Some(Err(error)) => eprintln!("bru: {error}"),
         None => {}
@@ -284,6 +289,7 @@ pub fn bookmark_load(
     url: Option<&str>,
     tab: bool,
     bg: bool,
+    window: bool,
     delete: bool,
 ) {
     let Some(url) = url else {
@@ -297,7 +303,12 @@ pub fn bookmark_load(
         return;
     };
     let target = target.url().to_string();
-    crate::open::open(state, browser, Some(&target), tab, bg);
+    // `wB` — a window of its own.
+    if window {
+        crate::window::open(state, &target);
+    } else {
+        crate::open::open(state, browser, Some(&target), tab, bg);
+    }
     if delete {
         bookmark_del(state, Some(&target));
     }

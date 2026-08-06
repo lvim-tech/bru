@@ -64,9 +64,16 @@ pub enum Command {
     TabPin,
     /// `tab-mute` — toggle the showing tab's audio.
     TabMute,
-    /// `tab-give [win-id] [-p]` — move the tab to another window. bru has one window; the variant
-    /// exists so `gD` keeps its place in the trie and so the report can say what is missing.
-    TabGive,
+// --- src/window.rs ---------------------------------------------------------
+    /// `tab-give [win-id]` — move the showing tab to another window, or to a new one when no id is
+    /// given (`commands.py:460`). A count overrides the argument and is one-based, so `2gD` gives to
+    /// window 1.
+    ///
+    /// The variant is spelled with its argument because `:tab-give 1` and a bare `:tab-give` are
+    /// different commands: one moves, the other detaches. Ignoring the id would send every
+    /// `:tab-give N` to a brand new window, which is worse than not parsing it.
+    TabGive { win_id: Option<u32> },
+// --- end src/window.rs -----------------------------------------------------
     /// `session-save [-f] [name]` — write the open tabs to `~/.local/share/bru/sessions/`.
     SessionSave { name: Option<String>, force: bool },
     /// `session-load [-c] [--history] <name>`.
@@ -857,7 +864,14 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
 // --- src/session.rs --------------------------------------------------------
         "tab-pin" => Command::TabPin,
         "tab-mute" => Command::TabMute,
-        "tab-give" => Command::TabGive,
+// --- src/window.rs ---------------------------------------------------------
+        "tab-give" => Command::TabGive {
+            win_id: match args.arg(0).filter(|id| !id.is_empty()) {
+                Some(id) => Some(id.parse().map_err(|_| bad(&format!("invalid window id {id:?}")))?),
+                None => None,
+            },
+        },
+// --- end src/window.rs -----------------------------------------------------
         // The name is positional and optional; qutebrowser falls back to `session.default_name`
         // and then to `default` (`sessions.py:_get_session_name`), and bru has only the last of
         // those until there is a settings store to hold the first.

@@ -140,8 +140,13 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // rather than the same tab: a new tab on the current URL, with an empty history.
         Command::TabClone { bg, window, .. } => {
             if let Some(url) = active_tab_url(state) {
-                // `-w` has no window management behind it yet; a tab is closer than nothing.
-                let _ = window;
+// --- src/window.rs ---------------------------------------------------------
+                // `-w` is a window of its own. It was a tab standing in for one.
+                if *window {
+                    crate::window::open(state, &url);
+                    return;
+                }
+// --- end src/window.rs -----------------------------------------------------
                 crate::tabs::new_tab(state, &url, *bg);
             }
         }
@@ -149,10 +154,31 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // The URL of a closed tab is all that is kept, for the same reason. `2u` reaches one
         // further down the stack rather than reopening two tabs — the count is a depth.
         Command::Undo { window } => {
-            // `undo -w` reopens a closed *window*, and bru has one window that outlives its tabs.
+// --- src/window.rs ---------------------------------------------------------
+            // `U` — the last closed *window*, with every tab it held, in the order it held them.
+            // qutebrowser refuses a count here (`commands.py:851`): a window's undo entry is the
+            // whole window, so there is nothing for a depth to mean.
             if *window {
+                let urls = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .take_closed_window();
+                let Some(urls) = urls else {
+                    crate::message::error("undo: no closed window to reopen");
+                    return;
+                };
+                let mut urls = urls.into_iter();
+                let Some(first) = urls.next() else {
+                    return;
+                };
+                let reopened = crate::window::open(state, &first);
+                // The rest in the background, or each one would steal the selection from the last.
+                for url in urls {
+                    crate::tabs::new_tab_in(state, reopened, &url, true);
+                }
                 return;
             }
+// --- end src/window.rs -----------------------------------------------------
             let url = state
                 .lock()
                 .expect("state mutex poisoned")
@@ -165,12 +191,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
 // --- src/session.rs --------------------------------------------------------
         Command::TabPin => crate::tabs::toggle_pin(state),
         Command::TabMute => crate::tabs::toggle_mute(state),
-        // `gD`. There is one window, and a tab cannot be given to a window that does not exist —
-        // see the report: this needs `window_create_top_level` a second time, a `Vec<Window>` in
-        // `BruState` where there is one `Option<Window>`, and a rule for which window a key
-        // belongs to. Faking it by cloning the tab would lose the original's history and look
-        // like a bug rather than a gap.
-        Command::TabGive => {}
+// --- src/window.rs ---------------------------------------------------------
+        // `gD` — the showing tab moves, whole, to another window. A count overrides the argument
+        // and is one-based (`commands.py:475`), so `2gD` gives to window 1 and `gD` alone detaches
+        // into a new one.
+        //
+        // The tab is re-parented rather than recreated: the same `BrowserView`, the same browser,
+        // the same navigation history, so `H` still works in the window it arrived in. See
+        // `tabs::give_tab` for why holding the reference across the move is the whole trick.
+        Command::TabGive { win_id } => {
+            let target = count.map(|c| c.saturating_sub(1)).or(*win_id);
+            crate::tabs::give_tab(state, target);
+        }
+// --- end src/window.rs -----------------------------------------------------
 
         Command::SessionSave { name, .. } => {
             let name = name.as_deref().unwrap_or(crate::session::DEFAULT_NAME);
@@ -216,16 +249,27 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                     return;
                 }
             };
-            crate::open::open(state, browser, url.as_deref(), *tab || *window, *bg)
 // --- end src/clip.rs -------------------------------------------------------
+// --- src/window.rs ---------------------------------------------------------
+            // `wo`, `wO`, `wp`, `wP` — a window of its own. The address is decided by the same
+            // function `open` uses, so `:open -w ddg rust` searches exactly as `:open ddg rust`
+            // does; a window is *created around* a URL, so there is no browser to hand over.
+            if *window {
+                if let Some(target) = crate::open::resolve(url.as_deref()) {
+                    crate::window::open(state, &target);
+                }
+                return;
+            }
+// --- end src/window.rs -----------------------------------------------------
+            crate::open::open(state, browser, url.as_deref(), *tab, *bg)
         }
 
         // --- navigation ---------------------------------------------------------------------
         Command::Back { tab, bg, window } => {
-            back_forward(state, browser, false, repeat, *tab || *bg || *window, *bg)
+            back_forward(state, browser, false, repeat, *tab || *bg, *bg, *window)
         }
         Command::Forward { tab, bg, window } => {
-            back_forward(state, browser, true, repeat, *tab || *bg || *window, *bg)
+            back_forward(state, browser, true, repeat, *tab || *bg, *bg, *window)
         }
         Command::Reload { force } => {
             if *force {
@@ -263,9 +307,13 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 
         // --- lifetime -----------------------------------------------------------------------
-        // Closing the window is the whole teardown: `can_close` → `do_close` → `on_before_close`
-        // → `quit_message_loop`, the path `--close-after-ms` already exercises. There is one
-        // window, so `close` and `quit` do the same thing.
+        // Closing a window is `can_close` → `do_close` → `on_before_close`, the path
+        // `--close-after-ms` already exercises; `quit_message_loop` comes at the end of the *last*
+        // one, because `BruState::on_before_close` counts browsers across every window.
+        //
+        // So `close` and `quit` are two different things now, which is what their qutebrowser
+        // spellings always meant: `<Ctrl-Shift-W>` closes the window in front of you and
+        // `<Ctrl-Q>`/`ZZ`/`ZQ` end the application.
         Command::Quit { save } => {
             // `:quit --save` (qutebrowser's `wq` alias) writes the open tabs before the window
             // goes. It has to happen here rather than in `on_before_close`: by the time that runs
@@ -276,7 +324,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                     Err(e) => eprintln!("bru: could not save the session: {e}"),
                 }
             }
-            close_window(state);
+            crate::window::close_all(state);
         }
         Command::Close => close_window(state),
 
@@ -404,10 +452,10 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::SearchNext => crate::find::search_next(browser, count),
         Command::SearchPrev => crate::find::search_prev(browser, count),
 
-        // `[[`, `]]`, `{{`, `}}`, `gu`, `gU`, `<Ctrl-A>`, `<Ctrl-X>`. `-w` folds into `-t`, as it
-        // does for `open`: bru has one window.
+        // `[[`, `]]`, `{{`, `}}`, `gu`, `gU`, `<Ctrl-A>`, `<Ctrl-X>`. `-w` is its own destination
+        // now — `wu` is a window, not the tab it folded into.
         Command::Navigate { to, tab, bg, window } => {
-            crate::navigate::navigate(state, browser, *to, *tab || *window, *bg, count)
+            crate::navigate::navigate(state, browser, *to, *tab, *bg, *window, count)
         }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
@@ -437,7 +485,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::history::quickmark_save(state, name.as_deref())
         }
         Command::QuickmarkLoad { name, tab, bg, window } => {
-            crate::history::quickmark_load(state, browser, name.as_deref(), *tab || *window, *bg)
+            crate::history::quickmark_load(state, browser, name.as_deref(), *tab, *bg, *window)
         }
         Command::QuickmarkDel { name } => crate::history::quickmark_del(state, name.as_deref()),
         Command::BookmarkAdd { url, title, toggle } => {
@@ -447,8 +495,9 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             state,
             browser,
             url.as_deref(),
-            *tab || *window,
+            *tab,
             *bg,
+            *window,
             *delete,
         ),
         Command::BookmarkDel { url } => crate::history::bookmark_del(state, url.as_deref()),
@@ -637,13 +686,19 @@ pub fn is_live(command: &Command) -> bool {
         | Command::TabFocus { .. }
         | Command::TabMove { .. }
         | Command::TabClone { .. } => true,
-        // `undo -w` is the one spelling that does nothing: there is one window.
-        Command::Undo { window } => !window,
+// --- src/window.rs ---------------------------------------------------------
+        // Both spellings act now. `undo -w` reopens the last closed window with its tabs; it was
+        // the one spelling that did nothing, because there was one window and it outlived them.
+        Command::Undo { .. } => true,
+// --- end src/window.rs -----------------------------------------------------
 
 // --- src/session.rs --------------------------------------------------------
         Command::TabPin | Command::TabMute => true,
-        // `gD` needs a second window to give the tab to, and bru has one. Inert on purpose.
-        Command::TabGive => false,
+// --- src/window.rs ---------------------------------------------------------
+        // `gD` moves the showing tab to another window, or detaches it into a new one. It was inert
+        // because there was nowhere to give a tab to.
+        Command::TabGive { .. } => true,
+// --- end src/window.rs -----------------------------------------------------
         Command::SessionSave { .. } | Command::SessionLoad { .. } | Command::SessionDelete { .. } => {
             true
         }
@@ -829,8 +884,21 @@ fn back_forward(
     steps: u32,
     new_tab: bool,
     background: bool,
+    new_window: bool,
 ) {
     let offset = if forward { steps as i32 } else { -(steps as i32) };
+
+// --- src/window.rs ---------------------------------------------------------
+    // `wh` / `wl` — the entry the command would have moved to, in a window of its own. Same
+    // limitation as the tab spelling and for the same reason: CEF serialises no navigation list, so
+    // the new window starts on that page with an empty history.
+    if new_window {
+        if let Some(url) = entry_at_offset(browser, offset) {
+            crate::window::open(state, &url);
+        }
+        return;
+    }
+// --- end src/window.rs -----------------------------------------------------
 
     if new_tab {
         if let Some(url) = entry_at_offset(browser, offset) {
@@ -911,11 +979,14 @@ wrap_navigation_entry_visitor! {
     }
 }
 
-/// Close the one window, which is bru's whole teardown.
+/// Close the window in front — `:close`. The process only ends if it was the last one.
 fn close_window(state: &SharedState) {
-    let window = state.lock().expect("state mutex poisoned").window();
+    let window = state
+        .lock()
+        .expect("state mutex poisoned")
+        .current_window_id();
     if let Some(window) = window {
-        window.close();
+        crate::window::close(state, window);
     }
 }
 
@@ -1138,7 +1209,7 @@ wrap_task! {
 /// `order` is the strip, left to right, each tab shown by the tail of its URL — without it a
 /// `tab-move` that did nothing and one that moved a tab back to where it was look identical.
 fn report(state: &SharedState, step: &str) {
-    let (active, total, url, order) = {
+    let (active, total, url, order, windows, current) = {
         let guard = state.lock().expect("state mutex poisoned");
         let active = guard.active_tab();
         let total = guard.tab_count();
@@ -1146,7 +1217,25 @@ fn report(state: &SharedState, step: &str) {
         let order: Vec<String> = (0..total)
             .map(|i| tail(&guard.tab_url(i).unwrap_or_default()))
             .collect();
-        (active, total, url, order.join(","))
+// --- src/window.rs ---------------------------------------------------------
+        // How many windows there are, which one this is, and how many tabs each holds. Without it a
+        // `:tab-give` that moved a tab and one that opened a window and lost it look identical —
+        // the current window's count falls by one either way.
+        let windows: Vec<String> = guard
+            .window_ids()
+            .into_iter()
+            .map(|id| format!("{id}:{}", guard.tab_count_in(id)))
+            .collect();
+        let current = guard.current_window_id();
+        (
+            active,
+            total,
+            url,
+            order.join(","),
+            windows.join(" "),
+            current,
+        )
+// --- end src/window.rs -----------------------------------------------------
     };
     // Re-fetched outside the lock: reading the zoom is a CEF call.
     let browser = state.lock().expect("state mutex poisoned").active_browser();
@@ -1155,7 +1244,8 @@ fn report(state: &SharedState, step: &str) {
         .unwrap_or(ZOOM_DEFAULT);
 
     eprintln!(
-        "cmd: after {step:?} -> tabs={total} active={active} zoom={zoom}% order=[{order}] url={url}"
+        "cmd: after {step:?} -> windows=[{windows}] win={current:?} tabs={total} active={active} \
+         zoom={zoom}% order=[{order}] url={url}"
     );
 }
 
@@ -1242,8 +1332,14 @@ mod tests {
         // which opens `bru://chrome/settings`. The fourth of that group, `<Return>` in hint mode,
         // stays inert on purpose and raises nothing — see the `HintFollow` arm in `run`.
         //
+        // 243 with a second window: `gD` (`tab-give`) and `U` (`undo -w`), the two bindings whose
+        // whole reason for being inert was that there was one window. The `-w` spellings of `open`,
+        // `back`, `forward`, `navigate`, `quickmark-load` and `bookmark-load` raise no number here
+        // — they counted as live while they quietly opened a tab — so what fixing them shows up in
+        // is the run against the real browser, not this.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 248, "the live-binding count moved");
+        assert_eq!(live, 250, "the live-binding count moved");
     }
 
 // --- src/settingspage.rs -------------------------------------------------------------------
@@ -1457,9 +1553,14 @@ mod tests {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
-        // `gD` is tab-give, and bru has one window. It parses and stays inert deliberately.
-        assert_eq!(commands::parse("tab-give").unwrap(), Command::TabGive);
-        assert!(!is_live(&commands::parse("tab-give").unwrap()));
+// --- src/window.rs ---------------------------------------------------------
+        // `gD` is tab-give. It was inert for as long as there was one window; it moves the tab now.
+        assert_eq!(
+            commands::parse("tab-give").unwrap(),
+            Command::TabGive { win_id: None }
+        );
+        assert!(is_live(&commands::parse("tab-give").unwrap()));
+// --- end src/window.rs -----------------------------------------------------
 
         assert!(is_live(&commands::parse("session-save").unwrap()));
         assert!(is_live(&commands::parse("session-load work").unwrap()));
@@ -1641,9 +1742,49 @@ mod tests {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
-        // `U` is `undo -w`, and bru has one window: it parses and stays inert deliberately.
-        assert!(!is_live(&commands::parse("undo -w").unwrap()));
+// --- src/window.rs ---------------------------------------------------------
+        // `U` is `undo -w`. It was the one spelling that did nothing, because there was one window;
+        // it reopens the last closed one now, with the tabs it held.
+        assert!(is_live(&commands::parse("undo -w").unwrap()));
+// --- end src/window.rs -----------------------------------------------------
     }
+
+// --- src/window.rs ---------------------------------------------------------
+    /// The two bindings a second window turned on, named — and the two `-w` spellings that were
+    /// already counted live and were quietly wrong.
+    ///
+    /// `wo`, `wh`, `wu`, `wb` and the rest have counted as live since stage 2, because
+    /// `Command::Open`/`Back`/`Navigate` are live whatever their flags say and the dispatcher folded
+    /// `-w` into `-t`. So this number cannot show that they were fixed — only the run against the
+    /// real browser can, and it is in the report. What the number *can* show is `gD` and `U`.
+    #[test]
+    fn the_bindings_a_second_window_turned_on() {
+        for keys in [
+            "gD", // tab-give
+            "U",  // undo -w
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+
+        // A window id is an argument, and a count overrides it — `commands.py:475`. Parsing it is
+        // what stops `:tab-give 1` detaching into a new window instead of moving to window 1.
+        assert_eq!(
+            commands::parse("tab-give 1").unwrap(),
+            Command::TabGive { win_id: Some(1) }
+        );
+        assert!(commands::parse("tab-give nowhere").is_err());
+
+        // `;R` is the one hint binding a second window does *not* turn on, and its reason is now in
+        // `hints.rs` rather than in the shape of bru: `Target::Window` still opens a foreground tab
+        // there. Flipping this without that change would claim `;R` works when it does not.
+        assert!(!is_live(&commands::parse("hint --rapid links window").unwrap()));
+    }
+// --- end src/window.rs -----------------------------------------------------
 
 // --- src/find.rs + src/navigate.rs ---------------------------------------------------------------
     /// The eleven bindings this milestone made live, named one by one. A total is not enough to

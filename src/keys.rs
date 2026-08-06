@@ -58,11 +58,15 @@ wrap_keyboard_handler! {
             // command mode becomes the one exception, because then the bottom strip really does
             // want the letters.
             let browser_id = browser.identifier();
-            let chrome_key = self
-                .state
-                .lock()
-                .expect("state mutex poisoned")
-                .is_chrome_browser(browser_id);
+            // With more than one window, "the showing tab" is the showing tab *of the window this
+            // key arrived at*. CEF hands the event to the browser that has focus, and that browser
+            // names its window — so the aim below resolves in the right one. Without this line
+            // trap 11 sends a strip's key to whichever window was last made current.
+            let chrome_key = {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                state.focus_window_of_browser(browser_id);
+                state.is_chrome_browser(browser_id)
+            };
 
             let mut redirected;
             let target: &mut Browser = if chrome_key {
@@ -396,14 +400,18 @@ wrap_display_handler! {
             };
             let url = url.map(CefString::to_string).unwrap_or_default();
 
-            let (is_tab, is_active, tabs) = {
+            // Which window the tab is in, so a page loading in a background window pushes into that
+            // window's bar and strip instead of into whichever one is in front. `None` is not a tab
+            // at all — a chrome strip reporting its own bru:// URL.
+            let (window, is_active, tabs) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
-                let is_tab = state.set_tab_url(id, url.clone());
-                (is_tab, state.is_active_browser(id), state.tabs_json())
+                let window = state.set_tab_url(id, url.clone());
+                let tabs = window.map(|w| state.tabs_json_in(w)).unwrap_or_default();
+                (window, state.is_active_browser(id), tabs)
             };
-            if !is_tab {
+            let Some(window) = window else {
                 return;
-            }
+            };
 // --- src/history.rs --------------------------------------------------------
             // A tab's main frame committed an address: that is a visit, and this is the callback
             // `data.rs` was written against. Below the `is_tab` guard, so a chrome strip's own
@@ -411,9 +419,9 @@ wrap_display_handler! {
             crate::history::visited(id, &url);
 // --- end src/history.rs ----------------------------------------------------
             if is_active {
-                crate::ipc::set_url(url);
+                crate::ipc::set_url_for(window, url);
             }
-            crate::ipc::set_tabs(tabs);
+            crate::ipc::set_tabs_for(window, tabs);
         }
 
         fn on_title_change(&self, browser: Option<&mut Browser>, title: Option<&CefString>) {
@@ -422,23 +430,25 @@ wrap_display_handler! {
             };
             let title = title.map(CefString::to_string).unwrap_or_default();
 
-            let (is_tab, is_active, tabs) = {
+            // The window the tab is in — see `on_address_change` above.
+            let (window, is_active, tabs) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
-                let is_tab = state.set_tab_title(id, title.clone());
-                (is_tab, state.is_active_browser(id), state.tabs_json())
+                let window = state.set_tab_title(id, title.clone());
+                let tabs = window.map(|w| state.tabs_json_in(w)).unwrap_or_default();
+                (window, state.is_active_browser(id), tabs)
             };
-            if !is_tab {
+            let Some(window) = window else {
                 return;
-            }
+            };
 // --- src/history.rs --------------------------------------------------------
             // The row written at commit has no title yet — the address arrives first. This is what
             // fills it in, against the URL *this* browser was last reported to be on.
             crate::history::retitled(id, &title);
 // --- end src/history.rs ----------------------------------------------------
             if is_active {
-                crate::ipc::set_title(title);
+                crate::ipc::set_title_for(window, title);
             }
-            crate::ipc::set_tabs(tabs);
+            crate::ipc::set_tabs_for(window, tabs);
         }
 
         // The `<link rel=icon>` URLs of the page. Not keyed by browser here, unlike the two above:

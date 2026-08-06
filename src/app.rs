@@ -1,25 +1,15 @@
 //! The application object, and the one callback that matters at startup.
 
 use cef::*;
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::keys::BruClient;
 use crate::state::{schedule_close, BruState};
-use crate::window::{BruChromeViewDelegate, BruWindowDelegate};
 
 /// Where bru goes with no argument, and what `open` with no URL opens, unless `config.lua` says
 /// otherwise — see `bru.set("start_page", ...)` and [`crate::open::start_page`], which is what
 /// everything should ask. This is qutebrowser's `url.default_page` default (configdata.yml :2569).
 pub const HOME: &str = "https://start.duckduckgo.com/";
-
-/// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
-const TOP_URL: &str = "bru://chrome/top.html";
-const BOTTOM_URL: &str = "bru://chrome/bottom.html";
-
-/// Chrome strip heights, in logical pixels.
-const TOP_HEIGHT: i32 = 40;
-const BOTTOM_HEIGHT: i32 = 24;
 
 /// TEMPORARY (M5): a page for a tab opened by the stand-in `t` key, distinct enough that a
 /// screenshot shows which tab is on. Goes when `:open` lands in M9.
@@ -202,55 +192,13 @@ wrap_browser_process_handler! {
             let start_page = crate::open::start_page();
             let url = CefString::from(if url.is_empty() { start_page.as_str() } else { url.as_str() });
 
-            let settings = BrowserSettings::default();
-            let mut client = self.default_client();
-
-            // All three share one Client, so one set of handlers serves the page and the chrome.
-            // Which browser an event came from is answered by its identifier, not by its handler.
-            // The third argument is `grows` — see `window::COMPLETION_HEIGHT`. Only the bottom
-            // strip does; the tab strip's height is its own.
-            let mut top_delegate =
-                BruChromeViewDelegate::new(self.state.clone(), TOP_HEIGHT, false);
-            let top_view = browser_view_create(
-                client.as_mut(),
-                Some(&CefString::from(TOP_URL)),
-                Some(&settings),
-                None,
-                None,
-                Some(&mut top_delegate),
+            // The first window, made by the same function `:open -w` uses — see `window::create`.
+            // `FirstTab::Startup` is the one thing about it that is special: `--restore` may fill it
+            // instead of the start page, and only the first window asks.
+            crate::window::create(
+                &self.state,
+                crate::window::FirstTab::Startup(&url.to_string()),
             );
-
-            // --- sessions (merge: this block belongs to src/session.rs's workstream) ------------
-            // `--restore=<name>` opens a saved session's tabs instead of the start page, the way
-            // `qutebrowser --restore` does. It is decided here, before the first tab is made:
-            // opening the start page and then closing it would flash the wrong site on every
-            // restore. `--restore-history` additionally replays each tab's navigation list, which
-            // costs one page load per entry — see the head of src/session.rs.
-            //
-            // The page is tab zero. It is made before the window exists, and the window delegate
-            // adds whatever tabs it finds when it is created.
-            if !crate::session::restore_at_startup(&self.state) {
-                crate::tabs::new_tab(&self.state, &url.to_string(), false);
-            }
-            // --- end sessions -------------------------------------------------------------------
-
-            let mut bottom_delegate =
-                BruChromeViewDelegate::new(self.state.clone(), BOTTOM_HEIGHT, true);
-            let bottom_view = browser_view_create(
-                client.as_mut(),
-                Some(&CefString::from(BOTTOM_URL)),
-                Some(&settings),
-                None,
-                None,
-                Some(&mut bottom_delegate),
-            );
-
-            let mut window_delegate = BruWindowDelegate::new(
-                self.state.clone(),
-                RefCell::new(top_view),
-                RefCell::new(bottom_view),
-            );
-            window_create_top_level(Some(&mut window_delegate));
 
             // Debug hook, off unless asked for. See state::schedule_close.
             let close_after =

@@ -155,22 +155,40 @@ impl BrowserSideHandler for BruQueryHandler {
                     fail(&callback, -3, "ready without a frame");
                     return true;
                 };
+                // Which window's strip this is. Asked of `BruState` rather than of the page,
+                // because `BruChromeViewDelegate::on_browser_created` has already recorded it — the
+                // strip's own URL is the same in every window and could never say. This takes the
+                // state lock inside a query handler, which trap 12 allows: it creates no browser and
+                // starts no navigation.
+                let window = browser
+                    .as_ref()
+                    .map(|browser| browser.identifier())
+                    .and_then(|id| {
+                        crate::state::BruState::instance().and_then(|state| {
+                            state.lock().ok().and_then(|state| state.window_of_browser(id))
+                        })
+                    });
+                let Some(window) = window else {
+                    fail(&callback, -8, "a chrome view that belongs to no window");
+                    return true;
+                };
                 let response = match view.as_str() {
                     "top" => {
-                        chrome().lock().ok().map(|mut c| c.top = Some(frame));
+                        with_window(window, |entry| entry.frames.top = Some(frame));
                         // The strip keeps the favicons it has been given rather than being handed
                         // them with every state push, so a strip that has just loaded — at startup,
                         // or after a theme reload — has to be given the ones already downloaded.
                         crate::favicon::push_all();
-                        tabs_json()
+                        with_window(window, |entry| tabs_json_of(&entry.tabs))
+                            .unwrap_or_else(|| "{\"tabs\":[]}".to_string())
                     }
                     "bottom" => {
-                        chrome().lock().ok().map(|mut c| c.bottom = Some(frame));
+                        with_window(window, |entry| entry.frames.bottom = Some(frame));
                         // The command line cannot be driven before there is an input to drive, so
                         // its debug script starts here rather than in `on_context_initialized`.
                         start_cmdline_script();
                         crate::completers::start_script();
-                        bar_json()
+                        bar_json_for(window)
                     }
                     other => {
                         fail(&callback, -4, &format!("unknown view {other:?}"));
@@ -194,7 +212,14 @@ impl BrowserSideHandler for BruQueryHandler {
             // that acts on a browser from here.
             Some("tab-select") => {
                 if let Some(index) = json_number_field(request, "index") {
-                    crate::tabs::schedule_select(index as usize);
+                    // Which window's strip was clicked. A click is the one input that does not go
+                    // through `keys.rs`, so nothing else has named the window; the browser id is
+                    // carried into the posted task and resolved there, so this handler still takes
+                    // no lock of bru's own.
+                    crate::tabs::schedule_select(
+                        browser.as_ref().map(|browser| browser.identifier()),
+                        index as usize,
+                    );
                 }
                 succeed(&callback, "");
             }
@@ -252,17 +277,32 @@ struct ChromeFrames {
     bottom: Option<Frame>,
 }
 
-fn chrome() -> &'static Mutex<ChromeFrames> {
-    static CHROME: Mutex<ChromeFrames> = Mutex::new(ChromeFrames {
-        top: None,
-        bottom: None,
-    });
+/// Everything one window's chrome is and shows.
+///
+/// It was three process-wide `static`s — the frames, the bar and the tab strip's JSON — and they
+/// were `static` rather than fields of `BruState` because `RefGuard<T>` is `unsafe impl Send + Sync`
+/// (CEF-NOTES), so a `Frame` may live in a `Mutex`. That is still true and still why they are here;
+/// what changed is that there is now a row per window instead of one of each. Two windows sharing
+/// one `BarState` pushed into each other's status line, and a `render` aimed at "the" bottom frame
+/// reached whichever window loaded last.
+struct Chrome {
+    window: u32,
+    frames: ChromeFrames,
+    bar: BarState,
+    /// The tab strip's payload, cached so a push triggered by something other than a tab change
+    /// still has it. Held as JSON rather than as a borrow of the state so that a push never has to
+    /// take the state mutex — pushes run on the UI thread, and so does everything holding that lock.
+    tabs: String,
+}
+
+fn chrome() -> &'static Mutex<Vec<Chrome>> {
+    static CHROME: Mutex<Vec<Chrome>> = Mutex::new(Vec::new());
     &CHROME
 }
 
-/// What the bottom bar shows. `mode`, `keystring`, `scroll` and `tabindex` are part of the pushed
-/// object from the start so the chrome renders against its final shape; the code that fills them is
-/// the mode machine, which is a later milestone.
+/// What one window's bottom bar shows. `mode`, `keystring`, `scroll` and `tabindex` are part of the
+/// pushed object from the start so the chrome renders against its final shape.
+#[derive(Default)]
 struct BarState {
     url: String,
     title: String,
@@ -276,38 +316,51 @@ struct BarState {
     download: String,
 }
 
-fn bar() -> &'static Mutex<BarState> {
-    static BAR: Mutex<BarState> = Mutex::new(BarState {
-        url: String::new(),
-        title: String::new(),
-        mode: String::new(),
-        keystring: String::new(),
-        scroll: String::new(),
-        tabindex: String::new(),
-        search: String::new(),
-        download: String::new(),
-    });
-    &BAR
+/// The window a command with nothing else to go on acts against. `None` in the renderer process and
+/// once the last window has closed.
+fn current_window() -> Option<u32> {
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.current_window_id()))
 }
 
-/// From `DisplayHandler::on_address_change` on the main frame.
-pub fn set_url(url: String) {
-    if let Ok(mut bar) = bar().lock() {
-        bar.url = url;
+/// Run `f` against one window's chrome, making the row if this is the first thing said about it.
+/// The lock is held only for `f`, which must not call into CEF.
+fn with_window<R>(window: u32, f: impl FnOnce(&mut Chrome) -> R) -> Option<R> {
+    let mut chrome = chrome().lock().ok()?;
+    if !chrome.iter().any(|entry| entry.window == window) {
+        chrome.push(Chrome {
+            window,
+            frames: ChromeFrames::default(),
+            bar: BarState::default(),
+            tabs: String::new(),
+        });
     }
-    push();
+    let entry = chrome.iter_mut().find(|entry| entry.window == window)?;
+    Some(f(entry))
 }
 
-/// From `DisplayHandler::on_title_change`.
-pub fn set_title(title: String) {
-    // And onto the toplevel, which is the only place the compositor can read a window's name from.
-    // Here rather than in the display handler because a tab *switch* also changes the title and
-    // fires no display callback — both routes already come through this function.
-    crate::window::set_title(&title);
-    if let Ok(mut bar) = bar().lock() {
-        bar.title = title;
+/// Drop a window's chrome. Called from `on_window_destroyed`; without it a push after a window has
+/// gone would run a script in a dead renderer.
+pub fn forget_window(window: u32) {
+    if let Ok(mut chrome) = chrome().lock() {
+        chrome.retain(|entry| entry.window != window);
     }
-    push();
+}
+
+/// From `DisplayHandler::on_address_change` on the main frame, for the window the tab is in.
+pub fn set_url_for(window: u32, url: String) {
+    with_window(window, |entry| entry.bar.url = url);
+    push_for(window);
+}
+
+/// From `DisplayHandler::on_title_change`, for the window the tab is in.
+pub fn set_title_for(window: u32, title: String) {
+    // And onto that window's toplevel, which is the only place the compositor can read a window's
+    // name from. Here rather than in the display handler because a tab *switch* also changes the
+    // title and fires no display callback — both routes already come through this function.
+    crate::window::set_title(window, &title);
+    with_window(window, |entry| entry.bar.title = title);
+    push_for(window);
 }
 
 /// The current mode, spelled as qutebrowser spells it. The chrome colours the bar by it, and
@@ -324,21 +377,29 @@ pub fn set_mode(mode: String) {
     if mode == "command" {
         crate::message::clear();
     }
-    if let Ok(mut bar) = bar().lock() {
-        bar.mode = mode;
+    // The mode is the process's, not the window's — bru has one `ModeManager` — but only the window
+    // being typed into needs to be told, and the others keep whatever they were last shown.
+    if let Some(window) = current_window() {
+        with_window(window, |entry| entry.bar.mode = mode);
+        push_for(window);
     }
-    push();
 }
 
 /// The address of the tab that is showing, for `{url}` in a `cmd-set-text` — which is how `go` and
 /// `gO` prefill the line with the current page.
 pub fn current_url() -> String {
-    bar().lock().map(|bar| bar.url.clone()).unwrap_or_default()
+    let Some(window) = current_window() else {
+        return String::new();
+    };
+    with_window(window, |entry| entry.bar.url.clone()).unwrap_or_default()
 }
 
 /// The title of the tab that is showing, for `yank title` and for `{title}` in a `yank inline`.
 pub fn current_title() -> String {
-    bar().lock().map(|bar| bar.title.clone()).unwrap_or_default()
+    let Some(window) = current_window() else {
+        return String::new();
+    };
+    with_window(window, |entry| entry.bar.title.clone()).unwrap_or_default()
 }
 
 /// src/clip.rs: one line of message on the status bar, or `""` to take it away.
@@ -371,11 +432,17 @@ pub fn push_bar() {
 /// carrying every one of them in the object pushed on every keystring and scroll change would put
 /// tens of kilobytes of JavaScript on paths that run constantly. This hands the strip one icon,
 /// once, and the strip keeps it.
+/// Every window's tab strip, not only the current one: a favicon is keyed by the origin of the page
+/// it belongs to, and the same site open in two windows wants its icon in both strips.
 pub fn top_chrome_eval(code: &str) {
-    let Ok(chrome) = chrome().lock() else {
-        return;
+    let frames: Vec<Frame> = match chrome().lock() {
+        Ok(chrome) => chrome
+            .iter()
+            .filter_map(|entry| entry.frames.top.clone())
+            .collect(),
+        Err(_) => return,
     };
-    if let Some(frame) = chrome.top.clone() {
+    for frame in frames {
         frame.execute_java_script(Some(&CefString::from(code)), None, 0);
     }
 }
@@ -383,18 +450,29 @@ pub fn top_chrome_eval(code: &str) {
 /// The pending key chain and count — `g` after `g`, `3` after `3`, empty once something ran. This
 /// is qutebrowser's keystring widget, and it is what makes a half-typed `gg` visible.
 pub fn set_keystring(keystring: String) {
-    let changed = match bar().lock() {
-        Ok(mut bar) if bar.keystring != keystring => {
-            bar.keystring = keystring;
-            true
-        }
-        _ => false,
-    };
     // Every keypress reaches here, and most leave the string as it was. Pushing regardless would
     // run a script in the chrome renderer on every `j` — on the one path this project exists to
-    // keep fast.
-    if changed {
-        push();
+    // keep fast. So the change is decided under the lock and the push happens outside it.
+    set_bar_field(|bar| &mut bar.keystring, keystring);
+}
+
+/// One field of the current window's bar, pushed only if it moved. The four callers below are all
+/// on paths that fire many times a second.
+fn set_bar_field(field: impl Fn(&mut BarState) -> &mut String, value: String) {
+    let Some(window) = current_window() else {
+        return;
+    };
+    let changed = with_window(window, |entry| {
+        let slot = field(&mut entry.bar);
+        if *slot == value {
+            false
+        } else {
+            *slot = value;
+            true
+        }
+    });
+    if changed == Some(true) {
+        push_for(window);
     }
 }
 
@@ -403,61 +481,49 @@ pub fn set_keystring(keystring: String) {
 /// held `j` reaches this on every settled position and a push each time would run a script in the
 /// chrome renderer for a string that is already right.
 pub fn set_scroll(scroll: String) {
-    let changed = match bar().lock() {
-        Ok(mut bar) if bar.scroll != scroll => {
-            bar.scroll = scroll;
-            true
-        }
-        _ => false,
-    };
-    if changed {
-        push();
-    }
+    set_bar_field(|bar| &mut bar.scroll, scroll);
 }
 
 /// `Match [3/17]` from `find.rs`, or empty for no search. Chromium sends several updates per
 /// search as it scans the page, so this is filtered the same way.
 pub fn set_search_match(search: String) {
-    let changed = match bar().lock() {
-        Ok(mut bar) if bar.search != search => {
-            bar.search = search;
-            true
-        }
-        _ => false,
-    };
-    if changed {
-        push();
-    }
+    set_bar_field(|bar| &mut bar.search, search);
 }
 
 /// `[dl 45%]` from `downloads.rs`, or empty when nothing is running. Filtered like the two above:
 /// `on_download_updated` arrives several times a second and the string it produces does not change
 /// nearly that often.
 pub fn set_download(download: String) {
-    let changed = match bar().lock() {
-        Ok(mut bar) if bar.download != download => {
-            bar.download = download;
-            true
-        }
-        _ => false,
-    };
-    if changed {
-        push();
+    set_bar_field(|bar| &mut bar.download, download);
+}
+
+/// Push the current window's state into whichever of its chrome frames have announced themselves.
+fn push() {
+    if let Some(window) = current_window() {
+        push_for(window);
     }
 }
 
-/// Push the current state into whichever chrome frames have announced themselves.
-fn push() {
-    let (top, bottom) = match chrome().lock() {
-        Ok(chrome) => (chrome.top.clone(), chrome.bottom.clone()),
+/// The same for a named window. Every push is aimed at one window: a background window's bar keeps
+/// what it was last shown, which is what its own tab is doing.
+fn push_for(window: u32) {
+    let (top, bottom, tabs) = match chrome().lock() {
+        Ok(chrome) => match chrome.iter().find(|entry| entry.window == window) {
+            Some(entry) => (
+                entry.frames.top.clone(),
+                entry.frames.bottom.clone(),
+                entry.tabs.clone(),
+            ),
+            None => return,
+        },
         Err(_) => return,
     };
 
     if let Some(frame) = top {
-        render(&frame, &tabs_json());
+        render(&frame, &tabs_json_of(&tabs));
     }
     if let Some(frame) = bottom {
-        render(&frame, &bar_json());
+        render(&frame, &bar_json_for(window));
     }
 }
 
@@ -468,6 +534,7 @@ fn render(frame: &Frame, state_json: &str) {
 }
 
 /// Drop frames belonging to a browser that is going away, or a push would run against a dead frame.
+/// Every window is searched: the browser that died names no window by itself.
 fn forget_chrome_frames_of(browser: Option<&Browser>) {
     let Some(browser) = browser else {
         return;
@@ -476,21 +543,29 @@ fn forget_chrome_frames_of(browser: Option<&Browser>) {
         return;
     };
     let id = browser.identifier();
-    let chrome = &mut *chrome;
-    for slot in [&mut chrome.top, &mut chrome.bottom] {
-        let is_gone = slot
-            .as_ref()
-            .and_then(|frame| frame.browser())
-            .map(|frame_browser| frame_browser.identifier() == id)
-            .unwrap_or(false);
-        if is_gone {
-            *slot = None;
+    for entry in chrome.iter_mut() {
+        for slot in [&mut entry.frames.top, &mut entry.frames.bottom] {
+            let is_gone = slot
+                .as_ref()
+                .and_then(|frame| frame.browser())
+                .map(|frame_browser| frame_browser.identifier() == id)
+                .unwrap_or(false);
+            if is_gone {
+                *slot = None;
+            }
         }
     }
 }
 
 /// `pub(crate)` so a check can read the exact JSON the chrome is handed rather than assert about it.
 pub(crate) fn bar_json() -> String {
+    match current_window() {
+        Some(window) => bar_json_for(window),
+        None => "{}".to_string(),
+    }
+}
+
+fn bar_json_for(window: u32) -> String {
     // Built before the lock is taken: `cmdline::json` reads the mode out of `BruState`, and a bar
     // lock held across that would order two mutexes against each other for no reason.
     let cmdline = crate::cmdline::json();
@@ -500,24 +575,25 @@ pub(crate) fn bar_json() -> String {
     let completion = crate::completers::json();
     // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
     let message = crate::message::json();
-    let Ok(bar) = bar().lock() else {
-        return "{}".to_string();
-    };
-    format!(
-        // Six workstreams have each added a key here, and every one is optional to the chrome,
-        // which ignores a key it has no element for: `search` is the find handler's match count,
-        // `download` a running download's progress, `message` one line with a level and its own
-        // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
-        json_escape(&bar.url),
-        json_escape(&bar.title),
-        json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
-        json_escape(&bar.keystring),
-        json_escape(&bar.scroll),
-        json_escape(&bar.tabindex),
-        json_escape(&bar.search),
-        json_escape(&bar.download),
-    )
+    with_window(window, |entry| {
+        let bar = &entry.bar;
+        format!(
+            // Six workstreams have each added a key here, and every one is optional to the chrome,
+            // which ignores a key it has no element for: `search` is the find handler's match count,
+            // `download` a running download's progress, `message` one line with a level and its own
+            // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
+            json_escape(&bar.url),
+            json_escape(&bar.title),
+            json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
+            json_escape(&bar.keystring),
+            json_escape(&bar.scroll),
+            json_escape(&bar.tabindex),
+            json_escape(&bar.search),
+            json_escape(&bar.download),
+        )
+    })
+    .unwrap_or_else(|| "{}".to_string())
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -529,8 +605,15 @@ pub(crate) fn bar_json() -> String {
 // must not widen to the tab strip. `BruState::is_chrome_browser` cannot tell them apart — it holds
 // both identifiers in one list — but the frame that announced itself as `view: "bottom"` can.
 
+/// The current window's bottom frame. The command line is only ever open in one window at a time —
+/// bru has one `ModeManager` — and it is the one the user is typing into.
 fn bottom_frame() -> Option<Frame> {
-    chrome().lock().ok().and_then(|chrome| chrome.bottom.clone())
+    let window = current_window()?;
+    let chrome = chrome().lock().ok()?;
+    chrome
+        .iter()
+        .find(|entry| entry.window == window)
+        .and_then(|entry| entry.frames.bottom.clone())
 }
 
 /// The browser drawing the bottom strip, once it has announced itself.
@@ -538,12 +621,24 @@ pub fn bottom_chrome_browser() -> Option<Browser> {
     bottom_frame().and_then(|frame| frame.browser())
 }
 
-/// Whether a key that arrived at `identifier` arrived at the bottom strip. Used by trap 11's
-/// exception, which must not apply to the tab strip.
+/// Whether a key that arrived at `identifier` arrived at *a* bottom strip — any window's.
+///
+/// Used by trap 11's exception, which must not apply to the tab strip. It asks about every window
+/// rather than the current one on purpose: `keys.rs` has already made the key's own window current,
+/// but a key that raced a window switch would otherwise be swallowed instead of typed.
 pub fn is_bottom_chrome_browser(identifier: i32) -> bool {
-    bottom_chrome_browser()
-        .map(|browser| browser.identifier() == identifier)
-        .unwrap_or(false)
+    let Ok(chrome) = chrome().lock() else {
+        return false;
+    };
+    chrome.iter().any(|entry| {
+        entry
+            .frames
+            .bottom
+            .as_ref()
+            .and_then(|frame| frame.browser())
+            .map(|browser| browser.identifier() == identifier)
+            .unwrap_or(false)
+    })
 }
 
 /// What the bottom strip is showing. `bru://chrome/bottom.html` unless something has navigated it
@@ -595,27 +690,25 @@ fn start_cmdline_script() {
     crate::cmdline::schedule_script(&script, step_ms);
 }
 
-/// The tab strip's payload. It is built by `BruState`, which owns the tabs, and cached here so a
-/// push triggered by something other than a tab change still has it. Held as JSON rather than as a
-/// borrow of the state so that a push never has to take the state mutex — pushes run on the UI
-/// thread, and so does everything that holds that lock.
-fn tabs() -> &'static Mutex<String> {
-    static TABS: Mutex<String> = Mutex::new(String::new());
-    &TABS
+/// From the display handler, after `BruState` has updated the tab the browser belongs to — for the
+/// window that tab is in.
+pub fn set_tabs_for(window: u32, json: String) {
+    with_window(window, |entry| entry.tabs = json);
+    push_for(window);
 }
 
-/// From the display handler, after `BruState` has updated the tab the browser belongs to.
+/// The current window's strip, for callers that act on it by definition.
 pub fn set_tabs(json: String) {
-    if let Ok(mut tabs) = tabs().lock() {
-        *tabs = json;
+    if let Some(window) = current_window() {
+        set_tabs_for(window, json);
     }
-    push();
 }
 
-fn tabs_json() -> String {
-    match tabs().lock() {
-        Ok(tabs) if !tabs.is_empty() => tabs.clone(),
-        _ => "{\"tabs\":[]}".to_string(),
+fn tabs_json_of(cached: &str) -> String {
+    if cached.is_empty() {
+        "{\"tabs\":[]}".to_string()
+    } else {
+        cached.to_string()
     }
 }
 
