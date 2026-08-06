@@ -204,6 +204,20 @@ wrap_browser_process_handler! {
                 .unwrap_or(3000);
                 crate::state::schedule_tab_script(&script, step_ms);
             }
+
+            // Debug hook, off unless asked for. See exec::schedule_cmd_script — the general form of
+            // --tab-script, running real command strings through the real dispatcher.
+            let cmds = CefString::from(&command_line.switch_value(Some(&CefString::from("cmd"))))
+                .to_string();
+            if !cmds.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("cmd-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(1500);
+                crate::exec::schedule_cmd_script(&cmds, step_ms);
+            }
         }
 
         fn default_client(&self) -> Option<Client> {
