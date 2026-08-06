@@ -56,11 +56,12 @@ wrap_keyboard_handler! {
             // So the key is handled as usual and simply aimed at the tab that is showing. From M9
             // command mode becomes the one exception, because then the bottom strip really does
             // want the letters.
+            let browser_id = browser.identifier();
             let chrome_key = self
                 .state
                 .lock()
                 .expect("state mutex poisoned")
-                .is_chrome_browser(browser.identifier());
+                .is_chrome_browser(browser_id);
 
             let mut redirected;
             let target: &mut Browser = if chrome_key {
@@ -120,8 +121,34 @@ wrap_keyboard_handler! {
                 run(&self.state, target, &command, count);
             }
 
-            // A key that came in on a chrome strip is always swallowed, matched or not — see above.
+            // A key that came in on a chrome strip is always swallowed, matched or not — see above
+            // — with exactly one exception, and this is it.
+            //
+            // WORKTREE-ONLY (M9 command-line workstream): `src/keys.rs` belongs to the dispatcher
+            // workstream. These four lines are here to verify trap 11's exception and must be
+            // re-added deliberately at merge, on top of that workstream's version of this file.
             if chrome_key {
+                let in_command_mode = self
+                    .state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .mode()
+                    == crate::modes::Mode::Command;
+                let forward = in_command_mode
+                    && crate::ipc::is_bottom_chrome_browser(browser_id)
+                    && crate::cmdline::types_into_cmdline(&info);
+                if std::env::var_os("BRU_DEBUG_KEYS").is_some() {
+                    eprintln!(
+                        "bru[keys]: {info:?} on chrome browser {browser_id} -> {}",
+                        if forward { "FORWARDED to the chrome" } else { "swallowed" },
+                    );
+                }
+                if forward {
+                    // The bottom strip really does want this letter. Everything else — every
+                    // modifier chord, and every key command mode binds — has already been handled
+                    // above and is swallowed here.
+                    return 0;
+                }
                 return 1;
             }
             outcome.swallow as ::std::os::raw::c_int
@@ -140,6 +167,14 @@ fn run(
     command: &Command,
     count: Option<u32>,
 ) {
+    // WORKTREE-ONLY (M9 command-line workstream): the one arm `src/exec.rs` has to grow for the
+    // command line. `cmd-set-text`, `command-accept` and every `rl-*`/`command-history-*` binding
+    // are handled behind it; `false` means it was none of those. Re-add at merge on top of the
+    // dispatcher workstream's `exec.rs`.
+    if crate::cmdline::run_command(command, count) {
+        return;
+    }
+
     // `3j` is three steps of `j`, not one big one — qutebrowser repeats the command.
     let repeat = count.unwrap_or(1).clamp(1, MAX_COUNT);
 

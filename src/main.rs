@@ -7,6 +7,7 @@
 mod app;
 mod bindings;
 mod chrome;
+mod cmdline;
 mod commands;
 mod config;
 mod ipc;

@@ -111,6 +111,9 @@ impl BrowserSideHandler for BruQueryHandler {
                     }
                     "bottom" => {
                         chrome().lock().ok().map(|mut c| c.bottom = Some(frame));
+                        // The command line cannot be driven before there is an input to drive, so
+                        // its debug script starts here rather than in `on_context_initialized`.
+                        start_cmdline_script();
                         bar_json()
                     }
                     other => {
@@ -122,6 +125,30 @@ impl BrowserSideHandler for BruQueryHandler {
                 // first push.
                 succeed(&callback, &response);
             }
+            // --- M9: the command line -----------------------------------------------------------
+            // Three types, exactly as STAGE2-CONTRACTS.md specifies them. The `#cmdline` input is
+            // the real editor for plain typing — see `cmdline::types_into_cmdline` — so this is
+            // where Rust learns what it holds.
+            Some("text-changed") => {
+                crate::cmdline::on_text_changed(
+                    &json_field(request, "text").unwrap_or_default(),
+                    json_number_field(request, "cursor"),
+                );
+                // The completion model hangs here: `completion::categories(text)` per keystroke,
+                // pushed back as the `completion` field of the bottom state.
+                succeed(&callback, "");
+            }
+            // The authoritative text, in answer to `bru.accept()`. Nothing else may run a command
+            // line: the mirror above is one IPC hop behind and Enter can overtake it.
+            Some("accept") => {
+                crate::cmdline::on_accept(&json_field(request, "text").unwrap_or_default());
+                succeed(&callback, "");
+            }
+            Some("cancel") => {
+                crate::cmdline::on_cancel();
+                succeed(&callback, "");
+            }
+
             // A round trip with no side effect, for proving the router is wired end to end.
             Some("echo") => {
                 succeed(&callback, &json_field(request, "text").unwrap_or_default());
@@ -205,11 +232,28 @@ pub fn set_title(title: String) {
     push();
 }
 
-/// The current mode, spelled as qutebrowser spells it. The chrome colours the bar by it.
+/// The current mode, spelled as qutebrowser spells it. The chrome colours the bar by it, and
+/// `body.mode-command` is what reveals `#cmdline`.
 pub fn set_mode(mode: String) {
+    // Every route out of command mode passes through here — `mode-leave`, an accepted command, a
+    // page focusing a field — so this is where the line is cleared and the page gets its focus
+    // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
+    // the command line out of `exec.rs`.
+    crate::cmdline::on_mode_changed(&mode);
     if let Ok(mut bar) = bar().lock() {
         bar.mode = mode;
     }
+    push();
+}
+
+/// The address of the tab that is showing, for `{url}` in a `cmd-set-text` — which is how `go` and
+/// `gO` prefill the line with the current page.
+pub fn current_url() -> String {
+    bar().lock().map(|bar| bar.url.clone()).unwrap_or_default()
+}
+
+/// Push the bar again. The command line calls it after every edit it makes.
+pub fn push_bar() {
     push();
 }
 
@@ -275,11 +319,14 @@ fn forget_chrome_frames_of(browser: Option<&Browser>) {
 }
 
 fn bar_json() -> String {
+    // Built before the lock is taken: `cmdline::json` reads the mode out of `BruState`, and a bar
+    // lock held across that would order two mutexes against each other for no reason.
+    let cmdline = crate::cmdline::json();
     let Ok(bar) = bar().lock() else {
         return "{}".to_string();
     };
     format!(
-        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\"}}",
+        "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"cmdline\":{cmdline}}}",
         json_escape(&bar.url),
         json_escape(&bar.title),
         json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -287,6 +334,81 @@ fn bar_json() -> String {
         json_escape(&bar.scroll),
         json_escape(&bar.tabindex),
     )
+}
+
+// -----------------------------------------------------------------------------------------------
+// The bottom strip, addressed on its own
+// -----------------------------------------------------------------------------------------------
+//
+// The command line lives in one of the two chrome browsers, and three things need to name *that*
+// one: the focus calls, the `bru.accept()` round trip, and trap 11's exception in `keys.rs`, which
+// must not widen to the tab strip. `BruState::is_chrome_browser` cannot tell them apart — it holds
+// both identifiers in one list — but the frame that announced itself as `view: "bottom"` can.
+
+fn bottom_frame() -> Option<Frame> {
+    chrome().lock().ok().and_then(|chrome| chrome.bottom.clone())
+}
+
+/// The browser drawing the bottom strip, once it has announced itself.
+pub fn bottom_chrome_browser() -> Option<Browser> {
+    bottom_frame().and_then(|frame| frame.browser())
+}
+
+/// Whether a key that arrived at `identifier` arrived at the bottom strip. Used by trap 11's
+/// exception, which must not apply to the tab strip.
+pub fn is_bottom_chrome_browser(identifier: i32) -> bool {
+    bottom_chrome_browser()
+        .map(|browser| browser.identifier() == identifier)
+        .unwrap_or(false)
+}
+
+/// What the bottom strip is showing. `bru://chrome/bottom.html` unless something has navigated it
+/// away — which is exactly what trap 11 is about, and what the `<Ctrl-T>` check reads.
+pub fn bottom_chrome_url() -> String {
+    bottom_frame()
+        .map(|frame| CefString::from(&frame.url()).to_string())
+        .unwrap_or_default()
+}
+
+/// Give the bottom strip keyboard focus, so the `#cmdline` input receives what is typed.
+///
+/// Two levels are needed and both are here: CEF's, so the key is delivered to this browser at all,
+/// and the DOM's, which the chrome does itself when the pushed state says `focus`.
+pub fn focus_bottom_chrome() {
+    if let Some(browser) = bottom_chrome_browser() {
+        if let Some(host) = browser.host() {
+            host.set_focus(1);
+        }
+    }
+}
+
+/// Ask the chrome to send one of its messages back. The only caller is `command-accept`, which
+/// needs the text the DOM holds rather than the copy Rust has, one IPC hop behind.
+pub fn ask_cmdline(what: &str) {
+    let Some(frame) = bottom_frame() else {
+        return;
+    };
+    let code = format!("window.bru && window.bru.{what} && window.bru.{what}();");
+    frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
+}
+
+/// `--cmdline-script=…`, read once the bottom strip is up. See `cmdline::schedule_script`.
+fn start_cmdline_script() {
+    let Some(command_line) = command_line_get_global() else {
+        return;
+    };
+    let script =
+        CefString::from(&command_line.switch_value(Some(&CefString::from("cmdline-script"))))
+            .to_string();
+    if script.is_empty() {
+        return;
+    }
+    let step_ms =
+        CefString::from(&command_line.switch_value(Some(&CefString::from("cmdline-step-ms"))))
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(700);
+    crate::cmdline::schedule_script(&script, step_ms);
 }
 
 /// The tab strip's payload. It is built by `BruState`, which owns the tabs, and cached here so a
@@ -390,6 +512,18 @@ fn json_field(src: &str, key: &str) -> Option<String> {
         };
         return Some(json_unescape(after));
     }
+}
+
+/// Read one *number* field. `cursor` is the only one, and it is a number rather than a string
+/// because `selectionStart` is one — quoting it in the chrome to fit `json_field` would be the tail
+/// wagging the dog.
+fn json_number_field(src: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\"");
+    let at = src.find(&needle)?;
+    let after = src[at + needle.len()..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn json_unescape(src: &str) -> String {
