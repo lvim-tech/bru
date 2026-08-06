@@ -248,6 +248,20 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
 
+        // --- hints --------------------------------------------------------------------------
+        // `f` and `F`. The labels are drawn by injected JS, but every keystroke that follows is
+        // matched in Rust by a `BindingTrie<usize>` in hint mode — nothing typed reaches the page.
+        Command::Hint { target } => {
+            let target = match target {
+                crate::commands::HintTarget::Normal => crate::hints::Target::Normal,
+                crate::commands::HintTarget::TabBg => crate::hints::Target::TabBg,
+            };
+            crate::hints::start(state, browser, target);
+        }
+        // `<Return>` in hint mode. Labels are prefix-free, so an exact match has already followed
+        // itself by the time this could run — it exists because the binding does.
+        Command::HintFollow => {}
+
         // --- the command line ---------------------------------------------------------------
         // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
         // stay because the match has no `_`, and they document where the two actually go.
@@ -306,6 +320,10 @@ pub fn is_live(command: &Command) -> bool {
 
         // Claimed by `cmdline.rs` before this match ever runs.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
+
+        Command::Hint { .. } => true,
+        // Bound, reachable, and deliberately a no-op — see the arm in `run`.
+        Command::HintFollow => false,
 
         Command::Nop | Command::ClearKeychain => true,
 
@@ -633,12 +651,14 @@ mod tests {
             live + ignored + unparsed
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
-        assert_eq!(DEFAULT_BINDINGS.len(), 226);
+        // 226 through stage 1 and most of stage 2; 231 once hint mode existed and its five
+        // `hint:` bindings (configdata.yml:3884) had a mode to belong to.
+        assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings. Raise this when a milestone
-        // raises the number, never to make a failing build pass.
-        assert_eq!(live, 100, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
+        // when a milestone raises the number, never to make a failing build pass.
+        assert_eq!(live, 106, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice

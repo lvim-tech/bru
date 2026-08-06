@@ -1,9 +1,9 @@
 //! Keyboard modes and the transitions between them.
 //!
-//! A behavioural port of qutebrowser 3.7.0's `keyinput/modeman.py`. Only the four modes stage 1
-//! needs are here — `hint` is stage 2 and `caret`/`prompt`/`yesno`/`register` are stage 3 — but the
-//! transition rules are the real ones, so adding a mode later is a variant and a table row rather
-//! than a rewrite.
+//! A behavioural port of qutebrowser 3.7.0's `keyinput/modeman.py`. Stage 1's four modes and
+//! stage 2's `hint` are here — `caret`/`prompt`/`yesno`/`register` are stage 3 — but the transition
+//! rules are the real ones, so adding a mode later is a variant and a table row rather than a
+//! rewrite. `hint` was exactly that: a variant, a row in each `match`, and nothing else.
 //!
 //! Nothing in this file touches CEF or Lua. It is a state machine over an enum.
 
@@ -24,11 +24,15 @@ pub enum Mode {
     Command,
     /// Everything goes to the page. Only `<Shift-Escape>` gets out.
     Passthrough,
+    /// Labels are drawn over the page's links and a keypress names one. Entered by `f`/`F`, left by
+    /// `<Escape>` or by following a hint. `src/hints.rs` owns everything it does.
+    Hint,
 }
 
 impl Mode {
     /// Every mode bru implements, in a stable order. Used to build one key parser per mode.
-    pub const ALL: [Mode; 4] = [Mode::Normal, Mode::Insert, Mode::Command, Mode::Passthrough];
+    pub const ALL: [Mode; 5] =
+        [Mode::Normal, Mode::Insert, Mode::Command, Mode::Passthrough, Mode::Hint];
 
     /// The name used in `configdata.yml` and in `config.lua`.
     pub fn name(self) -> &'static str {
@@ -37,19 +41,21 @@ impl Mode {
             Mode::Insert => "insert",
             Mode::Command => "command",
             Mode::Passthrough => "passthrough",
+            Mode::Hint => "hint",
         }
     }
 
     /// Parse a mode name as written in `config.lua` or in a `mode-enter` command.
     ///
-    /// Returns `None` for names qutebrowser knows but bru does not implement yet (`hint`, `caret`,
-    /// …) as well as for nonsense, so the caller warns once at startup either way.
+    /// Returns `None` for names qutebrowser knows but bru does not implement yet (`caret`,
+    /// `register`, …) as well as for nonsense, so the caller warns once at startup either way.
     pub fn from_name(name: &str) -> Option<Mode> {
         match name {
             "normal" => Some(Mode::Normal),
             "insert" => Some(Mode::Insert),
             "command" => Some(Mode::Command),
             "passthrough" => Some(Mode::Passthrough),
+            "hint" => Some(Mode::Hint),
             _ => None,
         }
     }
@@ -57,11 +63,13 @@ impl Mode {
     /// Whether unbound keys reach the page.
     ///
     /// `modeman.init` constructs the insert, command and passthrough parsers with
-    /// `passthrough=True`; normal mode is the only one that eats what it does not recognise
-    /// (subject to `input.forward_unbound_keys`, see [`Mode::swallows_unmatched`]).
+    /// `passthrough=True`; normal and hint are the ones that eat what they do not recognise
+    /// (subject to `input.forward_unbound_keys`, see [`Mode::swallows_unmatched`]). `HintKeyParser`
+    /// is built with `BaseKeyParser`'s default of `passthrough=False` — modeman.py:90 — because a
+    /// stray letter while labels are up would be typed into whatever the last click focused.
     pub fn passthrough(self) -> bool {
         match self {
-            Mode::Normal => false,
+            Mode::Normal | Mode::Hint => false,
             Mode::Insert | Mode::Command | Mode::Passthrough => true,
         }
     }
@@ -69,11 +77,12 @@ impl Mode {
     /// Whether a digit prefix is read as a count.
     ///
     /// `modeman.init` passes `supports_count=False` to every parser except normal mode's, so `3`
-    /// in insert mode is the character `3` and nothing else.
+    /// in insert mode is the character `3` and nothing else. In hint mode a digit is a hint label
+    /// under `hints.mode = number`, never a count.
     pub fn supports_count(self) -> bool {
         match self {
             Mode::Normal => true,
-            Mode::Insert | Mode::Command | Mode::Passthrough => false,
+            Mode::Insert | Mode::Command | Mode::Passthrough | Mode::Hint => false,
         }
     }
 
@@ -251,21 +260,27 @@ mod tests {
         for mode in Mode::ALL {
             assert_eq!(Mode::from_name(mode.name()), Some(mode));
         }
+        assert_eq!(Mode::from_name("hint"), Some(Mode::Hint));
         // Modes qutebrowser has and bru does not, yet.
-        assert_eq!(Mode::from_name("hint"), None);
         assert_eq!(Mode::from_name("caret"), None);
         assert_eq!(Mode::from_name("nonsense"), None);
     }
 
     #[test]
     fn only_normal_mode_counts_and_only_normal_mode_eats_keys() {
-        // modeman.init: every parser but normal's gets supports_count=False, passthrough=True.
+        // modeman.init: every parser but normal's gets supports_count=False, and every one but
+        // normal's and hint's gets passthrough=True.
         assert!(Mode::Normal.supports_count());
         assert!(!Mode::Normal.passthrough());
         for mode in [Mode::Insert, Mode::Command, Mode::Passthrough] {
             assert!(!mode.supports_count(), "{mode} must not read counts");
             assert!(mode.passthrough(), "{mode} must forward unbound keys");
         }
+        // Hint mode counts nothing and forwards nothing: a key while labels are up names a hint or
+        // is thrown away, and either way the page must not see it.
+        assert!(!Mode::Hint.supports_count());
+        assert!(!Mode::Hint.passthrough());
+        assert!(Mode::Hint.swallows_unmatched(false));
     }
 
     #[test]

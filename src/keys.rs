@@ -94,6 +94,13 @@ wrap_keyboard_handler! {
                 return 0;
             };
 
+            // Hint mode has its own parser, over a trie of hint labels rather than of commands
+            // (modeparsers.py:135). It answers None in every other mode, so the ordinary path below
+            // is untouched.
+            if let Some(swallow) = crate::hints::handle_key(&self.state, target, info) {
+                return swallow as ::std::os::raw::c_int;
+            }
+
             let Some(outcome) = self
                 .state
                 .lock()
@@ -112,11 +119,10 @@ wrap_keyboard_handler! {
             }
 
             // A key that came in on a chrome strip is always swallowed, matched or not — see above
-            // — with exactly one exception, and this is it.
-            //
-            // WORKTREE-ONLY (M9 command-line workstream): `src/keys.rs` belongs to the dispatcher
-            // workstream. These four lines are here to verify trap 11's exception and must be
-            // re-added deliberately at merge, on top of that workstream's version of this file.
+            // — with exactly one exception, and this is it: in command mode the bottom strip is a
+            // real text input and has to receive plain typing. The exception is deliberately narrow
+            // — command mode only, the bottom strip only, and only keys that type — because
+            // widening it is how Chromium's own shortcuts get to navigate bru's UI away (trap 11).
             if chrome_key {
                 let in_command_mode = self
                     .state

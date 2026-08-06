@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 /// qutebrowser's compiled-in bindings, as `(mode, keys, command)`.
 ///
 /// Generated from `/usr/lib/python3.13/site-packages/qutebrowser/config/configdata.yml`,
-/// `bindings.default:` — normal 3679–3878, insert 3879, passthrough 3890, command 3892–3924.
-/// The `hint`, `prompt`, `yesno`, `caret` and `register` sections are left out because bru has no
-/// such modes yet; they come back with the modes.
+/// `bindings.default:` — normal 3679–3878, insert 3879, hint 3884, passthrough 3890,
+/// command 3892–3924. The `prompt`, `yesno`, `caret` and `register` sections are left out because
+/// bru has no such modes yet; they come back with the modes.
 ///
 /// Command strings that bru does not implement are kept verbatim rather than removed: dropping
 /// them would change the shape of the trie, so `;` would report NoMatch instead of PartialMatch.
@@ -220,6 +220,12 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "tCH", "config-cycle -p -u *://*.{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
     ("normal", "tcu", "config-cycle -p -t -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
     ("normal", "tCu", "config-cycle -p -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
+    // -- hint ----------------------------------------------------------------------------------
+    ("hint", "<Return>", "hint-follow"),
+    ("hint", "<Ctrl-R>", "hint --rapid links tab-bg"),
+    ("hint", "<Ctrl-F>", "hint links"),
+    ("hint", "<Ctrl-B>", "hint all tab-bg"),
+    ("hint", "<Escape>", "mode-leave"),
     // -- insert --------------------------------------------------------------------------------
     ("insert", "<Ctrl-E>", "edit-text"),
     ("insert", "<Shift-Ins>", "insert-text -- {primary}"),
@@ -618,19 +624,20 @@ mod tests {
                 unimplemented += 1;
             }
         }
-        // 189 normal + 4 insert + 32 command + 1 passthrough, counted from configdata.yml.
-        assert_eq!(total, 226, "the default table is not the one transcribed from configdata.yml");
+        // 189 normal + 4 insert + 5 hint + 32 command + 1 passthrough, from configdata.yml.
+        assert_eq!(total, 231, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
     #[test]
     fn defaults_are_all_parseable_and_none_collide() {
         let bindings = Bindings::defaults();
-        // 226 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
+        // 231 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
         // mode, one would have silently overwritten the other and the counts would not add up.
         // <Ctrl-A> and <ctrl-a> are the same binding, so this really is checking something.
         assert_eq!(bindings.len(Mode::Normal), 189);
         assert_eq!(bindings.len(Mode::Insert), 4);
+        assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
         assert_eq!(bindings.len(Mode::Passthrough), 1);
     }
@@ -810,7 +817,8 @@ mod tests {
     #[test]
     fn an_unknown_mode_or_key_is_an_error_the_config_author_can_see() {
         let mut b = Bindings::defaults();
-        assert!(b.bind("hint", "f", "hint").is_err(), "hint mode is not implemented yet");
+        assert!(b.bind("hint", "<Ctrl-J>", "mode-leave").is_ok(), "hint is a mode as of M12");
+        assert!(b.bind("caret", "f", "hint").is_err(), "caret mode is not implemented yet");
         assert!(b.bind("nonsense", "f", "hint").is_err());
         assert!(b.bind("normal", "<Ctrl-Nonsense>", "tab-next").is_err());
         assert!(b.bind("normal", "j", "  ").is_err());
