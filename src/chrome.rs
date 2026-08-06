@@ -101,6 +101,12 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         // Generated per request from the live binding table, so it can never drift from the keys
         // the browser is actually running on. See src/help.rs.
         "/help" | "/help.html" => Some(("text/html", crate::help::current_page().into_bytes())),
+// --- src/history.rs --------------------------------------------------------
+        // Generated per request from `history.sqlite` and the two mark files, for the same reason
+        // `/help` is: a page written separately from what it describes drifts. See src/history.rs.
+        "/history" | "/history.html" => Some(("text/html", crate::history::history_page().into_bytes())),
+        "/bookmarks" | "/bookmarks.html" => Some(("text/html", crate::history::marks_page().into_bytes())),
+// --- end src/history.rs ----------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
         _ => None,
     }

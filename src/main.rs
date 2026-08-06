@@ -17,6 +17,7 @@ mod exec;
 mod find;
 mod help;
 mod hints;
+mod history;
 mod ipc;
 mod keys;
 mod modes;

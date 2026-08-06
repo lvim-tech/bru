@@ -119,6 +119,27 @@ pub enum Command {
     DownloadRetry,
 // --- end src/downloads.rs ----------------------------------------------------------------------
 
+// --- src/history.rs --------------------------------------------------------
+    /// `quickmark-save [name]` — `m`. With no name the command line is prefilled instead; see the
+    /// arm in `exec.rs` for why bru does not prompt.
+    QuickmarkSave { name: Option<String> },
+    /// `quickmark-load [-t|-b|-w] <name>` — what `b`, `B` and `wb` prefill.
+    QuickmarkLoad { name: Option<String>, tab: bool, bg: bool, window: bool },
+    /// `quickmark-del [name]` — no name means the quickmark on the current page.
+    QuickmarkDel { name: Option<String> },
+    /// `bookmark-add [url] [title] [--toggle]` — `M`, which passes neither.
+    BookmarkAdd { url: Option<String>, title: Option<String>, toggle: bool },
+    /// `bookmark-load [-t|-b|-w] [-d] <url>` — what `gb`, `gB` and `wB` prefill.
+    BookmarkLoad { url: Option<String>, tab: bool, bg: bool, window: bool, delete: bool },
+    /// `bookmark-del [url]` — no URL means the current page.
+    BookmarkDel { url: Option<String> },
+    /// `bookmark-list [--jump] [-b]` — `Sq` and `Sb`. Always a new tab, as in qutebrowser
+    /// (`commands.py:1347`, where `tab` defaults to True); `--jump` lands on the bookmarks heading.
+    BookmarkList { jump: bool, bg: bool },
+    /// `history [-b]` — `Sh`. A new tab for the same reason (`commands.py:1450`).
+    History { bg: bool },
+// --- end src/history.rs ----------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -588,6 +609,63 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
 
+// --- src/history.rs --------------------------------------------------------
+        // maxsplit=0 on the four that take a name or a URL, which is how qutebrowser registers them
+        // (`commands.py:1204`, `:1222`, `:1295`, `:1317`) — a quickmark name may contain spaces, and
+        // a URL may contain anything.
+        //
+        // `quickmark-save` is the exception in both directions: qutebrowser's takes no argument at
+        // all because it opens a prompt, and bru's takes an optional name because it has no prompt
+        // mode. A bare `quickmark-save` prefills the command line; see the arm in `exec.rs`.
+        "quickmark-save" => Command::QuickmarkSave {
+            name: Args::maxsplit0(&tokens[1..]).arg(0).filter(|n| !n.is_empty()).map(str::to_string),
+        },
+        "quickmark-load" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::QuickmarkLoad {
+                name: args.arg(0).filter(|n| !n.is_empty()).map(str::to_string),
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+            }
+        }
+        "quickmark-del" => Command::QuickmarkDel {
+            name: Args::maxsplit0(&tokens[1..]).arg(0).filter(|n| !n.is_empty()).map(str::to_string),
+        },
+        // Two positionals, so *not* maxsplit=0 (`commands.py:1256`). `:bookmark-add <url> <title>`
+        // needs the two split apart, and qutebrowser rejects a URL with no title.
+        "bookmark-add" => {
+            if args.arg(0).is_some() && args.arg(1).is_none() {
+                return Err(bad("a title must be given with a URL"));
+            }
+            Command::BookmarkAdd {
+                url: args.arg(0).map(str::to_string),
+                title: args.positional.get(1..).map(|rest| rest.join(" ")).filter(|t| !t.is_empty()),
+                toggle: args.has("toggle"),
+            }
+        }
+        "bookmark-load" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::BookmarkLoad {
+                url: args.arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+                delete: args.any(&["d", "delete"]),
+            }
+        }
+        "bookmark-del" => Command::BookmarkDel {
+            url: Args::maxsplit0(&tokens[1..]).arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+        },
+        // `tab` defaults to True on both of these in qutebrowser, so there is no in-place spelling
+        // to parse; `-t` is accepted and means what it already does.
+        "bookmark-list" => Command::BookmarkList {
+            jump: args.has("jump"),
+            bg: args.any(&["b", "bg"]),
+        },
+        "history" => Command::History { bg: args.any(&["b", "bg"]) },
+// --- end src/history.rs ----------------------------------------------------
+
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.
         "cmd-set-text" => {
@@ -811,6 +889,105 @@ mod tests {
             );
         }
     }
+
+// --- src/history.rs --------------------------------------------------------
+    #[test]
+    fn quickmarks_and_bookmarks() {
+        // `m`, and the line it prefills once a name has been typed.
+        assert_eq!(parse("quickmark-save").unwrap(), Command::QuickmarkSave { name: None });
+        assert_eq!(
+            parse("quickmark-save go").unwrap(),
+            Command::QuickmarkSave { name: Some("go".to_string()) }
+        );
+        // maxsplit=0: a quickmark name may contain spaces, and `data.rs` stores one that does.
+        assert_eq!(
+            parse("quickmark-save two words").unwrap(),
+            Command::QuickmarkSave { name: Some("two words".to_string()) }
+        );
+
+        // What `b`, `B` and `wb` prefill, with a name typed after the flags.
+        assert_eq!(
+            parse("quickmark-load go").unwrap(),
+            Command::QuickmarkLoad { name: Some("go".into()), tab: false, bg: false, window: false }
+        );
+        assert_eq!(
+            parse("quickmark-load -t two words").unwrap(),
+            Command::QuickmarkLoad {
+                name: Some("two words".into()),
+                tab: true,
+                bg: false,
+                window: false,
+            }
+        );
+        assert_eq!(
+            parse("quickmark-load -w go").unwrap(),
+            Command::QuickmarkLoad { name: Some("go".into()), tab: false, bg: false, window: true }
+        );
+        // A bare `:quickmark-load` is what the line says before a name is typed; it must parse, and
+        // the dispatcher says which quickmark it wanted.
+        assert_eq!(
+            parse("quickmark-load").unwrap(),
+            Command::QuickmarkLoad { name: None, tab: false, bg: false, window: false }
+        );
+
+        // `M`. Not `--toggle`: the default binding is bare (configdata.yml:3776).
+        assert_eq!(
+            parse("bookmark-add").unwrap(),
+            Command::BookmarkAdd { url: None, title: None, toggle: false }
+        );
+        assert_eq!(
+            parse("bookmark-add --toggle").unwrap(),
+            Command::BookmarkAdd { url: None, title: None, toggle: true }
+        );
+        // Two positionals, so *not* maxsplit=0 — the title is everything after the URL.
+        assert_eq!(
+            parse("bookmark-add https://example.com/ Example Domain").unwrap(),
+            Command::BookmarkAdd {
+                url: Some("https://example.com/".into()),
+                title: Some("Example Domain".into()),
+                toggle: false,
+            }
+        );
+        // qutebrowser's own error, commands.py:1275-1277.
+        assert!(parse("bookmark-add https://example.com/").is_err());
+
+        assert_eq!(
+            parse("bookmark-load -t https://example.com/").unwrap(),
+            Command::BookmarkLoad {
+                url: Some("https://example.com/".into()),
+                tab: true,
+                bg: false,
+                window: false,
+                delete: false,
+            }
+        );
+        // A URL with a query that contains what would otherwise be a flag survives maxsplit=0.
+        assert_eq!(
+            parse("bookmark-load https://example.com/?a=-t").unwrap(),
+            Command::BookmarkLoad {
+                url: Some("https://example.com/?a=-t".into()),
+                tab: false,
+                bg: false,
+                window: false,
+                delete: false,
+            }
+        );
+
+        assert_eq!(parse("quickmark-del go").unwrap(), Command::QuickmarkDel { name: Some("go".into()) });
+        assert_eq!(parse("quickmark-del").unwrap(), Command::QuickmarkDel { name: None });
+        assert_eq!(parse("bookmark-del").unwrap(), Command::BookmarkDel { url: None });
+
+        // `Sq` and `Sb` — the one flag between them.
+        assert_eq!(parse("bookmark-list").unwrap(), Command::BookmarkList { jump: false, bg: false });
+        assert_eq!(
+            parse("bookmark-list --jump").unwrap(),
+            Command::BookmarkList { jump: true, bg: false }
+        );
+        // `Sh`.
+        assert_eq!(parse("history").unwrap(), Command::History { bg: false });
+        assert_eq!(parse("history -b").unwrap(), Command::History { bg: true });
+    }
+// --- end src/history.rs ----------------------------------------------------
 
     #[test]
     fn malformed_arguments_are_errors() {
