@@ -104,6 +104,19 @@ pub enum Command {
     /// `help [-t]` — bru's own key and command reference, generated from the live binding table.
     Help { tab: bool },
 
+// --- src/caret.rs ------------------------------------------------------------------------------
+    /// `selection-toggle [--line]` — `v`, `<Space>` and `V` in caret mode.
+    SelectionToggle { line: bool },
+    /// `selection-drop` — `<Ctrl-Space>`.
+    SelectionDrop,
+    /// `selection-reverse` — `o`, which swaps which end of the selection the caret is on.
+    SelectionReverse,
+    /// `selection-follow [-t]` — `<Return>` and `<Ctrl-Return>` in *normal* mode.
+    SelectionFollow { tab: bool },
+    /// `move-to-<something>` — the fifteen caret movements, one variant each.
+    MoveTo(CaretMove),
+// --- end src/caret.rs --------------------------------------------------------------------------
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -139,6 +152,45 @@ pub enum HintTarget {
     /// in the background, which is `tabs.background = true` and is what `F` does here today.
     TabBg,
 }
+
+// --- src/caret.rs ------------------------------------------------------------------------------
+/// The fifteen `move-to-…` commands of the `caret:` binding section (configdata.yml:3961), as one
+/// enum rather than fifteen [`Command`] variants — they differ only in the direction and granularity
+/// `src/caret.rs` hands the page, and nothing outside that file needs to tell them apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaretMove {
+    /// `l`
+    NextChar,
+    /// `h`
+    PrevChar,
+    /// `j`
+    NextLine,
+    /// `k`
+    PrevLine,
+    /// `e`
+    EndOfWord,
+    /// `w`
+    NextWord,
+    /// `b`
+    PrevWord,
+    /// `0`
+    StartOfLine,
+    /// `$`
+    EndOfLine,
+    /// `]`
+    StartOfNextBlock,
+    /// `[`
+    StartOfPrevBlock,
+    /// `}`
+    EndOfNextBlock,
+    /// `{`
+    EndOfPrevBlock,
+    /// `gg`
+    StartOfDocument,
+    /// `G`
+    EndOfDocument,
+}
+// --- end src/caret.rs --------------------------------------------------------------------------
 
 /// The argument of `tab-focus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -539,6 +591,32 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
         "hint-follow" => Command::HintFollow,
+
+// --- src/caret.rs ------------------------------------------------------------------------------
+        // `selection-toggle` takes `--line` only; `-l` is not a spelling qutebrowser accepts, and
+        // accepting it here would make a config that used it work in bru and not in qutebrowser.
+        "selection-toggle" => Command::SelectionToggle { line: args.has("line") },
+        "selection-drop" => Command::SelectionDrop,
+        "selection-reverse" => Command::SelectionReverse,
+        "selection-follow" => Command::SelectionFollow { tab: args.any(&["t", "tab"]) },
+
+        "move-to-next-char" => Command::MoveTo(CaretMove::NextChar),
+        "move-to-prev-char" => Command::MoveTo(CaretMove::PrevChar),
+        "move-to-next-line" => Command::MoveTo(CaretMove::NextLine),
+        "move-to-prev-line" => Command::MoveTo(CaretMove::PrevLine),
+        "move-to-end-of-word" => Command::MoveTo(CaretMove::EndOfWord),
+        "move-to-next-word" => Command::MoveTo(CaretMove::NextWord),
+        "move-to-prev-word" => Command::MoveTo(CaretMove::PrevWord),
+        "move-to-start-of-line" => Command::MoveTo(CaretMove::StartOfLine),
+        "move-to-end-of-line" => Command::MoveTo(CaretMove::EndOfLine),
+        "move-to-start-of-next-block" => Command::MoveTo(CaretMove::StartOfNextBlock),
+        "move-to-start-of-prev-block" => Command::MoveTo(CaretMove::StartOfPrevBlock),
+        "move-to-end-of-next-block" => Command::MoveTo(CaretMove::EndOfNextBlock),
+        "move-to-end-of-prev-block" => Command::MoveTo(CaretMove::EndOfPrevBlock),
+        "move-to-start-of-document" => Command::MoveTo(CaretMove::StartOfDocument),
+        "move-to-end-of-document" => Command::MoveTo(CaretMove::EndOfDocument),
+// --- end src/caret.rs --------------------------------------------------------------------------
+
         // qutebrowser's `:help` opens its manual; bru's opens the only reference it has, which is
         // the one generated from the bindings it is running on.
         "help" => Command::Help { tab: args.has("t") || args.has("tab") },
@@ -722,11 +800,54 @@ mod tests {
             Command::ModeEnter(Mode::Passthrough)
         );
         assert_eq!(parse("mode-leave").unwrap(), Command::ModeLeave);
-        // caret is a real qutebrowser mode bru has not built; it is not an error, it is unbuilt.
+        // The three modes stage 3 added. `v`, `` ` `` and `'` are default bindings, so these three
+        // strings have to parse or the keys do nothing.
+        assert_eq!(parse("mode-enter caret").unwrap(), Command::ModeEnter(Mode::Caret));
+        assert_eq!(parse("mode-enter set_mark").unwrap(), Command::ModeEnter(Mode::SetMark));
+        assert_eq!(parse("mode-enter jump_mark").unwrap(), Command::ModeEnter(Mode::JumpMark));
+        // prompt is a real qutebrowser mode bru has not built; it is not an error, it is unbuilt.
         assert_eq!(
-            parse("mode-enter caret").unwrap(),
-            Command::Unimplemented("mode-enter caret".to_string())
+            parse("mode-enter prompt").unwrap(),
+            Command::Unimplemented("mode-enter prompt".to_string())
         );
+    }
+
+    #[test]
+    fn caret_commands() {
+        // The whole `caret:` section (configdata.yml:3961) has to parse into something, or a
+        // keystroke in caret mode falls through to Unimplemented and does nothing.
+        assert_eq!(parse("selection-toggle").unwrap(), Command::SelectionToggle { line: false });
+        assert_eq!(
+            parse("selection-toggle --line").unwrap(),
+            Command::SelectionToggle { line: true }
+        );
+        assert_eq!(parse("selection-drop").unwrap(), Command::SelectionDrop);
+        assert_eq!(parse("selection-reverse").unwrap(), Command::SelectionReverse);
+        assert_eq!(parse("selection-follow").unwrap(), Command::SelectionFollow { tab: false });
+        assert_eq!(parse("selection-follow -t").unwrap(), Command::SelectionFollow { tab: true });
+
+        assert_eq!(parse("move-to-next-line").unwrap(), Command::MoveTo(CaretMove::NextLine));
+        assert_eq!(parse("move-to-prev-char").unwrap(), Command::MoveTo(CaretMove::PrevChar));
+        assert_eq!(parse("move-to-end-of-word").unwrap(), Command::MoveTo(CaretMove::EndOfWord));
+        assert_eq!(
+            parse("move-to-start-of-next-block").unwrap(),
+            Command::MoveTo(CaretMove::StartOfNextBlock)
+        );
+        assert_eq!(
+            parse("move-to-end-of-document").unwrap(),
+            Command::MoveTo(CaretMove::EndOfDocument)
+        );
+
+        // `V` is a chain of two, and both halves have to be real for the binding to be live.
+        let cmd = parse("mode-enter caret ;; selection-toggle --line").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Chain(vec![
+                Command::ModeEnter(Mode::Caret),
+                Command::SelectionToggle { line: true },
+            ])
+        );
+        assert!(cmd.is_implemented());
     }
 
     #[test]

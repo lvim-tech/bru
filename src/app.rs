@@ -284,6 +284,22 @@ wrap_browser_process_handler! {
                 .unwrap_or(2000);
                 crate::hints::schedule_hint_script(&script, step_ms);
             }
+
+            // --- src/caret.rs (merge: this block belongs to caret mode's workstream) -------------
+            // Debug hook, off unless asked for. See caret::schedule_caret_script.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("caret-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("caret-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(1200);
+                crate::caret::schedule_caret_script(&script, step_ms);
+            }
+            // --- end src/caret.rs ---------------------------------------------------------------
         }
 
         fn default_client(&self) -> Option<Client> {

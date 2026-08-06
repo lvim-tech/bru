@@ -22,8 +22,9 @@ use std::sync::{Arc, Mutex};
 ///
 /// Generated from `/usr/lib/python3.13/site-packages/qutebrowser/config/configdata.yml`,
 /// `bindings.default:` — normal 3679–3878, insert 3879, hint 3884, passthrough 3890,
-/// command 3892–3924. The `prompt`, `yesno`, `caret` and `register` sections are left out because
-/// bru has no such modes yet; they come back with the modes.
+/// command 3892–3924, caret 3961–3989, and register 3991 written out under both of the modes that
+/// read it. The `prompt` and `yesno` sections are left out because bru has no such modes yet; they
+/// come back with the modes.
 ///
 /// Command strings that bru does not implement are kept verbatim rather than removed: dropping
 /// them would change the shape of the trie, so `;` would report NoMatch instead of PartialMatch.
@@ -220,6 +221,48 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "tCH", "config-cycle -p -u *://*.{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
     ("normal", "tcu", "config-cycle -p -t -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
     ("normal", "tCu", "config-cycle -p -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
+// --- src/caret.rs --------------------------------------------------------------------------
+    // -- caret ---------------------------------------------------------------------------------
+    // configdata.yml:3961–3989, transcribed in its own order.
+    ("caret", "v", "selection-toggle"),
+    ("caret", "V", "selection-toggle --line"),
+    ("caret", "<Space>", "selection-toggle"),
+    ("caret", "<Ctrl-Space>", "selection-drop"),
+    ("caret", "c", "mode-enter normal"),
+    ("caret", "j", "move-to-next-line"),
+    ("caret", "k", "move-to-prev-line"),
+    ("caret", "l", "move-to-next-char"),
+    ("caret", "h", "move-to-prev-char"),
+    ("caret", "e", "move-to-end-of-word"),
+    ("caret", "w", "move-to-next-word"),
+    ("caret", "b", "move-to-prev-word"),
+    ("caret", "o", "selection-reverse"),
+    ("caret", "]", "move-to-start-of-next-block"),
+    ("caret", "[", "move-to-start-of-prev-block"),
+    ("caret", "}", "move-to-end-of-next-block"),
+    ("caret", "{", "move-to-end-of-prev-block"),
+    ("caret", "0", "move-to-start-of-line"),
+    ("caret", "$", "move-to-end-of-line"),
+    ("caret", "gg", "move-to-start-of-document"),
+    ("caret", "G", "move-to-end-of-document"),
+    // The three that wait for the clipboard. They parse to Unimplemented on purpose: `yank` is the
+    // clipboard workstream's command, and a variant added here would collide with it.
+    ("caret", "Y", "yank selection -s"),
+    ("caret", "y", "yank selection"),
+    ("caret", "<Return>", "yank selection"),
+    ("caret", "H", "scroll left"),
+    ("caret", "J", "scroll down"),
+    ("caret", "K", "scroll up"),
+    ("caret", "L", "scroll right"),
+    ("caret", "<Escape>", "mode-leave"),
+    // -- set_mark / jump_mark ------------------------------------------------------------------
+    // configdata.yml has no section for either: `RegisterKeyParser` passes `mode=KeyMode.register`
+    // to `BaseKeyParser` (modeparsers.py:250), so both modes read the one-line `register:` section
+    // at 3991 and every other key names a mark. bru has no `register` mode object to hang that on,
+    // so the section is written out once per mode that uses it.
+    ("set_mark", "<Escape>", "mode-leave"),
+    ("jump_mark", "<Escape>", "mode-leave"),
+// --- end src/caret.rs ----------------------------------------------------------------------
     // -- hint ----------------------------------------------------------------------------------
     ("hint", "<Return>", "hint-follow"),
     ("hint", "<Ctrl-R>", "hint --rapid links tab-bg"),
@@ -645,22 +688,30 @@ mod tests {
                 unimplemented += 1;
             }
         }
-        // 189 normal + 4 insert + 5 hint + 32 command + 1 passthrough, from configdata.yml.
-        assert_eq!(total, 231, "the default table is not the one transcribed from configdata.yml");
+        // 189 normal + 4 insert + 5 hint + 32 command + 1 passthrough, from configdata.yml, plus
+        // stage 3's 29 caret rows and the one-line `register:` section under each of `set_mark` and
+        // `jump_mark`.
+        assert_eq!(total, 262, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
     #[test]
     fn defaults_are_all_parseable_and_none_collide() {
         let bindings = Bindings::defaults();
-        // 231 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
+        // 262 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
         // mode, one would have silently overwritten the other and the counts would not add up.
-        // <Ctrl-A> and <ctrl-a> are the same binding, so this really is checking something.
+        // <Ctrl-A> and <ctrl-a> are the same binding, so this really is checking something. Caret
+        // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
+        // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
+        // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
         assert_eq!(bindings.len(Mode::Normal), 189);
         assert_eq!(bindings.len(Mode::Insert), 4);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
         assert_eq!(bindings.len(Mode::Passthrough), 1);
+        assert_eq!(bindings.len(Mode::Caret), 29);
+        assert_eq!(bindings.len(Mode::SetMark), 1);
+        assert_eq!(bindings.len(Mode::JumpMark), 1);
     }
 
     #[test]
@@ -839,7 +890,11 @@ mod tests {
     fn an_unknown_mode_or_key_is_an_error_the_config_author_can_see() {
         let mut b = Bindings::defaults();
         assert!(b.bind("hint", "<Ctrl-J>", "mode-leave").is_ok(), "hint is a mode as of M12");
-        assert!(b.bind("caret", "f", "hint").is_err(), "caret mode is not implemented yet");
+        assert!(b.bind("caret", "f", "hint").is_ok(), "caret is a mode as of stage 3");
+        assert!(b.bind("set_mark", "<Ctrl-J>", "mode-leave").is_ok(), "so are the two mark modes");
+        assert!(b.bind("jump_mark", "<Ctrl-J>", "mode-leave").is_ok());
+        // `prompt` and `yesno` are the modes still to come, and naming one is still an error.
+        assert!(b.bind("prompt", "f", "hint").is_err(), "prompt mode is not implemented yet");
         assert!(b.bind("nonsense", "f", "hint").is_err());
         assert!(b.bind("normal", "<Ctrl-Nonsense>", "tab-next").is_err());
         assert!(b.bind("normal", "j", "  ").is_err());

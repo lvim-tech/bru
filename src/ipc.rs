@@ -107,6 +107,23 @@ impl BrowserSideHandler for BruQueryHandler {
             return true;
         }
 
+        // --- src/caret.rs -----------------------------------------------------------------------
+        // The second thing a web page is allowed to say, and again only because bru injected the
+        // script that says it. `chrome/caret.js` runs in the page's own world to see the page's
+        // document, so it cannot be a bru:// frame either. `caret::on_page_query` makes it safe the
+        // same way: it answers false unless a request bru itself made is outstanding, the query came
+        // from that request's browser, and it carries the token bru minted for it.
+        if json_field(request, "type").as_deref() == Some("caret") {
+            if crate::caret::on_page_query(browser.as_ref(), request) {
+                succeed(&callback, "");
+            } else {
+                eprintln!("bru: refused a caret answer from {url:?}");
+                fail(&callback, -7, "not an answer to a caret request bru made");
+            }
+            return true;
+        }
+        // --- end src/caret.rs -------------------------------------------------------------------
+
         // The security check, and it is the whole reason this function starts here. cefQuery is
         // registered on the window object of every V8 context the renderer creates, which includes
         // every page bru ever visits. Only bru's own chrome may use it.

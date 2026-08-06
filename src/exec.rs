@@ -228,20 +228,36 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
 
         // --- modes --------------------------------------------------------------------------
         Command::ModeEnter(mode) => {
+            // --- src/caret.rs ---------------------------------------------------------------
+            // The mode that is being left, read before the transition. Caret mode has a page half
+            // to set up and to tear down, and `mode-enter normal` (caret's `c`) is spelled as a
+            // *leave*, so both directions are visible only from the pair.
+            let before = state.lock().expect("state mutex poisoned").mode();
+            // --- end src/caret.rs -----------------------------------------------------------
             let entered = state
                 .lock()
                 .expect("state mutex poisoned")
                 .enter_mode(*mode, false);
             if entered {
                 crate::ipc::set_mode(mode.name().to_string());
+                // --- src/caret.rs -----------------------------------------------------------
+                let now = state.lock().expect("state mutex poisoned").mode();
+                crate::caret::on_mode_change(browser, before, now);
+                // --- end src/caret.rs -------------------------------------------------------
             }
         }
         Command::ModeLeave => {
             let mut guard = state.lock().expect("state mutex poisoned");
+            // --- src/caret.rs ---------------------------------------------------------------
+            let before = guard.mode();
+            // --- end src/caret.rs -----------------------------------------------------------
             if guard.leave_mode() {
                 let now = guard.mode();
                 drop(guard);
                 crate::ipc::set_mode(now.name().to_string());
+                // --- src/caret.rs -----------------------------------------------------------
+                crate::caret::on_mode_change(browser, before, now);
+                // --- end src/caret.rs -------------------------------------------------------
                 // Leaving insert mode should also give the page's text field up, or the next `j`
                 // is typed into it rather than scrolling.
                 blur(browser);
@@ -261,6 +277,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // `<Return>` in hint mode. Labels are prefix-free, so an exact match has already followed
         // itself by the time this could run — it exists because the binding does.
         Command::HintFollow => {}
+
+        // --- src/caret.rs -------------------------------------------------------------------
+        // Caret mode's movements and its selection. `v` moves a text cursor through the page's
+        // document, which CEF has no notion of, so the move itself is `Selection.modify` inside the
+        // page — but *what* to modify, how far, and what a line selection re-anchors to are all
+        // decided in `caret.rs` and sent as a list of primitives. `selection-follow` is normal
+        // mode's `<Return>` and needs no caret session.
+        Command::SelectionToggle { line } => crate::caret::selection_toggle(state, browser, *line),
+        Command::SelectionDrop => crate::caret::selection_drop(state, browser),
+        Command::SelectionReverse => crate::caret::selection_reverse(state, browser),
+        Command::SelectionFollow { tab } => crate::caret::selection_follow(state, browser, *tab),
+        Command::MoveTo(kind) => crate::caret::move_to(state, browser, *kind, count),
+        // --- end src/caret.rs ---------------------------------------------------------------
 
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
@@ -328,6 +357,15 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
+
+        // --- src/caret.rs -------------------------------------------------------------------
+        Command::SelectionToggle { .. }
+        | Command::SelectionDrop
+        | Command::SelectionReverse
+        | Command::SelectionFollow { .. }
+        | Command::MoveTo(_) => true,
+        // --- end src/caret.rs ---------------------------------------------------------------
+
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 
@@ -704,13 +742,81 @@ mod tests {
         );
         assert_eq!(live + ignored + unparsed, DEFAULT_BINDINGS.len());
         // 226 through stage 1 and most of stage 2; 231 once hint mode existed and its five
-        // `hint:` bindings (configdata.yml:3884) had a mode to belong to.
-        assert_eq!(DEFAULT_BINDINGS.len(), 231);
+        // `hint:` bindings (configdata.yml:3884) had a mode to belong to; 262 once caret mode
+        // brought the 29 of `caret:` (3961) and the two mark modes each brought the one line of
+        // `register:` (3991).
+        assert_eq!(DEFAULT_BINDINGS.len(), 262);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Stage 3:
+        // 140 with caret mode and marks — 26 of the 29 caret rows (the three `yank selection` ones
+        // wait for the clipboard), the two `register:` rows, and six in normal mode: `v`, `V`,
+        // `` ` ``, `'`, `<Return>` and `<Ctrl-Return>`. Raise this when a milestone raises the
+        // number, never to make a failing build pass.
+        assert_eq!(live, 140, "the live-binding count moved");
+    }
+
+    /// The bindings caret mode and marks made live, named one by one — a total is not enough to
+    /// notice that `]` went live and `[` did not.
+    #[test]
+    fn the_bindings_caret_mode_turned_on() {
+        for (mode, keys) in [
+            ("normal", "v"),
+            ("normal", "V"),
+            ("normal", "`"),
+            ("normal", "'"),
+            ("normal", "<Return>"),
+            ("normal", "<Ctrl-Return>"),
+            ("caret", "v"),
+            ("caret", "V"),
+            ("caret", "<Space>"),
+            ("caret", "<Ctrl-Space>"),
+            ("caret", "c"),
+            ("caret", "h"),
+            ("caret", "j"),
+            ("caret", "k"),
+            ("caret", "l"),
+            ("caret", "w"),
+            ("caret", "e"),
+            ("caret", "b"),
+            ("caret", "o"),
+            ("caret", "["),
+            ("caret", "]"),
+            ("caret", "{"),
+            ("caret", "}"),
+            ("caret", "0"),
+            ("caret", "$"),
+            ("caret", "gg"),
+            ("caret", "G"),
+            ("caret", "H"),
+            ("caret", "J"),
+            ("caret", "K"),
+            ("caret", "L"),
+            ("caret", "<Escape>"),
+            ("set_mark", "<Escape>"),
+            ("jump_mark", "<Escape>"),
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(m, k, _)| *m == mode && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys} in {mode}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{mode} {keys} -> {cmd:?} is still inert");
+        }
+
+        // The three that are deliberately still inert: `yank selection` is the clipboard
+        // workstream's command, and a variant defined here would collide with it. When that lands
+        // these become live and the count above goes to 143.
+        for keys in ["y", "Y", "<Return>"] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(m, k, _)| *m == "caret" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys} in caret"));
+            assert!(
+                !is_live(&commands::parse(cmd).unwrap()),
+                "caret {keys} is live — did the clipboard land without raising the count?"
+            );
+        }
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
