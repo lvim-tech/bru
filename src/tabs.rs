@@ -439,7 +439,18 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
 
     if !background {
         select_in(state, window_id, index);
+        return;
     }
+
+    // A background tab is in the strip, and in the count the bar reports, the moment it is opened —
+    // not when its page eventually commits an address. `select_in` is what pushes for a foreground
+    // tab and this branch pushed nothing at all, so until now the only thing that told the chrome
+    // about an `:open -b` was `on_address_change` in `keys.rs`, one network round trip later.
+    let tabs = state
+        .lock()
+        .expect("state mutex poisoned")
+        .tabs_json_in(window_id);
+    crate::ipc::set_tabs_for(window_id, tabs);
 }
 
 /// Puts every tab of one window into it. Called once per window, from `on_window_created`.

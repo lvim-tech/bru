@@ -300,8 +300,15 @@ fn chrome() -> &'static Mutex<Vec<Chrome>> {
     &CHROME
 }
 
-/// What one window's bottom bar shows. `mode`, `keystring`, `scroll` and `tabindex` are part of the
-/// pushed object from the start so the chrome renders against its final shape.
+/// What one window's bottom bar shows. `mode`, `keystring` and `scroll` are part of the pushed
+/// object from the start so the chrome renders against its final shape.
+///
+/// **`tabindex` is deliberately not a field here.** It was one, from the first commit that drew a
+/// bar, and nothing ever wrote it: every other key on this struct has a `set_…` and that one had
+/// none, so `<span id="tabindex">` stayed empty and bru drew no `[3/7]` where qutebrowser does. It
+/// is a pure function of the window's own tab list — `bar_json_for` asks `tabindex_of` on every
+/// push — because storing a copy means six call sites that each have to remember to update it, and
+/// that is precisely the arrangement that left it blank.
 #[derive(Default)]
 struct BarState {
     url: String,
@@ -309,7 +316,6 @@ struct BarState {
     mode: String,
     keystring: String,
     scroll: String,
-    tabindex: String,
     search: String,
     /// `[dl 45%]` while a download is running, empty otherwise — `downloads::summary`. Pushed like
     /// the rest; the chrome has no element for it yet and ignores the key until it does.
@@ -523,7 +529,12 @@ fn push_for(window: u32) {
         render(&frame, &tabs_json_of(&tabs));
     }
     if let Some(frame) = bottom {
-        render(&frame, &bar_json_for(window));
+        // `BRU_DEBUG_IPC=1` traced only chrome → Rust, which is the half a page can be asked about
+        // from its own console. This is the other half, and it is the only way to read the exact
+        // object the bar was handed without a screenshot.
+        let bar = bar_json_for(window);
+        log(&format!("push to window {window}: {bar}"));
+        render(&frame, &bar);
     }
 }
 
@@ -575,6 +586,10 @@ fn bar_json_for(window: u32) -> String {
     let completion = crate::completers::json();
     // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
     let message = crate::message::json();
+    // Which tab of how many, asked of `BruState` rather than kept on `BarState` — see the note
+    // there. Outside `with_window` for the same reason as the three above: the state mutex must
+    // never be taken while the chrome mutex is held.
+    let tabindex = tabindex_of(window);
     with_window(window, |entry| {
         let bar = &entry.bar;
         format!(
@@ -588,12 +603,38 @@ fn bar_json_for(window: u32) -> String {
             json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
             json_escape(&bar.keystring),
             json_escape(&bar.scroll),
-            json_escape(&bar.tabindex),
+            json_escape(&tabindex),
             json_escape(&bar.search),
             json_escape(&bar.download),
         )
     })
     .unwrap_or_else(|| "{}".to_string())
+}
+
+/// `[3/7]` — which tab of how many is showing in one window, spelled as qutebrowser's tabindex
+/// widget spells it: `'[{}/{}]'.format(current + 1, count)`, `statusbar/tabindex.py:19`. It is in
+/// `statusbar.widgets`' default list (`configdata.yml:2212`), which is the order `bottom.html` lays
+/// the spans out in.
+///
+/// **Named per window, never "the current one".** Every window draws its own bar, and a background
+/// window's `[2/4]` is as true as the front one's; asking about the current window here would make
+/// both windows show whichever was focused last. It is the same reason `set_url_for` and
+/// `set_title_for` take a window rather than assume one.
+///
+/// Empty for a window with no tabs — the moment between `window::create(FirstTab::None)` and the
+/// tab arriving, which `gD` goes through. `#statusline > span:empty` is `display: none`, so the bar
+/// shows nothing there rather than a `[1/0]` that is true of nothing.
+fn tabindex_of(window: u32) -> String {
+    let Some(state) = crate::state::BruState::instance() else {
+        return String::new();
+    };
+    let Ok(state) = state.lock() else {
+        return String::new();
+    };
+    match state.tab_count_in(window) {
+        0 => String::new(),
+        count => format!("[{}/{}]", state.active_tab_in(window) + 1, count),
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
