@@ -199,17 +199,28 @@
     accept: accept,
     cancel: cancel,
 
-    // state = {url, title, mode, keystring, scroll, tabindex, cmdline}
+    // state = {url, title, mode, keystring, scroll, tabindex, search, download,
+    //          cmdline, completion, message}
+    //
+    // Every key ipc::bar_json emits is drawn by something below. `title` is the
+    // one that is not a status field — the window wears it — and it goes onto
+    // data-title at the end.
     render: function (state) {
       state = state || {};
 
-      // src/clip.rs: what a yank just said. Cleared by Rust two seconds later,
-      // which is qutebrowser's messages.timeout; this side only draws it.
-      put("message", state.message);
+      // In qutebrowser's `statusbar.widgets` order, which is the order the
+      // elements sit in inside #statusline; see bottom.html.
       put("keystring", state.keystring);
+      // src/find.rs: `Match [3/17]`, or empty for no search. Empty is what
+      // `#statusline > span:empty { display: none }` reads, so a bar with no
+      // search running is the same width it was before this field existed.
+      put("search", state.search);
       put("url", state.url);
       put("scroll", state.scroll);
       put("tabindex", state.tabindex);
+      // src/downloads.rs::summary: `[dl 45%]`, `[dl 3 45%]`, or empty. Same
+      // rule — nothing running is an empty span, which is a hidden one.
+      put("download", state.download);
 
       var url = document.getElementById("url");
       if (url) {

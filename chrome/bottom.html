@@ -21,25 +21,40 @@
              right always, the command line takes the left when the mode is
              command. They are grid-placed, so the row is theirs whichever way
              round the source happens to read. -->
-        <!-- src/clip.rs: where qutebrowser's message area would be. Empty in
-             every mode but the moment after a yank, and #message:empty is
+        <!-- Whatever bru has been asked to say — src/message.rs, and src/clip.rs
+             through it. Where qutebrowser's message area would be: empty in
+             every mode but the seconds after a yank, and #message:empty is
              display:none, so it costs the bar nothing. It shares grid cell 2/1
-             with #cmdline, which the two never occupy at once: the command line
-             is hidden outside command mode and the message is hidden inside
-             it. -->
+             with #cmdline, exactly as qutebrowser shares one QStackedLayout slot
+             between its cmd and txt widgets (statusbar/bar.py:169), and the two
+             never occupy it at once: the command line is hidden outside command
+             mode and the message is hidden inside it. So the bar is still one
+             row — the line when one is open, the message otherwise, and neither
+             when neither.
+
+             ONE of these, not two. There were two, with the same id, and
+             getElementById answers with the first: the second was an element
+             nothing could ever address and the stylesheet could only ever hide.
+             -->
         <div id="message"></div>
+        <!-- qutebrowser's widget order, from `statusbar.widgets`' default in
+             configdata.yml:2212 — keypress, search_match, url, scroll, history,
+             tabs, progress. bru has no history arrows and no load progress bar,
+             so what is left of that list, in that order, is keystring, search,
+             url, scroll, tabindex. #download takes progress's place at the end:
+             it is not a qutebrowser statusbar widget at all — qutebrowser gives
+             downloads a second row of their own — and last is where a widget
+             that is usually absent belongs, so its arrival never shifts the four
+             fields DESIGN.md names. -->
         <div id="statusline">
             <span id="keystring"></span>
+            <span id="search"></span>
             <span id="url"></span>
             <span id="scroll"></span>
             <span id="tabindex"></span>
+            <span id="download"></span>
         </div>
         <input id="cmdline" type="text" spellcheck="false" autocomplete="off" />
-        <!-- Whatever bru has been asked to say. It shares the command line's
-             cell, exactly as qutebrowser shares one QStackedLayout slot between
-             its cmd and txt widgets, so the bar is still one row: the line when
-             one is open, the message otherwise, and neither when neither. -->
-        <div id="message"></div>
         <!-- Before bottom.js, which calls into window.bruCompletion when it renders. -->
         <script src="completion.js"></script>
         <script src="bottom.js"></script>
