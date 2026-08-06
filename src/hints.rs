@@ -29,6 +29,17 @@ use crate::tabs::SharedState;
 /// the home row, and DESIGN.md's "same keys" makes changing it a config question, not a code one.
 pub const CHARS: &str = "asdfghjkl";
 
+/// Why `<Return>` in hint mode is *refused* rather than unimplemented, in one sentence for
+/// `bru://chrome/help`. The measurements are in the `Command::HintFollow` arm of `exec::run`.
+pub const WHY_HINT_FOLLOW_IS_REFUSED: &str =
+    "there is never a hint waiting to be followed. hints.auto_follow is unique-match \
+     (configdata.yml:1673) and bru implements it, so a chain that leaves one label showing has \
+     already followed it — measured over 1..1,000,000 elements, no prefix of a label that is not \
+     itself a label ever leaves fewer than two showing. The key is dead in qutebrowser 3.7.0 under \
+     its own defaults for the same reason: hint_follow reads _context.to_follow, which is only \
+     assigned when hints.auto_follow is never. Only that value would give it a job, and bru ships \
+     no configuration to set it with.";
+
 /// `hints.min_chars`, configdata.yml:1752.
 const MIN_CHARS: usize = 1;
 

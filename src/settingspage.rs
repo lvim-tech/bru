@@ -282,7 +282,7 @@ mod tests {
         }
         // The refusal's *reason* is the point of listing it — a name with no reason beside it is
         // the "someone forgot" the whole list exists to deny.
-        assert!(html.contains("Chromium 151 has no plugins content setting"));
+        assert!(html.contains("Chromium 151 has nothing behind this name"));
     }
 
     /// The scope rule that keeps bru's own chrome alive has to be visible, or the page invites a

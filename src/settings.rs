@@ -147,26 +147,55 @@ pub const SETTINGS: &[Def] = &[
 ///
 /// They are here rather than absent from the file so that the reason survives: someone who reads
 /// `config-cycle … content.plugins` in the binding table and wonders why it is inert finds the
-/// answer next to the ones that work, instead of concluding it was forgotten.
+/// answer next to the ones that work, instead of concluding it was forgotten. `bru://chrome/help`
+/// prints these strings against the twelve rows — see [`refusal_in`] — so a refusal is a sentence
+/// the user can read rather than a row that says "not yet" about something that never will be.
 ///
 /// Refusing them is the point. `tph` would otherwise toggle a value nothing reads, print it, reload
 /// the page, and leave the user certain that plugins are off.
+///
+/// **Both were re-measured 2026-08-06 against CEF 151 rather than reasoned about**, with
+/// `--settings-probe='prefs:…'` and `--settings-probe='cookies:…'` — see [`dump_preferences`] and
+/// [`probe_third_party_cookies`], which exist so that the next CEF can be asked the same questions
+/// in one command.
 pub const REFUSED: &[(&str, &str)] = &[
     (
         "content.plugins",
-        "Chromium 151 has no plugins content setting — NPAPI and PPAPI are gone, and \
-         cef_content_setting_types_t's only entry is DEPRECATED_PPAPI_BROKER. There is nothing \
-         behind this name to switch.",
+        "Chromium 151 has nothing behind this name. qutebrowser drives it through \
+         QWebEngineSettings::PluginsEnabled; cef_browser_settings_t has no plugin field at all, \
+         cef_content_setting_types_t's only plugin entry is DEPRECATED_PPAPI_BROKER, and the one \
+         settable preference in the family is plugins.always_open_pdf_externally — \"open PDFs in \
+         another application\", which is neither \"enable plugins\" nor scopeable to a URL. \
+         Measured 2026-08-06. NPAPI and PPAPI are gone, so these six keys are not waiting for \
+         work; there is no work that would make them act.",
     ),
     (
         "content.cookies.accept",
-        "its three values are all / no-3rdparty / never, and CEF can express two of them \
-         (ALLOW / BLOCK on CEF_CONTENT_SETTING_TYPE_COOKIES). no-3rdparty needs a rule keyed on a \
-         wildcard requesting URL under a fixed top-level URL, and set_content_setting takes URLs \
-         rather than patterns, so it cannot be written. A three-value cycle that is wrong on one \
-         press in three is worse than a key that says it does nothing.",
+        "its three values are all / no-3rdparty / never, and no-3rdparty cannot be written per \
+         URL. It needs a rule with a wildcard requesting pattern under a fixed top-level one, and \
+         set_content_setting derives both patterns from URLs. Measured 2026-08-06: \
+         set_content_setting(requesting=none, top_level=https://example.com/, COOKIES, BLOCK) \
+         changed nothing — every read-back, third-party and first-party alike, still answered \
+         allow — while the same call with the URLs the other way round answered block. Chromium \
+         does have a global switch, the preference profile.cookie_controls_mode, and CEF reports \
+         it settable; but all twelve default bindings pass -u <pattern>, and a per-site key that \
+         quietly changed the whole browser would be worse than one that does nothing. A \
+         three-value cycle that is wrong on one press in three is worse than a key that says it \
+         does nothing.",
     ),
 ];
+
+/// The reason a command string names a refused setting, for `bru://chrome/help`'s third state.
+///
+/// `commands.rs` refuses to build a `ConfigCycle` for a setting this file does not have, so the
+/// twelve `t**` rows arrive as `Command::Unimplemented` carrying their whole text — which is where
+/// the setting's name still is. See `exec::refusal`, the one caller.
+pub fn refusal_in(text: &str) -> Option<&'static str> {
+    REFUSED
+        .iter()
+        .find(|(name, _)| text.contains(name))
+        .map(|(_, why)| *why)
+}
 
 /// The definition for `name`, if bru has one.
 pub fn def(name: &str) -> Option<&'static Def> {
@@ -733,12 +762,23 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     )
 }
 
-/// `--settings-probe='<setting>@<url>,<setting>@<url>,…' [--settings-probe-after-ms=N]` prints what
-/// Chromium answers for each pair, once.
+/// `--settings-probe='<spec>,<spec>,…' [--settings-probe-after-ms=N]` prints what Chromium answers,
+/// once. A spec is one of:
+///
+/// | | |
+/// |---|---|
+/// | `<setting>@<url>` | what Chromium enforces for one of bru's settings at one URL |
+/// | `prefs:<name>` | whether a Chromium preference exists and is settable, plus every top-level one whose name contains it — see [`dump_preferences`] |
+/// | `cookies:<third-party>\|<top-level>` | whether the rule `no-3rdparty` needs can be written at all — see [`probe_third_party_cookies`] |
 ///
 /// It exists because "the setting was stored" and "Chromium is enforcing it" are different claims,
 /// and only the second one is worth anything. `--cmd` already drives `:set` and `:config-cycle`
-/// through the real dispatcher, so nothing here injects anything — it only reads.
+/// through the real dispatcher, so nothing here injects anything — the first two forms only read,
+/// and the third writes into a scratch profile to find out whether the write lands.
+///
+/// The last two are what [`REFUSED`] rests on. They are kept rather than deleted after the answer
+/// because the answer is CEF's, not bru's: a later CEF may have `no-3rdparty` in it, and the way to
+/// find out should be one command rather than an afternoon.
 pub fn schedule_probe(spec: &str, after_ms: i64) {
     let mut task = SettingsProbe::new(spec.to_string());
     post_delayed_task(ThreadId::UI, Some(&mut task), after_ms);
@@ -753,6 +793,14 @@ wrap_task! {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             for pair in self.spec.split(',').filter(|pair| !pair.is_empty()) {
+                if let Some(needle) = pair.strip_prefix("prefs:") {
+                    dump_preferences(needle);
+                    continue;
+                }
+                if let Some(spec) = pair.strip_prefix("cookies:") {
+                    probe_third_party_cookies(spec);
+                    continue;
+                }
                 let Some((name, url)) = pair.split_once('@') else {
                     eprintln!("settings-probe: {pair:?} is not <setting>@<url>");
                     continue;
@@ -774,6 +822,96 @@ wrap_task! {
             }
         }
     }
+}
+
+/// `--settings-probe='prefs:cookie'` — every Chromium preference CEF exposes whose name contains
+/// `needle`, with whether CEF will let bru write it.
+///
+/// A preference is the other half of Chromium's settings, beside the content-settings map: the
+/// per-profile switches `chrome://settings` writes. `RequestContext` implements
+/// `ImplPreferenceManager`, so both are reachable from the same object.
+fn dump_preferences(needle: &str) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let Some(context) = request_context_get_global_context() else {
+        eprintln!("settings-probe: no request context");
+        return;
+    };
+    // The needle as a name in its own right, because `get_all_preferences` answers a *nested*
+    // dictionary and its keys are the top-level components only — `plugins` is a dictionary, and
+    // whether `plugins.always_open_pdf_externally` exists cannot be read out of that list.
+    let exact = CefString::from(needle);
+    eprintln!(
+        "settings-probe: pref {needle:?} exists={} settable={}",
+        context.has_preference(Some(&exact)),
+        context.can_set_preference(Some(&exact)),
+    );
+    let Some(all) = context.all_preferences(1) else {
+        eprintln!("settings-probe: no preferences");
+        return;
+    };
+    let mut keys = CefStringList::new();
+    all.keys(Some(&mut keys));
+    let mut found = 0;
+    for key in keys.into_iter() {
+        if !key.to_lowercase().contains(&needle.to_lowercase()) {
+            continue;
+        }
+        found += 1;
+        let name = CefString::from(key.as_str());
+        eprintln!(
+            "settings-probe: pref {key} type={:?} settable={}",
+            all.get_type(Some(&name)),
+            context.can_set_preference(Some(&name)),
+        );
+    }
+    eprintln!("settings-probe: {found} preference(s) matching {needle:?}");
+}
+
+/// `--settings-probe='cookies:<third-party>|<top-level>'` — can CEF write the rule `no-3rdparty`
+/// needs, and does Chromium read it back?
+///
+/// The question is whether `set_content_setting` can produce a rule with a **wildcard requesting
+/// pattern** under a fixed top-level one. That is what "block cookies from anyone else while I am
+/// on this site" is in Chromium's content-settings map, and it is the one of
+/// `content.cookies.accept`'s three values that `ALLOW`/`BLOCK` on a single origin cannot say.
+fn probe_third_party_cookies(spec: &str) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let Some((third, top)) = spec.split_once('|') else {
+        eprintln!("settings-probe: {spec:?} is not <third-party>|<top-level>");
+        return;
+    };
+    let Some(context) = request_context_get_global_context() else {
+        eprintln!("settings-probe: no request context");
+        return;
+    };
+    let (third, top) = (CefString::from(third), CefString::from(top));
+    let read = |what: &str, requesting: Option<&CefString>, top_level: Option<&CefString>| {
+        let value = context.content_setting(requesting, top_level, ContentSettingTypes::COOKIES);
+        eprintln!(
+            "settings-probe: cookies {what} -> {}",
+            match value {
+                v if v == ContentSettingValues::ALLOW => "allow",
+                v if v == ContentSettingValues::BLOCK => "block",
+                v if v == ContentSettingValues::DEFAULT => "default",
+                _ => "other",
+            }
+        );
+    };
+
+    read("before, third-party at top", Some(&third), Some(&top));
+    read("before, first-party at top", Some(&top), Some(&top));
+
+    // The rule no-3rdparty needs: nothing named as the requesting URL, the site named as the
+    // top-level one.
+    context.set_content_setting(None, Some(&top), ContentSettingTypes::COOKIES, ContentSettingValues::BLOCK);
+    read("after wildcard-requesting BLOCK, third-party at top", Some(&third), Some(&top));
+    read("after wildcard-requesting BLOCK, first-party at top", Some(&top), Some(&top));
+    read("after wildcard-requesting BLOCK, third-party elsewhere", Some(&third), None);
+
+    // And the rule `never` needs, for comparison: the site as the requesting URL.
+    context.set_content_setting(Some(&top), None, ContentSettingTypes::COOKIES, ContentSettingValues::BLOCK);
+    read("after requesting BLOCK, first-party at top", Some(&top), Some(&top));
+    read("after requesting BLOCK, third-party at top", Some(&third), Some(&top));
 }
 
 #[cfg(test)]
@@ -808,7 +946,7 @@ mod tests {
         let error = settings
             .set_scoped("content.plugins", "true", None)
             .expect_err("content.plugins is refused");
-        assert!(error.contains("Chromium 151 has no plugins content setting"), "{error}");
+        assert!(error.contains("Chromium 151 has nothing behind this name"), "{error}");
 
         let error = settings
             .set_scoped("content.cookies.accept", "never", None)

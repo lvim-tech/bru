@@ -874,6 +874,38 @@ pub fn is_live(command: &Command) -> bool {
     }
 }
 
+// --- src/help.rs -----------------------------------------------------------
+/// Why a bound command will **never** act, or `None` if it might.
+///
+/// [`is_live`] answers "does pressing this do something today". This answers "and is that ever
+/// going to change", and it exists because the answer is no for thirteen of the 264 default
+/// bindings. A row that says "not yet" about a key nothing can implement is a lie of a different
+/// kind from a row that says it about a key waiting for a milestone: it invites the same
+/// investigation every few months, and the second one costs as much as the first.
+///
+/// The strings live with the module that measured them, not here — `settings::REFUSED` and
+/// `hints::WHY_HINT_FOLLOW_IS_REFUSED`. This is only the dispatch, and `help.rs` is the only
+/// caller. It is deliberately *not* consulted by `is_live`: a refused command is inert, and both
+/// halves of the count would otherwise depend on one function.
+pub fn refusal(command: &Command) -> Option<&'static str> {
+    debug_assert!(!is_live(command), "a live command cannot also be refused");
+    match command {
+        // `<Return>` in hint mode. The four measurements are in the arm of `run` above.
+        Command::HintFollow => Some(crate::hints::WHY_HINT_FOLLOW_IS_REFUSED),
+        // The twelve `t**` rows, all of them `config-cycle … content.plugins` or
+        // `… content.cookies.accept`. `commands.rs` will not build a `ConfigCycle` for a setting
+        // `settings.rs` does not have, so they arrive here as `Unimplemented` carrying the text
+        // the setting's name is still in.
+        Command::Unimplemented(text) => crate::settings::refusal_in(text),
+        // All twelve are `config-cycle … ;; reload`, so they arrive as a chain and never as the
+        // bare command. `is_live` on a chain is "every part acts", so one refused part is enough
+        // to refuse the whole row — and it is the part the reader pressed the key for.
+        Command::Chain(parts) => parts.iter().find_map(refusal),
+        _ => None,
+    }
+}
+// --- end src/help.rs -------------------------------------------------------
+
 /// `:back`/`:forward`, with a count and with `-t`/`-b`/`-w`.
 ///
 /// In place, `go_back`/`go_forward` are one step each and a count of one is the overwhelming case.
@@ -1413,6 +1445,53 @@ mod tests {
         // Raise this when a milestone raises the number, never to make a failing build pass.
         assert_eq!(live, 251, "the live-binding count moved");
     }
+
+// --- src/help.rs -----------------------------------------------------------
+    /// **Every default binding now either acts or is refused. Nothing is merely waiting.**
+    ///
+    /// 251 and 13, and the thirteen are named rather than counted: six `content.plugins`, six
+    /// `content.cookies.accept`, and `<Return>` in hint mode. Each of the three groups was
+    /// measured against CEF 151 rather than assumed — the reasons are in `settings::REFUSED` and
+    /// `hints::WHY_HINT_FOLLOW_IS_REFUSED`, and the arms above carry the numbers.
+    ///
+    /// If a milestone ever binds a key to a command it has not built, `waiting` stops being empty
+    /// and `bru://chrome/help` grows a "not yet" row again. That is correct, and it is why this
+    /// asserts the emptiness rather than deleting the state.
+    #[test]
+    fn nothing_bound_by_default_is_merely_waiting() {
+        let (mut live, mut refused, mut waiting) = (0usize, Vec::new(), Vec::new());
+        for (mode, keys, cmd) in DEFAULT_BINDINGS {
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            if is_live(&parsed) {
+                live += 1;
+            } else if refusal(&parsed).is_some() {
+                refused.push((*mode, *keys));
+            } else {
+                waiting.push((*mode, *keys, *cmd));
+            }
+        }
+        assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
+        assert_eq!(live, 251);
+        assert_eq!(
+            refused,
+            [
+                ("normal", "tph"), ("normal", "tPh"), ("normal", "tpH"),
+                ("normal", "tPH"), ("normal", "tpu"), ("normal", "tPu"),
+                ("normal", "tch"), ("normal", "tCh"), ("normal", "tcH"),
+                ("normal", "tCH"), ("normal", "tcu"), ("normal", "tCu"),
+                ("hint", "<Return>"),
+            ]
+        );
+        // A live command is never also refused — `refusal` debug-asserts it, and this walks the
+        // whole table past that assertion rather than trusting one call.
+        for (_, _, cmd) in DEFAULT_BINDINGS {
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            if !is_live(&parsed) {
+                let _ = refusal(&parsed);
+            }
+        }
+    }
+// --- end src/help.rs -------------------------------------------------------
 
 // --- src/settingspage.rs -------------------------------------------------------------------
     /// The three bindings this workstream turned on, named, and the one it did not.

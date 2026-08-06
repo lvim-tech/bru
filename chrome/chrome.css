@@ -635,3 +635,20 @@ body[data-view="help"] {
 /* A binding that is bound but does nothing yet reads as quieter, not as broken. */
 #help tr.todo .cmd,
 #help tr.todo .keys { opacity: 0.55; }
+
+/* A binding nothing can implement is quieter still, and carries the reason underneath the command
+   so that the row explains itself instead of sending the reader to the source. */
+#help tr.refused .cmd,
+#help tr.refused .keys { opacity: 0.45; }
+
+#help tr.refused .state { color: var(--completion-category-fg); }
+
+#help .why {
+    display: block;
+    margin: 0.15rem 0 0.25rem;
+    max-width: 46rem;
+    font-size: 0.85em;
+    line-height: 1.35;
+    color: var(--comment);
+    opacity: 1;
+}
