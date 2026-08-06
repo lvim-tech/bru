@@ -267,6 +267,22 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
         }
 
+// --- src/settings.rs -------------------------------------------------------
+        // `:set` and the 24 `config-cycle` bindings. The `-u` pattern still holds `{url:host}` at
+        // this point — `commands::parse` ran at startup, when there was no page to ask — so it is
+        // expanded inside `settings.rs` against the tab that is showing.
+        //
+        // Neither reloads: the bindings are `config-cycle … ;; reload`, and the chain arm above
+        // runs the second half. `:set content.javascript.enabled false` on its own leaves the page
+        // as it is, which is qutebrowser's behaviour too.
+        Command::Set { option, value, pattern, print } => {
+            crate::settings::run_set(option.as_deref(), value.as_deref(), pattern.as_deref(), *print)
+        }
+        Command::ConfigCycle { option, values, pattern, print } => {
+            crate::settings::run_cycle(option, values, pattern.as_deref(), *print)
+        }
+// --- end src/settings.rs ---------------------------------------------------
+
         // --- the command line ---------------------------------------------------------------
         // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
         // stay because the match has no `_`, and they document where the two actually go.
@@ -325,6 +341,17 @@ pub fn is_live(command: &Command) -> bool {
 
         // Claimed by `cmdline.rs` before this match ever runs.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
+
+// --- src/settings.rs -------------------------------------------------------
+        // `config-cycle` is only built for a setting bru implements — `content.plugins` and
+        // `content.cookies.accept` parse to `Unimplemented` and are counted with the rest of what
+        // does nothing, which is what keeps the twelve refused bindings honest.
+        Command::ConfigCycle { .. } => true,
+        // `:set` is live for any option, because naming one bru refuses is answered with the
+        // reason. Nothing is bound to `set <option>`, so this adds no binding to the count; the
+        // one binding that is bare `set` (`Ss`) parses to `Unimplemented` and stays inert.
+        Command::Set { option, .. } => option.is_some(),
+// --- end src/settings.rs ---------------------------------------------------
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
@@ -708,10 +735,79 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints, 118 once
+        // `settings.rs` gave `config-cycle` something to cycle. Raise this when a milestone raises
+        // the number, never to make a failing build pass.
+        assert_eq!(live, 118, "the live-binding count moved");
     }
+
+// --- src/settings.rs -------------------------------------------------------
+    /// The twelve `config-cycle` bindings a settings store turned on, and the twelve it did not.
+    ///
+    /// A total is not enough here: `config-cycle` accounts for 24 of the default bindings and half
+    /// of them name settings bru refuses. If a later change quietly makes `content.plugins` "work",
+    /// this is what says so.
+    #[test]
+    fn the_bindings_the_settings_store_turned_on_and_the_ones_it_refused() {
+        let live_now = [
+            // content.javascript.enabled, six spellings of the scope
+            "tsh", "tSh", "tsH", "tSH", "tsu", "tSu",
+            // content.images, the same six
+            "tih", "tIh", "tiH", "tIH", "tiu", "tIu",
+        ];
+        let still_inert = [
+            // content.plugins — Chromium 151 has no such content setting
+            "tph", "tPh", "tpH", "tPH", "tpu", "tPu",
+            // content.cookies.accept — no-3rdparty is not expressible through set_content_setting
+            "tch", "tCh", "tcH", "tCH", "tcu", "tCu",
+            // `set` with no option means qute://settings, and bru has no settings page
+            "Ss",
+        ];
+        let command_for = |keys: &str| {
+            DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"))
+                .2
+        };
+
+        for keys in live_now {
+            let cmd = command_for(keys);
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        for keys in still_inert {
+            let cmd = command_for(keys);
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(
+                !is_live(&parsed),
+                "{keys} -> {cmd:?} claims to work; if that is true, say which setting it moves"
+            );
+        }
+        assert_eq!(live_now.len() + still_inert.len(), 25);
+    }
+
+    /// `:set` answers for an option bru refuses; `config-cycle` on the same option does not.
+    ///
+    /// The asymmetry is the only reason the live count is allowed to stay at 118 while `:set`
+    /// accepts anything — so it is asserted rather than left to the comment beside it.
+    #[test]
+    fn set_answers_for_a_refused_option_and_config_cycle_stays_inert() {
+        let typed = commands::parse("set content.plugins false").unwrap();
+        assert!(is_live(&typed), ":set has to reach settings.rs to explain the refusal");
+        assert!(matches!(typed, Command::Set { .. }));
+
+        let bound = commands::parse("config-cycle -p -t -u *://x/* content.plugins").unwrap();
+        assert!(!is_live(&bound));
+        assert_eq!(
+            bound,
+            Command::Unimplemented("config-cycle -p -t -u *://x/* content.plugins".to_string())
+        );
+
+        // And a bare `:set` — the `Ss` binding — is inert either way: it means qute://settings.
+        assert!(!is_live(&commands::parse("set").unwrap()));
+    }
+// --- end src/settings.rs ---------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.

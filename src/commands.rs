@@ -109,6 +109,31 @@ pub enum Command {
     /// `command-accept [--rapid]`
     CommandAccept { rapid: bool },
 
+// --- src/settings.rs -------------------------------------------------------
+    /// `set [-t] [-p] [-u <pattern>] <option> [value]` — print with no value, set with one.
+    ///
+    /// There is no `temp` field. qutebrowser's `-t` means "do not write autoconfig.yml"; bru writes
+    /// no configuration at all, so every `:set` is already what `-t` asks for and a field storing
+    /// the flag would be a field nothing reads. See `settings::TEMP_IS_THE_ONLY_SPELLING`.
+    ///
+    /// `option` is `Option` only so that a bare `:set` has a shape; the parser never builds that
+    /// one, because it means "open qute://settings" and bru has no settings page.
+    Set {
+        option: Option<String>,
+        value: Option<String>,
+        pattern: Option<String>,
+        print: bool,
+    },
+    /// `config-cycle [-t] [-p] [-u <pattern>] <option> [values…]` — 24 of qutebrowser's default
+    /// bindings are this command, and twelve of them name a setting bru implements.
+    ConfigCycle {
+        option: String,
+        values: Vec<String>,
+        pattern: Option<String>,
+        print: bool,
+    },
+// --- end src/settings.rs ---------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -559,10 +584,123 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
         "command-accept" => Command::CommandAccept { rapid: args.has("rapid") },
 
+// --- src/settings.rs -------------------------------------------------------
+        // `-u` takes a value, which `Args` cannot express — it would file `*://{url:host}/*` as a
+        // positional and nothing would say which positional it was. Both commands are parsed by
+        // hand instead.
+        "set" | "config-cycle" => parse_config_command(name, &tokens[1..], s)?,
+// --- end src/settings.rs ---------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
 }
+
+// --- src/settings.rs -------------------------------------------------------
+/// `set` and `config-cycle`, which share their flags: `-t`/`--temp`, `-p`/`--print`, and
+/// `-u`/`--pattern`/`--url`, the last of which consumes the token after it.
+///
+/// An option bru does not implement produces [`Command::Unimplemented`] rather than an error, for
+/// the reason at the top of this file: the twelve `content.plugins` and `content.cookies.accept`
+/// bindings have to keep their place in the trie, and `bru://help` has to be able to say they do
+/// nothing. `settings::REFUSED` carries why each one is refused.
+fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Command, ParseError> {
+    let bad = |what: &str| ParseError(format!("{name}: {what}"));
+
+    let (mut print, mut pattern) = (false, None::<String>);
+    let mut positional: Vec<String> = Vec::new();
+    let mut end_of_flags = false;
+    let mut wants_pattern = false;
+
+    for token in tokens {
+        if wants_pattern {
+            pattern = Some(token.clone());
+            wants_pattern = false;
+            continue;
+        }
+        if end_of_flags || !is_flag(token) {
+            positional.push(token.clone());
+            continue;
+        }
+        if token == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            match long {
+                "print" => print = true,
+                // `-t` is accepted and deliberately does nothing — see Command::Set.
+                "temp" => {}
+                "pattern" | "url" => wants_pattern = true,
+                other => return Err(bad(&format!("unknown flag --{other}"))),
+            }
+            continue;
+        }
+        // `-ptu <pattern>` is three short flags, as in argparse, and `u` is always last because it
+        // is the one that takes a value.
+        for (index, c) in token[1..].chars().enumerate() {
+            match c {
+                'p' => print = true,
+                't' => {}
+                'u' => {
+                    let rest: String = token[1..].chars().skip(index + 1).collect();
+                    if rest.is_empty() {
+                        wants_pattern = true;
+                    } else {
+                        pattern = Some(rest);
+                    }
+                    break;
+                }
+                other => return Err(bad(&format!("unknown flag -{other}"))),
+            }
+        }
+    }
+    if wants_pattern {
+        return Err(bad("-u needs a URL pattern"));
+    }
+
+    let mut option = positional.first().cloned();
+    // `:set option?` prints instead of setting, and so does `:set option` with nothing after it.
+    if let Some(option) = option.as_mut() {
+        if let Some(stripped) = option.strip_suffix('?') {
+            let stripped = stripped.to_string();
+            positional.truncate(1);
+            *option = stripped;
+        }
+    }
+
+    // A bare `:set` opens qute://settings in qutebrowser. bru has no settings page, so `Ss` stays
+    // bound, stays parsed, and says it does nothing — which is true.
+    let Some(option) = option else {
+        return Ok(Command::Unimplemented(whole.trim().to_string()));
+    };
+
+    if name == "config-cycle" {
+        // An option bru does not implement leaves the binding inert rather than making it a key
+        // that prints an error and reloads the page. All twelve `content.plugins` and
+        // `content.cookies.accept` bindings land here; `settings::REFUSED` says why.
+        if !crate::settings::is_known(&option) {
+            return Ok(Command::Unimplemented(whole.trim().to_string()));
+        }
+        return Ok(Command::ConfigCycle {
+            option,
+            values: positional[1..].to_vec(),
+            pattern,
+            print,
+        });
+    }
+    // `:set` is typed, not bound — no default binding is `set <option>`, so this branch changes no
+    // binding's liveness. It stays live for an option bru does not have so that the answer is
+    // "bru does not implement content.plugins: Chromium 151 has no plugins content setting …"
+    // rather than the dispatcher's generic "not implemented yet".
+    Ok(Command::Set {
+        option: Some(option),
+        value: positional.get(1).cloned(),
+        pattern,
+        print,
+    })
+}
+// --- end src/settings.rs ---------------------------------------------------
 
 #[cfg(test)]
 mod tests {

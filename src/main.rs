@@ -21,6 +21,7 @@ mod keys;
 mod modes;
 mod open;
 mod scroll;
+mod settings;
 mod state;
 mod tabs;
 mod window;
