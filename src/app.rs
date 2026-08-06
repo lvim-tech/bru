@@ -8,8 +8,8 @@ use crate::keys::BruClient;
 use crate::state::{schedule_close, BruState};
 use crate::window::{BruChromeViewDelegate, BruWindowDelegate};
 
-/// Where bru goes with no argument.
-const HOME: &str = "https://start.duckduckgo.com/";
+/// Where bru goes with no argument, and what `open` with no URL opens.
+pub const HOME: &str = "https://start.duckduckgo.com/";
 
 /// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
 const TOP_URL: &str = "bru://chrome/top.html";

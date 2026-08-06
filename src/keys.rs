@@ -156,6 +156,22 @@ fn run(
         }
         Command::TabClose { .. } => crate::tabs::close_current(state),
 
+        // `open` is M9's command, and most of it needs the command line to type a URL into. The
+        // part that does not is worth having early: `ga` and `<Ctrl-T>` are bound to a bare
+        // `open -t`, so without this there is no way to reach a second tab from the keyboard at
+        // all, and `J`/`K`/`d` cannot be exercised. A URL only arrives here from a binding that
+        // carries one; the interactive path is M9's.
+        Command::Open { url, tab, bg, window, .. } => {
+            let target = url.as_deref().unwrap_or(crate::app::HOME);
+            // `-w` has no window management behind it yet; treat it as a tab rather than silently
+            // doing nothing, and say so once M9 gives windows a meaning.
+            if *tab || *bg || *window {
+                crate::tabs::new_tab(state, target, *bg);
+            } else if let Some(frame) = browser.main_frame() {
+                frame.load_url(Some(&CefString::from(target)));
+            }
+        }
+
         Command::ModeEnter(mode) => {
             let entered = state
                 .lock()
