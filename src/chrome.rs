@@ -28,24 +28,15 @@ const CHROME_CSS: &[u8] = include_bytes!("../chrome/chrome.css");
 const TOP_JS: &[u8] = include_bytes!("../chrome/top.js");
 const BOTTOM_JS: &[u8] = include_bytes!("../chrome/bottom.js");
 
-/// The fallback palette, used until `lvim-colorscheme` has written a real one to
-/// `~/.config/bru/theme.css`. It is not a theme — it exists so the chrome is legible on a machine
-/// that has not been themed yet, and so a missing file is never a blank bar.
-const DEFAULT_THEME_CSS: &str = "\
-:root {
-  --bg: #1e222a;
-  --fg: #b6bdca;
-  --font: monospace;
-  --tabs-bg: #1e222a;
-  --tabs-fg: #6b7089;
-  --tabs-separator: #2a2f3a;
-  --tabs-selected-bg: #2a2f3a;
-  --tabs-selected-fg: #b6bdca;
-  --statusbar-bg: #1e222a;
-  --statusbar-fg: #b6bdca;
-  --statusbar-keystring-fg: #d19a66;
-}
-";
+/// The theme bru ships with, used until themer has written one to `~/.config/bru/theme.css`.
+///
+/// It is a real generated file, copied verbatim from `lvim-colorscheme`'s `extras/bru/` — which is
+/// what DESIGN.md means by "bru ships a binary and generated themes, nothing a person edits". A
+/// hand-written stub is what was here first, and it defined 11 of the 62 custom properties
+/// `chrome.css` reads, so the chrome rendered as unstyled black-on-white: the layout was right and
+/// every colour was missing. A generated file cannot drift from the stylesheet that way, because
+/// the same generator produces the whole vocabulary.
+const DEFAULT_THEME_CSS: &str = include_str!("../chrome/theme.css");
 
 /// Called from `App::on_register_custom_schemes`, which runs in **every** process — browser,
 /// renderer, GPU, zygote. A renderer that never heard of `bru://` treats it as an opaque origin and
