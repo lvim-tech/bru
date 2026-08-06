@@ -175,8 +175,13 @@ wrap_client! {
             Some(crate::find::BruFindHandler::new())
         }
 
-        // bru has a request handler only because the message router demands two of its callbacks.
+        // The message router demands two of its callbacks, and the ad blocker asks for a third.
         fn request_handler(&self) -> Option<RequestHandler> {
+            // --- adblock -----------------------------------------------------------------------
+            // The first point in the browser process the ad blocker is reachable from. It starts a
+            // background thread and returns; nothing here waits for a filter list.
+            crate::adblock::ensure_loaded();
+            // --- end adblock -------------------------------------------------------------------
             Some(BruRequestHandler::new())
         }
 
@@ -260,6 +265,24 @@ wrap_request_handler! {
         ) {
             crate::ipc::on_render_process_terminated(browser);
         }
+
+        // --- adblock -------------------------------------------------------------------------
+        // Once per resource request, on the browser process IO thread, before the request is
+        // initiated. `None` — the answer for everything bru allows — is what CEF expects when
+        // nobody has an opinion. `Some` is a request that will be cancelled and never sent.
+        fn resource_request_handler(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            crate::adblock::resource_request_handler(browser, request)
+        }
+        // --- end adblock ---------------------------------------------------------------------
     }
 }
 

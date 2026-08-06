@@ -27,3 +27,49 @@ mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
 # `~/.local/share/bru/history.sqlite` — see src/data.rs. `bundled` compiles SQLite from source, so
 # the schema bru writes cannot drift under it when the system libsqlite3 is upgraded.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# Brave's own ad-blocking engine — see src/adblock.rs. The same engine qutebrowser runs, which
+# reaches it through the `python-adblock` binding; bru links it directly, so a request is decided in
+# Rust with no FFI in the way. Pure Rust, no C, no build script that fetches anything.
+#
+# `default-features = false` is not cosmetic. The default set includes `single-thread`, which swaps
+# the engine's internal `Arc`/`Mutex` for `Rc`/`RefCell` and makes `Engine` neither `Send` nor
+# `Sync` — and the engine is built on a background thread and read from CEF's IO thread. The two
+# features named back are the rest of the default set:
+#   embedded-domain-resolver  the public-suffix list, so "third party" means what it means in a
+#                             browser (ads.example.co.uk is not first party to example.co.uk)
+#   full-regex-handling       the regex filters; without it those rules are dropped, silently
+adblock = { version = "0.13.2", default-features = false, features = [
+    "embedded-domain-resolver",
+    "full-regex-handling",
+] }
+
+# The ad blocker is the one dependency bru runs *per network request*, and unoptimized it is not
+# slow, it is unusable. Measured 2026-08-06 against EasyList + EasyPrivacy and the 158 requests
+# https://www.vesti.bg/ makes, mean time to decide one request:
+#
+#   dev, nothing overridden            16663 us   (2.6 s of matcher for one page load)
+#   dev, adblock alone at opt-level 3    154 us
+#   dev, this block                      128 us
+#   release                             4.59 us   (0.72 ms for the same page)
+#
+# A debug build is what every check in this project runs, so the first line is the one that would
+# have been believed. These overrides cost 12 s of first build and nothing afterwards.
+[profile.dev.package.adblock]
+opt-level = 3
+[profile.dev.package.flatbuffers]
+opt-level = 3
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.addr]
+opt-level = 3
+[profile.dev.package.psl]
+opt-level = 3
+[profile.dev.package.seahash]
+opt-level = 3
