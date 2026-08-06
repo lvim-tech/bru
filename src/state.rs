@@ -23,6 +23,9 @@ pub struct BruState {
     client: Option<Client>,
     /// The top-level window, kept from `on_window_created` so views can be added to it later.
     window: Option<Window>,
+    /// Identifiers of the browsers behind the two chrome strips. Keys that reach those must not be
+    /// read as page movements — `j` in the command line is a letter, not a scroll.
+    chrome_browsers: Vec<i32>,
 }
 
 impl BruState {
@@ -43,6 +46,7 @@ impl BruState {
                 browsers: Vec::new(),
                 client: None,
                 window: None,
+                chrome_browsers: Vec::new(),
             })
         })
     }
@@ -65,6 +69,18 @@ impl BruState {
 
     pub fn window(&self) -> Option<Window> {
         self.window.clone()
+    }
+
+    /// Learned from the chrome views' own delegate, which CEF hands both the view and the browser
+    /// it made for it. Reading the frame URL instead would race the first load.
+    pub fn note_chrome_browser(&mut self, identifier: i32) {
+        if !self.chrome_browsers.contains(&identifier) {
+            self.chrome_browsers.push(identifier);
+        }
+    }
+
+    pub fn is_chrome_browser(&self, identifier: i32) -> bool {
+        self.chrome_browsers.contains(&identifier)
     }
 
     /// A browser has come up. Every browser bru creates goes through here.

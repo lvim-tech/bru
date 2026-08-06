@@ -15,7 +15,9 @@ use crate::state::BruState;
 const STEP: i32 = 120;
 
 wrap_keyboard_handler! {
-    pub struct BruKeyboardHandler;
+    pub struct BruKeyboardHandler {
+        state: Arc<Mutex<BruState>>,
+    }
 
     impl KeyboardHandler {
         fn on_pre_key_event(
@@ -40,6 +42,17 @@ wrap_keyboard_handler! {
             // Leave the page alone while a text field has focus, or j and k cannot be typed into a
             // search box.
             if event.focus_on_editable_field != 0 {
+                return 0;
+            }
+
+            // A key that reached a chrome strip is a key meant for the chrome — the command line
+            // takes letters. Scrolling the tab strip with j would be nonsense anyway.
+            if self
+                .state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_chrome_browser(browser.identifier())
+            {
                 return 0;
             }
 
@@ -71,7 +84,7 @@ wrap_client! {
 
     impl Client {
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
-            Some(BruKeyboardHandler::new())
+            Some(BruKeyboardHandler::new(self.state.clone()))
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {

@@ -30,7 +30,9 @@ fn handover(text: &str) -> CefString {
 wrap_window_delegate! {
     pub struct BruWindowDelegate {
         state: Arc<Mutex<BruState>>,
-        browser_view: RefCell<Option<BrowserView>>,
+        top_view: RefCell<Option<BrowserView>>,
+        page_view: RefCell<Option<BrowserView>>,
+        bottom_view: RefCell<Option<BrowserView>>,
     }
 
     impl ViewDelegate {
@@ -43,12 +45,39 @@ wrap_window_delegate! {
 
     impl WindowDelegate {
         fn on_window_created(&self, window: Option<&mut Window>) {
-            let browser_view = self.browser_view.borrow();
-            let (Some(window), Some(browser_view)) = (window, browser_view.as_ref()) else {
+            let (top, page, bottom) = (
+                self.top_view.borrow(),
+                self.page_view.borrow(),
+                self.bottom_view.borrow(),
+            );
+            let (Some(window), Some(top), Some(page), Some(bottom)) =
+                (window, top.as_ref(), page.as_ref(), bottom.as_ref())
+            else {
                 return;
             };
-            let mut view = View::from(browser_view);
-            window.add_child_view(Some(&mut view));
+
+            // A vertical stack: tab strip, page, status line. `horizontal: 0` is the vertical
+            // orientation, and STRETCH on the cross axis is what makes each strip span the full
+            // width — the default, START, would leave them at their preferred width instead.
+            let settings = BoxLayoutSettings {
+                horizontal: 0,
+                cross_axis_alignment: AxisAlignment::STRETCH,
+                ..Default::default()
+            };
+            let layout = window.set_to_box_layout(Some(&settings));
+
+            let mut top = View::from(top);
+            let mut page = View::from(page);
+            let mut bottom = View::from(bottom);
+            window.add_child_view(Some(&mut top));
+            window.add_child_view(Some(&mut page));
+            window.add_child_view(Some(&mut bottom));
+
+            // Flex 1 on the page alone: the two strips keep the height their delegates ask for and
+            // everything left over is the page's, at any window size.
+            if let Some(layout) = layout {
+                layout.set_flex_for_view(Some(&mut page), 1);
+            }
 
             // Nothing else ever gets handed the window; keep it where views can be added later.
             self.state
@@ -57,11 +86,17 @@ wrap_window_delegate! {
                 .set_window(window.clone());
 
             window.show();
+
+            // The first child added would otherwise hold focus, and that is the tab strip — keys
+            // would go to a chrome page instead of to the web page.
+            page.request_focus();
         }
 
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
-            // Drop the view here, or the window outlives the browser it holds.
-            *self.browser_view.borrow_mut() = None;
+            // Drop the views here, or the window outlives the browsers it holds.
+            *self.top_view.borrow_mut() = None;
+            *self.page_view.borrow_mut() = None;
+            *self.bottom_view.borrow_mut() = None;
         }
 
         // CEF's defaults for these three are 0, and a window that says it cannot be resized
@@ -99,21 +134,33 @@ wrap_window_delegate! {
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
-            // Ask the browser first: it may need to run beforeunload handlers.
-            let browser_view = self.browser_view.borrow();
-            let Some(browser_view) = browser_view.as_ref() else {
-                return 1;
-            };
-            match browser_view.browser() {
-                Some(browser) => match browser.host() {
-                    Some(host) => host.try_close_browser(),
+            // Ask every browser first: each may need to run beforeunload handlers. try_close_browser
+            // both answers and starts the close, so all three have to be asked — short-circuiting on
+            // the first 0 would leave the others open.
+            let mut closable = 1;
+            for view in [&self.top_view, &self.page_view, &self.bottom_view] {
+                let view = view.borrow();
+                let ready = match view.as_ref().and_then(BrowserView::browser) {
+                    Some(browser) => match browser.host() {
+                        Some(host) => host.try_close_browser(),
+                        None => 1,
+                    },
                     None => 1,
-                },
-                None => 1,
+                };
+                closable &= ready;
             }
+            closable
         }
     }
 }
+
+// Every BrowserView bru puts in the window is Alloy style, and it has to be. From the CEF header
+// documentation of cef_runtime_style_t: "a Chrome style Window can host at most one Chrome style
+// BrowserView but potentially multiple Alloy style BrowserViews." Chrome style is the default, so
+// the first attempt at the three-view layout drew only the tab strip — the page and the status line
+// were created, added and never painted. Alloy is what bru wants anyway: the content layer with
+// none of Chrome's own UI, which DESIGN.md rules out.
+const VIEW_STYLE: RuntimeStyle = RuntimeStyle::ALLOY;
 
 wrap_browser_view_delegate! {
     // The empty-struct shorthand the other wrap_ macros accept is not a rule this one has; it needs
@@ -122,5 +169,47 @@ wrap_browser_view_delegate! {
 
     impl ViewDelegate {}
 
-    impl BrowserViewDelegate {}
+    impl BrowserViewDelegate {
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            VIEW_STYLE
+        }
+    }
+}
+
+// A chrome strip: a browser view that asks for a fixed height and tells the state which browser
+// ended up behind it. `on_browser_created` is the reliable place for that — it hands over the
+// browser the moment CEF makes it, where matching on a frame URL would race the first load.
+wrap_browser_view_delegate! {
+    pub struct BruChromeViewDelegate {
+        state: Arc<Mutex<BruState>>,
+        height: i32,
+    }
+
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            // Width is ignored: the box layout stretches the strip across the window. Only the
+            // height is a real request.
+            Size { width: 1280, height: self.height }
+        }
+    }
+
+    impl BrowserViewDelegate {
+        fn on_browser_created(
+            &self,
+            _browser_view: Option<&mut BrowserView>,
+            browser: Option<&mut Browser>,
+        ) {
+            let Some(browser) = browser else {
+                return;
+            };
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .note_chrome_browser(browser.identifier());
+        }
+
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            VIEW_STYLE
+        }
+    }
 }
