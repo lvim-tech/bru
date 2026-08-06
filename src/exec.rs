@@ -272,6 +272,16 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // stay because the match has no `_`, and they document where the two actually go.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => {}
 
+// --- src/completers.rs ---------------------------------------------------------------------
+        // The completion's own three, and they need no browser: the table is built from the
+        // command line and from `src/data.rs`, and what they change is the command line.
+        Command::CompletionItemFocus { .. }
+        | Command::CompletionItemDel
+        | Command::CompletionItemYank { .. } => {
+            crate::completers::run_command(command);
+        }
+// --- end src/completers.rs -----------------------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -325,6 +335,13 @@ pub fn is_live(command: &Command) -> bool {
 
         // Claimed by `cmdline.rs` before this match ever runs.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
+
+// --- src/completers.rs ---------------------------------------------------------------------
+        Command::CompletionItemFocus { .. } | Command::CompletionItemDel => true,
+        // Bound and reachable, and it says what it would have copied — but there is no clipboard
+        // in bru yet, so claiming it as live would be claiming `<Ctrl-C>` copies something.
+        Command::CompletionItemYank { .. } => false,
+// --- end src/completers.rs -----------------------------------------------------------------
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
@@ -708,9 +725,12 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Then 116,
+        // once the completion could be moved through: the eight `completion-item-focus` bindings
+        // and the two `completion-item-del` ones. `completion-item-yank` is bound and parsed and
+        // stays out of the count — there is no clipboard behind it yet. Raise this when a
+        // milestone raises the number, never to make a failing build pass.
+        assert_eq!(live, 116, "the live-binding count moved");
     }
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
@@ -740,6 +760,31 @@ mod tests {
         // `U` is `undo -w`, and bru has one window: it parses and stays inert deliberately.
         assert!(!is_live(&commands::parse("undo -w").unwrap()));
     }
+
+// --- src/completers.rs ---------------------------------------------------------------------
+    /// The ten command-mode bindings the completion turned on, named one by one — a total is not
+    /// enough to notice that `<Tab>` went live and `<Shift-Tab>` did not.
+    #[test]
+    fn the_bindings_the_completion_turned_on() {
+        for keys in [
+            "<Tab>", "<Shift-Tab>",             // next, prev
+            "<Ctrl-Tab>", "<Ctrl-Shift-Tab>",   // next-category, prev-category
+            "<PgDown>", "<PgUp>",               // next-page, prev-page
+            "<Up>", "<Down>",                   // the same two, --history
+            "<Ctrl-D>", "<Shift-Delete>",       // completion-item-del
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "command" && *k == keys)
+                .unwrap_or_else(|| panic!("no command-mode binding for {keys}"));
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // And the two that are deliberately still inert: there is no clipboard to yank into.
+        assert!(!is_live(&commands::parse("completion-item-yank").unwrap()));
+        assert!(!is_live(&commands::parse("completion-item-yank --sel").unwrap()));
+    }
+// --- end src/completers.rs -----------------------------------------------------------------
 
     #[test]
     fn tab_move_arguments() {

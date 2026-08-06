@@ -855,6 +855,20 @@ fn with<T>(f: impl FnOnce(&mut CmdLine) -> T) -> T {
     f(&mut guard)
 }
 
+// --- src/completers.rs ---------------------------------------------------------------------
+
+/// What the command line holds, for the completion: the text, the cursor **in characters**, and
+/// whether `<Ctrl-P>` is currently walking the history (`cmdhistory.History.is_browsing`).
+///
+/// The completion is derived from all three — which model, which pattern, and whether `<Up>` means
+/// "previous command" or "previous item" — and it is rebuilt on pushes that never went through
+/// `on_text_changed`, so it cannot simply be handed them. Read-only; nothing here changes the line.
+pub fn state_for_completion() -> (String, usize, bool) {
+    with(|cmd| (cmd.text(), cmd.cursor(), cmd.browse.is_some()))
+}
+
+// --- end src/completers.rs -----------------------------------------------------------------
+
 /// The `cmdline` field of the bottom view's state. Called by `ipc::bar_json`.
 ///
 /// `rev` is what stops a push triggered by something else from rewriting a half-typed line: the

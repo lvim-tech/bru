@@ -1,5 +1,11 @@
-//! The completion model: which items `:open <text>` offers, in which order, and which parts of
-//! each one matched.
+//! The completion **models**: which items a half-typed command offers, in which order, and which
+//! parts of each one matched.
+//!
+//! `:open`'s model is here in full, because it is four categories and the rules are intricate; the
+//! list-category machinery it is built out of is [`list_category`], which `src/completers.rs` uses
+//! for the models it adds. Which model answers which command, the selection that moves through it,
+//! and what `<Tab>` writes back into the command line are all that module's — this one has no
+//! state at all.
 //!
 //! No UI and no disk. The chrome renders what [`to_json`] emits; the files under
 //! `~/.local/share/bru/` belong to `src/data.rs`, which hands them over through [`Sources`].
@@ -56,8 +62,15 @@ pub const MAX_ITEMS: usize = 25;
 /// A category as the chrome draws it: a coloured header and its rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Category {
-    /// One of "Search engines", "Quickmarks", "Bookmarks", "History".
+    /// For `:open`: one of "Search engines", "Quickmarks", "Bookmarks", "History".
     pub name: &'static str,
+    /// Column widths in percent, `CompletionModel(column_widths=…)`. qutebrowser sets them per
+    /// *model* and not per category, and so does bru — one QTreeView draws every category through
+    /// the same columns, and `chrome/completion.js` turns these into one `grid-template-columns`
+    /// per row. A category with fewer columns than widths leaves the last track empty rather than
+    /// widening its own, which is what keeps a two-column quickmark aligned with a three-column
+    /// history row underneath it.
+    pub widths: &'static [u8],
     pub items: Vec<Item>,
 }
 
@@ -128,6 +141,14 @@ pub fn install(sources: Box<dyn Sources>) {
     let _ = SOURCES.set(sources);
 }
 
+/// What was installed, for the models in `src/completers.rs` that read the same three lists.
+pub fn sources() -> Option<&'static dyn Sources> {
+    SOURCES.get().map(|sources| sources.as_ref())
+}
+
+/// The column widths `:open`'s model draws through — `urlmodel.py:41`.
+pub const URL_WIDTHS: &[u8] = &[40, 50, 10];
+
 /// The promised entry point: what `:open <text>` should offer.
 ///
 /// Before [`install`] has run there is no data and the answer is nothing — the completion bar is
@@ -151,15 +172,9 @@ pub fn categories_from(text: &str, sources: &dyn Sources) -> Vec<Category> {
 
     let mut out = Vec::with_capacity(4);
 
-    push_list(
-        &mut out,
-        "Search engines",
-        sources.search_engines(),
-        text,
-        &terms,
-    );
-    push_list(&mut out, "Quickmarks", sources.quickmarks(), text, &terms);
-    push_list(&mut out, "Bookmarks", sources.bookmarks(), text, &terms);
+    push_list(&mut out, "Search engines", sources.search_engines(), text);
+    push_list(&mut out, "Quickmarks", sources.quickmarks(), text);
+    push_list(&mut out, "Bookmarks", sources.bookmarks(), text);
 
     let mut items: Vec<Item> = Vec::new();
     sources.history(text, &mut |row| {
@@ -190,6 +205,7 @@ pub fn categories_from(text: &str, sources: &dyn Sources) -> Vec<Category> {
     if !items.is_empty() {
         out.push(Category {
             name: "History",
+            widths: URL_WIDTHS,
             items,
         });
     }
@@ -198,7 +214,11 @@ pub fn categories_from(text: &str, sources: &dyn Sources) -> Vec<Category> {
 }
 
 /// Serialises for the chrome, as STAGE2-CONTRACTS.md spells it:
-/// `{categories:[{name, items:[{cols, match}]}], selected:[cat, item]}`.
+/// `{categories:[{name, widths, items:[{cols, match}]}], selected:[cat, item]}`.
+///
+/// `widths` is the one key added since: the tab model's first column is an index two characters
+/// wide and three equal columns made the bar look broken. The chrome ignores a key it does not
+/// draw, so a renderer that has not learned about it still renders.
 ///
 /// `selected` is `null` when nothing is selected. Selection lives in Rust, never in the chrome.
 pub fn to_json(cats: &[Category], selected: Option<(usize, usize)>) -> String {
@@ -209,7 +229,14 @@ pub fn to_json(cats: &[Category], selected: Option<(usize, usize)>) -> String {
         }
         out.push_str("{\"name\":\"");
         out.push_str(&crate::ipc::json_escape(cat.name));
-        out.push_str("\",\"items\":[");
+        out.push_str("\",\"widths\":[");
+        for (j, width) in cat.widths.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&width.to_string());
+        }
+        out.push_str("],\"items\":[");
         for (j, item) in cat.items.iter().enumerate() {
             if j > 0 {
                 out.push(',');
@@ -243,41 +270,58 @@ pub fn to_json(cats: &[Category], selected: Option<(usize, usize)>) -> String {
     out
 }
 
-/// A list category: search engines, quickmarks, bookmarks.
-fn push_list(
-    out: &mut Vec<Category>,
+/// A list category of two columns: search engines, quickmarks, bookmarks.
+fn push_list(out: &mut Vec<Category>, name: &'static str, rows: Vec<(String, String)>, raw: &str) {
+    let rows = rows.into_iter().map(|(a, b)| vec![a, b]).collect();
+    if let Some(cat) = list_category(name, URL_WIDTHS, rows, raw) {
+        out.push(cat);
+    }
+}
+
+/// `listcategory.ListCategory(name, rows, sort=False)` — the whole of it, for any number of
+/// columns, so that a model in `src/completers.rs` gets the same filtering, the same ordering and
+/// the same highlighting as `:open`'s three list categories without restating a rule.
+///
+/// `raw` is the pattern exactly as typed; the whitespace split happens here, once.
+/// `None` is an empty category, which is never drawn — see the module comment.
+pub fn list_category(
     name: &'static str,
-    rows: Vec<(String, String)>,
+    widths: &'static [u8],
+    rows: Vec<Vec<String>>,
     raw: &str,
-    terms: &[String],
-) {
+) -> Option<Category> {
     // urlmodel.py:63,67,71 — a category with no source at all is not added.
     if rows.is_empty() {
-        return;
+        return None;
     }
+    let terms = split_whitespace(raw);
 
-    let mut kept: Vec<(String, String)> = rows
+    let mut kept: Vec<Vec<String>> = rows
         .into_iter()
-        .filter(|(a, b)| list_matches(&[a.as_str(), b.as_str()], terms))
+        .filter(|cols| {
+            let cols: Vec<&str> = cols.iter().map(String::as_str).collect();
+            list_matches(&cols, &terms)
+        })
         .collect();
 
     // listcategory.py:90-100 with _sort false: a stable partition putting everything whose column 0
     // starts with the whole raw pattern first. startswith is Python's, so it is case-sensitive and
     // it does not split on spaces.
-    kept.sort_by_key(|(a, _)| !a.starts_with(raw));
+    kept.sort_by_key(|cols| !cols[0].starts_with(raw));
 
     let items: Vec<Item> = kept
         .into_iter()
         .take(MAX_ITEMS)
-        .map(|(a, b)| Item {
-            matches: match_ranges(&a, terms),
-            cols: vec![a, b],
+        .map(|cols| Item {
+            matches: match_ranges(&cols[0], &terms),
+            cols,
         })
         .collect();
 
-    if !items.is_empty() {
-        out.push(Category { name, items });
+    if items.is_empty() {
+        return None;
     }
+    Some(Category { name, widths, items })
 }
 
 /// All terms inside one and the same column — `setFilterKeyColumn(-1)` plus a lookahead chain
@@ -761,6 +805,7 @@ mod tests {
             .iter()
             .map(|name| Category {
                 name,
+                widths: URL_WIDTHS,
                 items: items.clone(),
             })
             .collect();
@@ -772,6 +817,7 @@ mod tests {
     fn json_is_the_shape_the_contract_names() {
         let cats = vec![Category {
             name: "History",
+            widths: URL_WIDTHS,
             items: vec![Item {
                 cols: vec!["https://a/\"x\"".into(), "T".into()],
                 matches: vec![(0, 2)],
@@ -779,7 +825,7 @@ mod tests {
         }];
         assert_eq!(
             to_json(&cats, Some((0, 0))),
-            "{\"categories\":[{\"name\":\"History\",\"items\":[{\"cols\":[\"https://a/\\\"x\\\"\",\"T\"],\"match\":[[0,2]]}]}],\"selected\":[0,0]}"
+            "{\"categories\":[{\"name\":\"History\",\"widths\":[40,50,10],\"items\":[{\"cols\":[\"https://a/\\\"x\\\"\",\"T\"],\"match\":[[0,2]]}]}],\"selected\":[0,0]}"
         );
         assert_eq!(to_json(&[], None), "{\"categories\":[],\"selected\":null}");
     }
@@ -794,9 +840,9 @@ mod tests {
             to_json(&run("du"), Some((0, 0))),
             concat!(
                 r#"{"categories":["#,
-                r#"{"name":"Search engines","items":[{"cols":["duckduckgo","https://duckduckgo.com/?q={}"],"match":[[0,2],[4,2]]}]},"#,
-                r#"{"name":"Quickmarks","items":[{"cols":["https://duckduckgo.com/","du"],"match":[[8,2],[12,2]]}]},"#,
-                r#"{"name":"History","items":["#,
+                r#"{"name":"Search engines","widths":[40,50,10],"items":[{"cols":["duckduckgo","https://duckduckgo.com/?q={}"],"match":[[0,2],[4,2]]}]},"#,
+                r#"{"name":"Quickmarks","widths":[40,50,10],"items":[{"cols":["https://duckduckgo.com/","du"],"match":[[8,2],[12,2]]}]},"#,
+                r#"{"name":"History","widths":[40,50,10],"items":["#,
                 r#"{"cols":["https://duckduckgo.com/?q=rust","rust at DuckDuckGo","2026-08-06 13:51"],"match":[[8,2],[12,2]]},"#,
                 r#"{"cols":["https://DUCKling.example/","nothing here","2026-08-01 08:00"],"match":[[8,2]]}"#,
                 r#"]}],"selected":[0,0]}"#,

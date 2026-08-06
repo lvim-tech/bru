@@ -9,6 +9,7 @@ mod bindings;
 mod chrome;
 mod cmdline;
 mod commands;
+mod completers;
 mod completion;
 mod config;
 mod data;
