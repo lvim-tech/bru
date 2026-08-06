@@ -32,6 +32,19 @@
 //! `DownloadItemCallback` of a running download is kept, because it is the only handle
 //! `download-cancel` can act through.
 //!
+//! ## `download --mhtml`, which is not a download at all
+//!
+//! Saving a whole page is the one thing in this module that does not go through
+//! `DownloadHandler`. `CefBrowserHost` really does have no save-a-document call — the whole method
+//! list (bindings 12585-12770) writes a file in four places and no more: `start_download` (12626),
+//! `download_image` (12628), `print` (12637) and `print_to_pdf` (12639). There is no `SaveAs`.
+//!
+//! But three methods on that same object are the DevTools protocol —
+//! `send_dev_tools_message` (12668), `execute_dev_tools_method` (12670) and
+//! `add_dev_tools_message_observer` (12673) — and the protocol has `Page.captureSnapshot`, which
+//! returns the page and its assets as MHTML. So the serialiser was there the whole time; what it
+//! needed was an observer object and an asynchronous result path. See [`start_mhtml`].
+//!
 //! ## Where files go
 //!
 //! `$XDG_DOWNLOAD_DIR`, then the desktop's `user-dirs.dirs`, then `~/Downloads`. See
@@ -805,6 +818,355 @@ pub fn retry(state: &SharedState, browser: &mut Browser, count: Option<u32>) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// `download --mhtml` — a whole page, through the DevTools protocol
+// ------------------------------------------------------------------------------------------------
+
+/// Where the ids of MHTML rows start.
+///
+/// Chromium's own `DownloadItem::id` counts up from 1 within a session, so the top of the `u32`
+/// range is free. Staying there is what stops an `on_download_updated` for a real download from
+/// finding an MHTML row and overwriting its path with an empty one.
+const FIRST_SNAPSHOT_ID: u32 = 0x8000_0000;
+
+/// The DevTools calls bru is waiting for answers to.
+struct Pending {
+    /// The `id` of the protocol message, which is what `on_dev_tools_method_result` carries back.
+    message_id: i32,
+    /// Which row in [`downloads`] this will complete.
+    entry: u32,
+    path: PathBuf,
+}
+
+fn pending() -> &'static Mutex<Vec<Pending>> {
+    static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+    &PENDING
+}
+
+/// One observer registration per browser, kept forever.
+///
+/// **Dropping the `Registration` unregisters the observer**, so this is not bookkeeping for its own
+/// sake: a local that went out of scope at the end of [`start_mhtml`] would leave a call whose
+/// answer nothing is listening for. `Registration` wraps a `RefGuard`, which is
+/// `unsafe impl Send + Sync` (cef/src/rc.rs:283-284), which is what lets it live in a static.
+fn observers() -> &'static Mutex<Vec<(i32, Registration)>> {
+    static OBSERVERS: Mutex<Vec<(i32, Registration)>> = Mutex::new(Vec::new());
+    &OBSERVERS
+}
+
+fn next_snapshot_id() -> u32 {
+    static NEXT: Mutex<u32> = Mutex::new(FIRST_SNAPSHOT_ID);
+    let mut next = NEXT.lock().expect("snapshot id mutex poisoned");
+    let id = *next;
+    *next = id.saturating_add(1);
+    id
+}
+
+/// The protocol's `id`. The header allows 0 for "assign the next one yourself", and this does not
+/// use it: the assigned number comes back as the return value, i.e. *after* the call, and a result
+/// that arrived before it was recorded would have nothing to match against. Numbering here means
+/// the row is registered before the call is made.
+fn next_message_id() -> i32 {
+    static NEXT: Mutex<i32> = Mutex::new(1);
+    let mut next = NEXT.lock().expect("devtools message id mutex poisoned");
+    let id = *next;
+    *next = id.saturating_add(1);
+    id
+}
+
+// Reached from `start_mhtml`, once per browser. (The wrap_ macros take no doc comment on the struct
+// they declare — CEF-NOTES trap 8.)
+wrap_dev_tools_message_observer! {
+    pub struct SnapshotObserver;
+
+    impl DevToolsMessageObserver {
+        /// `on_dev_tools_message` is deliberately **not** overridden: its default returns 0, which
+        /// is "not handled, pass it on", and passing it on is what reaches this. Returning 1 there
+        /// would silence every result in the process.
+        ///
+        /// `result` is the `"result"` dictionary alone when `success` is 1, and the `"error"`
+        /// dictionary when it is 0 — not the whole protocol message either way
+        /// (`cef_devtools_message_observer_capi.h:95-106`).
+        fn on_dev_tools_method_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_id: ::std::os::raw::c_int,
+            success: ::std::os::raw::c_int,
+            result: Option<&[u8]>,
+        ) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+            // Every DevTools result in the process arrives here, including any bru has not sent —
+            // `:devtools` opens a front-end with a session of its own. An id that is not in the
+            // pending list is not ours and must be left alone.
+            let Some(waiting) = take_pending(message_id) else {
+                return;
+            };
+
+            let json = result.map(String::from_utf8_lossy).unwrap_or_default();
+            debug(&format!(
+                "devtools result #{message_id} success={success} {} bytes",
+                json.len()
+            ));
+
+            match finish_snapshot(success != 0, &json, &waiting.path) {
+                Ok(written) => {
+                    complete(waiting.entry, written as i64);
+                    crate::message::info(&format!("Saved {}", waiting.path.display()));
+                }
+                Err(e) => {
+                    fail(waiting.entry);
+                    crate::message::error(&format!("download --mhtml: {e}"));
+                    eprintln!("bru: download --mhtml: {e}");
+                }
+            }
+            crate::ipc::set_download(summary());
+            debug(&format!("mhtml #{message_id} -> {}", report_line()));
+        }
+    }
+}
+
+fn take_pending(message_id: i32) -> Option<Pending> {
+    let mut list = pending().lock().expect("pending mutex poisoned");
+    let at = list.iter().position(|p| p.message_id == message_id)?;
+    Some(list.remove(at))
+}
+
+/// `download --mhtml` / `:download -m`.
+///
+/// qutebrowser's is `commands.py:1396-1406`, and the shape is copied rather than invented: the page
+/// that is showing, a filename made from its title, and a row in the same download list every other
+/// download lands in. qutebrowser reaches it through `tab.action.save_page()`, which makes
+/// QtWebEngine start a real download that its `DownloadManager` then sees; CEF has no such action,
+/// so bru asks the protocol for the bytes and writes them itself. The user-visible result is the
+/// same three things: a filename, a destination, and a line in the download section of the bar.
+pub fn start_mhtml(browser: &mut Browser) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let url = crate::ipc::current_url();
+    if url.is_empty() {
+        crate::message::error("download --mhtml: no page to save");
+        return;
+    }
+
+    let dir = download_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::message::error(&format!("download --mhtml: could not create {}: {e}", dir.display()));
+        return;
+    }
+    let name = mhtml_filename(&crate::ipc::current_title(), &url);
+    let path = dir.join(unique_name(&dir, &name));
+
+    // Once per browser. A second registration would answer the same result twice, and the second
+    // answer would find the pending list already empty and do nothing — but the row would still
+    // have been written twice, so this is not merely tidy.
+    let identifier = browser.identifier();
+    {
+        let mut list = observers().lock().expect("observers mutex poisoned");
+        if !list.iter().any(|(id, _)| *id == identifier) {
+            let mut observer = SnapshotObserver::new();
+            match host.add_dev_tools_message_observer(Some(&mut observer)) {
+                Some(registration) => list.push((identifier, registration)),
+                None => {
+                    drop(list);
+                    crate::message::error("download --mhtml: CEF refused the DevTools observer");
+                    return;
+                }
+            }
+        }
+    }
+
+    let entry = next_snapshot_id();
+    let message_id = next_message_id();
+    pending()
+        .lock()
+        .expect("pending mutex poisoned")
+        .push(Pending { message_id, entry, path: path.clone() });
+    downloads().lock().expect("downloads mutex poisoned").push(Entry {
+        id: entry,
+        url,
+        path: path.clone(),
+        received: 0,
+        // Unknown until the snapshot arrives, which is what `-1` means everywhere else here. It is
+        // why the bar shows a byte count for this and a percentage for a real download: nobody can
+        // say how long a serialised page will be until it is serialised.
+        total: -1,
+        state: State::InProgress,
+        cancel: None,
+    });
+    crate::ipc::set_download(summary());
+
+    // `format` defaults to `mhtml` in the protocol; saying so is a line, and a default that changed
+    // under bru would otherwise write an MHTML file that was not one.
+    let mut params = dictionary_value_create();
+    if let Some(params) = params.as_mut() {
+        params.set_string(
+            Some(&CefString::from("format")),
+            Some(&CefString::from("mhtml")),
+        );
+    }
+    debug(&format!("Page.captureSnapshot #{message_id} -> {}", path.display()));
+    let assigned = host.execute_dev_tools_method(
+        message_id,
+        Some(&CefString::from("Page.captureSnapshot")),
+        params.as_mut(),
+    );
+    // 0 is "not on the UI thread, or the message failed validation" — the only two ways this can be
+    // refused before an answer exists. Nothing will ever call back, so the row is failed now rather
+    // than left running for the rest of the session.
+    if assigned == 0 {
+        take_pending(message_id);
+        fail(entry);
+        crate::message::error("download --mhtml: CEF refused the Page.captureSnapshot call");
+        crate::ipc::set_download(summary());
+    }
+}
+
+/// The bookkeeping half of a finished snapshot, split out so a test can run it — anything that
+/// posts a CEF task cannot be called under `cargo test` (CEF-NOTES trap 13), and the two `message::`
+/// calls above do.
+///
+/// Returns how many bytes were written.
+fn finish_snapshot(success: bool, json: &str, path: &Path) -> Result<usize, String> {
+    if !success {
+        // The `"error"` dictionary, which carries `code` and `message`.
+        let reason = json_string_field(json, "message")
+            .unwrap_or_else(|| "the DevTools call failed and said nothing".to_string());
+        return Err(reason);
+    }
+    let Some(data) = json_string_field(json, "data") else {
+        return Err("Page.captureSnapshot answered without any data".to_string());
+    };
+    if data.is_empty() {
+        return Err("Page.captureSnapshot answered with an empty page".to_string());
+    }
+    std::fs::write(path, data.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(data.len())
+}
+
+fn complete(id: u32, bytes: i64) {
+    let mut list = downloads().lock().expect("downloads mutex poisoned");
+    if let Some(entry) = list.iter_mut().find(|entry| entry.id == id) {
+        entry.received = bytes;
+        entry.total = bytes;
+        entry.state = State::Complete;
+    }
+}
+
+fn fail(id: u32) {
+    let mut list = downloads().lock().expect("downloads mutex poisoned");
+    if let Some(entry) = list.iter_mut().find(|entry| entry.id == id) {
+        entry.state = State::Interrupted;
+    }
+}
+
+/// `page title.mhtml`, which is `mhtml.py:495-497`'s default name.
+///
+/// A page with no title falls back to the URL's last segment with its extension replaced, because a
+/// saved `report.html` wants to be `report.mhtml` and not `report.html.mhtml`. [`sanitize`] does the
+/// rest, and it is applied to the stem alone so that a 300-character title cannot truncate the
+/// extension off the end.
+fn mhtml_filename(title: &str, url: &str) -> String {
+    let stem = if title.trim().is_empty() {
+        let base = url_basename(url);
+        match base.rsplit_once('.') {
+            Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+            _ => base,
+        }
+    } else {
+        title.trim().to_string()
+    };
+    let stem = sanitize(&stem);
+    let stem = if stem.is_empty() { "page".to_string() } else { stem };
+    format!("{stem}.mhtml")
+}
+
+/// One string field out of a flat JSON object.
+///
+/// `ipc.rs` has a reader of the same shape for the chrome's `JSON.stringify`, and this is not it:
+/// the value here is a **whole serialised page**, which the header itself warns "may exceed 1MB",
+/// so the unescaping copies in runs rather than a character at a time, and it puts a surrogate pair
+/// back together — `ipc`'s drops each half, which no chrome message has ever contained and an
+/// arbitrary page's title can.
+fn json_string_field(src: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut rest = src;
+    loop {
+        let at = rest.find(&needle)?;
+        rest = &rest[at + needle.len()..];
+        let after = rest.trim_start();
+        let Some(after) = after.strip_prefix(':') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let after = after.strip_prefix('"')?;
+        return Some(json_unescape(after));
+    }
+}
+
+/// Everything up to the closing quote, with the escapes undone.
+fn json_unescape(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        // The next thing that is not an ordinary character. Copying the run before it in one
+        // `push_str` is the whole difference between this and `ipc::json_unescape`: an MHTML
+        // snapshot is megabytes of ordinary characters.
+        let Some(at) = rest.find(['"', '\\']) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        if rest.as_bytes()[at] == b'"' {
+            return out;
+        }
+        let mut chars = rest[at + 1..].chars();
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let hex: String = rest[at + 2..].chars().take(4).collect();
+                let unit = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                let consumed = 2 + hex.len();
+                // A high surrogate is half a character: JSON has no other way to spell an
+                // astral one, and decoding the halves separately loses it entirely.
+                if (0xd800..0xdc00).contains(&unit) {
+                    let tail = &rest[at + consumed..];
+                    if let Some(low_hex) = tail.strip_prefix("\\u") {
+                        let low: String = low_hex.chars().take(4).collect();
+                        let low_unit = u32::from_str_radix(&low, 16).unwrap_or(0);
+                        if (0xdc00..0xe000).contains(&low_unit) {
+                            let combined =
+                                0x1_0000 + ((unit - 0xd800) << 10) + (low_unit - 0xdc00);
+                            if let Some(c) = char::from_u32(combined) {
+                                out.push(c);
+                            }
+                            rest = &rest[at + consumed + 2 + low.len()..];
+                            continue;
+                        }
+                    }
+                }
+                if let Some(c) = char::from_u32(unit) {
+                    out.push(c);
+                }
+                rest = &rest[at + consumed..];
+                continue;
+            }
+            // `\"`, `\\`, `\/` and anything else stand for themselves.
+            Some(other) => out.push(other),
+            None => return out,
+        }
+        rest = &rest[at + 1 + rest[at + 1..].chars().next().map(char::len_utf8).unwrap_or(0)..];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +1272,88 @@ mod tests {
         assert!(State::Complete.done());
         assert!(State::Cancelled.done());
         assert!(State::Interrupted.done());
+    }
+
+    // -- download --mhtml ------------------------------------------------------------------------
+
+    #[test]
+    fn an_mhtml_file_is_named_after_the_page_title() {
+        // mhtml.py:495-497 — `utils.sanitize_filename(title + '.mhtml', shorten=True)`.
+        assert_eq!(mhtml_filename("bru safe page", "https://e.com/x"), "bru safe page.mhtml");
+        // A `/` in a title comes from the page and must not become a directory.
+        assert_eq!(mhtml_filename("a/b", "https://e.com/x"), "a_b.mhtml");
+        // No title: the URL's last segment, with its extension replaced rather than kept, so a
+        // saved `report.html` is `report.mhtml` and not `report.html.mhtml`.
+        assert_eq!(mhtml_filename("", "https://e.com/a/report.html"), "report.mhtml");
+        assert_eq!(mhtml_filename("  ", "https://e.com/a/notes"), "notes.mhtml");
+        // Nothing usable anywhere still has to produce a name.
+        assert_eq!(mhtml_filename("", "https://e.com/"), "page.mhtml");
+        // A title long enough to be truncated keeps its extension — the truncation is applied to
+        // the stem, so `.mhtml` cannot be the part that is cut off.
+        let long = mhtml_filename(&"x".repeat(400), "https://e.com/");
+        assert!(long.ends_with(".mhtml"), "{long}");
+        assert!(long.len() <= 206, "{}", long.len());
+    }
+
+    #[test]
+    fn the_snapshot_is_taken_out_of_the_result_and_written_verbatim() {
+        let dir = std::env::temp_dir().join(format!("bru-mhtml-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("page.mhtml");
+
+        // The shape `Page.captureSnapshot` answers with: one `data` key holding the whole file,
+        // and CRLF line endings, which MHTML has and which arrive as `\r\n` escapes.
+        let json = r#"{"data":"From: <Saved by bru>\r\nSubject: t\r\n\r\n<b>hi<\/b>\r\n"}"#;
+        let written = finish_snapshot(true, json, &path).expect("writes");
+        let back = std::fs::read_to_string(&path).expect("reads back");
+        assert_eq!(back, "From: <Saved by bru>\r\nSubject: t\r\n\r\n<b>hi</b>\r\n");
+        assert_eq!(written, back.len());
+
+        // A failed call carries the `"error"` dictionary instead, and its message is the reason.
+        let error = finish_snapshot(false, r#"{"code":-32601,"message":"nope"}"#, &path)
+            .expect_err("fails");
+        assert_eq!(error, "nope");
+        // A success with nothing in it is a failure, not an empty file.
+        assert!(finish_snapshot(true, r#"{"x":1}"#, &path).is_err());
+        assert!(finish_snapshot(true, r#"{"data":""}"#, &path).is_err());
+
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn the_json_reader_survives_what_a_page_can_put_in_a_string() {
+        // `\/` is legal JSON and is what an MHTML body full of `</div>` arrives as.
+        assert_eq!(json_string_field(r#"{"data":"a\/b"}"#, "data").as_deref(), Some("a/b"));
+        assert_eq!(json_string_field(r#"{"data":"a\"b"}"#, "data").as_deref(), Some("a\"b"));
+        assert_eq!(json_string_field(r#"{"data":"a\\b"}"#, "data").as_deref(), Some("a\\b"));
+        // A surrogate pair is one character. `ipc::json_unescape` drops both halves here, which is
+        // harmless for the chrome's own messages and not for an arbitrary page's title.
+        assert_eq!(
+            json_string_field(r#"{"data":"e😀f"}"#, "data").as_deref(),
+            Some("e\u{1f600}f")
+        );
+        // A BMP escape is still one character.
+        assert_eq!(json_string_field(r#"{"data":"é"}"#, "data").as_deref(), Some("é"));
+        // A key that only looks like the one asked for is skipped, not answered.
+        assert_eq!(
+            json_string_field(r#"{"metadata":"no","data":"yes"}"#, "data").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(json_string_field(r#"{"other":"x"}"#, "data"), None);
+        // The string ends at its own closing quote and takes none of the object with it.
+        assert_eq!(
+            json_string_field(r#"{"data":"one","more":"two"}"#, "data").as_deref(),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn an_mhtml_row_can_never_collide_with_a_download_chromium_numbered() {
+        // Chromium's own `DownloadItem::id` counts from 1 in a session; these start at 2^31, and
+        // the two lists are the same list.
+        let first = next_snapshot_id();
+        let second = next_snapshot_id();
+        assert!(first >= FIRST_SNAPSHOT_ID);
+        assert_eq!(second, first + 1);
     }
 }

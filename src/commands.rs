@@ -139,6 +139,8 @@ pub enum Command {
 // --- src/downloads.rs --------------------------------------------------------------------------
     /// `download [url]` — `gd`. No URL means the page that is showing.
     Download { url: Option<String> },
+    /// `download --mhtml` — the whole showing page and its assets, as one MHTML file.
+    DownloadMhtml,
     /// `download-cancel [--all]` — `ad`. A count picks which one; none means the last.
     DownloadCancel { all: bool },
     /// `download-clear` — `cd`. Forgets the finished ones; touches no file.
@@ -1008,18 +1010,24 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "hint-follow" => Command::HintFollow,
 
 // --- src/downloads.rs --------------------------------------------------------------------------
-        // maxsplit=0, as `open` is: a URL is whatever follows the flags, verbatim. `--mhtml` and
-        // `--dest` stay unimplemented rather than becoming a near miss — one needs a page
-        // serialiser and the other needs the prompt bru does not have, and a `:download --dest x`
-        // that quietly saved somewhere else would be worse than one that does nothing.
+        // maxsplit=0, as `open` is: a URL is whatever follows the flags, verbatim. `--dest` stays
+        // unimplemented — it needs the prompt bru does not have, and a `:download --dest x` that
+        // quietly saved somewhere else would be worse than one that does nothing. `--mhtml` no
+        // longer does: `downloads::start_mhtml` serialises the page through the DevTools protocol.
         "download" => {
             let args = Args::maxsplit0(&tokens[1..]);
-            if args.any(&["m", "mhtml"]) || args.any(&["dest"]) {
+            let url = args.arg(0).filter(|u| !u.is_empty()).map(str::to_string);
+            if args.any(&["dest"]) {
                 Command::Unimplemented(s.trim().to_string())
-            } else {
-                Command::Download {
-                    url: args.arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+            } else if args.any(&["m", "mhtml"]) {
+                // commands.py:1390-1392 raises this rather than saving the wrong thing: there is
+                // nothing to serialise about a URL that is not open.
+                if url.is_some() {
+                    return Err(bad("can only download the current page as mhtml"));
                 }
+                Command::DownloadMhtml
+            } else {
+                Command::Download { url }
             }
         }
         "download-cancel" => Command::DownloadCancel { all: args.any(&["a", "all"]) },

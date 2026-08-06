@@ -437,6 +437,9 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // through rather than turned into a repeat: `2ad` cancels download 2, it does not cancel
         // twice.
         Command::Download { url } => crate::downloads::start(state, browser, url.as_deref()),
+        // Not a download: `Page.captureSnapshot` over the DevTools protocol, written by bru. It
+        // still lands in the same list and the same bar section — see the head of downloads.rs.
+        Command::DownloadMhtml => crate::downloads::start_mhtml(browser),
         Command::DownloadCancel { all } => crate::downloads::cancel(count, *all),
         Command::DownloadClear => crate::downloads::clear(),
         Command::DownloadOpen { cmdline, dir } => {
@@ -736,9 +739,11 @@ pub fn is_live(command: &Command) -> bool {
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
 
 // --- src/downloads.rs --------------------------------------------------------------------------
-        // All six act. `gd`, `ad` and `cd` are the three default bindings this turns on; the other
-        // three are `:` commands qutebrowser binds to nothing either.
+        // All seven act. `gd`, `ad` and `cd` are the three default bindings this turns on; the
+        // other four are `:` commands qutebrowser binds to nothing either — `download --mhtml`
+        // included, which is why making it live raises no binding count.
         Command::Download { .. }
+        | Command::DownloadMhtml
         | Command::DownloadCancel { .. }
         | Command::DownloadClear
         | Command::DownloadOpen { .. }
@@ -1581,8 +1586,15 @@ mod tests {
             is_live(&commands::parse("hint links download").unwrap()),
             "`;d` is live once `hints::install_downloads` has been called with downloads.rs"
         );
-        // The two spellings that need a prompt or a page serialiser bru has not got.
-        assert!(!is_live(&commands::parse("download --mhtml").unwrap()));
+        // `--mhtml` is live now: `CefBrowserHost` has no save-a-document call, but it has the
+        // DevTools protocol, and `Page.captureSnapshot` is one. It is bound to nothing in
+        // qutebrowser, so this raises the count by zero.
+        assert!(is_live(&commands::parse("download --mhtml").unwrap()));
+        assert_eq!(commands::parse("download -m").unwrap(), Command::DownloadMhtml);
+        // qutebrowser's own refusal, commands.py:1390 — there is nothing to serialise about a URL
+        // that is not open, so this is an error rather than a download of the wrong thing.
+        assert!(commands::parse("download --mhtml https://e.com/x").is_err());
+        // `--dest` still needs the prompt bru has not got.
         assert!(!is_live(&commands::parse("download --dest /tmp/x").unwrap()));
     }
 
