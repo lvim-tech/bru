@@ -28,6 +28,7 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
+mod macros;
 mod message;
 mod modes;
 mod navigate;

@@ -136,6 +136,14 @@ wrap_keyboard_handler! {
             crate::ipc::set_keystring(outcome.keystring.clone());
 
             if let crate::bindings::KeyAction::Run { command, count } = outcome.action {
+                // --- src/macros.rs ----------------------------------------------------------
+                // A macro records the command a binding resolved to and the count that reached it,
+                // never the keys — `runners.py:187`. Before the dispatch, not after: the mode this
+                // key was pressed in is what decides, and `mode-enter caret` would otherwise look
+                // like a caret-mode command. With no recording in progress this is one relaxed
+                // atomic load, which is the whole of what `j` pays for macros existing.
+                crate::macros::record(&self.state, &command, count);
+                // --- end src/macros.rs ------------------------------------------------------
                 crate::exec::run(&self.state, target, &command, count);
             }
 

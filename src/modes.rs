@@ -1,10 +1,10 @@
 //! Keyboard modes and the transitions between them.
 //!
 //! A behavioural port of qutebrowser 3.7.0's `keyinput/modeman.py`. Stage 1's four modes, stage 2's
-//! `hint` and stage 3's `caret`, `set_mark` and `jump_mark` are here — `prompt`, `yesno`,
-//! `record_macro` and `run_macro` are still to come — but the transition rules are the real ones, so
-//! adding a mode is a variant and a row in each `match` rather than a rewrite. `hint` was exactly
-//! that, and so were the three below it.
+//! `hint` and stage 3's `caret`, `set_mark`, `jump_mark`, `record_macro` and `run_macro` are here —
+//! `prompt` and `yesno` are still to come — but the transition rules are the real ones, so adding a
+//! mode is a variant and a row in each `match` rather than a rewrite. `hint` was exactly that, and
+//! so were the four below it.
 //!
 //! Nothing in this file touches CEF or Lua. It is a state machine over an enum.
 
@@ -36,11 +36,17 @@ pub enum Mode {
     SetMark,
     /// The next keystroke names a mark to jump to. Entered by `'`.
     JumpMark,
+    /// The next keystroke names the register a macro is recorded into. Entered by `q` with no
+    /// argument. `src/macros.rs` owns everything it does.
+    RecordMacro,
+    /// The next keystroke names the register a macro is replayed from. Entered by `@` with no
+    /// argument. `src/macros.rs` owns everything it does.
+    RunMacro,
 }
 
 impl Mode {
     /// Every mode bru implements, in a stable order. Used to build one key parser per mode.
-    pub const ALL: [Mode; 8] = [
+    pub const ALL: [Mode; 10] = [
         Mode::Normal,
         Mode::Insert,
         Mode::Command,
@@ -49,13 +55,15 @@ impl Mode {
         Mode::Caret,
         Mode::SetMark,
         Mode::JumpMark,
+        Mode::RecordMacro,
+        Mode::RunMacro,
     ];
 
     /// The name used in `configdata.yml` and in `config.lua`.
     ///
-    /// `set_mark` and `jump_mark` are spelled with an underscore because that is how
-    /// `usertypes.KeyMode` spells them and therefore how `mode-enter set_mark` — a real qutebrowser
-    /// default binding, configdata.yml:3838 — has to be written.
+    /// `set_mark`, `jump_mark`, `record_macro` and `run_macro` are spelled with an underscore
+    /// because that is how `usertypes.KeyMode` spells them and therefore how `mode-enter set_mark` —
+    /// a real qutebrowser default binding, configdata.yml:3838 — has to be written.
     pub fn name(self) -> &'static str {
         match self {
             Mode::Normal => "normal",
@@ -66,14 +74,18 @@ impl Mode {
             Mode::Caret => "caret",
             Mode::SetMark => "set_mark",
             Mode::JumpMark => "jump_mark",
+            Mode::RecordMacro => "record_macro",
+            Mode::RunMacro => "run_macro",
         }
     }
 
     /// Parse a mode name as written in `config.lua` or in a `mode-enter` command.
     ///
     /// Returns `None` for names qutebrowser knows but bru does not implement yet (`prompt`,
-    /// `yesno`, `register`, `record_macro`, `run_macro`) as well as for nonsense, so the caller
-    /// warns once at startup either way.
+    /// `yesno`, `register`) as well as for nonsense, so the caller warns once at startup either
+    /// way. `register` stays `None` on purpose even now that all four modes built on
+    /// `RegisterKeyParser` exist: it is the name of the *bindings section* those modes read
+    /// (configdata.yml:3991), not a mode `mode-enter` can be given.
     pub fn from_name(name: &str) -> Option<Mode> {
         match name {
             "normal" => Some(Mode::Normal),
@@ -84,6 +96,8 @@ impl Mode {
             "caret" => Some(Mode::Caret),
             "set_mark" => Some(Mode::SetMark),
             "jump_mark" => Some(Mode::JumpMark),
+            "record_macro" => Some(Mode::RecordMacro),
+            "run_macro" => Some(Mode::RunMacro),
             _ => None,
         }
     }
@@ -95,7 +109,10 @@ impl Mode {
     /// `register:` section, i.e. `<Escape>: mode-leave` alone — and then takes the next ordinary key
     /// as the register's name. `src/caret.rs::handle_mark_key` is that second half.
     pub fn names_a_register(self) -> bool {
-        matches!(self, Mode::SetMark | Mode::JumpMark)
+        matches!(
+            self,
+            Mode::SetMark | Mode::JumpMark | Mode::RecordMacro | Mode::RunMacro
+        )
     }
 
     /// Whether unbound keys reach the page.
@@ -109,19 +126,29 @@ impl Mode {
     /// for the same reason: while `` ` `` is waiting for a mark name, no key belongs to the page.
     pub fn passthrough(self) -> bool {
         match self {
-            Mode::Normal | Mode::Hint | Mode::SetMark | Mode::JumpMark => false,
+            Mode::Normal
+            | Mode::Hint
+            | Mode::SetMark
+            | Mode::JumpMark
+            | Mode::RecordMacro
+            | Mode::RunMacro => false,
             Mode::Insert | Mode::Command | Mode::Passthrough | Mode::Caret => true,
         }
     }
 
     /// Whether a digit prefix is read as a count.
     ///
-    /// `modeman.init` passes `supports_count=False` to the insert, command, passthrough, set_mark
-    /// and jump_mark parsers, so `3` in insert mode is the character `3` and nothing else, and `` `3 ``
+    /// `modeman.init` passes `supports_count=False` to the insert, command, passthrough and every
+    /// register parser, so `3` in insert mode is the character `3` and nothing else, and `` `3 ``
     /// names the mark `3`. In hint mode a digit is a hint label under `hints.mode = number`, never a
     /// count. **Caret mode does count**: its parser is a plain `CommandKeyParser` (modeman.py:145)
     /// and `CommandKeyParser.__init__` defaults `supports_count=True`, which is what makes `3j`
     /// three lines and `3w` three words.
+    ///
+    /// `3@q` still runs the macro three times, and that is not a contradiction: the `3` is read in
+    /// *normal* mode, by `@`'s own parser, and `macro-run` stashes it before `run_macro` mode opens
+    /// (`macros.py:79`, `self._macro_count[win_id] = count`). By the time the register key is
+    /// pressed the count is already spent.
     pub fn supports_count(self) -> bool {
         match self {
             Mode::Normal | Mode::Caret => true,
@@ -130,7 +157,9 @@ impl Mode {
             | Mode::Passthrough
             | Mode::Hint
             | Mode::SetMark
-            | Mode::JumpMark => false,
+            | Mode::JumpMark
+            | Mode::RecordMacro
+            | Mode::RunMacro => false,
         }
     }
 
@@ -314,16 +343,20 @@ mod tests {
         // `mode-enter set_mark` is a qutebrowser default binding and has to parse verbatim.
         assert_eq!(Mode::from_name("set_mark"), Some(Mode::SetMark));
         assert_eq!(Mode::from_name("jump_mark"), Some(Mode::JumpMark));
+        assert_eq!(Mode::from_name("record_macro"), Some(Mode::RecordMacro));
+        assert_eq!(Mode::from_name("run_macro"), Some(Mode::RunMacro));
         assert_eq!(Mode::from_name("set-mark"), None);
+        assert_eq!(Mode::from_name("record-macro"), None);
         // Modes qutebrowser has and bru does not, yet.
         assert_eq!(Mode::from_name("prompt"), None);
         assert_eq!(Mode::from_name("yesno"), None);
-        assert_eq!(Mode::from_name("record_macro"), None);
+        // Not a mode at all: `register` names the bindings section the four register modes read.
+        assert_eq!(Mode::from_name("register"), None);
         assert_eq!(Mode::from_name("nonsense"), None);
     }
 
     #[test]
-    fn caret_counts_and_forwards_but_the_mark_modes_do_neither() {
+    fn caret_counts_and_forwards_but_the_register_modes_do_neither() {
         // modeman.py:145 builds caret's parser as a plain CommandKeyParser with passthrough=True and
         // the default supports_count=True. Both matter: `3j` is three lines, and a key caret mode
         // does not bind reaches the page rather than being eaten.
@@ -333,8 +366,9 @@ mod tests {
 
         // RegisterKeyParser (modeparsers.py:245) passes supports_count=False and leaves passthrough
         // at BaseKeyParser's default of False. While `` ` `` waits for a mark name, `3` is the mark
-        // named 3 and nothing reaches the page.
-        for mode in [Mode::SetMark, Mode::JumpMark] {
+        // named 3 and nothing reaches the page. All four modes built on it answer the same, which
+        // is the whole reason `q` and `@` were two arms in an existing match and not a new parser.
+        for mode in [Mode::SetMark, Mode::JumpMark, Mode::RecordMacro, Mode::RunMacro] {
             assert!(!mode.supports_count(), "{mode} must not read counts");
             assert!(!mode.passthrough(), "{mode} must not forward to the page");
             assert!(mode.names_a_register(), "{mode} takes the next key as a register name");

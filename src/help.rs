@@ -99,11 +99,12 @@ mod tests {
     #[test]
     fn the_page_says_which_keys_work() {
         let html = page(&bindings());
-        // `j` scrolls today, and so does `yy` since src/clip.rs; `q` is bound and waiting for
-        // macros.
+        // `j` scrolls today, and so does `yy` since src/clip.rs; `q` records a macro since
+        // src/macros.rs, and `.` is what is bound and waiting now.
         assert!(html.contains(r#"<tr class="live"><td class="keys">j</td><td class="cmd">scroll down</td>"#));
         assert!(html.contains(r#"<tr class="live"><td class="keys">yy</td><td class="cmd">yank</td>"#));
-        assert!(html.contains(r#"<td class="cmd">macro-record</td><td class="state">not yet</td>"#));
+        assert!(html.contains(r#"<tr class="live"><td class="keys">q</td><td class="cmd">macro-record</td>"#));
+        assert!(html.contains(r#"<td class="cmd">cmd-repeat-last</td><td class="state">not yet</td>"#));
     }
 
     /// A `config.lua` that rebinds a key must change the page, or it is documentation of something

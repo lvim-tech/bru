@@ -397,6 +397,22 @@ wrap_browser_process_handler! {
                 crate::caret::schedule_caret_script(&script, step_ms);
             }
             // --- end src/caret.rs ---------------------------------------------------------------
+
+            // --- src/macros.rs (merge: this block belongs to the macros workstream) -------------
+            // Debug hook, off unless asked for. See macros::schedule_macro_script.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("macro-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("macro-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(900);
+                crate::macros::schedule_macro_script(&script, step_ms);
+            }
+            // --- end src/macros.rs --------------------------------------------------------------
         }
 
         fn default_client(&self) -> Option<Client> {
