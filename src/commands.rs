@@ -77,6 +77,15 @@ pub enum Command {
     /// `close` — this window, not the application.
     Close,
 
+    /// `hint [group] [target]` — draw labels over the page and follow the one that is typed.
+    ///
+    /// `f` is a bare `hint`, `F` is `hint all tab`. The group and the targets bru does not
+    /// implement yet parse into [`Command::Unimplemented`] rather than into a variant that would
+    /// silently do the wrong thing.
+    Hint { target: HintTarget },
+    /// `hint-follow` — the `<Return>` binding in hint mode.
+    HintFollow,
+
     /// `cmd-set-text [-s] [-a] [-r] <text>` — the machinery behind `o`, `O`, `go`, `b`, `T`, …
     CmdSetText { text: String, space: bool, append: bool, run_on_count: bool },
     /// `command-accept [--rapid]`
@@ -98,6 +107,19 @@ pub enum ScrollDirection {
     Bottom,
     PageUp,
     PageDown,
+}
+
+/// The `hint` targets M12 implements. `hints.Target` has sixteen; the rest — yank, download,
+/// userscript, fill, hover, … — arrive with the commands they depend on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HintTarget {
+    /// `hint` (no target): click the element where it is.
+    Normal,
+    /// `hint all tab` / `hint all tab-bg`: open the element's URL in a background tab.
+    ///
+    /// `tab` and `tab-bg` differ by `tabs.background`, which bru has no setting for yet; both open
+    /// in the background, which is `tabs.background = true` and is what `F` does here today.
+    TabBg,
 }
 
 /// The argument of `tab-focus`.
@@ -424,6 +446,29 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "quit" => Command::Quit { save: args.has("save") },
         "close" => Command::Close,
 
+        // `hint [group] [target] [args…]`, with qutebrowser's own defaults of group=all,
+        // target=normal — so a bare `hint`, which is what `f` is bound to, is the click case.
+        //
+        // Only the `all` group is accepted. `links`, `images`, `inputs` and the rest name different
+        // `hints.selectors` entries, and answering them with the `all` selector would hint the wrong
+        // elements quietly; unimplemented says so instead.
+        "hint" => {
+            let group = args.arg(0).unwrap_or("all");
+            let target = args.arg(1).unwrap_or("normal");
+            let has_args = args.arg(2).is_some();
+            let flags = args.any(&["rapid", "first", "mode", "add-history"]);
+            match (group, target, has_args || flags) {
+                ("all", "normal" | "current", false) => {
+                    Command::Hint { target: HintTarget::Normal }
+                }
+                ("all", "tab" | "tab-fg" | "tab-bg", false) => {
+                    Command::Hint { target: HintTarget::TabBg }
+                }
+                _ => Command::Unimplemented(s.trim().to_string()),
+            }
+        }
+        "hint-follow" => Command::HintFollow,
+
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.
         "cmd-set-text" => {
@@ -610,9 +655,40 @@ mod tests {
 
     #[test]
     fn unknown_commands_are_kept_verbatim_not_rejected() {
-        let cmd = parse("hint all tab-bg").unwrap();
-        assert_eq!(cmd, Command::Unimplemented("hint all tab-bg".to_string()));
+        let cmd = parse("yank pretty-url").unwrap();
+        assert_eq!(cmd, Command::Unimplemented("yank pretty-url".to_string()));
         assert!(!cmd.is_implemented());
+    }
+
+    #[test]
+    fn hints() {
+        // `f: hint` — no group, no target, so qutebrowser's defaults: all, normal.
+        assert_eq!(parse("hint").unwrap(), Command::Hint { target: HintTarget::Normal });
+        // `F: hint all tab`, and `;b: hint all tab-bg` reaches the same place.
+        assert_eq!(parse("hint all tab").unwrap(), Command::Hint { target: HintTarget::TabBg });
+        assert_eq!(parse("hint all tab-bg").unwrap(), Command::Hint { target: HintTarget::TabBg });
+        assert_eq!(parse("hint-follow").unwrap(), Command::HintFollow);
+
+        // Everything M12 does not do stays unimplemented rather than becoming a near miss. A
+        // `links` group hinted with the `all` selector would draw labels on images and buttons and
+        // look like a bug in the visibility test.
+        for cmd in [
+            "hint links",
+            "hint images",
+            "hint inputs",
+            "hint all window",
+            "hint all hover",
+            "hint all yank",
+            "hint --rapid links tab-bg",
+            "hint inputs --first",
+            "hint links fill :open {hint-url}",
+        ] {
+            assert_eq!(
+                parse(cmd).unwrap(),
+                Command::Unimplemented(cmd.to_string()),
+                "{cmd:?} should not be mistaken for something bru implements"
+            );
+        }
     }
 
     #[test]
