@@ -159,11 +159,21 @@ fn to_one_line(text: &str) -> String {
 /// The one line `chrome/greasemonkey.js:264` writes when a userscript throws:
 /// ``console.error(`bru: userscript ${bru_gm_name} threw: ${e}`)``.
 ///
-/// Matched on the *text* rather than on the source, because bru's greasemonkey injection calls
-/// `V8Context::eval` with `None` for the script URL (`greasemonkey.rs::evaluate`), so the console
-/// reports the page's own address as the source and there is nothing there to match. See the
-/// report: giving that `eval` a `bru-userscript:<name>` URL is a one-line change in a file this
-/// workstream does not own, and it would make this match a source rather than a string.
+/// Matched on the *source* first: `greasemonkey.rs::evaluate` now gives the injection a script URL
+/// of `bru-userscript:<name>`, so the message carries one. The text match stays beside it, because
+/// the two halves of this can land in separate commits and a gap between them loses the one console
+/// line a userscript author needs.
+///
+/// **This is not a security boundary, and it was measured rather than assumed.** A page can put the
+/// same string in its own source with `//# sourceURL=bru-userscript:…` inside an `eval` — measured
+/// 2026-08-06, the forged source came back byte for byte. What the source match buys is that it
+/// takes a deliberate act instead of a coincidence of wording; the worst either way is a wrong line
+/// in the bar for three seconds. Anything that must be unforgeable cannot come from the console.
+const USERSCRIPT_SOURCE: &str = "bru-userscript:";
+
+/// The one line `chrome/greasemonkey.js:264` writes when a userscript throws. Kept as the second
+/// half of the match above — the wrapper catches every userscript error itself, so `V8Exception`
+/// never sees one and the console is the only channel there is.
 const USERSCRIPT_THREW: &str = "bru: userscript ";
 
 /// Where one console message goes.
@@ -210,7 +220,10 @@ pub fn route(level: LogSeverity, text: &str, source: &str) -> Route {
     if !severe {
         return Route::Drop;
     }
-    if text.starts_with(USERSCRIPT_THREW) || source.starts_with("bru://") {
+    if source.starts_with(USERSCRIPT_SOURCE)
+        || text.starts_with(USERSCRIPT_THREW)
+        || source.starts_with("bru://")
+    {
         return Route::Bar(Level::Error);
     }
     Route::Stderr
