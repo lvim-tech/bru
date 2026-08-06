@@ -842,6 +842,25 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
         return None;
     }
 
+// --- per-window mode -----------------------------------------------------------------------
+    // Hint mode with **no** session at all, which is the other half of the same question now that
+    // a mode belongs to one window: there is one `SESSION` for the process, so `f` in a second
+    // window replaces the first window's, and the first window is then left in hint mode with
+    // nothing behind it. The old answer was further down — "nothing can match, and the keys must
+    // not reach the page", i.e. swallow everything until `<Escape>` — and while the mode was
+    // process-wide that state could not last, because the other window's next key left hint mode
+    // for both. It can last now. So it is ended here instead: leave the mode and answer `None`, and
+    // the key goes on to be the ordinary key it is.
+    let sessionless = session()
+        .lock()
+        .expect("hint session mutex poisoned")
+        .is_none();
+    if sessionless {
+        leave_mode(state);
+        return None;
+    }
+// --- end per-window mode -------------------------------------------------------------------
+
     // `<Escape>` is `mode-leave` in the `hint:` table, and it is taken *before* that table rather
     // than through it: `exec`'s `mode-leave` knows how to leave a mode and nothing about a hint
     // session, so running it would leave the labels drawn over the page and the session open behind

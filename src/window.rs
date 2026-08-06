@@ -202,6 +202,18 @@ fn completion_height(window: u32) -> i32 {
         .unwrap_or(0)
 }
 
+/// `BRU_DEBUG_BAR=1` prints the height each window's bottom strip asks for, every time CEF asks.
+///
+/// It is the only way to measure this without a screenshot, and a screenshot is not a measurement
+/// here: `grim` photographs the whole output and six brus share this compositor. Off by default —
+/// a layout pass is frequent enough that this is a line per relayout.
+fn debug_bar(window: u32, height: i32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_BAR").is_some()) {
+        eprintln!("bru[bar]: window {window} asks for {height} px");
+    }
+}
+
 /// Drop a window's entry, from `on_window_destroyed`. Without it the list grows by one row for
 /// every window ever opened, and a later window that happened to reuse the id — nothing does today,
 /// `next_window_id` only goes up — would inherit a height it never asked for.
@@ -514,6 +526,9 @@ wrap_browser_view_delegate! {
             } else {
                 0
             };
+            if self.grows {
+                debug_bar(self.window_id, self.height + extra);
+            }
             Size { width: 1280, height: self.height + extra }
 // --- end src/completers.rs -----------------------------------------------------------------
         }
