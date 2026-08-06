@@ -6,6 +6,7 @@
 
 mod app;
 mod keys;
+mod state;
 mod window;
 
 use cef::*;
@@ -20,7 +21,18 @@ fn main() -> Result<(), &'static str> {
     };
 
     let is_browser_process = cmd_line.has_switch(Some(&CefString::from("type"))) != 1;
-    let ret = execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
+
+    // The same App object goes to both execute_process and initialize. execute_process is what
+    // gives the child processes an App at all, and two callbacks are only reachable that way:
+    // on_register_custom_schemes, which has to run in every process for bru:// to be a real origin
+    // in the renderer, and render_process_handler, which only exists there. The state the App
+    // carries is browser-process state; in a child it is constructed and never filled in.
+    let mut app = app::BruApp::new(state::BruState::new());
+    let ret = execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
 
     if !is_browser_process {
         // A renderer, GPU or zygote process. execute_process ran its loop and is done; initialising
@@ -30,7 +42,6 @@ fn main() -> Result<(), &'static str> {
     }
     assert_eq!(ret, -1, "browser process could not execute");
 
-    let mut app = app::BruApp::new();
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.

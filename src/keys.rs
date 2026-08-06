@@ -6,6 +6,9 @@
 //! scrolling never felt like Brave's. Measured on 2026-08-06: through the wheel path it does.
 
 use cef::*;
+use std::sync::{Arc, Mutex};
+
+use crate::state::BruState;
 
 /// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
 /// delivers per click, and near enough to qutebrowser's step for the two to be compared.
@@ -62,11 +65,48 @@ wrap_keyboard_handler! {
 }
 
 wrap_client! {
-    pub struct BruClient;
+    pub struct BruClient {
+        state: Arc<Mutex<BruState>>,
+    }
 
     impl Client {
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(BruKeyboardHandler::new())
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(BruLifeSpanHandler::new(self.state.clone()))
+        }
+    }
+}
+
+// Browser lifetime. Without this nothing tells the message loop to stop, so closing the window
+// leaves the process running with no window. (The wrap_ macros take no doc comment on the struct.)
+wrap_life_span_handler! {
+    struct BruLifeSpanHandler {
+        state: Arc<Mutex<BruState>>,
+    }
+
+    impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .on_after_created(browser);
+        }
+
+        fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .do_close(browser)
+        }
+
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .on_before_close(browser);
         }
     }
 }

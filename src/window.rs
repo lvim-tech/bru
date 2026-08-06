@@ -5,9 +5,13 @@
 
 use cef::*;
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+
+use crate::state::BruState;
 
 wrap_window_delegate! {
     pub struct BruWindowDelegate {
+        state: Arc<Mutex<BruState>>,
         browser_view: RefCell<Option<BrowserView>>,
     }
 
@@ -27,6 +31,13 @@ wrap_window_delegate! {
             };
             let mut view = View::from(browser_view);
             window.add_child_view(Some(&mut view));
+
+            // Nothing else ever gets handed the window; keep it where views can be added later.
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_window(window.clone());
+
             window.show();
         }
 
