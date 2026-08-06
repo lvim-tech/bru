@@ -45,41 +45,83 @@
     return tab.loading ? "loading" : "loaded";
   }
 
+  // Favicons are keyed by origin, the way a browser's favicon cache is keyed:
+  // one site, one icon, and a second tab on the same site draws it with no
+  // download. src/favicon.rs spells the key exactly as this does — it is
+  // compared as a string, and a mismatch is an icon that never appears.
+  function origin(url) {
+    try {
+      return new URL(url).origin;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  // The icons this strip has been handed, and the last state it was pushed.
+  // Both are kept because the two arrive independently: an icon is a kilobyte
+  // of base64 that is sent once and then never again, so it cannot live in the
+  // state object that Rust pushes on every keystring and scroll change.
+  var icons = {};
+  var state = { tabs: [] };
+
+  function draw() {
+    var host = document.getElementById("tabs");
+    if (!host) {
+      return;
+    }
+    var tabs = state.tabs || [];
+
+    // textContent, not innerHTML: #tabs:empty is a real selector and a
+    // whitespace text node would defeat it.
+    host.textContent = "";
+
+    for (var i = 0; i < tabs.length; i++) {
+      var tab = tabs[i] || {};
+
+      var el = document.createElement("div");
+      el.className = "tab " + (tab.active ? "active " : "") + loadClass(tab);
+      el.title = tab.url || "";
+      // The one place a pointer is worth having in a keyboard-driven browser:
+      // the strip is the only chrome a mouse naturally goes for. The index is
+      // the strip's own order, which is what BruState calls a tab index.
+      el.dataset.index = String(i);
+
+      var favicon = document.createElement("span");
+      favicon.className = "favicon";
+      // A data: URL, because this page is served from bru:// and cannot fetch
+      // an image from a site. Absent until the download finishes, which is
+      // what keeps the box empty rather than broken.
+      var icon = icons[origin(tab.url || "")];
+      if (icon) {
+        favicon.style.backgroundImage = 'url("' + icon + '")';
+      }
+      el.appendChild(favicon);
+
+      var title = document.createElement("span");
+      title.className = "title";
+      title.textContent = tab.title || tab.url || "";
+      el.appendChild(title);
+
+      host.appendChild(el);
+    }
+  }
+
   window.bru = {
     // state = {tabs: [{title, url, active}, ...]}
-    render: function (state) {
-      var host = document.getElementById("tabs");
-      if (!host) {
+    render: function (pushed) {
+      state = pushed || { tabs: [] };
+      draw();
+    },
+
+    // One favicon, handed over as it arrives. Redraws, because the tab it
+    // belongs to has almost certainly been drawn already — a download finishes
+    // long after the tab appears.
+    favicon: function (key, dataUrl) {
+      if (!key || !dataUrl) {
         return;
       }
-      var tabs = (state && state.tabs) || [];
-
-      // textContent, not innerHTML: #tabs:empty is a real selector and a
-      // whitespace text node would defeat it.
-      host.textContent = "";
-
-      for (var i = 0; i < tabs.length; i++) {
-        var tab = tabs[i] || {};
-
-        var el = document.createElement("div");
-        el.className = "tab " + (tab.active ? "active " : "") + loadClass(tab);
-        el.title = tab.url || "";
-        // The one place a pointer is worth having in a keyboard-driven browser:
-        // the strip is the only chrome a mouse naturally goes for. The index is
-        // the strip's own order, which is what BruState calls a tab index.
-        el.dataset.index = String(i);
-
-        var favicon = document.createElement("span");
-        favicon.className = "favicon";
-        el.appendChild(favicon);
-
-        var title = document.createElement("span");
-        title.className = "title";
-        title.textContent = tab.title || tab.url || "";
-        el.appendChild(title);
-
-        host.appendChild(el);
-      }
+      icons[key] = dataUrl;
+      draw();
     },
   };
 

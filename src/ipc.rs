@@ -128,6 +128,10 @@ impl BrowserSideHandler for BruQueryHandler {
                 let response = match view.as_str() {
                     "top" => {
                         chrome().lock().ok().map(|mut c| c.top = Some(frame));
+                        // The strip keeps the favicons it has been given rather than being handed
+                        // them with every state push, so a strip that has just loaded — at startup,
+                        // or after a theme reload — has to be given the ones already downloaded.
+                        crate::favicon::push_all();
                         tabs_json()
                     }
                     "bottom" => {
@@ -296,6 +300,22 @@ pub fn current_url() -> String {
 /// Push the bar again. The command line calls it after every edit it makes.
 pub fn push_bar() {
     push();
+}
+
+/// Run one statement in the tab strip's frame.
+///
+/// The one caller is `favicon.rs`, and it is a separate call rather than another key in the pushed
+/// state on purpose: an icon is a kilobyte of base64 that never changes once it has arrived, and
+/// carrying every one of them in the object pushed on every keystring and scroll change would put
+/// tens of kilobytes of JavaScript on paths that run constantly. This hands the strip one icon,
+/// once, and the strip keeps it.
+pub fn top_chrome_eval(code: &str) {
+    let Ok(chrome) = chrome().lock() else {
+        return;
+    };
+    if let Some(frame) = chrome.top.clone() {
+        frame.execute_java_script(Some(&CefString::from(code)), None, 0);
+    }
 }
 
 /// Rebuild the completion for what is currently typed, and push it.

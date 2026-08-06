@@ -13,6 +13,7 @@ mod completion;
 mod config;
 mod data;
 mod exec;
+mod favicon;
 mod find;
 mod help;
 mod hints;

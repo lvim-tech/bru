@@ -324,5 +324,16 @@ wrap_display_handler! {
             }
             crate::ipc::set_tabs(tabs);
         }
+
+        // The `<link rel=icon>` URLs of the page. Not keyed by browser here, unlike the two above:
+        // `favicon.rs` keys what it stores by the *origin* of the page the browser is on, so a
+        // chrome strip — whose frame URL is `bru://` — is refused there and never reaches the map.
+        fn on_favicon_urlchange(
+            &self,
+            browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            crate::favicon::on_favicon_urls(browser, icon_urls);
+        }
     }
 }
