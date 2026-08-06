@@ -568,34 +568,60 @@ mod tests {
     }
 
     /// **What recording costs a key that is not being recorded**, which is the question this design
-    /// was chosen to answer. Printed rather than only asserted; the report quotes the number.
+    /// was chosen to answer, and what a key that *is* being recorded costs beside it. Both printed
+    /// rather than only asserted; the report quotes the numbers.
     ///
-    /// The assertion is deliberately loose — this runs on a shared machine under `cargo test` —
-    /// but it is not nothing: at 100 ns a keystroke this would have failed, and 100 ns is what a
-    /// mutex plus a `Vec` push of a cloned `Command` would have cost.
+    /// The two are what the choice between recording commands and recording keys comes down to.
+    /// The first is what `j` pays for macros existing at all; the second is what it would have paid
+    /// on **every** keystroke had a macro been a list of keys, because then there is no state to
+    /// check before copying — every key is the payload.
+    ///
+    /// The assertion is deliberately loose: this runs under `cargo test`, unoptimised, on a machine
+    /// with five other agents on it. It is still not nothing — the recording path below is an order
+    /// of magnitude slower, and that gap is the whole argument.
     #[test]
     fn the_key_path_cost_of_not_recording() {
         let _lock = exclusively();
         reset();
 
         let command = commands::parse("scroll down").unwrap();
-        const ROUNDS: u32 = 2_000_000;
+        const ROUNDS: u32 = 1_000_000;
 
         // Warm the branch predictor and the cache line the way a browser would.
         for _ in 0..10_000 {
             std::hint::black_box(RECORDING.load(Ordering::Relaxed));
         }
 
+        // Not recording: the load is the whole of it. `record` takes the state lock only after
+        // this, for the mode check, and never reaches it.
         let start = std::time::Instant::now();
         for _ in 0..ROUNDS {
-            // `record` itself needs a SharedState for the mode check it never reaches; this is the
-            // part before that, which is the whole cost when nothing is recording.
             if std::hint::black_box(RECORDING.load(Ordering::Relaxed)) {
                 std::hint::black_box(recordable(std::hint::black_box(&command)));
             }
         }
-        let each = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
-        println!("macros: a keystroke with no recording in progress costs {each:.3} ns");
-        assert!(each < 20.0, "the key path must stay free: {each:.3} ns");
+        let idle = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // Recording: the guard, the mutex, the clone and the push. `record_here` is `record`
+        // without the state lock, which no unit test can hold.
+        begin('z');
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            record_here(std::hint::black_box(&command), Some(3));
+        }
+        let busy = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+        assert_eq!(stored('z').len(), ROUNDS as usize);
+        reset();
+
+        println!(
+            "macros: a keystroke costs {idle:.3} ns with no recording in progress, \
+             {busy:.1} ns while one is — {:.0}x",
+            busy / idle.max(f64::MIN_POSITIVE)
+        );
+        assert!(idle < 20.0, "the key path must stay free: {idle:.3} ns");
+        assert!(
+            busy > idle * 3.0,
+            "if these are the same, the fast path is not being taken"
+        );
     }
 }
