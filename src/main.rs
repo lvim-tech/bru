@@ -12,6 +12,7 @@ mod commands;
 mod completion;
 mod config;
 mod data;
+mod downloads;
 mod exec;
 mod find;
 mod help;

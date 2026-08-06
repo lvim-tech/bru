@@ -175,6 +175,12 @@ wrap_client! {
             Some(crate::find::BruFindHandler::new())
         }
 
+        // Without this bru cannot save a file at all: with no download handler CEF has nowhere to
+        // ask where a file should go. src/downloads.rs owns everything past this call.
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(crate::downloads::BruDownloadHandler::new())
+        }
+
         // bru has a request handler only because the message router demands two of its callbacks.
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(BruRequestHandler::new())

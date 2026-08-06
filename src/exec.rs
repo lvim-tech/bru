@@ -262,6 +262,21 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // itself by the time this could run — it exists because the binding does.
         Command::HintFollow => {}
 
+// --- src/downloads.rs --------------------------------------------------------------------------
+        // `gd`, `ad`, `cd` and the four `:download-*` commands. The count means the same thing in
+        // all of them — which download, 1-based, with none meaning the last — so it is passed
+        // through rather than turned into a repeat: `2ad` cancels download 2, it does not cancel
+        // twice.
+        Command::Download { url } => crate::downloads::start(state, browser, url.as_deref()),
+        Command::DownloadCancel { all } => crate::downloads::cancel(count, *all),
+        Command::DownloadClear => crate::downloads::clear(),
+        Command::DownloadOpen { cmdline, dir } => {
+            crate::downloads::open_file(count, cmdline.as_deref(), *dir)
+        }
+        Command::DownloadDelete => crate::downloads::delete(count),
+        Command::DownloadRetry => crate::downloads::retry(state, browser, count),
+// --- end src/downloads.rs ----------------------------------------------------------------------
+
         // Generated from the live binding table on every request — see src/help.rs.
         Command::Help { tab } => {
             crate::open::open(state, browser, Some("bru://chrome/help"), *tab, false)
@@ -325,6 +340,17 @@ pub fn is_live(command: &Command) -> bool {
 
         // Claimed by `cmdline.rs` before this match ever runs.
         Command::CmdSetText { .. } | Command::CommandAccept { .. } => true,
+
+// --- src/downloads.rs --------------------------------------------------------------------------
+        // All six act. `gd`, `ad` and `cd` are the three default bindings this turns on; the other
+        // three are `:` commands qutebrowser binds to nothing either.
+        Command::Download { .. }
+        | Command::DownloadCancel { .. }
+        | Command::DownloadClear
+        | Command::DownloadOpen { .. }
+        | Command::DownloadDelete
+        | Command::DownloadRetry => true,
+// --- end src/downloads.rs ----------------------------------------------------------------------
 
         Command::Hint { .. } => true,
         Command::Help { .. } => true,
@@ -708,10 +734,74 @@ mod tests {
         assert_eq!(DEFAULT_BINDINGS.len(), 231);
         // Stage 2, as each workstream was wired in: 27 before any of it, 70 after the dispatcher,
         // 76 once `scroll.rs` made `gg`/`G`/the page keys real, 100 once the command line claimed
-        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints. Raise this
-        // when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 106, "the live-binding count moved");
+        // `cmd-set-text`, `command-accept` and the readline bindings, 106 with hints, 109 once
+        // `gd`/`ad`/`cd` could save a file. Raise this when a milestone raises the number, never to
+        // make a failing build pass.
+        assert_eq!(live, 109, "the live-binding count moved");
     }
+
+// --- src/downloads.rs --------------------------------------------------------------------------
+    /// The three bindings downloads turned on, named — and the one it deliberately did not.
+    #[test]
+    fn the_bindings_downloads_turned_on() {
+        for (keys, expected) in [
+            ("gd", "download"),
+            ("ad", "download-cancel"),
+            ("cd", "download-clear"),
+        ] {
+            let (_, _, cmd) = DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "normal" && *k == keys)
+                .unwrap_or_else(|| panic!("no default binding for {keys}"));
+            assert_eq!(*cmd, expected);
+            let parsed = commands::parse(cmd).expect("a default binding must parse");
+            assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
+        }
+        // `;d` is `hint links download`, and the `links` group is src/hints.rs's to implement — it
+        // stays unimplemented here rather than being answered with the `all` selector.
+        assert_eq!(
+            commands::parse("hint links download").unwrap(),
+            Command::Unimplemented("hint links download".to_string())
+        );
+        // The two spellings that need a prompt or a page serialiser bru has not got.
+        assert!(!is_live(&commands::parse("download --mhtml").unwrap()));
+        assert!(!is_live(&commands::parse("download --dest /tmp/x").unwrap()));
+    }
+
+    #[test]
+    fn download_arguments() {
+        use crate::commands::Command as C;
+        assert_eq!(commands::parse("download").unwrap(), C::Download { url: None });
+        assert_eq!(
+            commands::parse("download https://e.com/a b.pdf").unwrap(),
+            C::Download { url: Some("https://e.com/a b.pdf".to_string()) }
+        );
+        assert_eq!(
+            commands::parse("download-cancel").unwrap(),
+            C::DownloadCancel { all: false }
+        );
+        assert_eq!(
+            commands::parse("download-cancel --all").unwrap(),
+            C::DownloadCancel { all: true }
+        );
+        assert_eq!(commands::parse("download-clear").unwrap(), C::DownloadClear);
+        assert_eq!(
+            commands::parse("download-open").unwrap(),
+            C::DownloadOpen { cmdline: None, dir: false }
+        );
+        assert_eq!(
+            commands::parse("download-open -d").unwrap(),
+            C::DownloadOpen { cmdline: None, dir: true }
+        );
+        // maxsplit=0: the command to open with keeps its own flags.
+        assert_eq!(
+            commands::parse("download-open mpv --no-audio {}").unwrap(),
+            C::DownloadOpen { cmdline: Some("mpv --no-audio {}".to_string()), dir: false }
+        );
+        assert_eq!(commands::parse("download-delete").unwrap(), C::DownloadDelete);
+        assert_eq!(commands::parse("download-retry").unwrap(), C::DownloadRetry);
+    }
+// --- end src/downloads.rs ----------------------------------------------------------------------
 
     /// The bindings this milestone made live, named one by one — a total is not enough to notice
     /// that `gJ` went live and `gK` did not.
