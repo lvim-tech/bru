@@ -85,16 +85,18 @@ pub struct Opts {
 
 /// Where a message goes once something wants to show one.
 ///
-/// bru has no message line yet — `ipc.rs`'s bar carries url, title, mode, keystring, scroll, tab
-/// index, search, command line and completion, and nothing that says "here is what just happened".
-/// Rather than invent a tenth key in a payload three other workstreams also write, this is a hook:
-/// whoever builds the message line calls [`set_message_sink`] once at startup and every message
-/// here starts arriving there. Until then they go to stderr, which is where `:spawn`'s output would
-/// otherwise be lost.
+/// A hook rather than a call into `message.rs` by name, because this module was written before there
+/// was a message line and had to say something either way. `app.rs` installs `message::info` at
+/// startup; with nothing installed — every unit test, and the moment before
+/// `on_context_initialized` — messages go to stderr rather than nowhere.
+///
+/// One level, not three: `spawn::message` says "started …" and "could not run …" through the same
+/// call, so everything here arrives as info. Splitting the failures out to `message::error` means
+/// giving this module a second entry point, which is a change to make deliberately rather than
+/// while wiring the sink up.
 static SINK: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
-/// Install the message sink. Called once, at startup, by whoever owns the message line.
-#[allow(dead_code)]
+/// Install the message sink. Called once, at startup, by `app.rs`.
 pub fn set_message_sink(sink: fn(&str)) {
     if let Ok(mut slot) = SINK.lock() {
         *slot = Some(sink);
