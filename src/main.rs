@@ -9,6 +9,7 @@ mod bindings;
 mod chrome;
 mod commands;
 mod config;
+mod data;
 mod exec;
 mod find;
 mod ipc;
