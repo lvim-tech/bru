@@ -1070,6 +1070,10 @@ fn blur(browser: &mut Browser) {
 ///
 /// A step is `[<count>:]<command string>`, so `3:tab-move +` is what `3gJ` would do. `|` separates
 /// steps because `;;` is the command language's own chain separator and a URL may contain a comma.
+// --- per-window mode -----------------------------------------------------------------------
+/// A step may also be `win<id>:<step>`, which runs it in that window rather than in the one in
+/// front. It is the only way a script can say anything about a second window's mode.
+// --- end per-window mode -------------------------------------------------------------------
 pub fn schedule_cmd_script(steps: &str, interval_ms: i64) {
     for (i, step) in steps.split('|').filter(|s| !s.is_empty()).enumerate() {
         let at = interval_ms * (i as i64 + 1);
@@ -1112,13 +1116,42 @@ wrap_task! {
                 return;
             };
 
-            let (count, text) = match self.step.split_once(':') {
+// --- per-window mode -----------------------------------------------------------------------
+            // `win<id>:<step>` runs `<step>` in that window. Without it every `--cmd` script drives
+            // whichever window is in front, and a claim about window 1's mode could only ever be
+            // measured in window 0 — which is not a measurement. bru has no `:window-focus` command
+            // for a script to use instead, and inventing one for a debug switch would change the
+            // default-binding count.
+            //
+            // The focus and the command are taken in the **same** posted task on purpose. Focusing
+            // in a step of its own does not hold: measured 2026-08-06 under mango, a script that
+            // focused window 1 and ran the next step 900 ms later reported `win=Some(0)` again by
+            // then — the compositor gives the focus back, and `on_window_activation_changed` is
+            // wired to `focus_window`. Nothing between these two lines can run.
+            let step: &str = match self
+                .step
+                .strip_prefix("win")
+                .and_then(|rest| rest.split_once(':'))
+                .filter(|(id, _)| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            {
+                Some((id, rest)) => {
+                    crate::tabs::focus(&state, id.parse().unwrap_or_default());
+                    if rest.is_empty() {
+                        return;
+                    }
+                    rest
+                }
+                None => self.step.as_str(),
+            };
+// --- end per-window mode -------------------------------------------------------------------
+
+            let (count, text) = match step.split_once(':') {
                 Some((count, rest)) => match count.parse::<u32>() {
                     Ok(count) => (Some(count), rest),
                     // `:open http://x` — a colon that is not a count prefix.
-                    Err(_) => (None, self.step.as_str()),
+                    Err(_) => (None, step),
                 },
-                None => (None, self.step.as_str()),
+                None => (None, step),
             };
 
             let command = match crate::commands::parse(text) {
@@ -1214,7 +1247,7 @@ wrap_task! {
 /// `order` is the strip, left to right, each tab shown by the tail of its URL — without it a
 /// `tab-move` that did nothing and one that moved a tab back to where it was look identical.
 fn report(state: &SharedState, step: &str) {
-    let (active, total, url, order, windows, current) = {
+    let (active, total, url, order, windows, current, ids) = {
         let guard = state.lock().expect("state mutex poisoned");
         let active = guard.active_tab();
         let total = guard.tab_count();
@@ -1226,11 +1259,16 @@ fn report(state: &SharedState, step: &str) {
         // How many windows there are, which one this is, and how many tabs each holds. Without it a
         // `:tab-give` that moved a tab and one that opened a window and lost it look identical —
         // the current window's count falls by one either way.
+// --- per-window mode -----------------------------------------------------------------------
+        // Each window's tab count *and its mode*. A mode is one window's now, so a report that
+        // printed one mode could not tell "window 1 is in command mode" from "both windows are",
+        // which is the whole of what this workstream changed.
         let windows: Vec<String> = guard
             .window_ids()
             .into_iter()
-            .map(|id| format!("{id}:{}", guard.tab_count_in(id)))
+            .map(|id| format!("{id}:{}:{}", guard.tab_count_in(id), guard.mode_in(id)))
             .collect();
+// --- end per-window mode -------------------------------------------------------------------
         let current = guard.current_window_id();
         (
             active,
@@ -1239,6 +1277,7 @@ fn report(state: &SharedState, step: &str) {
             order.join(","),
             windows.join(" "),
             current,
+            guard.window_ids(),
         )
 // --- end src/window.rs -----------------------------------------------------
     };
@@ -1248,9 +1287,30 @@ fn report(state: &SharedState, step: &str) {
         .map(|mut browser| zoom_percent(&mut browser))
         .unwrap_or(ZOOM_DEFAULT);
 
+// --- per-window mode -----------------------------------------------------------------------
+    // What each window's command line is holding, printed only when one of them holds something.
+    // There is a line per window now, and two windows half way through typing different things is
+    // the case a single shared line could not hold at all — so it has to be visible from a script.
+    //
+    // Outside the state lock deliberately: `cmdline::text_in` takes the command-line lock, and
+    // `cmdline` takes the state lock in other places. Two locks in one order are safe; the same two
+    // in both orders are a deadlock waiting for the day a push lands mid-report.
+    let lines: Vec<String> = ids
+        .into_iter()
+        .map(|id| (id, crate::cmdline::text_in(id)))
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(id, text)| format!("{id}:{text:?}"))
+        .collect();
+    let lines = if lines.is_empty() {
+        String::new()
+    } else {
+        format!(" lines=[{}]", lines.join(" "))
+    };
+// --- end per-window mode -------------------------------------------------------------------
+
     eprintln!(
         "cmd: after {step:?} -> windows=[{windows}] win={current:?} tabs={total} active={active} \
-         zoom={zoom}% order=[{order}] url={url}"
+         zoom={zoom}% order=[{order}]{lines} url={url}"
     );
 }
 

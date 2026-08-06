@@ -1292,6 +1292,13 @@ pub fn state_for_completion_in(window: u32) -> (String, usize, bool) {
     with_in(window, |cmd| (cmd.text(), cmd.cursor(), cmd.browse.is_some()))
 }
 
+/// What a named window's command line is holding. For `exec::report`, so that a `--cmd` script can
+/// say that two windows are half way through typing two different things — which is the case one
+/// shared line could not hold.
+pub fn text_in(window: u32) -> String {
+    with_in(window, |cmd| cmd.text())
+}
+
 // --- end src/completers.rs -----------------------------------------------------------------
 
 /// The `cmdline` field of one window's bottom view state. Called by `ipc::bar_json_for`.
