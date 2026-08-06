@@ -343,7 +343,8 @@ impl BruState {
 
     /// Removes the showing tab and moves the selection to the one that takes its place.
     pub fn take_active_tab(&mut self) -> Option<BrowserView> {
-        let tab = self.detach_active_tab()?;
+        let window = self.current_window_id()?;
+        let tab = self.detach_active_tab_in(window)?;
         // Kept so `u` can open it again. Only the URL — see `BruState::closed`.
         self.closed.push(tab.url.clone());
         Some(tab.view)
@@ -352,8 +353,13 @@ impl BruState {
     /// The same removal without the undo entry: the tab is not being closed, it is being handed to
     /// another window. Whole, because `tab-give` has to put it back somewhere — a `BrowserView`
     /// alone would lose the pin, the mute and the browser id.
-    pub(crate) fn detach_active_tab(&mut self) -> Option<Tab> {
-        let slot = self.current_slot_mut()?;
+    ///
+    /// **The window is named rather than assumed**, and that is not tidiness: `window::create` makes
+    /// the window it opens current, so a `gD` that detaches into a new one would otherwise take the
+    /// showing tab of the window it had just made. Measured — the first run of `gD` reported
+    /// `windows=[0:2 1:0]`, the tab still in the window it was supposed to leave.
+    pub(crate) fn detach_active_tab_in(&mut self, window: u32) -> Option<Tab> {
+        let slot = self.slot_mut(window)?;
         if slot.tabs.is_empty() {
             return None;
         }
@@ -748,7 +754,7 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     // dropped and the browser is never closed.
     let (tab, old_window, remaining, old_active) = {
         let mut state = state.lock().expect("state mutex poisoned");
-        let tab = state.detach_active_tab();
+        let tab = state.detach_active_tab_in(from_window);
         (
             tab,
             state.window_handle(from_window),
@@ -786,15 +792,19 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     }
 
     select_in(state, target, index);
-    // The window it came from is still showing the tab that took its place — unless it has none
-    // left, which only happens with `--keep`-less detaching from a window bru has just emptied.
     if remaining > 0 {
+        // The window it came from shows whatever took its place.
         select_in(state, from_window, old_active);
         let tabs = state
             .lock()
             .expect("state mutex poisoned")
             .tabs_json_in(from_window);
         crate::ipc::set_tabs_for(from_window, tabs);
+    } else {
+        // It gave away its last tab, so it goes — the same rule `close_current` follows. Only
+        // reachable through `:tab-give <id>`; the detaching spelling refuses a single-tab window
+        // above, because opening a window as another closes is a flicker and nothing else.
+        crate::window::close(state, from_window);
     }
 
     // And the receiving window comes to the front, which is what "give" means when you are the one
