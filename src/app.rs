@@ -32,6 +32,34 @@ fn data_uri(content: &str, mime_type: &str) -> CefString {
     CefString::from(format!("data:{mime_type};base64,{escaped}").as_str())
 }
 
+/// Add one name to a comma-separated Chromium switch, keeping whatever is already there.
+///
+/// **Never `append_switch_with_value` on its own.** Chromium reads a single value for each of these,
+/// so a second append replaces the first — and CEF sets them itself. Measured 2026-08-06: on this
+/// machine `--disable-features` already arrives holding
+/// `GlicActorUi,AutofillActorMode,LensOverlay,KillOnInvalidNavigationHeaders`, and overwriting it
+/// would turn those four back **on** in exactly the subprocesses CEF had turned them off in — a
+/// failure that would surface somewhere else entirely, as something else entirely.
+fn add_to_switch(command_line: &mut CommandLine, switch: &str, name: &str) {
+    let spelling = switch;
+    let switch = CefString::from(switch);
+    let existing = CefString::from(&command_line.switch_value(Some(&switch))).to_string();
+    if existing.split(',').any(|present| present.trim() == name) {
+        return;
+    }
+    let value = if existing.is_empty() {
+        name.to_string()
+    } else {
+        format!("{existing},{name}")
+    };
+    if std::env::var_os("BRU_DEBUG_SWITCHES").is_some() {
+        eprintln!(
+            "bru[switches]: {spelling} {existing:?} -> {value:?}"
+        );
+    }
+    command_line.append_switch_with_value(Some(&switch), Some(&CefString::from(value.as_str())));
+}
+
 wrap_app! {
     pub struct BruApp {
         state: Arc<Mutex<BruState>>,
@@ -45,7 +73,8 @@ wrap_app! {
         // Chromium's own command line, before Chromium reads it. bru had no hook here at all until
         // a crash needed one.
         //
-        // **`--disable-features=SoftNavigationDetection`.** Measured 2026-08-06 on
+        // **A soft navigation crashes bru, and this is where it is turned off.** Measured
+        // 2026-08-06 on
         // `youtube.com/watch?v=…`: clicking a link inside the page killed bru with SIGSEGV in **two
         // of three runs**, and the core shows the fault is entirely inside libcef, with no bru frame
         // above the message loop:
@@ -65,9 +94,8 @@ wrap_app! {
         // the SPA this user opens; the bug is not YouTube's and not the ad blocker's — bru has no
         // filter lists on this machine and `adblock` appears nowhere in the trace.
         //
-        // Disabling the detection is the narrowest lever bru has: the observer is what is broken,
-        // but it is Chromium's, and the feature that wakes it is the only end reachable from here.
-        // What it costs is a metric nothing in bru reads.
+        // The observer is what is broken, but it is Chromium's, so the only end reachable from
+        // here is the detection that wakes it. What that costs is a metric nothing in bru reads.
         //
         // The switch belongs on every process, so no `process_type` test: the renderer computes the
         // soft-navigation metrics that the browser process then dispatches into the crash.
@@ -79,26 +107,26 @@ wrap_app! {
             let Some(command_line) = command_line else {
                 return;
             };
-            // Appended to whatever is already there, never over it. `--disable-features` is one
-            // comma-separated list and Chromium reads a single value for it, so a second
-            // `append_switch_with_value` replaces the first — and CEF sets this switch itself for
-            // some processes. Overwriting it would turn features back **on** in exactly the
-            // subprocesses that had them off for a reason, which is a failure that shows up as
-            // something else entirely, somewhere else entirely.
-            let name = CefString::from("disable-features");
-            let existing = CefString::from(&command_line.switch_value(Some(&name))).to_string();
-            let mut value = String::from("SoftNavigationDetection");
-            if !existing.is_empty() {
-                if existing.split(',').any(|feature| feature.trim() == value) {
-                    return;
-                }
-                value = format!("{existing},{value}");
-            }
-            if std::env::var_os("BRU_DEBUG_SWITCHES").is_some() {
-                eprintln!("bru[switches]: disable-features {existing:?} -> {value:?}");
-            }
-            command_line
-                .append_switch_with_value(Some(&name), Some(&CefString::from(value.as_str())));
+            // **The one that is measured to engage.** Blink's heuristic is what notices a soft
+            // navigation at all, so with it off the renderer reports none and the browser process
+            // never reaches the observer. Measured 2026-08-06 by asking a page what it supports:
+            //
+            // ```
+            // no switch                                          -> soft-nav supported: true
+            // --disable-features=SoftNavigationHeuristics         -> soft-nav supported: true
+            // --disable-blink-features=SoftNavigationHeuristics   -> soft-nav supported: false
+            // ```
+            add_to_switch(command_line, "disable-blink-features", "SoftNavigationHeuristics");
+
+            // A hedge, and named as one. It aims at the browser-side feature that owns the observer
+            // that actually faults, which is the more direct target — but **nothing here proves it
+            // does anything**: with `--disable-features=SoftNavigationDetection` and nothing else,
+            // the page still reported `soft-navigation` as a supported entry type, so its only
+            // evidence is that `SoftNavigationDetection` appears as a bare string in libcef, i.e.
+            // that it is a real feature name. It stays because it costs one word in a list and
+            // covers the case where something other than Blink's heuristic reaches
+            // `PageLoadTracker::OnSoftNavigation`; it is not what the fix rests on.
+            add_to_switch(command_line, "disable-features", "SoftNavigationDetection");
         }
 
         // --- M2 --------------------------------------------------------------------------------
