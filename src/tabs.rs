@@ -122,6 +122,11 @@ impl BruState {
     }
 
     /// The address of a tab, as the display handler last reported it.
+    /// The title of the tab at `index`, for the status line on a switch.
+    pub fn tab_title(&self, index: usize) -> Option<String> {
+        self.tabs.get(index).map(|tab| tab.title.clone())
+    }
+
     pub fn tab_url(&self, index: usize) -> Option<String> {
         self.tabs.get(index).map(|tab| tab.url.clone())
     }
@@ -286,6 +291,20 @@ pub fn select(state: &SharedState, index: usize) {
     // over a tab that is at the top; the new tab's own position arrives as soon as it is scrolled.
     crate::scroll::forget();
     crate::find::forget();
+
+    // And the address and title, which otherwise only move when a page navigates: the display
+    // handler fires on navigation, and switching tabs is not one. Without this the status line keeps
+    // the URL of the tab you just left — measured after the stage-2 merge, with the bar reading
+    // example.com over a vesti.bg page.
+    let (url, title) = {
+        let state = state.lock().expect("state mutex poisoned");
+        (
+            state.tab_url(index).unwrap_or_default(),
+            state.tab_title(index).unwrap_or_default(),
+        )
+    };
+    crate::ipc::set_url(url);
+    crate::ipc::set_title(title);
 }
 
 pub fn next_tab(state: &SharedState) {
