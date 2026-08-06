@@ -150,6 +150,19 @@ impl BrowserSideHandler for BruQueryHandler {
             // Three types, exactly as STAGE2-CONTRACTS.md specifies them. The `#cmdline` input is
             // the real editor for plain typing — see `cmdline::types_into_cmdline` — so this is
             // where Rust learns what it holds.
+            // A click on the tab strip. The only pointer input bru accepts, and it is here rather
+            // than on the key path because a mouse cannot cost the scrolling anything.
+            //
+            // It must not select the tab from inside this handler: selection focuses a browser
+            // view, and CEF-NOTES trap 12 says a query handler is the wrong place for that — the
+            // router holds a lock `on_before_browse` wants. So it is posted, like everything else
+            // that acts on a browser from here.
+            Some("tab-select") => {
+                if let Some(index) = json_number_field(request, "index") {
+                    crate::tabs::schedule_select(index as usize);
+                }
+                succeed(&callback, "");
+            }
             Some("text-changed") => {
                 let text = json_field(request, "text").unwrap_or_default();
                 crate::cmdline::on_text_changed(&text, json_number_field(request, "cursor"));

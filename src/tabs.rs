@@ -403,3 +403,29 @@ pub fn close_current(state: &SharedState) {
 
     select(state, active);
 }
+
+/// Select a tab on the next turn of the UI loop.
+///
+/// The one caller is a click on the tab strip, which arrives inside the message router's query
+/// handler — and CEF-NOTES trap 12 forbids touching a browser from there: `select` focuses a view,
+/// the router holds `browser_query_info_map` across the handler, and `on_before_browse` wants that
+/// same lock. Posting steps outside it.
+pub fn schedule_select(index: usize) {
+    let mut task = SelectTab::new(index);
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct SelectTab {
+        index: usize,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            if let Some(state) = BruState::instance() {
+                select(&state, self.index);
+            }
+        }
+    }
+}

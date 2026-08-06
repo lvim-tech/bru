@@ -64,6 +64,10 @@
         var el = document.createElement("div");
         el.className = "tab " + (tab.active ? "active " : "") + loadClass(tab);
         el.title = tab.url || "";
+        // The one place a pointer is worth having in a keyboard-driven browser:
+        // the strip is the only chrome a mouse naturally goes for. The index is
+        // the strip's own order, which is what BruState calls a tab index.
+        el.dataset.index = String(i);
 
         var favicon = document.createElement("span");
         favicon.className = "favicon";
@@ -83,6 +87,18 @@
     // An attribute, not a class: className belongs to the mode, and this
     // document must not fight the stylesheet for it.
     document.body.setAttribute("data-view", VIEW);
+
+    // Delegated, so it survives every re-render of the strip.
+    document.addEventListener("click", function (event) {
+      var tab = event.target && event.target.closest && event.target.closest(".tab");
+      if (!tab || !tab.dataset || tab.dataset.index === undefined) {
+        return;
+      }
+      var index = parseInt(tab.dataset.index, 10);
+      if (index >= 0) {
+        query({ type: "tab-select", index: index });
+      }
+    });
 
     query({ type: "ready", view: VIEW }, function (response) {
       // Rust answers the ready query with the current state, so the strip is
