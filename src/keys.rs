@@ -240,6 +240,42 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        // --- src/popups.rs ------------------------------------------------------------------
+        // A page asking for a window. Without this the default runs, which is 0 — "go ahead" — and
+        // CEF makes a top-level browser bru does not know exists: a `target="_blank"` link opened an
+        // operating-system window instead of a tab, against DESIGN.md's "one window, many tabs".
+        // `popups.rs` owns the decision and returns 1, which cancels the popup.
+        //
+        // `on_before_popup_aborted` (bindings 20774) is deliberately not implemented: it fires only
+        // for a popup that *was* allowed and then failed to be created, and this returns 1 for every
+        // one of them, so it cannot be reached. There is no pending-popup state here to clear either
+        // — the decision leaves the callback as a posted task and keeps nothing keyed by popup_id.
+        fn on_before_popup(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+            popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            crate::popups::on_before_popup(
+                browser,
+                target_url,
+                target_disposition,
+                user_gesture,
+                popup_features,
+            )
+        }
+        // --- end src/popups.rs --------------------------------------------------------------
+
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             self.state
                 .lock()
