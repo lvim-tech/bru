@@ -286,6 +286,17 @@ pub enum Command {
     MacroRun { register: Option<char> },
 // --- end src/macros.rs ---------------------------------------------------------------------------
 
+// --- src/settingspage.rs -------------------------------------------------------------------
+    /// `save [what…]` — `sf`.
+    ///
+    /// **Not "save the page".** qutebrowser's `:save` is `misc/savemanager.py:169-190`, "Save
+    /// configs and state": it walks the *saveables* — `command-history`, `quickmark-manager`,
+    /// `bookmark-manager`, `state-config`, `yaml-config` — and writes each. Nothing in it touches
+    /// the document. See `src/cmdline.rs::save` for what bru's saveables are and which of them
+    /// have anything to write.
+    Save { what: Vec<String> },
+// --- end src/settingspage.rs ---------------------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
@@ -1303,6 +1314,18 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
 // --- end src/macros.rs ---------------------------------------------------------------------------
 
+// --- src/settingspage.rs -------------------------------------------------------------------
+        // `save [what…]`, `star_args_optional=True` (savemanager.py:169): no argument means every
+        // saveable. Flags it has none of, so anything flag-shaped is a typo worth refusing rather
+        // than a saveable named `-x`.
+        "save" => {
+            if !args.flags.is_empty() {
+                return Err(bad("takes no flags, only the names of what to save"));
+            }
+            Command::Save { what: tokens[1..].to_vec() }
+        }
+// --- end src/settingspage.rs ---------------------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
@@ -1671,20 +1694,30 @@ mod tests {
 
     #[test]
     fn unknown_commands_are_kept_verbatim_not_rejected() {
-        // `.` and `sf` in the default table. `cmd-repeat-last` needs the last command remembered
-        // per mode and `save` needs a config to write, and neither is in any milestone — but the
-        // bindings still have to keep their place in the trie, or `s` would report NoMatch and eat
-        // a pending chain.
+        // A binding whose command is not implemented still has to keep its place in the trie, or
+        // `s` would report NoMatch and eat a pending chain.
         //
-        // (This test used to name `print`, which the polish workstream implemented, and then
-        // `macro-record`/`macro-run`, which src/macros.rs implemented. Move it again rather than
-        // deleting it: something is always unimplemented, and the behaviour it pins — unknown is
-        // kept, not rejected — is what makes that survivable.)
-        for name in ["cmd-repeat-last", "save"] {
-            let cmd = parse(name).unwrap();
-            assert_eq!(cmd, Command::Unimplemented(name.to_string()));
-            assert!(!cmd.is_implemented());
+        // This test named `print`, then `macro-record`/`macro-run`, then `cmd-repeat-last`/`save`,
+        // and each was implemented under it within the week — the fourth time is enough. It no
+        // longer names anything: it reads the default table and holds whatever is unimplemented
+        // *today* to the rule, so it can never go stale and can never need moving again.
+        let mut checked = 0;
+        for (_mode, _keys, text) in crate::config::DEFAULT_BINDINGS {
+            let cmd = parse(text).expect("a default binding must parse");
+            if let Command::Unimplemented(kept) = &cmd {
+                assert_eq!(kept, text, "the text must survive verbatim, not be rewritten");
+                assert!(!cmd.is_implemented());
+                checked += 1;
+            }
         }
+
+        // The table emptying out is the good outcome, so it must not silently turn this test into
+        // one that asserts nothing. This name is not a qutebrowser command and never will be, so
+        // the mechanism stays pinned on the day `checked` reaches zero.
+        let cmd = parse("no-such-command-and-never-will-be").unwrap();
+        assert_eq!(cmd, Command::Unimplemented("no-such-command-and-never-will-be".to_string()));
+        assert!(!cmd.is_implemented());
+        eprintln!("{checked} default bindings name a command that is not implemented yet");
     }
 
 // --- src/macros.rs -------------------------------------------------------------------------------

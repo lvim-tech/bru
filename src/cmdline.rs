@@ -35,6 +35,7 @@
 use crate::commands::Command;
 use crate::modes::Mode;
 use cef::*;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// The characters a command line may start with. `modeparsers.STARTCHARS`.
@@ -125,8 +126,7 @@ impl CmdLine {
         STARTCHARS.contains(first).then_some(first)
     }
 
-    /// The accepted lines, oldest first. For the tests and for a future `:cmd-history`.
-    #[allow(dead_code)]
+    /// The accepted lines, oldest first. What [`save`] writes to `cmd-history`.
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -313,8 +313,7 @@ impl CmdLine {
         }
     }
 
-    /// Replace the history wholesale — how a stored `cmd-history` file would be loaded.
-    #[allow(dead_code)]
+    /// Replace the history wholesale — how `cmd-history` is loaded. See [`ensure_history_loaded`].
     pub fn set_history(&mut self, history: Vec<String>) {
         self.history = history;
         self.browse = None;
@@ -618,6 +617,10 @@ fn run_named_inner(name: &str, arg: String) -> bool {
     // History recall goes through `cmd_set_text`, exactly as `command_history_prev` does, so a
     // recalled line arrives with the cursor at its end and the chrome is told to apply it.
     match name {
+        "command-history-prev" | "command-history-next" => ensure_history_loaded(),
+        _ => {}
+    }
+    match name {
         "command-history-prev" => {
             if let Some(item) = with(|cmd| cmd.history_prev()) {
                 with(|cmd| cmd.set_text(&item));
@@ -730,6 +733,9 @@ pub fn on_accept(text: &str) {
     }
     let rapid = PENDING_RAPID.lock().map(|pending| *pending).unwrap_or(false);
 
+    // Before the line is appended, or `:save` would write this session's history over last
+    // session's rather than after it.
+    ensure_history_loaded();
     let to_run = with(|cmd| cmd.accept(text));
 
     if rapid {
@@ -768,6 +774,176 @@ pub fn on_mode_changed(mode: &str) {
     if had_text {
         focus_page();
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// `sf` — save
+// -----------------------------------------------------------------------------------------------
+
+/// The saveables bru has, in the sense `misc/savemanager.py` means: things held in memory that a
+/// file on disk has to be brought up to date with.
+///
+/// qutebrowser registers six (`add_saveable` calls): `command-history`, `quickmark-manager`,
+/// `bookmark-manager`, `state-config`, `yaml-config` and, on the QtWebKit backend only, `cookies`.
+/// bru has exactly one, and the other five are absent for reasons rather than by omission:
+///
+/// - **`yaml-config` / `state-config`** are qutebrowser writing configuration. DESIGN.md gives
+///   `~/.config/bru/config.lua` to configer and `theme.css` to themer; bru writes neither, ever, so
+///   there is nothing here to flush and `:save config` is refused rather than made a no-op.
+/// - **quickmarks and bookmarks** are already on disk. `data.rs` rewrites the file inside
+///   `quickmark_save`, `quickmark_del`, `bookmark_add` and `bookmark_del`, atomically, before the
+///   command returns — so a saveable would be a saveable that is never dirty.
+/// - **history** is a SQLite database written per visit; `cookies` are Chromium's, under
+///   `--user-data-dir`, and no bru code owns them.
+///
+/// That leaves the command line, which until now was the one thing bru held and never wrote: an
+/// accepted `:open …` lived in a `Vec<String>` and went with the process. The file is
+/// `cmd-history` in bru's data directory, which is the name and the shape qutebrowser's
+/// `LimitLineParser(standarddir.data(), 'cmd-history')` uses (`cmdhistory.py:126-131`).
+const SAVEABLES: &[&str] = &["command-history"];
+
+/// What `data.rs` writes without being asked, and therefore what `:save` has nothing to do for.
+const ALREADY_ON_DISK: &[&str] = &["quickmarks", "bookmarks", "history", "cookies"];
+
+/// What bru refuses to write at all, and the reason, in the shape `settings::REFUSED` uses.
+const NOT_BRUS_TO_WRITE: &[(&str, &str)] = &[
+    (
+        "config",
+        "bru writes no configuration: ~/.config/bru/config.lua belongs to configer and theme.css \
+         to themer, and a browser that rewrote either would be a second author of a hand-written \
+         file",
+    ),
+    ("key-config", "keys are bound in config.lua, which is configer's file"),
+    ("yaml-config", "bru has no autoconfig.yml — :set changes the running browser and nothing else"),
+    ("state-config", "bru keeps no state file; the session is :session-save's, under sessions/"),
+];
+
+/// `completion.cmd_history_max_items` (configdata.yml:1347), whose default is 100. The file is
+/// bounded for the same reason qutebrowser bounds it: it is read in full at startup.
+const HISTORY_MAX: usize = 100;
+
+/// `save [what…]` — `sf`, and `:save` typed.
+///
+/// With no argument everything is saved and one line reports it, which is `save_command`'s
+/// `what = tuple(self.saveables)` (savemanager.py:178-180). With names, each is looked up and an
+/// unknown one is an error naming what can be saved — qutebrowser's own wording.
+pub fn save(what: &[String]) {
+    ensure_history_loaded();
+
+    let names: Vec<&str> = if what.is_empty() {
+        SAVEABLES.to_vec()
+    } else {
+        what.iter().map(String::as_str).collect()
+    };
+
+    let (mut done, mut errors) = (Vec::new(), Vec::new());
+    for name in names {
+        match name {
+            "command-history" => match write_command_history() {
+                Ok((path, lines)) => done.push(format!("{lines} lines to {}", path.display())),
+                Err(error) => errors.push(format!("command-history: {error}")),
+            },
+            name if ALREADY_ON_DISK.contains(&name) => {
+                done.push(format!("{name} (written when it changes; nothing to flush)"))
+            }
+            name => match NOT_BRUS_TO_WRITE.iter().find(|(refused, _)| *refused == name) {
+                Some((_, why)) => errors.push(format!("{name}: {why}")),
+                None => errors.push(format!(
+                    "{name} is nothing which can be saved; bru saves {}",
+                    SAVEABLES.join(", ")
+                )),
+            },
+        }
+    }
+
+    if !done.is_empty() {
+        crate::message::info(&format!("saved {}", done.join(", ")));
+    }
+    for error in errors {
+        crate::message::error(&error);
+    }
+}
+
+/// `$XDG_DATA_HOME/bru/cmd-history`, or `~/.local/share/bru/cmd-history`.
+///
+/// Through `data::data_dir` rather than a second copy of the XDG rules, so that a scratch
+/// `XDG_DATA_HOME` moves the command history with everything else bru owns.
+fn history_path() -> Option<PathBuf> {
+    Some(crate::data::data_dir()?.join("cmd-history"))
+}
+
+/// Write the accepted lines out, newest last, and answer where they went and how many there were.
+fn write_command_history() -> std::io::Result<(PathBuf, usize)> {
+    let Some(path) = history_path() else {
+        return Err(std::io::Error::other(
+            "neither XDG_DATA_HOME nor HOME is set, so there is nowhere to save",
+        ));
+    };
+    let entries = with(|cmd| cmd.history().to_vec());
+    let lines = write_history(&path, &entries)?;
+    Ok((path, lines))
+}
+
+/// The pure half: the bytes, the cap, and the atomic rename. Takes a path so that it is testable
+/// without an `XDG_DATA_HOME` the whole process shares.
+fn write_history(path: &Path, entries: &[String]) -> std::io::Result<usize> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let kept: Vec<&String> = entries
+        .iter()
+        // A line with a newline in it would come back as two commands; the `<input>` cannot produce
+        // one, but the file is read again on the next start and this is the cheap end to guard.
+        .filter(|entry| !entry.is_empty() && !entry.contains('\n'))
+        .rev()
+        .take(HISTORY_MAX)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let mut body = String::new();
+    for entry in &kept {
+        body.push_str(entry);
+        body.push('\n');
+    }
+
+    // Temp file and rename, so an interrupted save leaves the previous history rather than half of
+    // this one — the same shape `data::write_atomically` uses for the two mark files.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(kept.len())
+}
+
+fn read_history(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Read `cmd-history` into the live command line, once, the first time something needs it.
+///
+/// Lazily rather than from `app.rs` so that no other workstream's file has to be edited to install
+/// it, and so that a data directory that cannot be read costs `<Ctrl-P>` its older entries and
+/// nothing else. It is called from the live half only — `on_accept`, the two history commands, and
+/// [`save`] — so the unit tests below never touch a real directory.
+fn ensure_history_loaded() {
+    static LOADED: std::sync::Once = std::sync::Once::new();
+    LOADED.call_once(|| {
+        let Some(path) = history_path() else { return };
+        let entries = read_history(&path);
+        if entries.is_empty() {
+            return;
+        }
+        cmdline()
+            .lock()
+            .expect("command line mutex poisoned")
+            .set_history(entries);
+    });
 }
 
 // --- mode and focus ---------------------------------------------------------------------------
@@ -1421,6 +1597,36 @@ mod tests {
                 "{named:?} is bound in command mode and must stay in Rust"
             );
         }
+    }
+
+    /// The file `:save` writes, and the cap it writes under.
+    #[test]
+    fn the_command_history_survives_a_round_trip_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("bru-cmdline-{}", std::process::id()));
+        let path = dir.join("cmd-history");
+
+        let entries: Vec<String> = vec![
+            ":open example.com".to_string(),
+            ":quit".to_string(),
+            // Neither of these may reach the file: an empty line is not a command, and a line with
+            // a newline in it would come back as two.
+            String::new(),
+            ":open a\n:quit".to_string(),
+        ];
+        assert_eq!(write_history(&path, &entries).unwrap(), 2);
+        assert_eq!(read_history(&path), [":open example.com", ":quit"]);
+
+        // The cap keeps the newest, because that is what `<Ctrl-P>` reaches first.
+        let many: Vec<String> = (0..HISTORY_MAX + 20).map(|i| format!(":open {i}")).collect();
+        assert_eq!(write_history(&path, &many).unwrap(), HISTORY_MAX);
+        let back = read_history(&path);
+        assert_eq!(back.len(), HISTORY_MAX);
+        assert_eq!(back.last().unwrap(), &format!(":open {}", HISTORY_MAX + 19));
+        assert_eq!(back.first().unwrap(), ":open 20");
+
+        // A missing file is an empty history, not an error: the first run of bru has none.
+        assert!(read_history(&dir.join("nothing-here")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

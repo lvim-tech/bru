@@ -545,6 +545,12 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         },
 // --- end src/devtools.rs, src/message.rs ---------------------------------------------------------
 
+// --- src/settingspage.rs -------------------------------------------------------------------
+        // `sf`. Not the page — see `Command::Save`: qutebrowser's `:save` walks its saveables, and
+        // the one bru has that is not already on disk is the command line's history.
+        Command::Save { what } => crate::cmdline::save(what),
+// --- end src/settingspage.rs ---------------------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -725,6 +731,11 @@ pub fn is_live(command: &Command) -> bool {
 
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
+
+// --- src/settingspage.rs -------------------------------------------------------------------
+        // `sf` writes a file, or says why there was nothing to write. See `cmdline::save`.
+        Command::Save { .. } => true,
+// --- end src/settingspage.rs ---------------------------------------------------------------
 
         // --- src/spawn.rs, src/editor.rs ----------------------------------------------------
         Command::Spawn { .. } => true,
@@ -1178,8 +1189,11 @@ mod tests {
         // as well, exactly as `set_mark` and `jump_mark` each did. Both new rows are live, so the
         // denominator and the numerator move together — 241/262 to 245/264.
         //
+        // 242 with `sf`, whose `save` writes the command line's history to `cmd-history` — the one
+        // saveable bru has that was not already on disk.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 245, "the live-binding count moved");
+        assert_eq!(live, 246, "the live-binding count moved");
     }
 
 // --- hint-follow -----------------------------------------------------------------------------
