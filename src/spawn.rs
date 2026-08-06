@@ -557,6 +557,9 @@ fn configure_stdio(command: &mut Command, opts: Opts) {
 /// not have yet. Setting a variable to a plausible wrong value is worse than not setting it: a
 /// script tests `if [ -n "$BRU_TEXT" ]`.
 ///
+/// Every name here is also exported under qutebrowser's `QUTE_` prefix — see [`alias_as_qute`],
+/// which is what lets this user's existing userscripts run unmodified.
+///
 /// UI thread — it reads `BruState` for the URL, the title and the tab index.
 fn environment(fifo: &Path, count: Option<u32>) -> Vec<(String, String)> {
     let mut env = vec![
@@ -592,7 +595,53 @@ fn environment(fifo: &Path, count: Option<u32>) -> Vec<(String, String)> {
         }
     }
 
+    alias_as_qute(&mut env);
     env
+}
+
+/// Add a `QUTE_…` twin for every `BRU_…` variable, so this user's existing qutebrowser userscripts
+/// run under bru without being edited.
+///
+/// **Measured, not assumed.** The five userscripts this machine actually has were read, and between
+/// them they name exactly five of qutebrowser's variables:
+///
+/// | variable | read by |
+/// |---|---|
+/// | `QUTE_FIFO` | all five |
+/// | `QUTE_URL` | all five |
+/// | `QUTE_DATA_DIR` | `qutebrowser_dmenu`, `qutebrowser_tab_dmenu`, `qute-keepassxc` |
+/// | `QUTE_CONFIG_DIR` | `qutebrowser_dmenu`, `qutebrowser_tab_dmenu` |
+/// | `QUTE_SELECTED_TEXT` | `qutebrowser_translate`, and only in its `--text` mode |
+///
+/// Four of the five are `BRU_*` already, so aliasing is the whole fix for four of the five scripts.
+/// The fifth — `QUTE_SELECTED_TEXT` — needs the page's DOM and is deliberately unset; see
+/// [`environment`]. `<Ctrl+Shift+T>` in this user's `config.py` is the one binding that wants it,
+/// and under bru it would translate an empty string. `<Ctrl+T>`, the same script without `--text`,
+/// reads `QUTE_URL` and works.
+///
+/// Derived from the `BRU_*` list rather than written out again: a variable added to [`environment`]
+/// gets its alias for free, and there is no second list to forget to update. One name is held back:
+/// `QUTE_VERSION`. Every other alias says "here is bru's answer to that question", which is true;
+/// `QUTE_VERSION=0.1.0` would instead claim to be a qutebrowser version, and a script comparing it
+/// against one would be misled. That is this module's own rule — a plausible wrong value is worse
+/// than no value — applied to the one variable it bites.
+///
+/// **What aliasing does not fix.** `qutebrowser_dmenu` and `qutebrowser_tab_dmenu` read
+/// `$QUTE_CONFIG_DIR/quickmarks`, which is where *qutebrowser* keeps quickmarks; bru keeps them in
+/// its data directory (DESIGN.md), so that `cat` fails and prints to stderr. Neither script sets
+/// `-e`, so the rest of the pipeline still runs and the menu is history plus the current URL —
+/// degraded, not broken. `$QUTE_DATA_DIR/history.sqlite` needs no such caveat: bru's schema is
+/// qutebrowser's, `CompletionHistory(url, title, last_atime)` included (`data.rs`), so their
+/// `sqlite3` query runs verbatim.
+fn alias_as_qute(env: &mut Vec<(String, String)>) {
+    let aliases: Vec<(String, String)> = env
+        .iter()
+        .filter_map(|(key, value)| {
+            let rest = key.strip_prefix("BRU_").filter(|rest| *rest != "VERSION")?;
+            Some((format!("QUTE_{rest}"), value.clone()))
+        })
+        .collect();
+    env.extend(aliases);
 }
 
 /// `$XDG_CONFIG_HOME/bru`, or `~/.config/bru`. Reported to userscripts, never created here —
@@ -906,6 +955,67 @@ mod tests {
         assert!(shlex("a \"b").is_err());
         assert!(shlex("a 'b").is_err());
         assert!(shlex(r"a b\").is_err());
+    }
+
+    /// The four variables this user's own userscripts read and bru can answer. Named one by one,
+    /// because the point of the aliases is those five scripts and nothing more general.
+    #[test]
+    fn a_qutebrowser_userscript_finds_the_variables_it_reads() {
+        let mut env = vec![
+            ("BRU_FIFO".to_string(), "/run/user/1000/bru/userscript-1-0".to_string()),
+            ("BRU_MODE".to_string(), "command".to_string()),
+            ("BRU_VERSION".to_string(), "0.1.0".to_string()),
+            ("BRU_CONFIG_DIR".to_string(), "/home/x/.config/bru".to_string()),
+            ("BRU_DATA_DIR".to_string(), "/home/x/.local/share/bru".to_string()),
+            ("BRU_URL".to_string(), "https://example.com/a".to_string()),
+        ];
+        alias_as_qute(&mut env);
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        // qute-pass, ql-pass, qute-keepassxc, qutebrowser_dmenu, qutebrowser_tab_dmenu,
+        // qutebrowser_translate — every one of them reads these two.
+        assert_eq!(get("QUTE_FIFO").as_deref(), Some("/run/user/1000/bru/userscript-1-0"));
+        assert_eq!(get("QUTE_URL").as_deref(), Some("https://example.com/a"));
+        // The two dmenu scripts, and qute-keepassxc for its key file.
+        assert_eq!(get("QUTE_DATA_DIR").as_deref(), Some("/home/x/.local/share/bru"));
+        assert_eq!(get("QUTE_CONFIG_DIR").as_deref(), Some("/home/x/.config/bru"));
+        assert_eq!(get("QUTE_MODE").as_deref(), Some("command"));
+
+        // bru's own names are untouched: a bru userscript is not asked to learn qutebrowser's.
+        assert_eq!(get("BRU_FIFO").as_deref(), Some("/run/user/1000/bru/userscript-1-0"));
+
+        // The one deliberate omission. `QUTE_VERSION=0.1.0` would claim to be a qutebrowser
+        // version; bru's own version is still there under its own name.
+        assert_eq!(get("QUTE_VERSION"), None);
+        assert_eq!(get("BRU_VERSION").as_deref(), Some("0.1.0"));
+
+        // Nothing the page's DOM would be needed for is invented. `qutebrowser_translate --text`
+        // reads this one and gets nothing, which is the honest answer — not an empty string
+        // dressed up as a selection.
+        assert_eq!(get("QUTE_SELECTED_TEXT"), None);
+        assert_eq!(get("QUTE_SELECTED_HTML"), None);
+        assert_eq!(get("QUTE_TEXT"), None);
+        assert_eq!(get("QUTE_HTML"), None);
+    }
+
+    /// The alias list is derived, never written twice: an unrelated variable in the environment is
+    /// not given a `QUTE_` twin, and neither is a `QUTE_` name given a second one.
+    #[test]
+    fn only_brus_own_variables_are_aliased() {
+        let mut env = vec![
+            ("BRU_TAB_INDEX".to_string(), "3".to_string()),
+            ("EDITOR".to_string(), "nvim".to_string()),
+            ("QUTE_URL".to_string(), "https://already".to_string()),
+        ];
+        alias_as_qute(&mut env);
+        assert_eq!(env.len(), 4, "one alias added, and only one");
+        assert!(env.contains(&("QUTE_TAB_INDEX".to_string(), "3".to_string())));
+        assert!(!env.iter().any(|(key, _)| key == "QUTE_EDITOR"));
+        assert!(!env.iter().any(|(key, _)| key == "QUTE_QUTE_URL"));
     }
 
     #[test]
