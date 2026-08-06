@@ -79,8 +79,8 @@ pub enum Target {
     TabBg,
     /// `tab-fg` (`;f`) — the element's URL in a tab that is switched to.
     TabFg,
-    /// `window` (`wf`) — a new window in qutebrowser; bru has one window by DESIGN.md, so this is a
-    /// foreground tab, exactly as `:open -w` already is (`exec.rs`, `Command::Open`).
+    /// `window` (`wf`) — the element's URL in a new top-level window, as `:open -w` and `U` already
+    /// make one. It was a foreground tab until `src/window.rs` grew a second window to open.
     Window,
     /// `hover` (`;h`) — move the mouse onto the element and leave it there.
     Hover,
@@ -95,14 +95,15 @@ pub enum Target {
 }
 
 impl Target {
-    /// `hints.py:start`'s `no_rapid_targets`, plus bru's one addition.
+    /// `hints.py:start`'s `no_rapid_targets`, exactly.
     ///
     /// qutebrowser refuses `--rapid` with `tab-fg` (it opens a tab and switches to it), `fill` (it
-    /// leaves hint mode by entering command mode), `right-click` and `delete`. bru adds `window`,
-    /// because with one window `window` *is* `tab-fg` — see [`Target::Window`]. That is why `;R`
-    /// (`hint --rapid links window`) is the one hint binding this milestone leaves inert.
+    /// leaves hint mode by entering command mode), `right-click` and `delete`. `window` is **not**
+    /// in that list, and bru no longer adds it: it did while `window` was a foreground tab, which
+    /// is the same objection as `tab-fg`'s, and that stopped being true when [`Target::Window`]
+    /// started opening a window. `;R` (`hint --rapid links window`) is live because of this line.
     fn allows_rapid(&self) -> bool {
-        !matches!(self, Target::TabFg | Target::Window | Target::Fill(_))
+        !matches!(self, Target::TabFg | Target::Fill(_))
     }
 
     /// Whether following needs the element's URL out of the page. The other targets act on the
@@ -593,9 +594,25 @@ wrap_task! {
 
                 Target::TabBg => crate::tabs::new_tab(&state, &self.url, true),
                 Target::TabFg => crate::tabs::new_tab(&state, &self.url, false),
-                // One window (DESIGN.md), so `window` is a foreground tab — the same collapse
-                // `:open -w` already makes in `exec.rs`.
-                Target::Window => crate::tabs::new_tab(&state, &self.url, false),
+                // A window of its own, the same one `:open -w` makes. This was a foreground tab
+                // until `src/window.rs` had a second window to open, and it is the one line `wf`
+                // needed.
+                //
+                // `;R` needed nothing here and one thing in `handle_key`, and which one was
+                // measured rather than foreseen — see `Foreign` there. Handing focus back from
+                // this arm was tried first and loses a race it cannot win: the compositor's
+                // activation of the new toplevel arrives *after* the task that made it, so
+                // `tabs::focus` on the hinting window is undone by `on_window_activation_changed`
+                // a moment later. Measured 2026-08-06, with the focus-back in place:
+                //
+                //   bru[hints]: window 1 opened; focus asked back to Some(0), state says Some(0)
+                //   hint-script: after "s" -> mode normal, 0 hints, ... windows=2
+                //
+                // Whether a session is open behind this is read there rather than here, so nothing
+                // about opening a window depends on how the session that asked for it ends.
+                Target::Window => {
+                    crate::window::open(&state, &self.url);
+                }
 
                 // `;o` / `;O`. qutebrowser's `preset_cmd_text`: substitute `{hint-url}`, then
                 // refuse anything that is not a command line — a text not starting with `:`, `/`
@@ -824,23 +841,61 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
     debug(&format!("key {info}"));
 
     // A session belongs to one tab, and `--rapid` is the first thing that can outlive a tab switch.
-    // If the key arrived at a different browser the labels are on a page nobody is looking at, and
-    // matching against them would follow a link the user cannot see. End the session and answer
-    // `None`, so `keys.rs` treats this as the ordinary key it now is.
+    // If the key arrived at a different browser the labels are usually on a page nobody is looking
+    // at, and matching against them would follow a link the user cannot see. End the session and
+    // answer `None`, so `keys.rs` treats this as the ordinary key it now is.
     //
     // (The stale labels stay on the other tab until its next `collect`, which begins with `clear`,
     // or until it navigates. Reaching across to remove them would mean holding that tab's `Browser`
     // for the length of the session, and a live reference is what stops a tab from closing —
     // CEF-NOTES, Tabs.)
-    let stale = {
+    //
+    // **`;R` is the one session that has to survive it, and the reason is the session's own doing.**
+    // `hint --rapid links window` opens a window per follow; a new toplevel takes the compositor's
+    // keyboard focus, so the second label of every rapid window session is delivered to the window
+    // the *first* one made. Ending on that is `;f` with extra steps — measured 2026-08-06, and both
+    // the plain change and a focus-back from the follow task are in the report. So for that one
+    // combination the key is aimed back at the browser the labels are drawn on, which is the same
+    // decision `keys.rs` already makes for a key that lands on a chrome strip (CEF-NOTES trap 11).
+    // `<Escape>` below is aimed there too, so the session is still one key from over.
+    let foreign = {
         let guard = session().lock().expect("hint session mutex poisoned");
-        guard.as_ref().map(|open| open.browser_id != browser.identifier()) == Some(true)
+        match guard.as_ref() {
+            None => Foreign::Same,
+            Some(open) => Foreign::decide(
+                open.browser_id,
+                browser.identifier(),
+                open.rapid,
+                &open.target,
+            ),
+        }
     };
-    if stale {
-        *session().lock().expect("hint session mutex poisoned") = None;
-        leave_mode(state);
-        return None;
-    }
+    let mut hinting;
+    let browser: &mut Browser = match foreign {
+        Foreign::Same => browser,
+        Foreign::End => {
+            *session().lock().expect("hint session mutex poisoned") = None;
+            leave_mode(state);
+            return None;
+        }
+        Foreign::AimBack(id) => {
+            let found = state.lock().expect("state mutex poisoned").browser_with_id(id);
+            match found {
+                Some(found) => {
+                    debug(&format!("key aimed back at browser {id} for a rapid window session"));
+                    hinting = found;
+                    &mut hinting
+                }
+                // The hinting tab has gone since the last follow. Nothing to draw on and nothing to
+                // click; this is the ordinary stale case after all.
+                None => {
+                    *session().lock().expect("hint session mutex poisoned") = None;
+                    leave_mode(state);
+                    return None;
+                }
+            }
+        }
+    };
 
 // --- per-window mode -----------------------------------------------------------------------
     // Hint mode with **no** session at all, which is the other half of the same question now that
@@ -946,6 +1001,31 @@ enum Outcome {
     Follow(usize),
     Pending,
     NoMatch,
+}
+
+/// Where a key that reached hint mode should be acted on — see the block in [`handle_key`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Foreign {
+    /// It arrived at the browser the labels are on.
+    Same,
+    /// It arrived somewhere else, and the session goes.
+    End,
+    /// It arrived somewhere else because the session put it there. Aim it at this browser.
+    AimBack(i32),
+}
+
+impl Foreign {
+    /// The rule, with no CEF in it, so that it can be asserted in a unit test — `handle_key` posts
+    /// tasks and cannot be called from one (CEF-NOTES trap 13).
+    fn decide(session_browser: i32, key_browser: i32, rapid: bool, target: &Target) -> Foreign {
+        if session_browser == key_browser {
+            Foreign::Same
+        } else if rapid && *target == Target::Window {
+            Foreign::AimBack(session_browser)
+        } else {
+            Foreign::End
+        }
+    }
 }
 
 /// Push the current chain to the status bar and to the page's labels.
@@ -1190,17 +1270,18 @@ wrap_task! {
                 }
             }
 
-            // Tabs and the URL as well as the mode, because that is what the targets change and
-            // there is otherwise nothing to read: `;f` and `;b` differ only in which tab is
-            // active, and `;h` and `f` only in what the page did about it.
-            let (mode, tabs, active) = {
+            // Tabs, windows and the URL as well as the mode, because that is what the targets
+            // change and there is otherwise nothing to read: `;f` and `;b` differ only in which
+            // tab is active, `wf` and `;f` only in whether a window appeared, and `;h` and `f`
+            // only in what the page did about it.
+            let (mode, tabs, active, windows) = {
                 let guard = state.lock().expect("state mutex poisoned");
-                (guard.mode(), guard.tab_count(), guard.active_tab())
+                (guard.mode(), guard.tab_count(), guard.active_tab(), guard.window_count())
             };
             let guard = session().lock().expect("hint session mutex poisoned");
             eprintln!(
                 "hint-script: after {:?} -> mode {mode}, {} hints, chain {:?}, \
-                 tabs={tabs} active={active}, url={}",
+                 tabs={tabs} active={active} windows={windows}, url={}",
                 self.step,
                 guard.as_ref().map(|s| s.labels.len()).unwrap_or(0),
                 guard
@@ -1439,16 +1520,37 @@ mod tests {
 
     #[test]
     fn rapid_is_refused_exactly_where_qutebrowser_refuses_it() {
-        // hints.py:1027's `no_rapid_targets`, plus `window` because bru has one window.
+        // hints.py:1027's `no_rapid_targets`, and nothing else — `window` was bru's own addition
+        // for as long as it opened a foreground tab, and came out when it stopped.
         assert!(!Target::TabFg.allows_rapid());
-        assert!(!Target::Window.allows_rapid());
         assert!(!Target::Fill(":open {hint-url}".to_string()).allows_rapid());
+        assert!(Target::Window.allows_rapid());
         // And the ones `;r` and `<Ctrl-R>` actually use.
         assert!(Target::TabBg.allows_rapid());
         assert!(Target::Normal.allows_rapid());
         assert!(Target::Hover.allows_rapid());
         assert!(Target::Yank.allows_rapid());
         assert!(Target::Download.allows_rapid());
+    }
+
+    /// A key that arrives at the wrong browser ends the session — except for the one session whose
+    /// own follows are what sent it there.
+    ///
+    /// Measured before it was written: with this rule absent, `--hint-script='hint --rapid links
+    /// window,a,s,d'` read `mode normal, 0 hints` from the second step on, because a new toplevel
+    /// takes the compositor's keyboard focus and `;R` opens one per follow.
+    #[test]
+    fn only_a_rapid_window_session_survives_the_focus_its_own_follow_moved() {
+        // The ordinary case, and the one the check was written for: a tab switch during `;r`.
+        assert_eq!(Foreign::decide(7, 7, true, &Target::TabBg), Foreign::Same);
+        assert_eq!(Foreign::decide(7, 9, true, &Target::TabBg), Foreign::End);
+        assert_eq!(Foreign::decide(7, 9, false, &Target::Normal), Foreign::End);
+        // `wf` is not rapid: one window, one follow, and the session is over before the key that
+        // would land in the new window is pressed.
+        assert_eq!(Foreign::decide(7, 9, false, &Target::Window), Foreign::End);
+        // `;R`, and only `;R`.
+        assert_eq!(Foreign::decide(7, 9, true, &Target::Window), Foreign::AimBack(7));
+        assert_eq!(Foreign::decide(7, 7, true, &Target::Window), Foreign::Same);
     }
 
     #[test]

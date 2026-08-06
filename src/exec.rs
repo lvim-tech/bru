@@ -758,22 +758,17 @@ pub fn is_live(command: &Command) -> bool {
 // --- end src/completers.rs -----------------------------------------------------------------
 
 // --- src/hints.rs -----------------------------------------------------------------------
-        // Three targets and one combination are inert on purpose, and each for a different
-        // reason. Raise this when the reason goes away, in the commit that removes it.
-        //
-        // - `yank` / `yank-primary` (`;y`, `;Y`) collect the URL and have nowhere to put it:
-        //   the clipboard is another workstream's, and `hints::Clipboard` is the whole of what
-        //   this one needs from it. Live the moment `hints::install_clipboard` is called.
-        // - `download` (`;d`) is the same shape against `hints::Downloads`.
-        // - `--rapid` with `window` (`;R`) is refused, as qutebrowser refuses `--rapid tab-fg`:
-        //   bru has one window, so `window` *is* a foreground tab, and a rapid session cannot
-        //   survive the tab it is drawn on being switched away from.
+        // Every target acts. Two combinations do not, and they are the two `hints.py:1027` names
+        // in `no_rapid_targets`: `--rapid` with `tab-fg` opens a tab and switches to it, so the
+        // second label would be typed at the tab that was just left, and `--rapid` with `fill`
+        // leaves hint mode by entering command mode. `window` was a third for as long as it
+        // opened a foreground tab; it opens a window now, so `;R` is live — see `hints.rs`.
         Command::Hint { target, rapid, .. } => {
             use crate::commands::HintTarget;
             match target {
                 // Introduced to `clip.rs` and `downloads.rs` at startup — `app.rs` installs both.
                 HintTarget::Yank | HintTarget::YankPrimary | HintTarget::Download => true,
-                HintTarget::Window | HintTarget::TabFg | HintTarget::Fill(_) => !rapid,
+                HintTarget::TabFg | HintTarget::Fill(_) => !rapid,
                 _ => true,
             }
         }
@@ -1403,8 +1398,12 @@ mod tests {
         // — they counted as live while they quietly opened a tab — so what fixing them shows up in
         // is the run against the real browser, not this.
         //
+        // 251 with `;R` (`hint --rapid links window`). It is the third binding the second window
+        // is worth and the last one it was owed: `Target::Window` opened a foreground tab, which
+        // is `tab-fg`'s own reason for refusing `--rapid`, and it opens a window now.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 250, "the live-binding count moved");
+        assert_eq!(live, 251, "the live-binding count moved");
     }
 
 // --- src/settingspage.rs -------------------------------------------------------------------
@@ -1771,15 +1770,41 @@ mod tests {
                 "{cmd:?} has a clipboard and a download manager now"
             );
         }
-        // The fourth stays inert, and its reason is structural rather than a missing module: bru
-        // has one window, so `window` *is* a foreground tab, and a rapid session cannot survive
-        // the tab it is drawn on being switched away from. qutebrowser refuses the same pair.
-        assert!(!is_live(&commands::parse("hint --rapid links window").unwrap()));
-        // …but the same targets without `--rapid`, and `--rapid` with a target that survives it,
-        // are live. Otherwise the four above would pass with the whole feature switched off.
+        // The fourth was inert because `window` opened a foreground tab, which is `tab-fg`'s own
+        // objection to `--rapid`. It opens a window now, and `;R` is live with it.
+        assert!(is_live(&commands::parse("hint --rapid links window").unwrap()));
+        // The two `hints.py:1027` refuses are still refused, and the same targets without
+        // `--rapid` are live. Otherwise the four above would pass with the feature switched off.
+        assert!(!is_live(&commands::parse("hint --rapid links tab-fg").unwrap()));
+        assert!(!is_live(&commands::parse("hint --rapid links fill :open {hint-url}").unwrap()));
         assert!(is_live(&commands::parse("hint links window").unwrap()));
         assert!(is_live(&commands::parse("hint --rapid links tab-bg").unwrap()));
         assert!(is_live(&commands::parse("hint --rapid all hover").unwrap()));
+    }
+
+    /// The one binding a hint that opens a real window turned on, named: `;R`.
+    ///
+    /// `wf` is not in it, and that is the point of naming rather than counting. `hint all window`
+    /// has been live since hint targets existed — it opened a *foreground tab*, which `is_live`
+    /// cannot see and a total cannot show. What the number can show is `;R`, whose refusal was
+    /// `Target::Window` being a tab under a different name.
+    #[test]
+    fn the_binding_a_window_hint_turned_on() {
+        let (_, _, cmd) = DEFAULT_BINDINGS
+            .iter()
+            .find(|(mode, k, _)| *mode == "normal" && *k == ";R")
+            .expect("normal mode binds ;R");
+        assert_eq!(*cmd, "hint --rapid links window");
+        assert!(is_live(&commands::parse(cmd).unwrap()));
+
+        // `wf` was live before and is live now; it is here so that a reader looking for the second
+        // window's hint bindings finds both, and so that deleting the `window` target fails twice.
+        let (_, _, cmd) = DEFAULT_BINDINGS
+            .iter()
+            .find(|(mode, k, _)| *mode == "normal" && *k == "wf")
+            .expect("normal mode binds wf");
+        assert_eq!(*cmd, "hint all window");
+        assert!(is_live(&commands::parse(cmd).unwrap()));
     }
 // --- end src/hints.rs -------------------------------------------------------------------
 
@@ -1844,10 +1869,10 @@ mod tests {
         );
         assert!(commands::parse("tab-give nowhere").is_err());
 
-        // `;R` is the one hint binding a second window does *not* turn on, and its reason is now in
-        // `hints.rs` rather than in the shape of bru: `Target::Window` still opens a foreground tab
-        // there. Flipping this without that change would claim `;R` works when it does not.
-        assert!(!is_live(&commands::parse("hint --rapid links window").unwrap()));
+        // `;R` was the one hint binding a second window did not turn on, because `Target::Window`
+        // still opened a foreground tab in `hints.rs`. That line is a `window::open` now, so this
+        // is the third binding the second window is worth — see `the_binding_a_window_hint_turned_on`.
+        assert!(is_live(&commands::parse("hint --rapid links window").unwrap()));
     }
 // --- end src/window.rs -----------------------------------------------------
 
