@@ -919,6 +919,8 @@ fn install_over_the_running_browser(config: Config) {
         let mut state = state.lock().expect("state mutex poisoned");
         state.set_bindings(bindings);
         state.set_parsers(parsers);
+        // Every mode's, because every mode's trie has just been replaced.
+        state.clear_keychains(None);
     }
     // What the file set, pushed into Chromium. `into_parsers` only stores it.
     crate::settings::apply_at_startup();
@@ -1042,9 +1044,12 @@ fn change_live_binding(mode: Mode, keys: &str, command: Option<&str>) -> Result<
                 trie.remove(&sequence);
             }
         }
-        // A pending `g` matched against the old table has nothing to complete against the new one.
-        parsers.clear(mode);
     }
+    // A chain half-typed against the old table has nothing to complete against the new one, and it
+    // lives in the *window* as well as in the parser. Measured: without this, `:bind Z open -t`
+    // after a stray `Z` completed `ZZ` on the next press and quit bru. See
+    // `BruState::clear_keychains`.
+    state.clear_keychains(Some(mode));
     Ok(existed)
 }
 

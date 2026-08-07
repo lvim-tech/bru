@@ -351,6 +351,37 @@ impl BruState {
     pub fn parsers_mut(&mut self) -> Option<&mut crate::bindings::KeyParsers> {
         self.parsers.as_mut()
     }
+
+    /// Throw away every half-typed chain, in **every** window, for one mode or for all of them.
+    ///
+    /// **Measured, not foreseen.** `:bind Z open -t` and then a `Z` at the page quit bru, having
+    /// saved a session on the way out. The reason is that `Z` was already a prefix — bru binds `ZQ`
+    /// and `ZZ` to `quit` — so the first `Z` of the run left `Z` pending in the *window*, the rebind
+    /// changed the table underneath it, and the next `Z` completed `ZZ` against a chain that had
+    /// been typed against a table that no longer existed. The parser's own chain is cleared by
+    /// `KeyParsers::clear`; the window's is not, because it lives here (`pending_keys`), and that is
+    /// the half a rebind was missing.
+    ///
+    /// `None` means every mode, which is what `:config-source` needs: it replaces the whole set of
+    /// tries, so no chain typed against the old ones can complete against the new.
+    pub fn clear_keychains(&mut self, mode: Option<crate::modes::Mode>) {
+        for slot in &mut self.windows {
+            if mode.is_none_or(|wanted| slot.pending_keys.0 == wanted) {
+                slot.pending_keys = (slot.pending_keys.0, Vec::new(), String::new());
+            }
+        }
+        let Some(parsers) = self.parsers.as_mut() else {
+            return;
+        };
+        match mode {
+            Some(mode) => parsers.clear(mode),
+            None => {
+                for mode in crate::modes::Mode::ALL {
+                    parsers.clear(mode);
+                }
+            }
+        }
+    }
 // --- end config commands ---------------------------------------------------------------------
 
     /// Feed one keypress to the parser for the current window's mode. `None` before the bindings
