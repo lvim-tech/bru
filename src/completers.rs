@@ -61,6 +61,18 @@ enum Which {
     /// `:tab-select`, `:tab-focus`. `special` adds qutebrowser's Special category, which is where
     /// `tab-focus last` comes from (`miscmodels.py:176-189`).
     Tabs { special: bool },
+// --- src/utilcmds.rs -------------------------------------------------------
+    /// `:tab-select` — every window's tabs, one category per window, each row addressed
+    /// `<win-id>/<index>` (`miscmodels.py:91-155`, `add_win_id=True`).
+    ///
+    /// A separate variant from [`Which::Tabs`] rather than another flag on it: the rows are
+    /// *addressed differently*, and column 0 is what `<Tab>` writes into the line. `:tab-focus 2`
+    /// and `:tab-select 0/2` are two different commands' spellings of the same tab.
+    AllTabs,
+    /// `:tab-take` — the same, minus this window's own tabs (`miscmodels.py:168-174`,
+    /// `other_tabs`). A tab in this window is the one thing `:tab-take` refuses.
+    OtherTabs,
+// --- end src/utilcmds.rs ---------------------------------------------------
     /// `:quickmark-load` and friends — the name is what the command takes, so it leads.
     Quickmark,
     /// `:bookmark-load` and friends — a URL is what the command takes.
@@ -87,7 +99,12 @@ struct Spec {
 /// command-name model that `:` alone would open wants the same list.
 const SPECS: &[Spec] = &[
     Spec { name: "open", argpos: 0, which: Which::Url, maxsplit0: true },
-    Spec { name: "tab-select", argpos: 0, which: Which::Tabs { special: false }, maxsplit0: false },
+// --- src/utilcmds.rs -------------------------------------------------------
+    // `maxsplit0` on both, because both are registered that way (`commands.py:430`, `:930`) and
+    // because their argument may be a title fragment with a space in it.
+    Spec { name: "tab-select", argpos: 0, which: Which::AllTabs, maxsplit0: true },
+    Spec { name: "tab-take", argpos: 0, which: Which::OtherTabs, maxsplit0: true },
+// --- end src/utilcmds.rs ---------------------------------------------------
     Spec { name: "tab-focus", argpos: 0, which: Which::Tabs { special: true }, maxsplit0: false },
     Spec { name: "quickmark-load", argpos: 0, which: Which::Quickmark, maxsplit0: false },
     Spec { name: "quickmark-del", argpos: 0, which: Which::Quickmark, maxsplit0: false },
@@ -297,12 +314,78 @@ fn tabs_rows() -> Vec<Vec<String>> {
 
 /// `miscmodels.py:110` — `column_widths=(6, 40, 46, 8)`, less the pid column.
 const TAB_WIDTHS: &[u8] = &[6, 40, 54];
+
+// --- src/utilcmds.rs -------------------------------------------------------
+/// One window's rows, filtered by the pattern, as a category named after the window. Called with an
+/// empty `rows` at the start and at the end, where it does nothing.
+fn push_window(out: &mut Vec<Category>, window: Option<u32>, rows: &mut Vec<Vec<String>>, pattern: &str) {
+    let Some(window) = window else {
+        rows.clear();
+        return;
+    };
+    let taken = std::mem::take(rows);
+    if let Some(category) = completion::list_category(window_name(window), TAB_WIDTHS, taken, pattern)
+    {
+        out.push(category);
+    }
+}
+
+/// A window id as a `&'static str`, which is what `Category::name` is.
+///
+/// Interned rather than leaked per call, because [`build`] runs on **every keystroke** of a
+/// `:tab-select …` and a leak there would grow with the typing. What this does leak is one short
+/// string per window id the session has ever shown a completion for — a handful of bytes, once, for
+/// a number that never comes back.
+fn window_name(id: u32) -> &'static str {
+    static NAMES: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
+    let Ok(mut names) = NAMES.lock() else {
+        return "window";
+    };
+    if let Some((_, name)) = names.iter().find(|(known, _)| *known == id) {
+        return name;
+    }
+    let name: &'static str = Box::leak(id.to_string().into_boxed_str());
+    names.push((id, name));
+    name
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
 /// `miscmodels.py:49,68` — `column_widths=(30, 70, 0)`.
 const MARK_WIDTHS: &[u8] = &[30, 70];
 
 fn build(which: Which, pattern: &str) -> Vec<Category> {
     match which {
         Which::Url => completion::categories(pattern),
+
+// --- src/utilcmds.rs -------------------------------------------------------
+        // One category per window, titled with the window's id, exactly as `_tabs` does when
+        // `add_win_id` is on (`miscmodels.py:143-147`) — the id has to be visible somewhere, and a
+        // heading is where qutebrowser puts it.
+        Which::AllTabs | Which::OtherTabs => {
+            let here = crate::state::BruState::instance()
+                .and_then(|state| state.lock().ok().and_then(|state| state.current_window_id()));
+            let mut out = Vec::new();
+            let mut window = None;
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            // `all_tabs` is in window order, so a category breaks whenever the window changes and
+            // nothing has to be grouped again.
+            for tab in crate::utilcmds::all_tabs() {
+                if which == Which::OtherTabs && Some(tab.window) == here {
+                    continue;
+                }
+                if window != Some(tab.window) {
+                    push_window(&mut out, window, &mut rows, pattern);
+                    window = Some(tab.window);
+                }
+                rows.push(vec![
+                    format!("{}/{}", tab.window, tab.index + 1),
+                    tab.url,
+                    tab.title,
+                ]);
+            }
+            push_window(&mut out, window, &mut rows, pattern);
+            out
+        }
+// --- end src/utilcmds.rs ---------------------------------------------------
 
         Which::Tabs { special } => {
             let mut out = Vec::with_capacity(2);
@@ -1044,10 +1127,20 @@ mod tests {
 
     #[test]
     fn every_model_is_reachable_by_the_command_that_wants_it() {
-        assert_eq!(part(":tab-select 2").unwrap().which, Which::Tabs { special: false });
         assert_eq!(part(":tab-focus 2").unwrap().which, Which::Tabs { special: true });
         assert_eq!(part(":quickmark-load g").unwrap().which, Which::Quickmark);
         assert_eq!(part(":bookmark-load h").unwrap().which, Which::Bookmark);
+// --- src/utilcmds.rs -------------------------------------------------------
+        // `:tab-select` moved off `Which::Tabs` when the command was implemented: it takes
+        // `[win-id/]index`, so it needs every window's tabs and rows addressed with the window id.
+        // `:tab-focus` is the one that stays — it is this window's tabs and a bare index.
+        assert_eq!(part(":tab-select 2").unwrap().which, Which::AllTabs);
+        assert_eq!(part(":tab-take 0/2").unwrap().which, Which::OtherTabs);
+        // Both are `maxsplit0`, so a title fragment with a space in it is one pattern and the
+        // completion sees all of it.
+        assert_eq!(part(":tab-select rust std").unwrap().center, "rust std");
+        assert_eq!(part(":tab-take rust std").unwrap().center, "rust std");
+// --- end src/utilcmds.rs ---------------------------------------------------
     }
 
     #[test]

@@ -131,6 +131,24 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/cookies.js" => Some(("text/javascript", COOKIES_JS.to_vec())),
 // --- end src/cookies.rs ----------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
+// --- src/utilcmds.rs -------------------------------------------------------
+        // `:version`, `:messages` and `:process`. Generated per request from what the running
+        // browser knows, for the same reason `/help` is — and `/messages` is the one page here that
+        // is asked with a query string, which is why `asset` takes the URL and not only the path.
+        "/version" | "/version.html" => {
+            Some(("text/html", crate::utilcmds::version_page().into_bytes()))
+        }
+        "/messages" | "/messages.html" => {
+            let query = url.split_once('?').map(|(_, query)| query).unwrap_or("");
+            let query = query.split('#').next().unwrap_or(query);
+            Some(("text/html", crate::utilcmds::messages_page(query).into_bytes()))
+        }
+        // `/process` lists them all and `/process/<pid>` is the one `:process` opens.
+        path if path == "/process" || path.starts_with("/process/") => Some((
+            "text/html",
+            crate::utilcmds::process_page(path.trim_start_matches("/process")).into_bytes(),
+        )),
+// --- end src/utilcmds.rs ---------------------------------------------------
         _ => None,
     }
 }

@@ -46,6 +46,7 @@ mod settings;
 mod settingspage;
 mod state;
 mod tabs;
+mod utilcmds;
 mod window;
 
 use cef::*;

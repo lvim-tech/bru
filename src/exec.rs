@@ -657,6 +657,94 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
+// --- src/utilcmds.rs -------------------------------------------------------
+        // The twenty-two commands qutebrowser has that had no arm here. None of them is bound by
+        // qutebrowser's defaults, so none raises the live-binding count — what `gt` prefills now
+        // does something, which is a different thing from a key becoming live.
+        Command::TabSelect { index } => {
+            crate::utilcmds::tab_select(state, index.as_deref(), count)
+        }
+        Command::TabTake { index, keep } => {
+            crate::utilcmds::tab_take(state, browser, index, *keep)
+        }
+        Command::WindowOnly => crate::utilcmds::window_only(state),
+
+        Command::Screenshot { filename, rect, force } => {
+            crate::utilcmds::screenshot(browser, filename, rect.as_deref(), *force)
+        }
+
+        // `--file` and `--url` are read here rather than at parse time: a binding naming a file
+        // should not fail to load because the file is missing at startup.
+        Command::JsEval { code, file, url, quiet } => {
+            let code = match (file, url) {
+                (true, _) => crate::utilcmds::jseval_file(code),
+                (_, true) => crate::utilcmds::jseval_url(code),
+                _ => Ok(code.clone()),
+            };
+            match code {
+                Ok(code) => crate::utilcmds::jseval(browser, &code, *quiet),
+                Err(problem) => crate::message::error(&format!("jseval: {problem}")),
+            }
+        }
+
+        Command::EditUrl { url, tab, bg, window } => {
+            crate::utilcmds::edit_url(state, url.as_deref(), *tab, *bg, *window)
+        }
+        Command::EditCommand { run } => crate::utilcmds::edit_command(state, *run),
+
+        Command::QuickmarkAdd { url, name } => crate::utilcmds::quickmark_add(url, name),
+        Command::HistoryClear { force } => crate::utilcmds::history_clear(state, *force),
+        Command::MarksReload { which } => crate::utilcmds::reload_marks(*which),
+
+        // The three that run other commands. `later` posts; the other two recurse straight away,
+        // and that recursion is bounded for the same reason a chain's is — the carried command was
+        // parsed once, at parse time, and cannot grow another level while it runs.
+        Command::Later { ms, command } => crate::utilcmds::later(*ms, command, count),
+        // "count: Multiplies with 'times' when given" (`utilcmds.py:64-79`). The ceiling is bru's:
+        // `:repeat 99999 scroll down` would hold the UI thread for the same reason `99999j` would,
+        // which is what `MAX_COUNT` is already here for.
+        Command::Repeat { times, command } => {
+            let times = (*times as u64 * count.unwrap_or(1) as u64).min(MAX_COUNT as u64);
+            for _ in 0..times {
+                run(state, browser, command, None);
+            }
+        }
+        // "If cmd_run_with_count itself is run with a count, it multiplies count_arg"
+        // (`utilcmds.py:86-97`).
+        Command::RunWithCount { count: given, command } => {
+            let given = (*given as u64 * count.unwrap_or(1) as u64).min(MAX_COUNT as u64);
+            run(state, browser, command, Some(given as u32));
+        }
+
+        Command::Restart => crate::utilcmds::restart(state),
+        Command::Version => crate::utilcmds::version(state, browser),
+        Command::Messages { level, plain, tab, bg, window } => {
+            crate::utilcmds::messages(state, browser, level, *plain, *tab, *bg, *window)
+        }
+        Command::Process { pid, action } => {
+            crate::utilcmds::process(state, browser, *pid, *action)
+        }
+
+        Command::ClickElement { filter, value, target, force_event, select_first } => {
+            crate::utilcmds::click_element(
+                state,
+                browser,
+                *filter,
+                value.as_deref(),
+                *target,
+                *force_event,
+                *select_first,
+            )
+        }
+        // A navigation to a fragment, which is what an anchor is — see the function, and note that
+        // it therefore does not go near `send_mouse_wheel_event` or `window.scrollBy`.
+        Command::ScrollToAnchor { name } => crate::utilcmds::scroll_to_anchor(browser, name),
+
+        // The count names which download, as it does for the other seven.
+        Command::DownloadRemove { all } => crate::downloads::remove(count, *all),
+        Command::ClearMessages => crate::message::clear(),
+// --- end src/utilcmds.rs ---------------------------------------------------
+
         // Nothing to do, and that is the point: `nop` exists to shadow a Chromium default, and
         // clear-keychain is already done by the parser reporting the key.
         Command::Nop | Command::ClearKeychain => {}
@@ -899,6 +987,39 @@ pub fn is_live(command: &Command) -> bool {
 
         Command::Nop | Command::ClearKeychain => true,
 
+// --- src/utilcmds.rs -------------------------------------------------------
+        // All twenty-two act, and **not one of them is bound by qutebrowser's defaults**, so this
+        // block moves the live-binding count by nothing. `gt` is the near miss: it is
+        // `cmd-set-text -s :tab-select`, which was live because prefilling the line is something
+        // happening, and what changed is that the line now has a command behind it.
+        //
+        // `later`, `repeat` and `run-with-count` are live only when what they carry is: a
+        // `:repeat 3 <something inert>` does nothing three times, and claiming it acts would be
+        // claiming the inert command does. Same rule as a chain's, one link long.
+        Command::Later { command, .. }
+        | Command::Repeat { command, .. }
+        | Command::RunWithCount { command, .. } => is_live(command),
+
+        Command::TabSelect { .. }
+        | Command::TabTake { .. }
+        | Command::WindowOnly
+        | Command::Screenshot { .. }
+        | Command::JsEval { .. }
+        | Command::EditUrl { .. }
+        | Command::EditCommand { .. }
+        | Command::QuickmarkAdd { .. }
+        | Command::HistoryClear { .. }
+        | Command::Restart
+        | Command::Version
+        | Command::Messages { .. }
+        | Command::Process { .. }
+        | Command::ClickElement { .. }
+        | Command::ScrollToAnchor { .. }
+        | Command::DownloadRemove { .. }
+        | Command::ClearMessages
+        | Command::MarksReload { .. } => true,
+// --- end src/utilcmds.rs ---------------------------------------------------
+
 // --- src/macros.rs -------------------------------------------------------------------------------
         // Both act in every spelling: bare (`q`, `@`) they open the mode that names a register,
         // and with one they record or replay straight away. A register that holds nothing says so
@@ -967,6 +1088,16 @@ pub fn refusal(command: &Command) -> Option<&'static str> {
         // the second half of the chain. A `config.lua` writing `reload ;; config-cycle …` would
         // have reached it with nothing stubbed at all.
         Command::Chain(parts) => parts.iter().filter(|part| !is_live(part)).find_map(refusal),
+// --- src/utilcmds.rs -------------------------------------------------------
+        // The three that carry a command are exactly a chain one link long, so they answer the same
+        // way: `:later 1s config-cycle … content.plugins` is refused for the reason the carried
+        // command is refused for, and not "not yet". No default binding is any of these — the
+        // reader who reaches this line wrote it in `config.lua`, which is precisely the case the
+        // three-state page exists for.
+        Command::Later { command, .. }
+        | Command::Repeat { command, .. }
+        | Command::RunWithCount { command, .. } => refusal(command),
+// --- end src/utilcmds.rs ---------------------------------------------------
         _ => None,
     }
 }

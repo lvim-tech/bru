@@ -658,8 +658,24 @@ fn watch(
     opts: Opts,
     fifo: Option<(PathBuf, std::fs::File)>,
 ) {
+// --- src/utilcmds.rs -------------------------------------------------------
+    // Every child `:spawn` starts, whatever its flags were, so `:process` has something to list.
+    // Here rather than at the two `Command::spawn` calls above: this is the one function both of
+    // them end at, and it is the one that learns how the child finished.
+    let pid = child.id();
+    crate::utilcmds::process_started(pid, &what);
+// --- end src/utilcmds.rs ---------------------------------------------------
     std::thread::spawn(move || {
         let output = child.wait_with_output();
+// --- src/utilcmds.rs -------------------------------------------------------
+        crate::utilcmds::process_finished(
+            pid,
+            &match &output {
+                Ok(output) => output.status.to_string(),
+                Err(problem) => format!("could not be waited for: {problem}"),
+            },
+        );
+// --- end src/utilcmds.rs ---------------------------------------------------
 
         if let Some((path, mut waker)) = fifo {
             // The reader is blocked in `read`; it cannot notice the child is gone on its own,

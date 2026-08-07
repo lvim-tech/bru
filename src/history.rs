@@ -538,6 +538,23 @@ code {{ color: var(--completion-match-fg); }}
     )
 }
 
+// --- src/utilcmds.rs -------------------------------------------------------
+/// [`head`] and [`escape`], for the pages `src/utilcmds.rs` generates — `bru://chrome/version`,
+/// `/messages` and `/process`.
+///
+/// Two wrappers rather than making the originals public: the stylesheet above is what makes every
+/// generated `bru://` page look like the same browser, and a second copy of it in another module
+/// would drift the first time a colour moved. Everything here writes `var(--…)` and not one colour,
+/// which is `chrome/chrome.css`'s rule and the reason swapping a theme is swapping one file.
+pub fn chrome_head(title: &str, view: &str) -> String {
+    head(title, view)
+}
+
+pub fn chrome_escape(s: &str) -> String {
+    escape(s)
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
+
 /// Text going into an element. A page title is the page's own, and a URL is whatever a site put in
 /// the address bar; both are one `<` away from becoming markup.
 fn escape(s: &str) -> String {

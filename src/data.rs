@@ -379,6 +379,46 @@ impl Data {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+// --- src/utilcmds.rs -------------------------------------------------------
+    /// `history-clear` — forget every visit and every completion row (`history.py:437-452`).
+    ///
+    /// Returns how many visits were in the log, because "cleared" with no number reads the same
+    /// whether there were nine thousand rows or none.
+    ///
+    /// `DELETE FROM` rather than `DROP`/`CREATE`: the schema and its index are what
+    /// `create_schema` promises, and rebuilding them here would be a second place they are
+    /// spelled. The freed pages are handed back to the filesystem with a `VACUUM`, since a history
+    /// that was cleared and left a 40 MB file behind has not really been cleared.
+    pub fn clear_history(&mut self) -> Result<usize> {
+        let (visits, _) = self.history_counts()?;
+        self.conn.execute("DELETE FROM History", ())?;
+        self.conn.execute("DELETE FROM CompletionHistory", ())?;
+        self.last_url = None;
+        // Outside a transaction by definition; `execute` is fine with that and a failure here is
+        // not a failure to clear, so it is deliberately not propagated.
+        let _ = self.conn.execute("VACUUM", ());
+        Ok(visits)
+    }
+
+    /// `quickmarks-reload` / `bookmarks-reload` — read the file again (`commands.py:1190`, `:1361`).
+    ///
+    /// The two lists are read once at open and kept in memory (see the field docs), which is what
+    /// makes a completion keystroke free and what makes an edit in `$EDITOR` invisible until this
+    /// is called. Returns how many entries the file now holds.
+    pub fn reload_marks(&mut self, which: crate::utilcmds::Marks) -> Result<usize> {
+        match which {
+            crate::utilcmds::Marks::Quickmarks => {
+                self.quickmarks = read_quickmarks(&self.dir.join("quickmarks"))?;
+                Ok(self.quickmarks.len())
+            }
+            crate::utilcmds::Marks::Bookmarks => {
+                self.bookmarks = read_bookmarks(&self.dir.join("bookmarks"))?;
+                Ok(self.bookmarks.len())
+            }
+        }
+    }
+// --- end src/utilcmds.rs ---------------------------------------------------
+
     /// Forget one URL, from both tables. Behind the completion's delete key —
     /// `completers.rs`'s `History` category calls it, as `urlmodel.py:14-19` does.
     pub fn forget_url(&mut self, url: &str) -> Result<()> {

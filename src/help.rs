@@ -220,12 +220,17 @@ mod tests {
         // The state is still reachable, and still rendered — a `config.lua` may name a command
         // qutebrowser has and bru has not built. Without this the branch would be untested the
         // moment the defaults stopped using it.
+        //
+        // It was `click-element id foo` until `src/utilcmds.rs` implemented that command. The
+        // stand-in is a `debug-*` command on purpose: qutebrowser's debug commands are the one
+        // group bru has decided not to port at all, so this example cannot go live under someone
+        // else's milestone the way the last one did.
         let mut b = bindings();
-        b.bind("normal", "ZW", "click-element id foo").expect("a valid binding");
+        b.bind("normal", "ZW", "debug-dump-page /tmp/x").expect("a valid binding");
         let html = page(&b);
-        assert_eq!(State::of("click-element id foo"), State::NotYet);
+        assert_eq!(State::of("debug-dump-page /tmp/x"), State::NotYet);
         assert!(html.contains(
-            r#"<tr class="todo"><td class="keys">ZW</td><td class="cmd">click-element id foo</td><td class="state">not yet</td></tr>"#
+            r#"<tr class="todo"><td class="keys">ZW</td><td class="cmd">debug-dump-page /tmp/x</td><td class="state">not yet</td></tr>"#
         ));
     }
 
@@ -270,6 +275,18 @@ mod tests {
 
         // A refused row is not a "not yet" row, or the third state is decoration.
         assert!(!html.contains(r#"<td class="cmd">hint-follow</td><td class="state">not yet</td>"#));
+
+// --- src/utilcmds.rs -------------------------------------------------------
+        // A command carried by `:later`, `:repeat` or `:run-with-count` keeps its own state, which
+        // for a refused one is the reason and not "not yet". Only reachable from a `config.lua`;
+        // the default table binds none of the three.
+        assert!(matches!(
+            State::of("later 1s config-cycle -p -u *://x/* content.plugins"),
+            State::Refused(_)
+        ));
+        assert_eq!(State::of("repeat 2 scroll down"), State::Live);
+        assert_eq!(State::of("repeat 2 debug-dump-page /tmp/x"), State::NotYet);
+// --- end src/utilcmds.rs ---------------------------------------------------
 
         // The twelve are chains — `config-cycle … ;; reload` — and the reason must come from the
         // half that is refused whichever half is written first. Asking `exec::refusal` for the

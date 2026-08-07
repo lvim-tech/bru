@@ -283,6 +283,17 @@ fn run_editor(text: &str, caret: usize) -> Result<String, String> {
     Ok(edited)
 }
 
+// --- src/utilcmds.rs -------------------------------------------------------
+/// `$EDITOR` over a string that did not come from a page — `edit-url` and `edit-command`.
+///
+/// [`run_editor`] with the caret at the start, exposed under a name that says what it is for.
+/// **It blocks until the editor exits**, so the caller runs it on a thread of its own; both callers
+/// do, and both come back to the UI thread with a posted task.
+pub fn edit_externally(text: &str) -> Result<String, String> {
+    run_editor(text, 0)
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
+
 /// The editor to run, with qutebrowser's placeholders filled in.
 ///
 /// `editor.command` is a config option in qutebrowser and this user sets it to `["kitty", "-e",
