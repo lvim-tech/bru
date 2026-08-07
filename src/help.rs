@@ -70,15 +70,15 @@ impl State {
 pub fn page(bindings: &Bindings) -> String {
     let rows = bindings.all();
 
-    let (live, refused, total) =
-        rows.iter()
-            .fold((0usize, 0usize, 0usize), |(live, refused, total), (_, _, cmd)| {
-                match State::of(cmd) {
-                    State::Live => (live + 1, refused, total + 1),
-                    State::Refused(_) => (live, refused + 1, total + 1),
-                    State::NotYet => (live, refused, total + 1),
-                }
-            });
+    // No total: the summary counts what acts and what is refused, and does not divide one by the
+    // other or by anything else.
+    let (live, refused) = rows.iter().fold((0usize, 0usize), |(live, refused), (_, _, cmd)| {
+        match State::of(cmd) {
+            State::Live => (live + 1, refused),
+            State::Refused(_) => (live, refused + 1),
+            State::NotYet => (live, refused),
+        }
+    });
 
     let mut out = String::with_capacity(64 * 1024);
     out.push_str(
@@ -92,12 +92,15 @@ pub fn page(bindings: &Bindings) -> String {
 "#,
     );
 
+    // **A count, not a fraction.** This said "251 of 264 bindings do something today", and the
+    // user's objection 2026-08-07 was the shape rather than the wording: an "x of y" reads as a
+    // score against somebody else's total even when y is bru's own table. bru's numbers stand on
+    // their own — this many keys act, this many say why they never will — and nothing here is
+    // measured against anything.
     out.push_str(&format!(
-        "<h1>bru</h1>\n<p class=\"summary\">{live} of {total} bindings do something today. \
-         The rest are bound and parsed so that a chain like <code>gg</code> still works, \
-         and say so when pressed. {refused} of them are marked <em>refused</em>: CEF 151 has \
-         nothing behind what they name, so they are not waiting for a milestone. Each says \
-         why.</p>\n"
+        "<h1>bru</h1>\n<p class=\"summary\">{live} keys do something. \
+         {refused} more are bound and parsed — so that a chain like <code>gg</code> still \
+         works — and say why they never will when pressed. Each carries its reason.</p>\n"
     ));
 
     for mode in Mode::ALL {
@@ -257,7 +260,10 @@ mod tests {
 
         // Thirteen rows, and the summary says so rather than only the table.
         assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 13);
-        assert!(html.contains("13 of them are marked <em>refused</em>"), "the summary undercounts");
+        assert!(html.contains("13 more are bound and parsed"), "the summary undercounts");
+        // And it states counts rather than a fraction of anything — the user asked for that
+        // 2026-08-07, and a helpful-looking "x of y" is exactly what crept back last time.
+        assert!(!html.contains(" of 264"), "the summary is measuring against a total again");
 
         // A refused row is not a "not yet" row, or the third state is decoration.
         assert!(!html.contains(r#"<td class="cmd">hint-follow</td><td class="state">not yet</td>"#));
