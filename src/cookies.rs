@@ -797,10 +797,75 @@ wrap_task! {
                         BASETIME_EPOCH_OFFSET_SECS,
                     );
                 }
+                // `key:Down`, `key:Return`, `key:Tab` — one named key at the showing tab.
+                //
+                // `cmdline.rs::inject_key` refuses these ("only character keys can be injected so
+                // far"), and this page is driven by exactly the keys it refuses: Down and Up pick a
+                // row, Enter deletes it, Tab reaches the buttons. So the injector for them lives
+                // here rather than in another workstream's file.
+                //
+                // **It is not the keyboard, and the difference bites this page specifically.**
+                // `send_key_event` aims every event of a press at one browser (CEF-NOTES trap 18),
+                // and it leaves `focus_on_editable_field` at 0 — which is the flag `keys.rs` reads
+                // to enter insert mode when a page focuses a field. A real press into the filter
+                // box therefore enters insert mode by itself and an injected one does not, so a
+                // script has to run `mode-enter insert` first. What is injected after that travels
+                // the ordinary path.
+                "key" => inject_named(arg),
                 other => eprintln!("cookies-script: no step named {other:?}"),
             }
         }
     }
+}
+
+/// The named keys this page is driven by, as Windows virtual key codes —
+/// `bindings::named_key_for_vkey`'s table read the other way round.
+fn inject_named(name: &str) {
+    // The second value is the character the key types, or 0 for the ones that type nothing.
+    //
+    // **Enter needs its CHAR or a focused `<button>` is not activated.** Measured 2026-08-07: two
+    // injected Tabs moved the focus onto `#undo` — the probe read `focus=undo` — and an injected
+    // Return with only KEYDOWN and KEYUP left `Undo (1)` on the screen. Chromium runs a button's
+    // default action off the character event, not off the key-down, which is the same fact
+    // CEF-NOTES records for typing into an input: "without the CHAR the key reaches
+    // `on_pre_key_event` and types nothing".
+    let (code, character) = match name.to_ascii_lowercase().as_str() {
+        "tab" => (0x09, 9u16),
+        "return" | "enter" => (0x0D, 13u16),
+        "escape" | "esc" => (0x1B, 27u16),
+        "up" => (0x26, 0u16),
+        "down" => (0x28, 0u16),
+        other => {
+            eprintln!("cookies-script: {other:?} is not a named key this can inject");
+            return;
+        }
+    };
+    let browser = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|mut state| state.active_browser()));
+    let Some(host) = browser.and_then(|browser| browser.host()) else {
+        eprintln!("cookies-script: no tab to inject into");
+        return;
+    };
+    // KEYDOWN, then the CHAR when the key types one, then KEYUP — the order a real press delivers
+    // them in. No explicit RAWKEYDOWN: CEF synthesises it from the KEYDOWN, and sending both
+    // delivers two (CEF-NOTES).
+    let mut types = vec![KeyEventType::KEYDOWN];
+    if character != 0 {
+        types.push(KeyEventType::CHAR);
+    }
+    types.push(KeyEventType::KEYUP);
+    for type_ in types {
+        let event = KeyEvent {
+            type_,
+            windows_key_code: code,
+            native_key_code: code,
+            character,
+            unmodified_character: character,
+            ..Default::default()
+        };
+        host.send_key_event(Some(&event));
+    }
+    eprintln!("cookies-script: injected {name} at the page");
 }
 
 /// Walk the jar and print what is in it. Uses the same visitor the page does, through a callback
