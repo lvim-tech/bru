@@ -28,7 +28,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// How long a message stays, in milliseconds. qutebrowser's `messages.timeout` default.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **It is `messages.timeout`'s default now**, and [`timeout_ms`] is what the timer reads. The
+/// number is unchanged.
+// --- end unhardcoded ---------------------------------------------------------------------------
 const TIMEOUT_MS: i64 = 3000;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `messages.timeout`, in milliseconds, or [`TIMEOUT_MS`] before the settings store exists.
+///
+/// **0 means the message stays**, which is qutebrowser's own meaning for the value
+/// (`configdata.yml:2060`) and is behaviour bru could not express while this was a `const`: there
+/// was no way to ask for a line that does not disappear while you read it.
+///
+/// Off the key path — one lock per message shown, and a message shown per keystroke is not a thing
+/// that happens.
+fn timeout_ms() -> i64 {
+    match crate::settings::int_of("messages.timeout") {
+        // `int_of` answers 0 for a name it does not know as well as for a timeout of 0, and in a
+        // process with no settings installed — a renderer — that is the wrong 0. The `def` is what
+        // tells the two apart, and it is compiled in, so this cannot be fooled by a config.
+        0 if crate::settings::def("messages.timeout").is_none() => TIMEOUT_MS,
+        value => value,
+    }
+}
+
+/// How long the **console rate limit** waits, in milliseconds.
+///
+/// It was [`TIMEOUT_MS`] until `messages.timeout` became a setting, and separating the two is the
+/// point rather than an oversight. [`bar_is_free`] is not a display choice: it is the only thing
+/// standing between a `bru://` console error and an unbounded loop with the UI thread in it, and a
+/// user who asks for `messages.timeout 0` — a message that stays until it is replaced — must not
+/// get a browser that can be hung by a page. So the loop breaker keeps the number it has always
+/// had, and it now says out loud that it is a loop breaker.
+const CONSOLE_RATE_MS: i64 = 3000;
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// The three qutebrowser has, and the three the theme has colours for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,8 +159,15 @@ pub fn show(level: Level, text: &str) {
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     crate::ipc::push_bar();
 
-    let mut task = ClearMessage::new(sequence);
-    post_delayed_task(ThreadId::UI, Some(&mut task), TIMEOUT_MS);
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // `messages.timeout 0` is "never clear", so no timer is started at all. Posting one with a
+    // delay of 0 would clear the message on the next turn of the loop, which is the opposite.
+    let timeout = timeout_ms();
+    if timeout > 0 {
+        let mut task = ClearMessage::new(sequence);
+        post_delayed_task(ThreadId::UI, Some(&mut task), timeout);
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
 }
 
 /// Take the message away now — what `Escape` does in qutebrowser, and what leaving command mode
@@ -166,9 +208,26 @@ pub fn json() -> String {
 // `bru://` scheme the help page uses, so what it costs is this buffer: a bounded `Vec` written once
 // per message, off the key path, and never read unless the command is typed.
 
-/// How many messages are kept. qutebrowser's `messages.limit` — 100 by default
-/// (configdata.yml:2044), the same number and for the same reason: the page is read by a person.
+/// How many messages are kept — 100, because the page is read by a person.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **The line above used to credit this to qutebrowser's `messages.limit`, citing
+/// `configdata.yml:2044`. There is no such option**: that line is `keyhint.delay`, and grepping
+/// qutebrowser 3.7.0's `configdata.yml` for `messages.limit` finds nothing. The number was always
+/// bru's own. It is `messages.limit` now — bru's name for bru's number — and it is unchanged.
+// --- end unhardcoded ---------------------------------------------------------------------------
 const LOG_LIMIT: usize = 100;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `messages.limit`, or [`LOG_LIMIT`] before the settings store exists.
+fn log_limit() -> usize {
+    match crate::settings::int_of("messages.limit") {
+        limit if limit > 0 => limit as usize,
+        // A renderer process, or a unit test: nothing has installed a store, so bru's own stands.
+        _ => LOG_LIMIT,
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// One message that was said, with the second it was said in.
 pub struct Logged {
@@ -189,9 +248,15 @@ fn remember(level: Level, text: &str) {
     let Ok(mut log) = log().lock() else {
         return;
     };
-    if log.len() >= LOG_LIMIT {
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // A `while` rather than an `if`, because the limit can now come down while the log is full:
+    // `:set messages.limit 10` with ninety in the buffer has to shed eighty, and an `if` would shed
+    // one per message said afterwards.
+    let limit = log_limit();
+    while log.len() >= limit {
         log.remove(0);
     }
+    // --- end unhardcoded -----------------------------------------------------------------------
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs() as i64)
@@ -377,7 +442,7 @@ fn bar_is_free() -> bool {
         return false;
     };
     let free = match *last {
-        Some(at) => at.elapsed() >= Duration::from_millis(TIMEOUT_MS as u64),
+        Some(at) => at.elapsed() >= Duration::from_millis(CONSOLE_RATE_MS as u64),
         None => true,
     };
     if free {

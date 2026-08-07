@@ -23,7 +23,40 @@ use crate::tabs::SharedState;
 
 /// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
 /// delivers per click, and near enough to qutebrowser's step for the two to be compared.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **This is now `scroll.step_px`'s default and nothing else reads it directly.** The value a `j`
+/// uses is [`step`]; this is what that answers until something sets the setting, and it is
+/// unchanged at 120 — the number the whole project exists for, measured on this machine and not
+/// moved.
+// --- end unhardcoded ---------------------------------------------------------------------------
 pub const STEP: i32 = 120;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `scroll.step_px`, cached where a keypress can read it without a lock.
+///
+/// **This is the whole reason `scroll.step_px` has a `Backing` of its own.** Every other setting
+/// lifted out of a `const` this round is read through `settings::int_of`, which takes the settings
+/// mutex — fine for a download starting or a message being posted, and not fine for `j`, which is
+/// the key this browser was built to make feel right. `settings::apply` writes here when the
+/// setting changes; [`step`] is a relaxed load, which is what a `const` compiled into the same
+/// function costs plus one uncontended read of a cache line.
+///
+/// Relaxed is the right ordering and not the lazy one: there is exactly one writer, it is on the UI
+/// thread, and so is every reader — the only thing an `Acquire` would buy is an ordering against
+/// stores this value has no relationship with.
+static STEP_PX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(STEP);
+
+/// How far one `j` moves, in pixels. On the key path — see [`STEP_PX`].
+pub fn step() -> i32 {
+    STEP_PX.load(Ordering::Relaxed)
+}
+
+/// Put `scroll.step_px` where [`step`] will find it. The one caller is `settings::apply`.
+pub fn set_step(px: i32) {
+    STEP_PX.store(px.clamp(1, 10_000), Ordering::Relaxed);
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// A ceiling on `<count><command>`. qutebrowser has none, but a typo like `99999j` should not lock
 /// the UI thread up sending wheel events.
@@ -55,11 +88,16 @@ pub fn scroll(
     count: Option<u32>,
 ) {
     let repeat = repeat(count);
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // Read once per press, not once per event: `10j` is one load and ten wheel events, and the step
+    // cannot change between the first and the tenth. See `STEP_PX`.
+    let step = step();
+    // --- end unhardcoded -----------------------------------------------------------------------
     match direction {
-        ScrollDirection::Down => wheel_times(browser, 0, -STEP, repeat),
-        ScrollDirection::Up => wheel_times(browser, 0, STEP, repeat),
-        ScrollDirection::Left => wheel_times(browser, STEP, 0, repeat),
-        ScrollDirection::Right => wheel_times(browser, -STEP, 0, repeat),
+        ScrollDirection::Down => wheel_times(browser, 0, -step, repeat),
+        ScrollDirection::Up => wheel_times(browser, 0, step, repeat),
+        ScrollDirection::Left => wheel_times(browser, step, 0, repeat),
+        ScrollDirection::Right => wheel_times(browser, -step, 0, repeat),
         ScrollDirection::Top => jump(browser, false),
         ScrollDirection::Bottom => jump(browser, true),
         ScrollDirection::PageUp => scroll_page(state, browser, 0.0, -1.0, count),

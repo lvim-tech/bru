@@ -239,6 +239,20 @@ wrap_download_handler! {
             }
             drop(list);
 
+// --- unhardcoded ---------------------------------------------------------------------------
+            // `downloads.location.prompt`, configdata.yml:1478 — true is qutebrowser's default and
+            // bru's, and it is exactly what this handler did unconditionally. False is
+            // qutebrowser's own meaning for the option: use the directory without asking, which is
+            // what `target_path` has already computed. Nothing else changes; the same path is
+            // handed to the same callback, which is why `<Return>` at the prompt and this branch
+            // write the same file.
+            if !crate::settings::is_on("downloads.location.prompt")
+                && crate::settings::def("downloads.location.prompt").is_some()
+            {
+                callback.cont(Some(&CefString::from(path.to_string_lossy().as_ref())), 0);
+                return 1;
+            }
+// --- end unhardcoded -----------------------------------------------------------------------
 // --- src/prompt.rs ---------------------------------------------------------
             let window = browser
                 .as_deref()
@@ -392,6 +406,10 @@ wrap_download_handler! {
                 if let Some((path, cmdline)) = opening {
                     open_path(&path, cmdline.as_deref());
                 }
+// --- unhardcoded -----------------------------------------------------------
+                // `downloads.remove_finished`. Inert at its default of -1, which is what bru did.
+                schedule_removal(id);
+// --- end unhardcoded -------------------------------------------------------
             }
 // --- end src/prompt.rs -----------------------------------------------------
 
@@ -413,24 +431,36 @@ wrap_download_handler! {
 /// bru's behaviour too. What this function answers is what the question *opens with*, so
 /// `<Return>` still writes the file where the version that never asked wrote it.
 ///
-/// qutebrowser's fallback for a declined prompt is `downloads.location.directory`, which is a
-/// setting bru still has nowhere to keep. So the directory below stays the desktop's answer, in the
-/// order every other XDG-aware program takes it:
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **`downloads.location.directory` is the first thing consulted**, which is what the paragraph
+/// this replaces said would happen "once the settings workstream lands". It ships **unset**, and
+/// unset is what leaves the desktop's answer standing:
+// --- end unhardcoded ---------------------------------------------------------------------------
 ///
 /// 1. `$XDG_DOWNLOAD_DIR`, if it is set and absolute.
 /// 2. `XDG_DOWNLOAD_DIR=` in `$XDG_CONFIG_HOME/user-dirs.dirs`, which is what `xdg-user-dirs-update`
 ///    writes and what this machine has (`XDG_DOWNLOAD_DIR="$HOME/Downloads"`).
 /// 3. `$HOME/Downloads`.
 ///
-/// It is defensible because it is not bru's opinion: the file that answers it is the desktop's, so
-/// bru saves where every other application on this machine saves, and it ships no configuration of
-/// its own to say otherwise (DESIGN.md).
-///
-/// **What changes once the settings workstream lands:** `downloads.location.directory` becomes the
-/// first thing consulted, with this as its default rather than as the whole answer, and
-/// `downloads.location.prompt` becomes a setting that can turn the question *off* again. Neither
-/// changes the shape of anything below — `target_path` takes a directory.
+/// That order is defensible because it is not bru's opinion: the file that answers it is the
+/// desktop's, so a bru with no config saves where every other application on this machine saves.
+/// qutebrowser's own default for the option is `null` with the same meaning — "a sensible
+/// OS-specific default is used" (configdata.yml:1476) — so the two agree on the shape and bru fills
+/// the hole with XDG rather than with a path of its own.
 pub fn download_dir() -> PathBuf {
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // Absolute only. A relative download directory would be resolved against whatever directory
+    // bru happened to be started from, which is a different place on every launch — and the
+    // download would still land somewhere, silently, which is the failure that is worse than an
+    // error. It falls through to the desktop's answer rather than refusing, because a browser in
+    // the middle of a download has to write the file somewhere.
+    if let Some(dir) = crate::settings::text_of("downloads.location.directory")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return dir;
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
     if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -694,6 +724,75 @@ pub fn schedule_start(url: String) {
     let mut task = StartDownload::new(url);
     post_task(ThreadId::UI, Some(&mut task));
 }
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `downloads.remove_finished` — take a finished download's row off the list after that many
+/// milliseconds, or never at -1.
+///
+/// **-1 is bru's default and is exactly what bru did**: a finished row stayed until `cd`
+/// (`:download-clear`) or the browser closed. qutebrowser's default is -1 too
+/// (configdata.yml:1557), so nothing here moves unless somebody asks it to.
+///
+/// **Only a *complete* download is removed**, and that is narrower than qutebrowser's `finished`
+/// signal, which an errored download emits as well. The reason is bru's own: `download-retry`
+/// finds a row by `state.done() && state != Complete`, so a failed download that removed itself
+/// after ten seconds would take the only record of the failure — and the only way to retry it —
+/// with it. A download that succeeded has nothing left to say.
+///
+/// Scheduled at most once per download id. `on_download_updated` reports `Complete` more than once
+/// for the same item, and a timer per report would be one removal task per report.
+fn schedule_removal(id: u32) {
+    let delay = crate::settings::int_of("downloads.remove_finished");
+    if delay < 0 || crate::settings::def("downloads.remove_finished").is_none() {
+        return;
+    }
+    {
+        let mut scheduled = removals().lock().expect("downloads mutex poisoned");
+        if scheduled.contains(&id) {
+            return;
+        }
+        scheduled.push(id);
+    }
+    let mut task = RemoveFinished::new(id);
+    post_delayed_task(ThreadId::UI, Some(&mut task), delay);
+}
+
+/// The ids a removal has already been scheduled for. Its own list rather than a field on [`Entry`]
+/// so that the bookkeeping this setting needs does not reach into a struct three other paths build.
+fn removals() -> &'static Mutex<Vec<u32>> {
+    static REMOVALS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    &REMOVALS
+}
+
+wrap_task! {
+    struct RemoveFinished {
+        id: u32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            {
+                let mut scheduled = removals().lock().expect("downloads mutex poisoned");
+                scheduled.retain(|id| *id != self.id);
+            }
+            let removed = {
+                let mut list = downloads().lock().expect("downloads mutex poisoned");
+                let before = list.len();
+                // Still asked at the moment of removal rather than only when it was scheduled: a
+                // `:download-open` or a `:download-delete` in between may have taken the row
+                // already, and `state == Complete` is the condition the delay was granted under.
+                list.retain(|entry| entry.id != self.id || entry.state != State::Complete);
+                before != list.len()
+            };
+            if removed {
+                debug(&format!("remove_finished dropped #{} -> {}", self.id, report_line()));
+                crate::ipc::set_download(summary());
+            }
+        }
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 wrap_task! {
     struct StartDownload {

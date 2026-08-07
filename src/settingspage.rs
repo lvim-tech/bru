@@ -149,7 +149,7 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
             "<tr class=\"live\"><td class=\"keys\">{}</td><td class=\"cmd\">{} · default {} · {}</td>\
              <td class=\"state\">{}</td></tr>\n",
             escape(def.name),
-            escape(kind(def.kind)),
+            escape(&kind(def.kind)),
             escape(&default_of(def)),
             escape(scope(def.scopes)),
             // Not escaped as one string: a dictionary's cell is a line per pair, and the `<br>`s
@@ -269,16 +269,41 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     }
 }
 
-fn kind(kind: Kind) -> &'static str {
+/// What a setting takes, in the words of the column heading.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **It answers a `String` rather than a `&'static str`**, which it used to, and that is not
+/// tidying: a [`Kind::Int`]'s answer names its own range and unit — "a whole number, 0 to 86400000
+/// milliseconds" — so there is no literal to return. The `Choice` arm was already reaching for
+/// `Box::leak` to get around the same problem, one leaked allocation per page render; six numbers
+/// would have made it seven. This is the same string built and dropped.
+// --- end unhardcoded ---------------------------------------------------------------------------
+fn kind(kind: Kind) -> String {
     match kind {
-        Kind::Bool => "true or false",
-        Kind::Text => "text",
-        // Leaked as a `&'static str` because this returns one and the list is compiled in: one
-        // allocation per settings-page render, of a string that would have been a literal anyway.
-        Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
-        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key",
-        Kind::Dict(_) => "a dictionary, fixed keys",
-        Kind::List(_) => "a list",
+        Kind::Bool => "true or false".to_string(),
+        Kind::Text => "text".to_string(),
+        Kind::Choice(choices) => choices.join(" or "),
+        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key".to_string(),
+        Kind::Dict(_) => "a dictionary, fixed keys".to_string(),
+        Kind::List(_) => "a list".to_string(),
+        // --- unhardcoded ---------------------------------------------------------------------
+        // The range and the unit, because "a whole number" against `messages.timeout` says nothing
+        // about whether 3000 is a long time, and against `scroll.step_px` says nothing about what
+        // would happen if you typed 100000. A sentinel is spelled out where there is one, so that
+        // `-1` on `downloads.remove_finished` is a word rather than an oddity at the end of a range.
+        Kind::Int(shape) => {
+            let sentinel = if shape.sentinel.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} is {})", shape.min, shape.sentinel)
+            };
+            format!(
+                "a whole number, {} to {} {}{sentinel}",
+                shape.min, shape.max, shape.unit
+            )
+        }
+        Kind::Chars => "at least two different characters, no spaces".to_string(),
+        // --- end unhardcoded -------------------------------------------------------------------
     }
 }
 
@@ -423,9 +448,14 @@ mod tests {
         // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
         // Nor are the four insert-mode settings: they are bru's own and always in force. Their
-        // rows are the only `true`/`false` cells on the page, which is what this counts.
-        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 4);
+        // rows are `true`/`false` cells on the page, which is what this counts.
+        // --- unhardcoded -------------------------------------------------------------------
+        // Two `false` and six `true`, not one and four: `hints.uppercase` is the second false, and
+        // `url.open_base_url`, `hints.scatter` and `downloads.location.prompt` are the extra trues.
+        // Every one of them is a boolean bru answers itself, which is what the count is about.
+        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 2);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 6);
+        // --- end unhardcoded ---------------------------------------------------------------
     }
 
     /// **A dict is not one line, and this is what the value column does about it.** One row per

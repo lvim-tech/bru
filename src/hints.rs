@@ -26,21 +26,75 @@ use crate::modes::Mode;
 use crate::state::BruState;
 use crate::tabs::SharedState;
 
-/// `hints.chars`, configdata.yml:1723. qutebrowser's default and bru's only value for now — it is
-/// the home row, and DESIGN.md's "same keys" makes changing it a config question, not a code one.
+/// `hints.chars`, configdata.yml:1723 — the home row, and qutebrowser's own default.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **It is `hints.chars`'s default now**, and [`chars`] is what generates labels from. The value is
+/// unchanged; what has changed is the sentence that used to be here, which said changing it was "a
+/// config question, not a code one" while there was no config to ask.
+// --- end unhardcoded ---------------------------------------------------------------------------
 pub const CHARS: &str = "asdfghjkl";
 
-/// Why `<Return>` in hint mode is *refused* rather than unimplemented, in one sentence for
-/// `bru://chrome/help`. The measurements are in the `Command::HintFollow` arm of `exec::run`.
-pub const WHY_HINT_FOLLOW_IS_REFUSED: &str =
-    "there is never a hint waiting to be followed. bru follows a label as soon as the chain leaves \
-     exactly one showing, whether or not it has been typed out, so the state this key exists for \
-     cannot be reached — measured over 1..1,000,000 elements, no prefix of a label that is not \
-     itself a label ever leaves fewer than two showing. It would have a job only if following on a \
-     unique match could be turned off, and bru has no such setting.";
-
-/// `hints.min_chars`, configdata.yml:1752.
+/// `hints.min_chars`, configdata.yml:1752. `hints.min_chars`'s default; [`min_chars`] reads it.
 const MIN_CHARS: usize = 1;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `hints.auto_follow`, configdata.yml:1673 — when a hint is followed without `<Return>`.
+///
+/// All four of qutebrowser's values. bru had `UniqueMatch` compiled in with a doc comment
+/// explaining why the other three were absent; the reason given was that "bru ships no
+/// configuration", which DESIGN.md's correction of 2026-08-06 says is not true of bru.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutoFollow {
+    /// Follow as soon as one label is showing, **even before a key is pressed**. `hints.py:657`
+    /// calls `_handle_auto_follow` once from `_start_cb` "to make auto_follow == 'always' work", so
+    /// `f` on a page with one link follows it; bru fires it from `on_collected` for the same reason.
+    Always,
+    /// Follow as soon as one label is showing *and something has been typed* —
+    /// `bool(keystr or filterstr)`. bru's default and qutebrowser's.
+    UniqueMatch,
+    /// Follow when the whole label has been typed. **This is the rule bru followed on before
+    /// `auto_follow` existed as a function**, and it is not qutebrowser's default.
+    FullMatch,
+    /// Never. `<Return>` — `hint-follow` — is what follows, and this value is the only one under
+    /// which that binding has a job.
+    Never,
+}
+
+impl AutoFollow {
+    /// The setting, read once when a session starts. The name is `settings.rs`'s own spelling.
+    fn current() -> AutoFollow {
+        match crate::settings::choice_of("hints.auto_follow") {
+            "always" => AutoFollow::Always,
+            "full-match" => AutoFollow::FullMatch,
+            "never" => AutoFollow::Never,
+            // Including the empty answer a process with no settings store gives, which is a
+            // renderer or a unit test: bru's own default is what stands there.
+            _ => AutoFollow::UniqueMatch,
+        }
+    }
+}
+
+/// `hints.chars`, or [`CHARS`] in a process with no settings store behind it.
+fn chars() -> Vec<char> {
+    crate::settings::text_of("hints.chars")
+        .unwrap_or_else(|| CHARS.to_string())
+        .chars()
+        .collect()
+}
+
+/// `hints.min_chars`, or [`MIN_CHARS`] in a process with no settings store behind it.
+///
+/// `Kind::Int`'s range on it is 1..5 and the store cannot hold anything else, so the ceiling here
+/// is not a second opinion about the range — it is what keeps a `0` from a store-less process, and
+/// anything else that is not a length, out of an exponent.
+fn min_chars() -> usize {
+    match crate::settings::int_of("hints.min_chars") {
+        length if length >= 1 => (length as usize).min(5),
+        _ => MIN_CHARS,
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// The page half, injected into the tab's main frame. Not served over `bru://`: it has to run in
 /// the page's own world to see the page's elements.
@@ -179,6 +233,16 @@ struct Session {
     command_sequence: Vec<KeyInfo>,
     /// The hint characters typed so far.
     sequence: Vec<KeyInfo>,
+    // --- unhardcoded -------------------------------------------------------------------------
+    /// `hints.auto_follow`, snapshotted when the session started.
+    ///
+    /// **Per session rather than per keypress**, which is the same decision `commands` above
+    /// carries: a page that is already labelled was labelled under one rule, and changing the rule
+    /// under a chain that has been half typed would follow something the user did not aim at. It
+    /// also keeps the settings mutex off the hint key path, which is the nearest thing to the
+    /// scroll key path in this file.
+    auto_follow: AutoFollow,
+    // --- end unhardcoded -----------------------------------------------------------------------
     /// When `start` injected the script, so collection can be timed rather than asserted.
     started: std::time::Instant,
 }
@@ -276,20 +340,54 @@ fn shuffle_hints(hints: Vec<String>, length: usize) -> Vec<String> {
     buckets.into_iter().flatten().collect()
 }
 
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `_hint_strings`: the labels for `count` elements, under whatever `hints.chars`,
+/// `hints.min_chars` and `hints.scatter` are set to.
+///
+/// The settings are read here, once per `f`, rather than inside the two generators — the two of
+/// them plus the caller would otherwise take three locks for one answer.
+pub fn hint_strings(count: usize) -> Vec<String> {
+    let chars = chars();
+    let min_chars = min_chars();
+    // `hints.scatter`, configdata.yml:1795. True is Vimium's and bru's default and was bru's only
+    // behaviour; false is dwb's, which is `_hint_linear`.
+    if crate::settings::is_on("hints.scatter") || crate::settings::def("hints.scatter").is_none() {
+        hint_scattered(count, &chars, min_chars)
+    } else {
+        hint_linear(count, &chars, min_chars)
+    }
+}
+
+/// `_hint_linear` (hints.py:495) — constant-length labels in the elements' own order, the way dwb
+/// draws them. What `hints.scatter false` selects.
+///
+/// It is the shorter of the two by a long way, and the difference is the whole of what the setting
+/// buys: no variable length, so nothing is a prefix of anything, and no shuffle, so the first link
+/// on the page is `aa` and the second is `as`.
+fn hint_linear(count: usize, chars: &[char], min_chars: usize) -> Vec<String> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let needed = min_chars.max(ceil_log(count, chars.len()));
+    (0..count)
+        .map(|i| number_to_hint_str(i, chars, needed))
+        .collect()
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
+
 /// `_hint_scattered`, which is what `hints.scatter` (default true) selects.
 ///
 /// Variable-length labels, Vimium-style: as many links as will fit get a label one character
 /// shorter than the worst case. The short ones are never a prefix of a long one, because the long
 /// ones start at `short_count * len(chars)` — which is what makes an exact match final and lets a
 /// hint follow the moment it is complete.
-pub fn hint_strings(count: usize) -> Vec<String> {
+fn hint_scattered(count: usize, chars: &[char], min_chars: usize) -> Vec<String> {
     if count == 0 {
         return Vec::new();
     }
-    let chars: Vec<char> = CHARS.chars().collect();
-    let needed = MIN_CHARS.max(ceil_log(count, chars.len()));
+    let needed = min_chars.max(ceil_log(count, chars.len()));
 
-    let short_count = if needed > MIN_CHARS && needed > 1 {
+    let short_count = if needed > min_chars && needed > 1 {
         let total_space = chars.len().pow(needed as u32);
         total_space.saturating_sub(count) / (chars.len() - 1)
     } else {
@@ -300,12 +398,12 @@ pub fn hint_strings(count: usize) -> Vec<String> {
     let mut strings = Vec::with_capacity(count);
     if needed > 1 {
         for i in 0..short_count {
-            strings.push(number_to_hint_str(i, &chars, needed - 1));
+            strings.push(number_to_hint_str(i, chars, needed - 1));
         }
     }
     let start = short_count * chars.len();
     for i in start..start + long_count {
-        strings.push(number_to_hint_str(i, &chars, needed));
+        strings.push(number_to_hint_str(i, chars, needed));
     }
 
     shuffle_hints(strings, chars.len())
@@ -371,6 +469,10 @@ pub fn start(
                 commands,
                 command_sequence: Vec::new(),
                 sequence: Vec::new(),
+                // --- unhardcoded -----------------------------------------------------------
+                // Once, here, beside the bindings snapshot — see the field.
+                auto_follow: AutoFollow::current(),
+                // --- end unhardcoded -------------------------------------------------------
                 started: std::time::Instant::now(),
             },
         );
@@ -597,7 +699,7 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
         }
     }
 
-    let first = {
+    let (first, mode) = {
         let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
         let Some(open) = guard.get_mut(&window) else {
             return;
@@ -606,16 +708,27 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
         open.labels = labels.clone();
         open.trie = trie;
         open.sequence.clear();
-        open.first
+        (open.first, open.auto_follow)
     };
 
     debug(&format!("window {window} labels {}", labels.join(" ")));
 
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // `hints.uppercase`, configdata.yml:1878 — **the drawn label only**, which is qutebrowser's own
+    // behaviour and not a simplification of it: `HintLabel._update_text` (hints.py:113-119) upper-
+    // cases what it paints, while `HintKeyParser.update_bindings` (modeparsers.py:235) is given the
+    // raw strings. So `A` is drawn and `a` is typed, the trie is untouched, and nothing about the
+    // key path changes. Uppercasing the trie instead would need Shift on every hint.
+    let uppercase = crate::settings::is_on("hints.uppercase");
     let list = labels
         .iter()
-        .map(|label| format!("\"{label}\""))
+        .map(|label| {
+            let shown = if uppercase { label.to_uppercase() } else { label.clone() };
+            format!("\"{shown}\"")
+        })
         .collect::<Vec<_>>()
         .join(",");
+    // --- end unhardcoded -----------------------------------------------------------------------
     show(
         browser,
         &format!("window.__bru_hints.show([{list}],{});", label_style_json()),
@@ -640,7 +753,18 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
     // index is 0 and the label is not necessarily "a".
     if first {
         follow(state, window, browser, 0);
+        return;
     }
+
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // `hints.auto_follow always`, and this is the only place it can act: `_handle_auto_follow` is
+    // called once from `_start_cb` (hints.py:657) "to make auto_follow == 'always' work", because
+    // a page with one link has one label showing before any key is pressed. Every other value
+    // answers `None` for an empty chain, so this costs them one comparison.
+    if mode == AutoFollow::Always && labels.len() == 1 {
+        follow(state, window, browser, 0);
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
 }
 
 /// The page has reported the URL behind a followed hint — every target except `normal` and `hover`.
@@ -1112,6 +1236,13 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
         };
         open.sequence.push(info);
         match open.trie.matches(&open.sequence) {
+            // --- unhardcoded -------------------------------------------------------------------
+            // An exact match is `hints.auto_follow full-match`, which is also what `always` and
+            // `unique-match` do once the label is complete — so three of the four values follow
+            // here. `never` is the one that does not: the chain stays, one label is left showing,
+            // and `<Return>` is what acts on it. See `follow_current`.
+            Match::Exact(_) if open.auto_follow == AutoFollow::Never => Outcome::Pending,
+            // --- end unhardcoded ---------------------------------------------------------------
             Match::Exact(index) => Outcome::Follow(*index),
             Match::Partial => Outcome::Pending,
             Match::NoMatch => {
@@ -1240,18 +1371,25 @@ impl Foreign {
     }
 }
 
-/// `hints.auto_follow`, configdata.yml:1673, at its default **`unique-match`**: follow as soon as
-/// the chain leaves exactly one label showing, whether or not that label has been typed out.
+/// `hints.auto_follow`, configdata.yml:1673 — the rule, with the setting's value passed in.
+///
 /// `visible` is the indices still showing and `typed` the chain that left them.
 ///
-/// The other three values (`always`, `full-match`, `never`) are not implemented, because bru ships
-/// no configuration and [`SETTINGS`](crate::settings::SETTINGS) holds only what a user can change.
-/// Two of them are worth knowing about anyway:
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **All four values, and the default is the behaviour bru already had.** What was here before was
+/// `unique-match` written out as the only rule, with a doc comment explaining that the other three
+/// "are not implemented, because bru ships no configuration" — which was the reading of DESIGN.md
+/// the user corrected on 2026-08-06. Two of them are still worth knowing about:
 ///
-/// - **`full-match` is the rule bru followed before this function existed** — `Match::Exact` on the
-///   whole label. It is *not* what qutebrowser does by default.
-/// - **`never` is the only value under which `<Return>` has a job**, which is why `hint-follow` is
-///   inert. See the `Command::HintFollow` arm of `exec::run`, which carries that measurement.
+/// - **[`AutoFollow::FullMatch`] is the rule bru followed before this function existed** — an exact
+///   match on the whole label, which `handle_key` still takes as `Outcome::Follow`. It is *not*
+///   what qutebrowser does by default, and the difference is measurable only under a `min_chars`
+///   above 1 — see the measurement below.
+/// - **[`AutoFollow::Never`] is the only value under which `<Return>` has a job.** `hint-follow`
+///   was inert and documented as permanently refused; it is live now, and it is live *because* this
+///   value exists. Under any other value it says why there is nothing to follow rather than doing
+///   nothing.
+// --- end unhardcoded ---------------------------------------------------------------------------
 ///
 /// `always` also fires with an empty chain — `_handle_auto_follow` is called once from `_start_cb`
 /// (hints.py:657) "to make auto_follow == 'always' work", so a page with one link is followed
@@ -1266,9 +1404,15 @@ impl Foreign {
 /// rule that happens to agree with it, and the agreement is a property of `hint_strings`'
 /// arithmetic rather than of the rule: a `min_chars` of 2 breaks it on the first page with one
 /// link, which is what `unique_match_follows_a_label_that_was_never_typed_out` pins down.
-fn auto_follow(visible: &[usize], typed: &str) -> Option<usize> {
-    match visible {
-        [only] if !typed.is_empty() => Some(*only),
+fn auto_follow(mode: AutoFollow, visible: &[usize], typed: &str) -> Option<usize> {
+    match (mode, visible) {
+        // --- unhardcoded -----------------------------------------------------------------------
+        (AutoFollow::Always, [only]) => Some(*only),
+        // The whole label, and nothing shorter. `handle_key`'s `Match::Exact` is what fires it, so
+        // there is nothing for this function to answer.
+        (AutoFollow::FullMatch, _) | (AutoFollow::Never, _) => None,
+        // --- end unhardcoded -------------------------------------------------------------------
+        (AutoFollow::UniqueMatch, [only]) if !typed.is_empty() => Some(*only),
         _ => None,
     }
 }
@@ -1279,7 +1423,7 @@ fn auto_follow(visible: &[usize], typed: &str) -> Option<usize> {
 /// The visible set is computed here, in Rust, and sent as a list of indices. The page is told which
 /// labels to show; it is never asked which ones match, and never which one to follow.
 fn redraw(window: u32, browser: &mut Browser) -> Option<usize> {
-    let (keystring, visible, matched_len) = {
+    let (keystring, visible, matched_len, mode) = {
         let guard = sessions().lock().expect("hint sessions mutex poisoned");
         let open = guard.get(&window)?;
         let typed = crate::bindings::sequence_to_string(&open.sequence);
@@ -1290,7 +1434,7 @@ fn redraw(window: u32, browser: &mut Browser) -> Option<usize> {
             .filter(|(_, label)| label.starts_with(&typed))
             .map(|(index, _)| index)
             .collect();
-        (typed.clone(), visible, typed.chars().count())
+        (typed.clone(), visible, typed.chars().count(), open.auto_follow)
     };
 
     // The hinting window's bar, not the one in front. During `;R` the key that filtered these labels
@@ -1308,8 +1452,61 @@ fn redraw(window: u32, browser: &mut Browser) -> Option<usize> {
                 .join(",")
         ),
     );
-    auto_follow(&visible, &keystring)
+    auto_follow(mode, &visible, &keystring)
 }
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `hint-follow` — `<Return>` in hint mode, and the whole of what `hints.auto_follow never` buys.
+///
+/// **This binding was refused rather than unimplemented until the setting existed**, and the
+/// refusal said exactly why: "It would have a job only if following on a unique match could be
+/// turned off, and bru has no such setting." It has one, so this follows the label the chain has
+/// left standing.
+///
+/// It follows a *unique* one, which is qutebrowser's own rule — `follow_hint` with no argument
+/// raises `HintingError("No hint to follow")` when nothing is filtered and picks the single
+/// remaining one when something is. Under any other value of `hints.auto_follow` the label would
+/// already have been followed before the key arrived, so this says so instead of doing nothing;
+/// that is the difference between a key that is inert and a key that answers.
+pub fn follow_current(state: &SharedState, browser: &mut Browser) {
+    let Some(window) = window_of(state, browser) else {
+        return;
+    };
+    let found = {
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        guard.get(&window).map(|open| {
+            let typed = crate::bindings::sequence_to_string(&open.sequence);
+            let visible: Vec<usize> = open
+                .labels
+                .iter()
+                .enumerate()
+                .filter(|(_, label)| label.starts_with(&typed))
+                .map(|(index, _)| index)
+                .collect();
+            (open.auto_follow, visible)
+        })
+    };
+    let Some((mode, visible)) = found else {
+        crate::message::error("hint-follow: no hints are showing");
+        return;
+    };
+    if mode != AutoFollow::Never {
+        crate::message::error(
+            "hint-follow: with hints.auto_follow at anything but `never`, a hint that could be \
+             followed has been followed already — set it to `never` to follow with <Return>",
+        );
+        return;
+    }
+    match visible.as_slice() {
+        [only] => follow(state, window, browser, *only),
+        [] => crate::message::error("hint-follow: nothing matches what has been typed"),
+        many => crate::message::error(&format!(
+            "hint-follow: {} hints still match — type more of the label",
+            many.len()
+        )),
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// A hint matched. The element's position is enough for `normal` and `hover`; every other target
 /// needs its URL, which only the page can give, so those ask and continue in [`on_href`].
@@ -1851,17 +2048,70 @@ mod tests {
     fn unique_match_follows_a_label_that_was_never_typed_out() {
         // What `hints.min_chars = 2` (configdata.yml:1752) does to a page with one link: the label
         // is `aa`, and one keystroke leaves it alone on the page without having been typed.
-        assert_eq!(auto_follow(&[0], "a"), Some(0), "one label showing is a unique match");
+        let unique = AutoFollow::UniqueMatch;
+        assert_eq!(auto_follow(unique, &[0], "a"), Some(0), "one label showing is a unique match");
         // `always` would follow this; `unique-match` is `bool(keystr or filterstr)` and does not.
         // It is what stops `f` on a one-link page from clicking before a key is pressed.
-        assert_eq!(auto_follow(&[0], ""), None);
+        assert_eq!(auto_follow(unique, &[0], ""), None);
         // Two showing is not unique, whatever has been typed.
-        assert_eq!(auto_follow(&[3, 7], "l"), None);
+        assert_eq!(auto_follow(unique, &[3, 7], "l"), None);
         // Nothing showing is not a match either — a chain that named no label.
-        assert_eq!(auto_follow(&[], "z"), None);
+        assert_eq!(auto_follow(unique, &[], "z"), None);
         // The index answered is the label's, not its position in the visible list.
-        assert_eq!(auto_follow(&[41], "jk"), Some(41));
+        assert_eq!(auto_follow(unique, &[41], "jk"), Some(41));
     }
+
+    // --- unhardcoded ---------------------------------------------------------------------------
+    /// **The other three values of `hints.auto_follow`, each doing the one thing it names.**
+    ///
+    /// Written against the rule rather than against the browser, which is what the rule is a
+    /// function for. What it cannot say is whether `handle_key` asks it — see
+    /// `never_leaves_an_exact_match_standing_for_return`, which reads the source for that, and the
+    /// live run in the report.
+    #[test]
+    fn the_four_values_of_auto_follow_are_four_rules() {
+        // `always`: one label showing is enough, typed or not. This is the value under which `f` on
+        // a page with one link clicks it without a keypress.
+        assert_eq!(auto_follow(AutoFollow::Always, &[0], ""), Some(0));
+        assert_eq!(auto_follow(AutoFollow::Always, &[0], "a"), Some(0));
+        assert_eq!(auto_follow(AutoFollow::Always, &[3, 7], ""), None, "two is not one");
+
+        // `full-match`: nothing here ever fires. The follow happens on the trie's exact match in
+        // `handle_key`, which is the rule bru had before `auto_follow` was a function.
+        assert_eq!(auto_follow(AutoFollow::FullMatch, &[0], ""), None);
+        assert_eq!(auto_follow(AutoFollow::FullMatch, &[0], "a"), None);
+
+        // `never`: nothing fires here either, and `handle_key` does not fire on an exact match — so
+        // the only thing that follows is `hint-follow`.
+        assert_eq!(auto_follow(AutoFollow::Never, &[0], "a"), None);
+        assert_eq!(auto_follow(AutoFollow::Never, &[0], ""), None);
+
+        // And the default is `unique-match`, which is what bru did before any of this existed.
+        assert_eq!(AutoFollow::current(), AutoFollow::UniqueMatch);
+    }
+
+    /// **`never` is only worth anything if `handle_key` stops following an exact match**, and that
+    /// is a branch inside a function that posts CEF tasks and cannot be called from a test (trap
+    /// 13). So this reads the source for the branch, the way
+    /// `settings::the_wire_from_the_store_to_the_pill_is_still_connected` reads it for the bar.
+    ///
+    /// A weak test of a strong kind: it cannot say the branch is right, only that nobody has
+    /// deleted it and left `never` following on the last character of the label anyway.
+    #[test]
+    fn never_leaves_an_exact_match_standing_for_return() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(root.join("src/hints.rs")).expect("readable");
+        assert!(
+            source.contains("Match::Exact(_) if open.auto_follow == AutoFollow::Never"),
+            "handle_key follows an exact match under `never`, which leaves <Return> nothing to do"
+        );
+        let exec = std::fs::read_to_string(root.join("src/exec.rs")).expect("readable");
+        assert!(
+            exec.contains("Command::HintFollow => crate::hints::follow_current"),
+            "hint-follow is inert again"
+        );
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
 
     /// **The measurement `<Return>` rests on**, and the reason `unique-match` changes no behaviour
     /// today: with `hints.chars` and `hints.min_chars` at their defaults, a chain that leaves one
