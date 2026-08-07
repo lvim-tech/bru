@@ -240,9 +240,9 @@ wrap_browser_process_handler! {
             crate::chrome::register_factory();
             // --- src/chrome.rs: themes ---------------------------------------------------------
             // `themer` writes ~/.config/bru/theme.css while bru is running, and a chrome document
-            // fetches its stylesheets when it loads. This is what closes that gap; see the function
-            // for the signal and the command that were tried before it.
-            crate::chrome::watch_theme_file();
+            // fetches its stylesheets when it loads. This is what closes that gap; see
+            // `src/theme_watch.rs` for the signal, the command and the polling that came before it.
+            crate::theme_watch::start();
             // --- end src/chrome.rs: themes -----------------------------------------------------
 
 // --- lua runtime -------------------------------------------------------------------------------

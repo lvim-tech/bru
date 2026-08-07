@@ -58,6 +58,14 @@ adblock = { version = "0.13.2", default-features = false, features = [
 # it cannot honour.
 regex = "1.13"
 
+# --- src/theme_watch.rs -------------------------------------------------------------------------
+# `inotify_init1`, `inotify_add_watch` and a blocking `read`, so that a theme written under a running
+# browser is noticed by the kernel telling bru rather than by bru asking. Already in the tree
+# transitively (adblock reaches it through console/indicatif); named here because a direct `use` of a
+# crate nobody declared is a dependency that disappears the day the indirect path changes.
+libc = "0.2"
+
+
 # The ad blocker is the one dependency bru runs *per network request*, and unoptimized it is not
 # slow, it is unusable. Measured 2026-08-06 against EasyList + EasyPrivacy and the 158 requests
 # https://www.vesti.bg/ makes, mean time to decide one request:

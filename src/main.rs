@@ -56,6 +56,8 @@ mod settings;
 mod settingspage;
 mod state;
 mod tabs;
+// How bru learns that ~/.config/bru/theme.css has been rewritten under it.
+mod theme_watch;
 mod utilcmds;
 mod window;
 

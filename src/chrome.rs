@@ -244,7 +244,7 @@ pub(crate) fn theme_css() -> Vec<u8> {
 
 // --- src/chrome.rs: themes ---------------------------------------------------------------------
 /// `~/.config/bru/`, or whatever `XDG_CONFIG_HOME` names. **bru never writes here.**
-fn config_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
     // XDG, hand-rolled rather than pulled in as a dependency: two environment variables.
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
         return Some(std::path::PathBuf::from(dir).join("bru"));
@@ -349,74 +349,6 @@ pub fn chrome_background() -> Option<u32> {
     // Opaque, which the header requires: the alpha "must be either fully opaque (0xFF) or fully
     // transparent (0x00)", and transparent is the default that produces the white.
     Some(0xFF00_0000 | (value & 0x00FF_FFFF))
-}
-
-/// Watch `~/.config/bru/theme.css` for a rewrite, and re-read it when one happens.
-///
-/// **Polling, and the two better ideas that were tried first.**
-///
-/// `themer` writes that file and then has to tell whatever is wearing it. Its own vocabulary offers
-/// two ways, and both were measured before this one was written:
-///
-/// - **A signal**, the way its `waybar` target does it. `kill -USR1` on a running bru killed it,
-///   which is the default action and also the proof that nothing else uses the signal — so a
-///   `sigwait` thread with the signal blocked process-wide should have worked. It does not:
-///   `pthread_sigmask` reports `SIGUSR1` blocked before `initialize` and **unblocked after it**,
-///   because CEF resets the mask on the threads it starts. A signal delivered to any thread that
-///   does not block it kills the process, and bru does not own most of its threads.
-/// - **A command**, the way its `dunst` target does it. bru takes commands on its own command line
-///   at startup and has no way to be spoken to afterwards; giving it one means a socket, a protocol
-///   and a second door into the browser, which is a great deal to add so that a stylesheet can be
-///   re-read.
-///
-/// So: one `stat` every two seconds, on the UI thread, comparing the file's modification time with
-/// the last one seen. It costs a syscall on a timer and it needs nothing at the other end — a
-/// `themer` target with a plain `fetch` and no second operation is enough, which is the shape every
-/// one of its fifty-one other targets already has.
-///
-/// The first tick records what is there rather than acting on it, so a bru that starts after the
-/// file was written does not reload the chrome it has only just drawn.
-pub fn watch_theme_file() {
-    let mut task = ThemeWatch::new();
-    post_delayed_task(ThreadId::UI, Some(&mut task), WATCH_MS);
-}
-
-/// How often the file is looked at. Two seconds is under the time it takes to notice a colour is
-/// wrong and over anything that could be called polling hard.
-const WATCH_MS: i64 = 2000;
-
-/// The modification time last seen, as seconds since the epoch. `None` before the first look.
-static SEEN: Mutex<Option<u64>> = Mutex::new(None);
-
-fn theme_mtime() -> Option<u64> {
-    let path = theme_path()?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
-}
-
-wrap_task! {
-    struct ThemeWatch {}
-
-    impl Task {
-        fn execute(&self) {
-            debug_assert_ne!(currently_on(ThreadId::UI), 0);
-            let now = theme_mtime();
-            let changed = {
-                let mut seen = SEEN.lock().expect("the theme watch mutex is never poisoned");
-                // **The first look only records.** Acting on it would reload the chrome once at
-                // every startup, for a file that has not moved since the last one.
-                let changed = seen.is_some() && *seen != now && now.is_some();
-                *seen = now;
-                changed
-            };
-            if changed {
-                warn_if_incomplete();
-                crate::ipc::reload_chrome_everywhere();
-                eprintln!("bru[theme]: ~/.config/bru/theme.css changed on disk — re-read");
-            }
-            watch_theme_file();
-        }
-    }
 }
 
 /// Say once what a theme is missing. Called where a theme is chosen, not where it is served — the
