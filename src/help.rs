@@ -154,6 +154,31 @@ mod tests {
         crate::config::Config::load_from(None).bindings
     }
 
+    /// **The page never names qutebrowser.** Asked for by the user 2026-08-07: bru's own help is
+    /// not the place to measure bru against anything — it states bru's numbers and bru's reasons.
+    ///
+    /// The refusals are where this went wrong. They were argued by comparison — "qutebrowser drives
+    /// it through QWebEngineSettings::PluginsEnabled", "the key is dead in qutebrowser 3.7.0 too" —
+    /// which is right in a commit message and wrong on a page someone opens to find out what a key
+    /// does. The measurements stayed; the comparisons went.
+    ///
+    /// Comments and commit messages are not covered and should not be: `.claude/` and the source
+    /// are where the port is documented, and naming what a behaviour was ported from is how the
+    /// next person checks it.
+    #[test]
+    fn the_page_measures_bru_against_nothing() {
+        let html = page(&bindings());
+        let text = html.to_lowercase();
+        assert!(
+            !text.contains("qutebrowser"),
+            "the help page names qutebrowser; it states bru's own numbers and reasons only"
+        );
+        // `qute://` and `qutebrowser`'s own file names are the same mistake wearing a shorter word.
+        for needle in ["qute://", "configdata.yml", "qwebengine"] {
+            assert!(!text.contains(needle), "the help page still points at {needle:?}");
+        }
+    }
+
     #[test]
     fn every_binding_appears() {
         let b = bindings();
@@ -228,7 +253,7 @@ mod tests {
 
         // And `<Return>` in hint mode, whose reason is `hints.rs`'s.
         assert!(html.contains(r#"<tr class="refused"><td class="keys">&lt;Return&gt;</td><td class="cmd">hint-follow"#));
-        assert!(html.contains("hints.auto_follow is unique-match"));
+        assert!(html.contains("there is never a hint waiting to be followed"));
 
         // Thirteen rows, and the summary says so rather than only the table.
         assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 13);

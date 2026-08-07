@@ -161,13 +161,12 @@ pub const SETTINGS: &[Def] = &[
 pub const REFUSED: &[(&str, &str)] = &[
     (
         "content.plugins",
-        "Chromium 151 has nothing behind this name. qutebrowser drives it through \
-         QWebEngineSettings::PluginsEnabled; cef_browser_settings_t has no plugin field at all, \
-         cef_content_setting_types_t's only plugin entry is DEPRECATED_PPAPI_BROKER, and the one \
-         settable preference in the family is plugins.always_open_pdf_externally — \"open PDFs in \
-         another application\", which is neither \"enable plugins\" nor scopeable to a URL. \
-         Measured 2026-08-06. NPAPI and PPAPI are gone, so these six keys are not waiting for \
-         work; there is no work that would make them act.",
+        "Chromium 151 has nothing behind this name. cef_browser_settings_t has no plugin field \
+         at all, cef_content_setting_types_t's only plugin entry is DEPRECATED_PPAPI_BROKER, and \
+         the one settable preference in the family is plugins.always_open_pdf_externally — \"open \
+         PDFs in another application\", which is neither \"enable plugins\" nor scopeable to a \
+         URL. Measured 2026-08-06. NPAPI and PPAPI are gone, so these six keys are not waiting \
+         for work; there is no work that would make them act.",
     ),
     (
         "content.cookies.accept",

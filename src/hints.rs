@@ -33,13 +33,11 @@ pub const CHARS: &str = "asdfghjkl";
 /// Why `<Return>` in hint mode is *refused* rather than unimplemented, in one sentence for
 /// `bru://chrome/help`. The measurements are in the `Command::HintFollow` arm of `exec::run`.
 pub const WHY_HINT_FOLLOW_IS_REFUSED: &str =
-    "there is never a hint waiting to be followed. hints.auto_follow is unique-match \
-     (configdata.yml:1673) and bru implements it, so a chain that leaves one label showing has \
-     already followed it — measured over 1..1,000,000 elements, no prefix of a label that is not \
-     itself a label ever leaves fewer than two showing. The key is dead in qutebrowser 3.7.0 under \
-     its own defaults for the same reason: hint_follow reads _context.to_follow, which is only \
-     assigned when hints.auto_follow is never. Only that value would give it a job, and bru ships \
-     no configuration to set it with.";
+    "there is never a hint waiting to be followed. bru follows a label as soon as the chain leaves \
+     exactly one showing, whether or not it has been typed out, so the state this key exists for \
+     cannot be reached — measured over 1..1,000,000 elements, no prefix of a label that is not \
+     itself a label ever leaves fewer than two showing. It would have a job only if following on a \
+     unique match could be turned off, and bru has no such setting.";
 
 /// `hints.min_chars`, configdata.yml:1752.
 const MIN_CHARS: usize = 1;
