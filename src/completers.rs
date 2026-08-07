@@ -61,6 +61,12 @@ const PAGE: usize = 14;
 /// The models bru has. `src/completion.rs` builds `Url`; the rest are below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Which {
+    // --- src/chrome.rs: themes -----------------------------------------------------------------
+    /// `:colorscheme` — the `.css` files in `~/.config/bru/themes/`, read at the moment they are
+    /// asked for rather than from a compiled-in list, because they are files a person adds and
+    /// removes without telling bru.
+    Themes,
+    // --- end src/chrome.rs: themes -------------------------------------------------------------
     /// `:` alone, `:m`, and the second argument of `:bind` — every command bru understands, with
     /// what it does and the keys that reach it (`miscmodels.py:17-23`, `util.py:16-43`). The rows
     /// are `src/help.rs`'s, because the join to the key table is already written there.
@@ -169,6 +175,9 @@ const SPECS: &[Spec] = &[
     Spec { name: "tab-take", argpos: 0, which: Which::OtherTabs, rest_from: Some(0), vararg: false },
 // --- end src/utilcmds.rs ---------------------------------------------------
     Spec { name: "tab-focus", argpos: 0, which: Which::Tabs { special: true }, rest_from: None, vararg: false },
+    // --- src/chrome.rs: themes -----------------------------------------------------------------
+    Spec { name: "colorscheme", argpos: 0, which: Which::Themes, rest_from: None, vararg: false },
+    // --- end src/chrome.rs: themes -------------------------------------------------------------
     Spec { name: "quickmark-load", argpos: 0, which: Which::Quickmark, rest_from: None, vararg: false },
     Spec { name: "quickmark-del", argpos: 0, which: Which::Quickmark, rest_from: None, vararg: false },
     Spec { name: "bookmark-load", argpos: 0, which: Which::Bookmark, rest_from: None, vararg: false },
@@ -750,6 +759,24 @@ fn build(part: &Partition) -> Vec<Category> {
 
 fn build_which(which: Which, pattern: &str) -> Vec<Category> {
     match which {
+        // --- src/chrome.rs: themes -------------------------------------------------------------
+        // Read off the disk each time. Every other model here is built from a table bru compiles
+        // in or from its own store; this one is a directory a person edits with a file manager,
+        // and a cached list would offer a theme they deleted a minute ago.
+        Which::Themes => {
+            let live = crate::settings::text_of("colors.scheme").unwrap_or_default();
+            let rows: Vec<Vec<String>> = crate::chrome::theme_names()
+                .into_iter()
+                .map(|name| {
+                    let note = if name == live { "in force" } else { "" };
+                    vec![name, note.to_string()]
+                })
+                .collect();
+            completion::list_category_max("Themes", MARK_WIDTHS, rows, pattern, usize::MAX)
+                .into_iter()
+                .collect()
+        }
+        // --- end src/chrome.rs: themes ---------------------------------------------------------
         // **Two categories, because a refused setting is not a setting.** The names in
         // `settings::REFUSED` are ones bru will not implement and has a measured reason for; `:set`
         // answers one with that reason instead of a value. Leaving them out of the completion would
@@ -1683,7 +1710,7 @@ mod tests {
         // this one exists so that a table which silently stopped growing is noticed.
         let names: usize = crate::help::COMMANDS.iter().map(|doc| doc.names.len()).sum();
         assert_eq!(cats[0].items.len(), names);
-        assert_eq!(names, 169);
+        assert_eq!(names, 170);
 
         let row = |name: &str| {
             cats[0]
@@ -1769,7 +1796,7 @@ mod tests {
     fn the_whole_command_list_does_not_ask_for_an_absurd_bar() {
         let cats = build_which(Which::Commands, "");
         let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
-        assert_eq!(rows, 169);
+        assert_eq!(rows, 170);
         // `resize_bar`'s arithmetic, which is `chrome.css:186-191`'s: 20px per row and per header,
         // capped at --completion-max-h and one pixel for the border. 166 rows want 3,340px and get
         // 301, because past the cap the table scrolls inside itself.

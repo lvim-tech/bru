@@ -507,6 +507,15 @@ pub enum Command {
     WindowOnly,
     /// `screenshot [--rect WxH+X+Y] [--force] <filename>`.
     Screenshot { filename: String, rect: Option<String>, force: bool },
+    // --- src/chrome.rs: themes -----------------------------------------------------------------
+    /// `colorscheme [<name>]` — with a name, sets `colors.scheme`; without one, lists what is in
+    /// `~/.config/bru/themes/` and says which is in force.
+    ///
+    /// **bru's own; qutebrowser has no such command.** It cannot be `:set colors.scheme` and
+    /// nothing else, because the choices are files on disk that change without bru being told, so
+    /// the listing has to read the directory at the moment it is asked.
+    Colorscheme { name: Option<String> },
+    // --- end src/chrome.rs: themes -------------------------------------------------------------
     /// `jseval [--file] [--url] [--quiet] <js>`.
     ///
     /// `--file` and `--url` are read at *run* time, not here: a `config.lua` binding a `:jseval
@@ -1797,6 +1806,10 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             Command::TabTake { index: index.to_string(), keep: args.any(&["k", "keep"]) }
         }
         "window-only" => Command::WindowOnly,
+
+        // --- src/chrome.rs: themes -------------------------------------------------------------
+        "colorscheme" => Command::Colorscheme { name: tokens.get(1).map(|t| t.to_string()) },
+        // --- end src/chrome.rs: themes ---------------------------------------------------------
 
         "screenshot" => {
             let args = Flagged::new(&tokens[1..], &["rect"])?;

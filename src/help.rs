@@ -562,6 +562,11 @@ pub const COMMANDS: &[Doc] = &[
     Doc { names: &["screenshot"], args: "<filename>", flags: &["--rect", "-f/--force"],
         what: "Write the showing page to a PNG; --rect WxH+X+Y takes part of it.",
         example: "screenshot /tmp/x.png" },
+    // --- src/chrome.rs: themes -----------------------------------------------------------------
+    Doc { names: &["colorscheme"], args: "[<name>]", flags: &[],
+        what: "Paint the chrome with a theme from ~/.config/bru/themes/; with no name, list them.",
+        example: "colorscheme" },
+    // --- end src/chrome.rs: themes -------------------------------------------------------------
     Doc { names: &["jseval"], args: "<javascript>",
         flags: &["-f/--file", "-u/--url", "--world", "-q/--quiet"],
         what: "Run JavaScript in the page. --world names an isolated world bru does not offer and \
@@ -1482,7 +1487,7 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 169, "the scrape found a different number of commands");
+        assert_eq!(source.len(), 170, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1692,6 +1697,9 @@ mod tests {
                 Command::DownloadRemove { .. } => "DownloadRemove",
                 Command::ClearMessages => "ClearMessages",
                 Command::MarksReload { .. } => "MarksReload",
+                // --- src/chrome.rs: themes -----------------------------------------------------
+                Command::Colorscheme { .. } => "Colorscheme",
+                // --- end src/chrome.rs: themes -------------------------------------------------
                 Command::Unimplemented(_) => "Unimplemented",
             }
         }
@@ -1761,7 +1769,7 @@ mod tests {
         "CmdRepeatLast", "SettingsPage", "TabSelect", "TabTake", "WindowOnly", "Screenshot",
         "JsEval", "EditUrl", "EditCommand", "QuickmarkAdd", "HistoryClear", "Later", "Repeat",
         "RunWithCount", "Restart", "Version", "Messages", "Process", "ClickElement",
-        "ScrollToAnchor", "DownloadRemove", "ClearMessages", "MarksReload", "Unimplemented",
+        "ScrollToAnchor", "DownloadRemove", "ClearMessages", "MarksReload", "Colorscheme", "Unimplemented",
 // --- lua runtime -------------------------------------------------------------------------------
         "Plugin", "PluginList", "PluginReload", "PluginDisable",
 // --- end lua runtime ---------------------------------------------------------------------------

@@ -1671,6 +1671,24 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
     },
+    Def {
+        // --- src/chrome.rs: themes -----------------------------------------------------------
+        // Which file in `~/.config/bru/themes/` paints the chrome. Unset — the shipped default —
+        // means `~/.config/bru/theme.css`, the single path `themer` writes, and then the theme bru
+        // compiles in. A bru with no `~/.config/bru/` at all is fully themed, which is the rule
+        // every other setting here follows.
+        //
+        // `Kind::Text` and not `Kind::Choice`: the choices are files on disk, they change without
+        // bru being told, and a compiled-in list would be a promise about a directory. `:colorscheme`
+        // reads the directory each time it is asked, which is why it is a command rather than a
+        // spelling of `:set`.
+        name: "colors.scheme",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+        // --- end src/chrome.rs: themes -------------------------------------------------------
+    },
     // --- end src/chrome.rs: fonts ----------------------------------------------------------------
 ];
 
@@ -3804,7 +3822,15 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             // moves — so the three pushes above cannot carry them and a reload is what applies one.
             // Only for those three: reloading both strips of every window on a `tabs.title.format`
             // change would be paying for something the push already did.
-            if applied.def.name.starts_with("fonts.") {
+            if applied.def.name.starts_with("fonts.") || applied.def.name.starts_with("colors.") {
+                // --- src/chrome.rs: themes -------------------------------------------------
+                // A theme is a stylesheet too, and it is chosen here rather than where it is
+                // served — `theme.css` is fetched several times per window, and a warning per
+                // fetch is a warning nobody reads.
+                if applied.def.name.starts_with("colors.") {
+                    crate::chrome::warn_if_incomplete();
+                }
+                // --- end src/chrome.rs: themes ---------------------------------------------
                 crate::ipc::reload_chrome_everywhere();
             }
             // --- end src/chrome.rs: fonts ------------------------------------------------------
@@ -4435,7 +4461,7 @@ mod tests {
         // **Sixty-one**, +3 for the `fonts.*` block: a family, a size and a weight. They are
         // one workstream's and split three ways because CSS keeps them apart — Qt's
         // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
-        assert_eq!(SETTINGS.len(), 61);
+        assert_eq!(SETTINGS.len(), 62);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

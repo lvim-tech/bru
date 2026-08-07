@@ -753,6 +753,34 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::Screenshot { filename, rect, force } => {
             crate::utilcmds::screenshot(browser, filename, rect.as_deref(), *force)
         }
+        // --- src/chrome.rs: themes -------------------------------------------------------------
+        Command::Colorscheme { name } => match name {
+            Some(name) => {
+                // Through `:set`'s own path rather than beside it: `colors.scheme` is a setting
+                // like any other, and a second way to write it is a second way to forget the
+                // reload and the completeness check that `Backing::Chrome` does.
+                crate::settings::run_set(Some("colors.scheme"), Some(name), None, false);
+            }
+            None => {
+                let names = crate::chrome::theme_names();
+                let live = crate::settings::text_of("colors.scheme").unwrap_or_default();
+                if names.is_empty() {
+                    crate::message::info(
+                        "no themes in ~/.config/bru/themes/ — a theme is one .css file there, and \
+                         bru://chrome/theme-default.css is the list of properties it has to set",
+                    );
+                } else {
+                    let listed: Vec<String> = names
+                        .iter()
+                        .map(|name| {
+                            if *name == live { format!("[{name}]") } else { name.clone() }
+                        })
+                        .collect();
+                    crate::message::info(&format!("themes: {}", listed.join(" ")));
+                }
+            }
+        },
+        // --- end src/chrome.rs: themes ---------------------------------------------------------
 
         // `--file` and `--url` are read here rather than at parse time: a binding naming a file
         // should not fail to load because the file is missing at startup.
@@ -899,6 +927,10 @@ pub fn is_live(command: &Command) -> bool {
         // A chain is live when every link is: `clear-keychain ;; search` half-works, and half is
         // not what the binding means.
         Command::Chain(parts) => parts.iter().all(is_live),
+
+        // --- src/chrome.rs: themes -------------------------------------------------------------
+        Command::Colorscheme { .. } => true,
+        // --- end src/chrome.rs: themes ---------------------------------------------------------
 
         // All four directions live now: `scroll.rs` reaches the top and the bottom by sending many
         // wheel events rather than one impossible one.

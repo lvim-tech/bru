@@ -131,6 +131,16 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/cookies.js" => Some(("text/javascript", COOKIES_JS.to_vec())),
 // --- end src/cookies.rs ----------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
+// --- src/chrome.rs: themes -------------------------------------------------
+        // **The vocabulary a theme has to speak, as a file.** 141 declarations, of which
+        // `chrome.css` reads 89 — and the other 52 are the indirection a hand-written theme is
+        // for: `--bg-light` is read nine times inside this very file, so overriding one line
+        // repaints everything derived from it.
+        //
+        // Served rather than documented, because a list in prose drifts from the code and this
+        // cannot: it is the same bytes `theme_css` falls back to when there is no user theme.
+        "/theme-default.css" => Some(("text/css", DEFAULT_THEME_CSS.as_bytes().to_vec())),
+// --- end src/chrome.rs: themes ---------------------------------------------
 // --- src/chrome.rs: fonts --------------------------------------------------
         // Three custom properties built from three settings, served rather than embedded.
         //
@@ -204,14 +214,110 @@ pub(crate) fn theme_css() -> Vec<u8> {
     }
 }
 
-fn theme_path() -> Option<std::path::PathBuf> {
+// --- src/chrome.rs: themes ---------------------------------------------------------------------
+/// `~/.config/bru/`, or whatever `XDG_CONFIG_HOME` names. **bru never writes here.**
+fn config_dir() -> Option<std::path::PathBuf> {
     // XDG, hand-rolled rather than pulled in as a dependency: two environment variables.
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-        return Some(std::path::PathBuf::from(dir).join("bru/theme.css"));
+        return Some(std::path::PathBuf::from(dir).join("bru"));
     }
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    Some(std::path::PathBuf::from(home).join(".config/bru/theme.css"))
+    Some(std::path::PathBuf::from(home).join(".config/bru"))
 }
+
+/// Where the colours come from, in the order they are tried.
+///
+/// 1. **`colors.scheme`**, naming a file in `~/.config/bru/themes/`. This is what `:colorscheme`
+///    sets and it is how a person keeps more than one theme and switches between them.
+/// 2. **`~/.config/bru/theme.css`**, the single file. It came first and it stays: it is what
+///    `themer` writes, and a tool that overwrites one path should not have to learn a directory.
+/// 3. **The theme bru compiles in.** A bru with no `~/.config/bru/` at all is fully themed, which
+///    is the same rule the settings follow.
+fn theme_path() -> Option<std::path::PathBuf> {
+    let dir = config_dir()?;
+    let scheme = crate::settings::text_of("colors.scheme").unwrap_or_default();
+    if !scheme.is_empty() {
+        let named = dir.join("themes").join(format!("{scheme}.css"));
+        if named.is_file() {
+            return Some(named);
+        }
+        // Named but absent is worth a line rather than a silent fall-through to a different theme:
+        // the user has said which one they want and is looking at something else.
+        crate::message::error(&format!(
+            "colors.scheme: no {} — :colorscheme with no name lists what is there",
+            named.display()
+        ));
+    }
+    Some(dir.join("theme.css"))
+}
+
+/// Every theme in `~/.config/bru/themes/`, by name, sorted. What `:colorscheme` lists and completes.
+pub fn theme_names() -> Vec<String> {
+    let Some(dir) = config_dir().map(|dir| dir.join("themes")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension()? == "css").then(|| path.file_stem()?.to_str().map(str::to_string))?
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The custom properties one stylesheet declares, as a set of names.
+///
+/// Deliberately not a CSS parser, for `scrollbar.rs`'s reason: `theme.css` is generated, one
+/// declaration per line, and [`tests::theme_css_carries_not_one_rule`] holds it to that. A theme
+/// that stopped being one declaration per line is the thing to fix, not this.
+fn declared_names(css: &str) -> std::collections::BTreeSet<String> {
+    css.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let name = line.strip_prefix("--")?;
+            let end = name.find(':')?;
+            Some(format!("--{}", name[..end].trim()))
+        })
+        .collect()
+}
+
+/// What a theme is missing against the one bru ships, or an empty list.
+///
+/// **This exists because only three of the eighty-nine properties `chrome.css` reads carry a
+/// fallback.** A theme that leaves one out does not fail: the declaration is invalid, the element
+/// inherits or initialises, and some text goes the colour of its parent — measured against nothing,
+/// reported by nobody. So the theme bru compiles in is the reference, and it is a reference that
+/// cannot drift, because it is the same bytes the browser falls back to.
+pub fn missing_from_theme(css: &str) -> Vec<String> {
+    let shipped = declared_names(DEFAULT_THEME_CSS);
+    let theirs = declared_names(css);
+    shipped.difference(&theirs).cloned().collect()
+}
+
+/// Say once what a theme is missing. Called where a theme is chosen, not where it is served — the
+/// stylesheet is fetched several times per window and a warning per fetch is a warning nobody reads.
+pub fn warn_if_incomplete() {
+    let css = String::from_utf8_lossy(&theme_css()).into_owned();
+    let missing = missing_from_theme(&css);
+    if missing.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = missing.iter().take(6).map(String::as_str).collect();
+    let rest = missing.len().saturating_sub(shown.len());
+    crate::message::error(&format!(
+        "the theme is missing {} propert{}: {}{} — bru://chrome/theme-default.css is the full list",
+        missing.len(),
+        if missing.len() == 1 { "y" } else { "ies" },
+        shown.join(", "),
+        if rest > 0 { format!(" and {rest} more") } else { String::new() },
+    ));
+}
+// --- end src/chrome.rs: themes -----------------------------------------------------------------
 
 /// Hand a `Vec<u8>` to CEF as a resource. The crate ships every piece of this: a ReadHandler over a
 /// byte slice, a StreamReader over the handler, and a ResourceHandler over the stream.
