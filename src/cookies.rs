@@ -779,6 +779,39 @@ wrap_task! {
                         restore(std::slice::from_ref(&row))
                     );
                 }
+                // `fill:<n>` — n cookies over n/5 invented domains, in one step.
+                //
+                // A jar with four cookies in it never fills a screen, so it cannot say whether the
+                // page scrolls, whether the domain headings group anything, or whether a filter
+                // that keeps *some* rows keeps the right ones. `set:` one at a time costs one
+                // posted task each and the whole point is to have a hundred of them.
+                "fill" => {
+                    let count: usize = arg.parse().unwrap_or(0);
+                    let rows: Vec<CookieRow> = (0..count)
+                        .map(|i| CookieRow {
+                            name: format!("fill_{i}"),
+                            value: format!("value-of-{i}"),
+                            // `hostN.example` and not `hostN.fill.example`, and the difference is
+                            // Chromium's, not this file's: its cookie store caps one **eTLD+1** at
+                            // 180 cookies and purges 30 when that is passed. Under
+                            // `*.fill.example` all 200 share one eTLD+1, and the next process
+                            // found 169 of them — Chromium evicting correctly and a harness that
+                            // would have blamed the page.
+                            domain: format!("host{}.example", i / 5),
+                            path: "/".to_string(),
+                            creation_us: basetime_now().val,
+                            last_access_us: basetime_now().val,
+                            // Persistent, so a filled jar survives into the next process the way a
+                            // real one does. A session cookie would not: measured 2026-08-07, 200
+                            // of them were accepted by `set_cookie` and the next process found
+                            // none, which is Chromium behaving correctly and a harness lying.
+                            has_expires: true,
+                            expires_us: basetime_now().val + 86_400 * 1_000_000,
+                            ..Default::default()
+                        })
+                        .collect();
+                    eprintln!("cookies-script: fill {count} -> {} accepted", restore(&rows));
+                }
                 // `list` is the whole jar; `filter:<text>` is what [`matches`] keeps of it, which
                 // is the number `chrome/cookies.js`'s own filter has to agree with.
                 "list" => report(String::new(), false),

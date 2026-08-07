@@ -716,7 +716,14 @@ body[data-view="cookies"] {
     overflow: auto;
     user-select: text;
     background: var(--bg);
-    color: var(--fg);
+    /* --completion-fg and not --fg, which is what body[data-view="help"] uses.
+       theme.css says why in its own comment: the palette's --fg is made for
+       reading code in an editor and "against a chrome strip it measures around
+       2.3:1, and a reader needs 4.5:1", so every *interface* colour it emits
+       points at --ui-fg instead, which it walks up in hsluv until it clears
+       4.5. Measured on the shipped EverforestDark: --fg on --bg is 2.31:1 and
+       --ui-fg on --bg is 4.55:1. This page is interface. */
+    color: var(--completion-fg);
 }
 
 #cookies {
@@ -814,14 +821,30 @@ body[data-view="cookies"] {
 #cookies .group .row:nth-child(even) { background: var(--completion-even-bg); }
 
 /* The row Down/Up is on. It is the completion table's selected-item vocabulary
-   rather than a new one, so a selection means the same thing everywhere in
-   bru. */
+   rather than a new one, so a selection means the same thing everywhere in bru
+   — with one addition, and it is measured rather than taste. On the shipped
+   EverforestDark, --completion-item-selected-bg (#272e2e) against
+   --completion-odd-bg (#252c2c) is a contrast ratio of 1.03:1: the background
+   alone says nothing at all. The completion table gets away with it because it
+   also lifts the row's *text* to --completion-item-selected-fg, and here the
+   columns set their own colours and would have overridden that. So every
+   column is lifted below, and the left marker — --completion-match-fg, the
+   same orange the matched substring uses, 4.49:1 against the page — is what
+   the eye actually finds. */
 #cookies .group .row.picked {
     background: var(--completion-item-selected-bg);
     color: var(--completion-item-selected-fg);
     border-top: 1px solid var(--completion-item-selected-border-top);
     border-bottom: 1px solid var(--completion-item-selected-border-bottom);
-    padding: calc(0.15rem - 1px) 0.5rem;
+    border-left: 3px solid var(--completion-match-fg);
+    padding: calc(0.15rem - 1px) 0.5rem calc(0.15rem - 1px) calc(0.5rem - 3px);
+}
+
+#cookies .group .row.picked .value,
+#cookies .group .row.picked .path,
+#cookies .group .row.picked .flags,
+#cookies .group .row.picked .expiry {
+    color: var(--completion-item-selected-fg);
 }
 
 #cookies .x {
