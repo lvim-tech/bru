@@ -358,13 +358,27 @@ pub fn edit_externally(text: &str) -> Result<String, String> {
 ///
 /// `editor.command` is a config option in qutebrowser and this user sets it to `["kitty", "-e",
 /// "nvim", "{file}"]` — a terminal, because a terminal editor started from a GUI browser with no
-/// terminal does nothing visible. bru has no such setting yet and this module deliberately did not
-/// add one to `config.rs`, which no workstream owns this round; until it does, the command comes
-/// from the environment, most specific first:
+/// terminal does nothing visible.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **`editor.command` is a setting in bru now**, and it is asked first. What follows it is the
+/// chain this function has always had, unchanged and now spelled as the setting's *default* —
+/// which is why `editor.command` ships unset rather than shipping a command: unsetting is what
+/// leaves the environment standing, exactly as it is for `start_page`.
+///
+/// bru's default is deliberately not qutebrowser's `["gvim", "-f", "{file}", …]`. gvim has never
+/// been on the machine bru is built for, and a browser that shipped it as its default would open
+/// nothing on the first `<Ctrl-E>` anyone pressed here.
+///
+/// It is one string rather than qutebrowser's list because `spawn::shlex` is already what parses
+/// it, and because a bru list *appends* — an override that added a flag to the end of somebody
+/// else's editor is not what setting your editor means.
+// --- end unhardcoded ---------------------------------------------------------------------------
 ///
 /// | | |
 /// |---|---|
-/// | `$BRU_EDITOR` | a whole command line, with `{file}` / `{line}` / `{column}` |
+/// | `editor.command` | the setting, a whole command line, with `{file}` / `{line}` / `{column}` |
+/// | `$BRU_EDITOR` | the same, from the environment |
 /// | `$VISUAL` | the Unix "editor that wants a terminal of its own" variable |
 /// | `$EDITOR` | |
 /// | `nvim` | this machine's editor, and qutebrowser's own default |
@@ -372,6 +386,13 @@ pub fn edit_externally(text: &str) -> Result<String, String> {
 /// A command with no placeholder gets the filename appended, which is what `$EDITOR file` means
 /// everywhere else.
 fn editor_spec() -> String {
+    // --- unhardcoded ---------------------------------------------------------------------------
+    if let Some(command) = crate::settings::text_of("editor.command") {
+        if !command.trim().is_empty() {
+            return command;
+        }
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
     ["BRU_EDITOR", "VISUAL", "EDITOR"]
         .iter()
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()))

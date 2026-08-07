@@ -149,7 +149,7 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
             "<tr class=\"live\"><td class=\"keys\">{}</td><td class=\"cmd\">{} · default {} · {}</td>\
              <td class=\"state\">{}</td></tr>\n",
             escape(def.name),
-            escape(kind(def.kind)),
+            escape(&kind(def.kind)),
             escape(&default_of(def)),
             escape(scope(def.scopes)),
             // Not escaped as one string: a dictionary's cell is a line per pair, and the `<br>`s
@@ -269,16 +269,41 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     }
 }
 
-fn kind(kind: Kind) -> &'static str {
+/// What a setting takes, in the words of the column heading.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **It answers a `String` rather than a `&'static str`**, which it used to, and that is not
+/// tidying: a [`Kind::Int`]'s answer names its own range and unit — "a whole number, 0 to 86400000
+/// milliseconds" — so there is no literal to return. The `Choice` arm was already reaching for
+/// `Box::leak` to get around the same problem, one leaked allocation per page render; six numbers
+/// would have made it seven. This is the same string built and dropped.
+// --- end unhardcoded ---------------------------------------------------------------------------
+fn kind(kind: Kind) -> String {
     match kind {
-        Kind::Bool => "true or false",
-        Kind::Text => "text",
-        // Leaked as a `&'static str` because this returns one and the list is compiled in: one
-        // allocation per settings-page render, of a string that would have been a literal anyway.
-        Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
-        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key",
-        Kind::Dict(_) => "a dictionary, fixed keys",
-        Kind::List(_) => "a list",
+        Kind::Bool => "true or false".to_string(),
+        Kind::Text => "text".to_string(),
+        Kind::Choice(choices) => choices.join(" or "),
+        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key".to_string(),
+        Kind::Dict(_) => "a dictionary, fixed keys".to_string(),
+        Kind::List(_) => "a list".to_string(),
+        // --- unhardcoded ---------------------------------------------------------------------
+        // The range and the unit, because "a whole number" against `messages.timeout` says nothing
+        // about whether 3000 is a long time, and against `scroll.step_px` says nothing about what
+        // would happen if you typed 100000. A sentinel is spelled out where there is one, so that
+        // `-1` on `downloads.remove_finished` is a word rather than an oddity at the end of a range.
+        Kind::Int(shape) => {
+            let sentinel = if shape.sentinel.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} is {})", shape.min, shape.sentinel)
+            };
+            format!(
+                "a whole number, {} to {} {}{sentinel}",
+                shape.min, shape.max, shape.unit
+            )
+        }
+        Kind::Chars => "at least two different characters, no spaces".to_string(),
+        // --- end unhardcoded -------------------------------------------------------------------
     }
 }
 
@@ -422,18 +447,70 @@ mod tests {
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
         // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
-        // Nor are the four insert-mode settings: they are bru's own and always in force. Their
+        // Nor is any other boolean bru answers itself: they are all always in force, and their
         // rows are the only `true`/`false` cells on the page, which is what this counts.
-        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
-// --- tabs and statusbar ----------------------------------------------------
-        // Seven, not four. Every boolean whose backing is bru's own rather than Chromium's shows
-        // its value here rather than "not read yet", and `tabs.background`, `tabs.wrap` and
-        // `tabs.tooltips` are three more of them — all three default to true, so the `false` count
-        // above is untouched. This number moves with every bru-backed boolean setting; it is not a
-        // fact about the insert-mode four.
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 7);
-// --- end tabs and statusbar ------------------------------------------------
+        //
+        // **This number moves with every bru-backed boolean setting**, and it is not a fact about
+        // the insert-mode four it started as. Two `false` — `insert.auto_leave` and
+        // `hints.uppercase` — against nine `true`: the other three insert-mode settings, then
+        // `tabs.background`, `tabs.wrap` and `tabs.tooltips` from the strips, then
+        // `url.open_base_url`, `hints.scatter` and `downloads.location.prompt` from the constants
+        // that became settings.
+        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 2);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 9);
     }
+
+    // --- unhardcoded -----------------------------------------------------------------------
+    /// **What `bru://chrome/settings` shows for a number**, which is the third of the four places a
+    /// [`Kind`] is read.
+    ///
+    /// The range and the unit are in the "what it takes" cell, because "a whole number" against
+    /// `messages.timeout` says nothing about whether 3000 is a long time and against
+    /// `scroll.step_px` says nothing about what 100000 would do. The value cell is bru's own answer
+    /// rather than "not read yet": none of these has a Chromium side, and a browser that printed
+    /// "not read yet" against a number it has compiled in would be saying it does not know its own
+    /// value.
+    #[test]
+    fn a_number_shows_its_range_and_its_unit_and_never_says_not_read_yet() {
+        let html = page(None);
+        assert!(html.contains("a whole number, 0 to 86400000 milliseconds (0 is never clear)"));
+        assert!(html.contains("a whole number, -1 to 86400000 milliseconds (-1 is never remove)"));
+        assert!(html.contains("a whole number, 1 to 10000 pixels"), "scroll.step_px");
+        assert!(html.contains("a whole number, 1 to 5 characters"), "hints.min_chars");
+        assert!(html.contains("at least two different characters, no spaces"), "hints.chars");
+        // The four values of `hints.auto_follow`, in the same cell a Choice has always used.
+        assert!(html.contains("always or unique-match or full-match or never"));
+
+        // Every row of the block answers with a value, at its own default, with nothing read from
+        // Chromium at all — which is what `page(None)` is.
+        for (name, value) in [
+            ("scroll.step_px", "120"),
+            ("messages.timeout", "3000"),
+            ("messages.limit", "100"),
+            ("zoom.default", "100"),
+            ("hints.chars", "asdfghjkl"),
+            ("hints.auto_follow", "unique-match"),
+            ("downloads.remove_finished", "-1"),
+        ] {
+            let at = html
+                .find(&format!("<td class=\"keys\">{name}</td>"))
+                .unwrap_or_else(|| panic!("no row for {name}"));
+            let row = &html[at..];
+            let row = &row[..row.find("</tr>").expect("the row ends")];
+            assert!(
+                row.contains(&format!("<td class=\"state\">{value}</td>")),
+                "{name} shows {row}"
+            );
+            assert!(!row.contains("not read yet"), "{name} claims Chromium has not been asked");
+        }
+        // `zoom.levels` is a list and its cell is a line per entry, the same shape the filter lists
+        // have — sixteen of them, indexed.
+        assert!(html.contains("<code>0</code> 25%"), "zoom.levels is not enumerated");
+        assert!(html.contains("<code>15</code> 500%"));
+        // The two that ship unset say so rather than showing a path they do not have.
+        assert!(html.contains("default unset"));
+    }
+    // --- end unhardcoded -------------------------------------------------------------------
 
     /// **A dict is not one line, and this is what the value column does about it.** One row per
     /// setting still, but the cell inside it is a line per pair.

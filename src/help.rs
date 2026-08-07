@@ -1009,13 +1009,18 @@ mod tests {
         assert!(html.contains("NPAPI and PPAPI are gone"), "the plugins reason is not on the page");
         assert!(html.contains("no-3rdparty cannot be written per URL"), "the cookies reason is not");
 
-        // And `<Return>` in hint mode, whose reason is `hints.rs`'s.
-        assert!(html.contains(r#"<tr class="refused"><td class="keys">&lt;Return&gt;</td><td class="cmd">hint-follow"#));
-        assert!(html.contains("there is never a hint waiting to be followed"));
+// --- unhardcoded -----------------------------------------------------------------------
+        // **`<Return>` in hint mode was the thirteenth and is not refused any more.**
+        // `hints.auto_follow` is a setting now, `never` is a value it takes, and that is the state
+        // the key exists for — so the row is live and the page must not still be telling the user
+        // it can never work. The reason string went with it.
+        assert!(!html.contains(r#"<tr class="refused"><td class="keys">&lt;Return&gt;</td><td class="cmd">hint-follow"#));
+        assert!(!html.contains("there is never a hint waiting to be followed"));
 
-        // Thirteen rows, and the summary says so rather than only the table.
-        assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 13);
-        assert!(html.contains("13 say why they do not"), "the summary undercounts");
+        // Twelve rows, and the summary says so rather than only the table.
+        assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 12);
+        assert!(html.contains("12 say why they do not"), "the summary undercounts");
+// --- end unhardcoded -------------------------------------------------------------------
         // And it states counts rather than a fraction of anything — the user asked for that
         // 2026-08-07, and a helpful-looking "x of y" is exactly what crept back last time.
         assert!(!html.contains(" of 264"), "the summary is measuring against a total again");
@@ -1344,14 +1349,20 @@ mod tests {
                 State::NotYet => panic!("{}: neither acts nor says why not", doc.names[0]),
             }
         }
-        // `hint-follow` is the one, and it carries `hints.rs`'s own words.
+        // **None**, and the empty vector is the assertion rather than the absence of one.
+        //
+        // `hint-follow` was the one, refused because a hint session followed its match the instant
+        // it was unambiguous and there was nothing left for `<Return>` to confirm. `hints.auto_follow`
+        // is what gave it a job: set to `never`, the session stays open on an exact match and waits.
+        // So the row went live by a setting arriving, not by anyone rewriting the command — which is
+        // the shape to expect here, and the reason this list is asserted whole instead of by count.
         assert_eq!(
             COMMANDS
                 .iter()
                 .filter(|doc| matches!(State::of(doc.example), State::Refused(_)))
                 .map(|doc| doc.names[0])
                 .collect::<Vec<_>>(),
-            vec!["hint-follow"]
+            Vec::<&str>::new()
         );
     }
 

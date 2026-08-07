@@ -23,7 +23,40 @@ use crate::tabs::SharedState;
 
 /// Pixels per press. Chromium's wheel notch is 40 on Linux, so this is three notches — what a mouse
 /// delivers per click, and near enough to qutebrowser's step for the two to be compared.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **This is now `scroll.step_px`'s default and nothing else reads it directly.** The value a `j`
+/// uses is [`step`]; this is what that answers until something sets the setting, and it is
+/// unchanged at 120 — the number the whole project exists for, measured on this machine and not
+/// moved.
+// --- end unhardcoded ---------------------------------------------------------------------------
 pub const STEP: i32 = 120;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `scroll.step_px`, cached where a keypress can read it without a lock.
+///
+/// **This is the whole reason `scroll.step_px` has a `Backing` of its own.** Every other setting
+/// lifted out of a `const` this round is read through `settings::int_of`, which takes the settings
+/// mutex — fine for a download starting or a message being posted, and not fine for `j`, which is
+/// the key this browser was built to make feel right. `settings::apply` writes here when the
+/// setting changes; [`step`] is a relaxed load, which is what a `const` compiled into the same
+/// function costs plus one uncontended read of a cache line.
+///
+/// Relaxed is the right ordering and not the lazy one: there is exactly one writer, it is on the UI
+/// thread, and so is every reader — the only thing an `Acquire` would buy is an ordering against
+/// stores this value has no relationship with.
+static STEP_PX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(STEP);
+
+/// How far one `j` moves, in pixels. On the key path — see [`STEP_PX`].
+pub fn step() -> i32 {
+    STEP_PX.load(Ordering::Relaxed)
+}
+
+/// Put `scroll.step_px` where [`step`] will find it. The one caller is `settings::apply`.
+pub fn set_step(px: i32) {
+    STEP_PX.store(px.clamp(1, 10_000), Ordering::Relaxed);
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// A ceiling on `<count><command>`. qutebrowser has none, but a typo like `99999j` should not lock
 /// the UI thread up sending wheel events.
@@ -55,11 +88,16 @@ pub fn scroll(
     count: Option<u32>,
 ) {
     let repeat = repeat(count);
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // Read once per press, not once per event: `10j` is one load and ten wheel events, and the step
+    // cannot change between the first and the tenth. See `STEP_PX`.
+    let step = step();
+    // --- end unhardcoded -----------------------------------------------------------------------
     match direction {
-        ScrollDirection::Down => wheel_times(browser, 0, -STEP, repeat),
-        ScrollDirection::Up => wheel_times(browser, 0, STEP, repeat),
-        ScrollDirection::Left => wheel_times(browser, STEP, 0, repeat),
-        ScrollDirection::Right => wheel_times(browser, -STEP, 0, repeat),
+        ScrollDirection::Down => wheel_times(browser, 0, -step, repeat),
+        ScrollDirection::Up => wheel_times(browser, 0, step, repeat),
+        ScrollDirection::Left => wheel_times(browser, step, 0, repeat),
+        ScrollDirection::Right => wheel_times(browser, -step, 0, repeat),
         ScrollDirection::Top => jump(browser, false),
         ScrollDirection::Bottom => jump(browser, true),
         ScrollDirection::PageUp => scroll_page(state, browser, 0.0, -1.0, count),
@@ -664,4 +702,75 @@ mod tests {
         assert_eq!(repeat(Some(10)), 10);
         assert_eq!(repeat(Some(99_999)), MAX_COUNT);
     }
+
+    // --- unhardcoded -----------------------------------------------------------------------
+    /// The step a `j` uses is the one bru has always used, and it is bru's own until something
+    /// sets it.
+    ///
+    /// The `const` is still there and is still 120; this says the cache starts on it, which is
+    /// what makes `apply_at_startup` — which only ever visits settings somebody *has* set —
+    /// enough. A bru whose `config.lua` says nothing about scrolling never calls `set_step`.
+    #[test]
+    fn the_step_starts_on_brus_own_and_is_bounded() {
+        assert_eq!(STEP, 120);
+        assert_eq!(step(), 120, "nothing has set it, so it is bru's own");
+
+        set_step(200);
+        assert_eq!(step(), 200);
+        // The `Kind::Int` range is 1..10000 and the store cannot hold anything outside it; this is
+        // the belt to that's braces, because a step of 0 is a `j` that does nothing at all and a
+        // negative one is a `j` that scrolls up.
+        set_step(0);
+        assert_eq!(step(), 1);
+        set_step(-40);
+        assert_eq!(step(), 1);
+        set_step(1_000_000);
+        assert_eq!(step(), 10_000);
+        set_step(STEP);
+        assert_eq!(step(), 120);
+    }
+
+    /// **`j` must not get slower, and this is the only setting that lands on its path.**
+    ///
+    /// The shape is `state::the_key_path_cost_of_a_per_window_chain`'s: a ratio against a baseline
+    /// taken in the same test, on the same machine, in the same build, because `cargo test` is a
+    /// debug build and an absolute bound would mean two different things in the two profiles.
+    ///
+    /// The baseline is `settings::int_of`, which is how every *other* value lifted this round is
+    /// read — one settings-mutex lock and a `HashMap` lookup. That is the thing `scroll.step_px`
+    /// has its own `Backing` to avoid, so it is the comparison worth making: the number this
+    /// prints is what a `j` would have paid if the step had been read like the message timeout.
+    #[test]
+    fn the_key_path_cost_of_reading_the_step() {
+        const ROUNDS: u32 = 500_000;
+
+        for _ in 0..20_000 {
+            std::hint::black_box(step());
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(step());
+        }
+        let cached = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        for _ in 0..20_000 {
+            std::hint::black_box(crate::settings::int_of("scroll.step_px"));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(crate::settings::int_of("scroll.step_px"));
+        }
+        let through_the_store = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        println!(
+            "step: `j` reads the step in {cached:.1} ns against {through_the_store:.1} ns through \
+             the settings mutex — {:.0}x",
+            through_the_store / cached.max(0.001)
+        );
+        assert!(
+            cached * 4.0 < through_the_store,
+            "the cache is not buying anything: {cached:.1} ns against {through_the_store:.1} ns"
+        );
+    }
+    // --- end unhardcoded -------------------------------------------------------------------
 }

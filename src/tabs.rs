@@ -133,8 +133,8 @@ impl BruState {
         // Read once for the whole strip rather than once per tab: `text_of` takes the settings
         // mutex, and a window with twenty tabs would take it eighty times for four answers that
         // cannot change in between.
-        let format = crate::settings::text_of("tabs.title.format");
-        let pinned_format = crate::settings::text_of("tabs.title.format_pinned");
+        let format = crate::settings::text_or_default("tabs.title.format");
+        let pinned_format = crate::settings::text_or_default("tabs.title.format_pinned");
         let count = slot.tabs.len();
         // --- end tabs and statusbar ------------------------------------------------------------
         let entries: Vec<String> = slot
@@ -173,8 +173,8 @@ impl BruState {
         format!(
             "{{\"tabs\":[{}],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
             entries.join(","),
-            crate::ipc::json_escape(&crate::settings::text_of("tabs.favicons.show")),
-            crate::ipc::json_escape(&crate::settings::text_of("tabs.title.alignment")),
+            crate::ipc::json_escape(&crate::settings::choice_of("tabs.favicons.show")),
+            crate::ipc::json_escape(&crate::settings::choice_of("tabs.title.alignment")),
             crate::settings::is_on("tabs.tooltips"),
         )
         // --- end tabs and statusbar ------------------------------------------------------------
@@ -435,8 +435,8 @@ pub fn new_tab(state: &SharedState, url: &str, background: bool) {
 fn empty_tabs_json() -> String {
     format!(
         "{{\"tabs\":[],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
-        crate::ipc::json_escape(&crate::settings::text_of("tabs.favicons.show")),
-        crate::ipc::json_escape(&crate::settings::text_of("tabs.title.alignment")),
+        crate::ipc::json_escape(&crate::settings::choice_of("tabs.favicons.show")),
+        crate::ipc::json_escape(&crate::settings::choice_of("tabs.title.alignment")),
         crate::settings::is_on("tabs.tooltips"),
     )
 }

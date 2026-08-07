@@ -329,8 +329,8 @@ pub fn leading_strip_count() -> i32 {
 /// Only the placement half, which is a pure function of two settings and the same for every window.
 fn places() -> Layout {
     Layout {
-        tabs_at_top: crate::settings::text_of("tabs.position") != "bottom",
-        status_at_top: crate::settings::text_of("statusbar.position") == "top",
+        tabs_at_top: crate::settings::choice_of("tabs.position") != "bottom",
+        status_at_top: crate::settings::choice_of("statusbar.position") == "top",
         // Not asked here — `wanted` fills these in per window.
         tabs_visible: true,
         status_visible: true,
@@ -356,7 +356,7 @@ fn wanted(window: u32) -> Layout {
 /// the two prompt modes, which are the three that own the strip's own inputs.
 fn strip_shown(window: u32, tabs: bool) -> bool {
     if tabs {
-        return match crate::settings::text_of("tabs.show").as_str() {
+        return match crate::settings::choice_of("tabs.show") {
             "never" => false,
             "multiple" => tab_count_in(window) > 1,
             "switching" => is_switching(window),
@@ -365,7 +365,7 @@ fn strip_shown(window: u32, tabs: bool) -> bool {
             _ => true,
         };
     }
-    match crate::settings::text_of("statusbar.show").as_str() {
+    match crate::settings::choice_of("statusbar.show") {
         "never" => strip_holds_the_keyboard(window),
         "in-mode" => {
             crate::state::BruState::instance()
@@ -436,7 +436,7 @@ fn is_switching(window: u32) -> bool {
 /// under every other value it does nothing at all, so the common path is one string compare.
 pub fn note_tab_switch(window: u32) {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
-    if crate::settings::text_of("tabs.show") != "switching" {
+    if crate::settings::choice_of("tabs.show") != "switching" {
         return;
     }
     let generation = {

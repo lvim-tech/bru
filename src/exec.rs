@@ -21,8 +21,48 @@ const MAX_COUNT: u32 = 1000;
 
 /// qutebrowser's `zoom.levels` (configdata.yml:2700-2722), in percent, and its `zoom.default` of
 /// 100 — the level `=` returns to.
+///
+// --- unhardcoded -------------------------------------------------------------------------------
+/// **Both are settings now**, `zoom.levels` and `zoom.default`, with these exact values as their
+/// defaults. `ZOOM_DEFAULT` is still what a browser with no host answers with, because a fallback
+/// that took the settings mutex to say "there is no page" would be a lock for nothing.
+// --- end unhardcoded ---------------------------------------------------------------------------
 const ZOOM_LEVELS: [u32; 16] = [25, 33, 50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
 const ZOOM_DEFAULT: u32 = 100;
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `zoom.levels`, sorted and deduplicated, as `zoom-in`/`zoom-out` step along them.
+///
+/// **The sort is here and not in the store**, and that is what makes an appending override work:
+/// a bru list layers the user's entries on the end of bru's own (see `settings::ListShape`), so
+/// `:config-list-add zoom.levels 133%` would otherwise land after `500%` and make `+` jump from
+/// 500 to 133. Sorting at read time turns the list into a set of levels, which is what a reader of
+/// `zoom.levels` means by it.
+///
+/// Off the key path: `+` and `-` are typed by hand, one lock per press, and the list is sixteen
+/// entries long.
+fn zoom_levels() -> Vec<u32> {
+    let mut levels: Vec<u32> = crate::settings::list_of("zoom.levels")
+        .iter()
+        .filter_map(|entry| crate::settings::percent_of(entry))
+        .collect();
+    levels.sort_unstable();
+    levels.dedup();
+    if levels.is_empty() {
+        // A process with no settings store — a renderer, or a unit test. bru's own sixteen.
+        return ZOOM_LEVELS.to_vec();
+    }
+    levels
+}
+
+/// `zoom.default`, the level `:zoom` with no argument and `=` return to.
+fn zoom_default() -> u32 {
+    match crate::settings::int_of("zoom.default") {
+        percent if percent > 0 => percent as u32,
+        _ => ZOOM_DEFAULT,
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// Run one command against the browser the key arrived at.
 ///
@@ -286,7 +326,9 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // --- zoom ---------------------------------------------------------------------------
         // A count beats the argument, as everywhere else (`zoomcommands.py:64`).
         Command::Zoom { level } => {
-            set_zoom_percent(browser, count.or(*level).unwrap_or(ZOOM_DEFAULT));
+            // --- unhardcoded ---------------------------------------------------------------
+            set_zoom_percent(browser, count.or(*level).unwrap_or_else(zoom_default));
+            // --- end unhardcoded -----------------------------------------------------------
         }
         Command::ZoomIn => zoom_by(browser, repeat as i32),
         Command::ZoomOut => zoom_by(browser, -(repeat as i32)),
@@ -396,42 +438,25 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::hints::start(state, browser, group, target, *rapid, *first);
         }
 // --- end src/hints.rs -------------------------------------------------------------------
-        // **`<Return>` in hint mode has no job, and this is where that was settled rather than
-        // deferred.** It is not "not yet" — `help.rs` marks it *refused*, with the reason below,
-        // because there is no version of bru in which pressing it does something. Four
-        // measurements, the last two taken 2026-08-06 by the workstream that closed it:
+// --- unhardcoded ---------------------------------------------------------------------------
+        // **`<Return>` in hint mode has a job now, and the thing that gave it one is a setting.**
         //
-        // 1. **bru's labels are prefix-free, so an exact match has already followed itself.**
-        //    `hints::hint_strings` gives the short labels the numbers `0..short_count` in
-        //    `needed - 1` digits and the long ones the numbers from `short_count * len(chars)` up
-        //    in `needed` digits, so a long label's leading `needed - 1` digits encode a number
-        //    **at least** `short_count` — never one a short label stands for. Asserted over 1..600
-        //    elements in `hint_labels_are_prefix_free` below. There is therefore no state in which
-        //    a complete label is sitting unfollowed waiting for Enter.
-        // 2. **`--rapid` does not change that.** A rapid session clears `sequence` after each
-        //    follow and keeps the same label set, so 1 holds for its second and later follows word
-        //    for word; `--first` (`gi`) fires label 0 before any key is pressed at all.
-        // 3. **The key is dead in qutebrowser 3.7.0 too, under its own defaults.** `<Return>` is
-        //    bound to a bare `hint-follow`, whose `keystring` is then `None`, so it follows
-        //    `_context.to_follow` (`hints.py:1008-1012`) — and `to_follow` is only ever assigned in
-        //    the `else` branch of `_handle_auto_follow` (`hints.py:833-836`), reached only when
-        //    `hints.auto_follow` is `never`. The default is `unique-match` (configdata.yml:1673),
-        //    so pressing Enter in stock qutebrowser raises `CommandError("No hint to follow")`.
-        // 4. **The gap between 1 and 3 was the one thing left, and it is empty.** qutebrowser
-        //    follows on a *unique* match and bru followed on a *full* one, so bru could in
-        //    principle sit with one visible label and an incomplete chain — a state qutebrowser's
-        //    default never reaches, and where Enter would have had a job. `hints::auto_follow` now
-        //    implements `unique-match` itself, and the state it was supposed to catch does not
-        //    exist: over 1..1,000,000 elements there is no prefix of a label that is not itself a
-        //    label and yet leaves exactly one label showing — the smallest such set has two in it.
-        //    `hints::tests::unique_match_cannot_beat_a_full_match_under_the_default_hints_chars`
-        //    asserts it to 1000, and the sweep to a million is in that workstream's report.
+        // This arm held forty lines saying the key could never do anything, and the fourth of the
+        // four measurements ended: "What would give the key a job is `hints.auto_follow = never`,
+        // and bru does not have the option: DESIGN.md gives it no configuration of its own … If
+        // that option is ever added, this arm and `hints::auto_follow` are the two places to
+        // change, and the row stops being refused." The premise was the reading of DESIGN.md the
+        // user corrected on 2026-08-06 — bru holds every setting and its default — and the option
+        // is `hints.auto_follow`, one of the fourteen values unhardcoded this round. So this is
+        // that change, at the two places that comment named.
         //
-        // What would give the key a job is `hints.auto_follow = never`, and bru does not have the
-        // option: DESIGN.md gives it no configuration of its own, and `settings::SETTINGS` holds
-        // only names a user can change *and* bru can honour. If that option is ever added, this arm
-        // and `hints::auto_follow` are the two places to change, and the row stops being refused.
-        Command::HintFollow => {}
+        // Nothing about the other three values moved: under `always`, `unique-match` and
+        // `full-match` a label that could be followed has been followed before the key arrives, and
+        // `hints::follow_current` says so rather than doing nothing. The four measurements that
+        // establish that are not deleted, they are `hints::auto_follow`'s documentation and the two
+        // tests it names.
+        Command::HintFollow => crate::hints::follow_current(state, browser),
+// --- end unhardcoded -----------------------------------------------------------------------
 
 // --- src/downloads.rs --------------------------------------------------------------------------
         // `gd`, `ad`, `cd` and the four `:download-*` commands. The count means the same thing in
@@ -1045,8 +1070,12 @@ pub fn is_live(command: &Command) -> bool {
         | Command::PromptFileselectExternal => true,
 // --- end src/prompt.rs ---------------------------------------------------------------------
 
-        // Bound, reachable, and deliberately a no-op — see the arm in `run`.
-        Command::HintFollow => false,
+// --- unhardcoded ---------------------------------------------------------------------------
+        // Live since `hints.auto_follow` became a setting: `never` is the value it acts under, and
+        // under the other three it answers with why there is nothing to follow. See the arm in
+        // `run`.
+        Command::HintFollow => true,
+// --- end unhardcoded -----------------------------------------------------------------------
 
 // --- src/settingspage.rs -------------------------------------------------------------------
         // `sf` writes a file, or says why there was nothing to write. See `cmdline::save`.
@@ -1140,15 +1169,12 @@ pub fn is_live(command: &Command) -> bool {
 /// kind from a row that says it about a key waiting for a milestone: it invites the same
 /// investigation every few months, and the second one costs as much as the first.
 ///
-/// The strings live with the module that measured them, not here — `settings::REFUSED` and
-/// `hints::WHY_HINT_FOLLOW_IS_REFUSED`. This is only the dispatch, and `help.rs` is the only
-/// caller. It is deliberately *not* consulted by `is_live`: a refused command is inert, and both
+/// The strings live with the module that measured them, not here — `settings::REFUSED`. This is
+/// only the dispatch, and `help.rs` is the only caller. It is deliberately *not* consulted by `is_live`: a refused command is inert, and both
 /// halves of the count would otherwise depend on one function.
 pub fn refusal(command: &Command) -> Option<&'static str> {
     debug_assert!(!is_live(command), "a live command cannot also be refused");
     match command {
-        // `<Return>` in hint mode. The four measurements are in the arm of `run` above.
-        Command::HintFollow => Some(crate::hints::WHY_HINT_FOLLOW_IS_REFUSED),
         // The twelve `t**` rows, all of them `config-cycle … content.plugins` or
         // `… content.cookies.accept`. `commands.rs` will not build a `ConfigCycle` for a setting
         // `settings.rs` does not have, so they arrive here as `Unimplemented` carrying the text
@@ -1334,6 +1360,23 @@ fn set_zoom_percent(browser: &mut Browser, percent: u32) {
         return;
     };
     let percent = percent.max(1);
+    // --- unhardcoded -------------------------------------------------------------------------
+    // `BRU_DEBUG_ZOOM=1`, in the shape of `BRU_DEBUG_KEYS` and its siblings. Nothing in bru
+    // reports the zoom level: `:zoom` is silent, the status bar has no field for it and a session
+    // does not record it, so `zoom.levels` and `zoom.default` had no way to be *measured* rather
+    // than asserted. Off by default — it is one line per `+`.
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_ZOOM").is_some()) {
+            eprintln!(
+                "bru[zoom]: {percent}% (levels {:?}, default {}%)",
+                zoom_levels(),
+                zoom_default()
+            );
+        }
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
     host.set_zoom_level((percent as f64 / 100.0).ln() / 1.2f64.ln());
 }
 
@@ -1341,15 +1384,18 @@ fn set_zoom_percent(browser: &mut Browser, percent: u32) {
 /// (`AbstractZoom.apply_offset`, over a NeighborList in `edge` mode).
 fn zoom_by(browser: &mut Browser, offset: i32) {
     let current = zoom_percent(browser);
+    // --- unhardcoded -------------------------------------------------------------------------
+    let levels = zoom_levels();
+    // --- end unhardcoded -----------------------------------------------------------------------
     // The nearest level to where the page actually is, so a zoom set by `:zoom 137` still steps.
-    let nearest = ZOOM_LEVELS
+    let nearest = levels
         .iter()
         .enumerate()
         .min_by_key(|(_, level)| level.abs_diff(current))
         .map(|(index, _)| index as i32)
         .unwrap_or(0);
-    let index = (nearest + offset).clamp(0, ZOOM_LEVELS.len() as i32 - 1) as usize;
-    set_zoom_percent(browser, ZOOM_LEVELS[index]);
+    let index = (nearest + offset).clamp(0, levels.len() as i32 - 1) as usize;
+    set_zoom_percent(browser, levels[index]);
 }
 
 /// Drop focus from whatever the page had focused. One-off script rather than a CEF call because
@@ -1706,7 +1752,8 @@ mod tests {
         // 242 with `sf`, whose `save` writes the command line's history to `cmd-history` — the one
         // saveable bru has that was not already on disk. 243 with `.`. 244 with `Ss`, a bare `set`,
         // which opens `bru://chrome/settings`. The fourth of that group, `<Return>` in hint mode,
-        // stays inert on purpose and raises nothing — see the `HintFollow` arm in `run`.
+        // stayed inert on purpose and raised nothing — until `hints.auto_follow` became a setting;
+        // see the `HintFollow` arm in `run`, and the note at the assertion below.
         //
         // 243 with a second window: `gD` (`tab-give`) and `U` (`undo -w`), the two bindings whose
         // whole reason for being inert was that there was one window. The `-w` spellings of `open`,
@@ -1727,17 +1774,30 @@ mod tests {
         // call that has counted command mode's seventeen since the ruler was fixed. Both halves
         // were checked by pressing them, not by reading this match.
         //
+        // --- unhardcoded -----------------------------------------------------------------
+        // **286 with `<Return>` in hint mode**, and it is the one row in this file's history that
+        // moved from *refused* to live rather than from waiting: `hints.auto_follow` became a
+        // setting, `never` is a value it can be set to, and that is the state the key exists for.
+        // The denominator does not move — the row was always in the table.
+        // --- end unhardcoded -------------------------------------------------------------
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 285, "the live-binding count moved");
+        assert_eq!(live, 286, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
     /// **Every default binding now either acts or is refused. Nothing is merely waiting.**
     ///
-    /// 285 and 13, and the thirteen are named rather than counted: six `content.plugins`, six
-    /// `content.cookies.accept`, and `<Return>` in hint mode. Each of the three groups was
-    /// measured against CEF 151 rather than assumed — the reasons are in `settings::REFUSED` and
-    /// `hints::WHY_HINT_FOLLOW_IS_REFUSED`, and the arms above carry the numbers.
+    /// 286 and 12, and the twelve are named rather than counted: six `content.plugins` and six
+    /// `content.cookies.accept`. Both groups were measured against CEF 151 rather than assumed —
+    /// the reasons are in `settings::REFUSED`, and the arms above carry the numbers.
+    ///
+    // --- unhardcoded ---------------------------------------------------------------------------
+    /// **It was 285 and 13, and the thirteenth was `<Return>` in hint mode.** It is live now, and
+    /// what made it live is `hints.auto_follow` becoming a setting — the arm in `run` carries that.
+    /// A refusal that stops being true is deleted rather than left standing: leaving it would be a
+    /// sentence on `bru://chrome/help` telling the user a key can never work while it works.
+    // --- end unhardcoded -----------------------------------------------------------------------
     ///
     /// If a milestone ever binds a key to a command it has not built, `waiting` stops being empty
     /// and `bru://chrome/help` grows a "not yet" row again. That is correct, and it is why this
@@ -1756,7 +1816,7 @@ mod tests {
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        assert_eq!(live, 285);
+        assert_eq!(live, 286);
         assert_eq!(
             refused,
             [
@@ -1764,7 +1824,6 @@ mod tests {
                 ("normal", "tPH"), ("normal", "tpu"), ("normal", "tPu"),
                 ("normal", "tch"), ("normal", "tCh"), ("normal", "tcH"),
                 ("normal", "tCH"), ("normal", "tcu"), ("normal", "tCu"),
-                ("hint", "<Return>"),
             ]
         );
         // A live command is never also refused — `refusal` debug-asserts it, and this walks the
@@ -1791,13 +1850,22 @@ mod tests {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
-        // `<Return>` in hint mode is bound, parses, and does nothing — measured, not forgotten.
+// --- unhardcoded -----------------------------------------------------------------------
+        // `<Return>` in hint mode was the fourth of that group, bound and deliberately inert. It
+        // acts now, and the thing that made it act is `hints.auto_follow` becoming a setting — see
+        // the arm in `run`. Kept as an assertion rather than deleted, because the row moving from
+        // refused to live is the whole of what this workstream did to the count.
         let (_, _, cmd) = DEFAULT_BINDINGS
             .iter()
             .find(|(mode, k, _)| *mode == "hint" && *k == "<Return>")
             .expect("hint mode binds <Return>");
         assert_eq!(*cmd, "hint-follow");
-        assert!(!is_live(&commands::parse(cmd).unwrap()));
+        assert!(is_live(&commands::parse(cmd).unwrap()));
+        // `refusal` is not asked here on purpose: it debug-asserts that its argument is *not* live,
+        // so asking it about a live command is a panic rather than a `None`. That the row is no
+        // longer refused is asserted where the refusals are counted — `help.rs`'s
+        // `a_binding_nothing_can_implement_says_refused_and_why`.
+// --- end unhardcoded -------------------------------------------------------------------
 
         // A bare `set` is the settings page; `set` with an option is still `settings.rs`'s.
         assert_eq!(commands::parse("set").unwrap(), Command::SettingsPage);
@@ -1808,8 +1876,13 @@ mod tests {
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
 // --- hint-follow -----------------------------------------------------------------------------
-    /// Measurement 1 behind the inert `hint-follow`: no label is a prefix of another, so a complete
-    /// label can never be sitting unfollowed with Enter left to press.
+    /// Measurement 1 behind the once-inert `hint-follow`: no label is a prefix of another, so a
+    /// complete label can never be sitting unfollowed with Enter left to press.
+    ///
+    /// It is still true and still worth asserting — it is why `hints.auto_follow` at its default
+    /// leaves `<Return>` nothing to do, which is what `hints::follow_current` says when it is
+    /// pressed there. Under `never` the key has a job because `handle_key` stops following, not
+    /// because this stopped holding.
     ///
     /// Over 1..600 elements rather than one page's worth, because the property is a claim about
     /// `hint_strings`' arithmetic — the short/long split at `short_count * len(chars)` — and one
@@ -2116,8 +2189,8 @@ mod tests {
     /// Not one of them is bound in `configdata.yml`, in any mode: they are typed. The one default
     /// binding that so much as mentions `:bind` is `sk`, which is `cmd-set-text -s :bind` — it puts
     /// the text in the command line and has been live since `cmdline.rs` existed, whether or not
-    /// anything answered when the line was accepted. So 285 stays 285, and this is what says so
-    /// rather than the absence of a change.
+    /// anything answered when the line was accepted. So the count is unmoved by them, and this is
+    /// what says so rather than the absence of a change.
     #[test]
     fn the_config_commands_raise_no_binding() {
         let names = [

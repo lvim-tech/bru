@@ -44,6 +44,28 @@ pub enum Kind {
     Dict(&'static DictShape),
     /// An ordered list of text, with bru's own entries compiled in. See [`ListShape`].
     List(&'static ListShape),
+    // --- unhardcoded -------------------------------------------------------------------------
+    /// A whole number inside a range bru names. See [`IntShape`].
+    ///
+    /// **`config-cycle` with no values is refused for one**, and that is the one place this kind
+    /// differs from every other scalar. A [`Kind::Bool`] has two values and a [`Kind::Choice`] has
+    /// its list, so both can be walked without being told what to walk; a number has 2^64 of them
+    /// and "the next one" is not a thing an option means. `:config-cycle messages.timeout 1000
+    /// 3000` is spelled out and works, and the error for the bare form says so rather than
+    /// answering with qutebrowser's generic "needs at least two values", which reads like a bug in
+    /// the command rather than a fact about the option.
+    Int(&'static IntShape),
+    /// A string of at least two distinct non-blank characters — qutebrowser's `UniqueCharString`
+    /// with `minlen: 2` (`configdata.yml:1717-1718`), and it has exactly one setting, `hints.chars`.
+    ///
+    /// **It is a kind rather than a [`Kind::Text`] because a one-character value is a division by
+    /// zero, not a preference.** `hints::hint_strings` divides the label space by
+    /// `chars.len() - 1`, so `:set hints.chars a` would take the browser down; and a value with a
+    /// character twice would generate two elements the same label, which
+    /// `labels_are_unique_and_prefix_free` exists to say cannot happen. `Kind::Text`'s only rule is
+    /// that the value is not empty, which catches neither.
+    Chars,
+    // --- end unhardcoded ---------------------------------------------------------------------
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -187,6 +209,14 @@ pub enum ListValue {
     /// the reason instead of with the list.
     StatusbarWidget,
     // --- end tabs and statusbar ----------------------------------------------------------------
+    // --- unhardcoded ---------------------------------------------------------------------------
+    /// A zoom level, in percent, spelled qutebrowser's way (`150%`) or bru's (`150`). Both are
+    /// taken because `:zoom 150` and `:zoom 150%` are already the same command here — the `%` is a
+    /// suffix `commands.rs` strips — and a list that refused the spelling its own command accepts
+    /// would be a rule with nothing behind it. [`percent_of`] is the one reader, and it sorts and
+    /// deduplicates numerically, so `133` and `133%` cannot become two levels.
+    Percent,
+    // --- end unhardcoded -----------------------------------------------------------------------
 }
 
 impl ListShape {
@@ -230,9 +260,45 @@ impl ListShape {
                 ))
             }
             // --- end tabs and statusbar --------------------------------------------------------
+            // --- unhardcoded -------------------------------------------------------------------
+            ListValue::Percent => match percent_of(value) {
+                Some(percent) if (1..=10_000).contains(&percent) => Ok(()),
+                Some(percent) => Err(format!(
+                    "{name}: {percent}% is outside 1..10000 percent"
+                )),
+                None => Err(format!(
+                    "{name}: {value:?} is not a zoom level — it needs to be a whole number of \
+                     percent, with or without the % sign"
+                )),
+            },
+            // --- end unhardcoded ---------------------------------------------------------------
         }
     }
 }
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// `150%` or `150` as the number 150. The one reader of a [`ListValue::Percent`] entry.
+pub fn percent_of(entry: &str) -> Option<u32> {
+    entry.trim().trim_end_matches('%').trim().parse::<u32>().ok()
+}
+
+/// `zoom.levels`, qutebrowser's own name and its own sixteen levels (`configdata.yml:2700-2722`) —
+/// which is where `exec::ZOOM_LEVELS` took them from, as a compiled-in `[u32; 16]` nothing could
+/// reach.
+///
+/// **The order is the reader's, not the list's**, and that is the one thing this shape needs saying
+/// about it. `zoom-in` steps along the levels by index, so an override that *appends* — which is
+/// what every bru list does, see [`ListShape`] — would otherwise put `133%` after `500%` and make
+/// `+` jump from 500 to 133. `crate::exec::zoom_levels` sorts, so the list is a **set** of levels
+/// and the entry order in it means nothing.
+pub static ZOOM_LEVELS: ListShape = ListShape {
+    defaults: &[
+        "25%", "33%", "50%", "67%", "75%", "90%", "100%", "110%", "125%", "150%", "175%", "200%",
+        "250%", "300%", "400%", "500%",
+    ],
+    value: ListValue::Percent,
+};
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 /// The filter lists `:adblock-update` fetches. qutebrowser's own name and its own two defaults
 /// (`configdata.yml:886-889`), which is where `adblock::DEFAULT_LISTS` took them from.
@@ -307,11 +373,121 @@ pub static STATUSBAR_WIDGETS: ListShape = ListShape {
 };
 // --- end tabs and statusbar --------------------------------------------------------------------
 
+// --- unhardcoded -------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------
+// Numbers
+// -----------------------------------------------------------------------------------------------
+
+/// The shape of a [`Kind::Int`] setting: the range bru will hold, what the number counts, and what
+/// a sentinel at one end of the range means.
+///
+/// **The range is not decoration.** Every number lifted out of the code was a `const` that the rest
+/// of its file was written against: `hints::MIN_CHARS` is an exponent, `scroll::STEP` is multiplied
+/// by a count that can be 1000, and `messages::LOG_LIMIT` sizes a `Vec` that is written on every
+/// message. A setting that took any `i64` would turn each of those from a constant into a way to
+/// hang the browser, which is the opposite of what unhardcoding one is for. So the bound is stated
+/// where the value is, next to the default it belongs to, and `:set` refuses what is outside it and
+/// says what the range was.
+#[derive(PartialEq, Eq, Debug)]
+pub struct IntShape {
+    /// The smallest value bru will hold, inclusive.
+    pub min: i64,
+    /// The largest, inclusive. Bounded even where qutebrowser is not — see the type's own note.
+    pub max: i64,
+    /// What the number counts: "milliseconds", "pixels", "characters". It goes in the error and in
+    /// `bru://chrome/settings`'s "what it takes" column, where "a whole number" on its own says
+    /// nothing about whether 3000 is a long time or a short one.
+    pub unit: &'static str,
+    /// What the value at `min` means when it is a sentinel rather than the smallest sensible
+    /// amount — `-1` on `downloads.remove_finished` is "never", not "minus one millisecond". Empty
+    /// when there is none, which is most of them.
+    pub sentinel: &'static str,
+}
+
+impl IntShape {
+    /// Whether a number may go into this setting, and why not when it may not.
+    fn check(&self, name: &str, value: i64) -> Result<(), String> {
+        if value >= self.min && value <= self.max {
+            return Ok(());
+        }
+        let sentinel = if self.sentinel.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} is {})", self.min, self.sentinel)
+        };
+        Err(format!(
+            "{name}: {value} is outside {}..{} {}{sentinel}",
+            self.min, self.max, self.unit
+        ))
+    }
+}
+
+/// `hints.min_chars` — how many characters the shortest label may be.
+///
+/// qutebrowser's `minval: 1` (`configdata.yml:1751`) and no maximum. bru caps at 5 because the
+/// number is an **exponent**: `hint_strings` asks for `chars.len().pow(needed)` labels, so 5 on the
+/// nine-character default is 59,049 and 20 is 12 quintillion and an instant overflow panic. Five is
+/// past anything a page needs — the largest page measured here wanted three.
+static HINT_MIN_CHARS: IntShape =
+    IntShape { min: 1, max: 5, unit: "characters", sentinel: "" };
+
+/// `messages.timeout` — how long a message stays in the bar.
+///
+/// qutebrowser's `minval: 0` with 0 meaning "never clear" (`configdata.yml:2060`), which bru now
+/// honours too. The maximum is a day: a timeout longer than that is "never" spelled the long way,
+/// and the value is handed to `post_delayed_task` as milliseconds.
+static MESSAGE_TIMEOUT: IntShape =
+    IntShape { min: 0, max: 86_400_000, unit: "milliseconds", sentinel: "never clear" };
+
+/// `messages.limit` — how many messages `:messages` keeps.
+///
+/// **bru's own name**: qutebrowser has no such option — the comment in `message.rs` cited
+/// `configdata.yml:2044` for it and that line is `keyhint.delay`. The number 100 is still bru's and
+/// still what it was. The ceiling is 10,000 because the buffer is a `Vec` walked from the front on
+/// every overflow.
+static MESSAGE_LIMIT: IntShape =
+    IntShape { min: 1, max: 10_000, unit: "messages", sentinel: "" };
+
+/// `downloads.remove_finished` — how long a finished download's row stays.
+///
+/// qutebrowser's `minval: -1`, with -1 meaning never (`configdata.yml:1557-1565`), and bru keeps
+/// both. The maximum is a day, for [`MESSAGE_TIMEOUT`]'s reason.
+static REMOVE_FINISHED: IntShape =
+    IntShape { min: -1, max: 86_400_000, unit: "milliseconds", sentinel: "never remove" };
+
+/// `zoom.default` — the level `=` returns to.
+///
+/// qutebrowser spells it as a percentage string (`100%`); bru's is the number, because `:zoom 150`
+/// and `:zoom 150%` are already the same command here and the `%` is a suffix the parser strips.
+/// The range is Chromium's own: `set_zoom_level` takes a logarithm, and 1% and 10,000% are past
+/// where a page is readable in either direction.
+static ZOOM_DEFAULT: IntShape =
+    IntShape { min: 1, max: 10_000, unit: "percent", sentinel: "" };
+
+/// `scroll.step_px` — how far one `j` moves.
+///
+/// **bru's own name, and the one number this project exists for.** qutebrowser has no option here
+/// at all: it scrolls by lines through `window.scrollBy`, which is the mechanism DESIGN.md rejects.
+/// 120 is three of Chromium's 40-pixel wheel notches and is exactly what `scroll::STEP` has always
+/// been; changing the default would be changing the feel the project was built to get.
+///
+/// The ceiling is one wheel event's own ceiling: measured (CEF-NOTES, "Input"), a single
+/// `send_mouse_wheel_event` moves at most one viewport whatever the delta says, so a step past a
+/// screen height is a number that lies about what it does. 10,000 is past any display here and
+/// still a number `j` multiplied by a count of 1000 cannot overflow.
+static SCROLL_STEP: IntShape =
+    IntShape { min: 1, max: 10_000, unit: "pixels", sentinel: "" };
+// --- end unhardcoded ---------------------------------------------------------------------------
+
 /// A setting's value, already validated against its [`Kind`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value {
     Bool(bool),
     Text(String),
+    // --- unhardcoded ---------------------------------------------------------------------------
+    /// A whole number, already inside its [`IntShape`]'s range.
+    Int(i64),
+    // --- end unhardcoded -----------------------------------------------------------------------
     /// A whole dictionary, bru's defaults with the user's overrides merged over them. The map is
     /// complete rather than a diff, so reading one is one lookup and never a merge.
     Dict(BTreeMap<String, String>),
@@ -326,6 +502,12 @@ impl std::fmt::Display for Value {
             Value::Bool(true) => f.write_str("true"),
             Value::Bool(false) => f.write_str("false"),
             Value::Text(text) => f.write_str(text),
+            // --- unhardcoded -----------------------------------------------------------------
+            // The number, and nothing else — `:set messages.timeout` prints `3000` and that is the
+            // spelling `:set messages.timeout 3000` takes back, which is what `Display` is for
+            // here. The unit is in `bru://chrome/settings`'s own column, where there is room.
+            Value::Int(number) => write!(f, "{number}"),
+            // --- end unhardcoded -------------------------------------------------------------
             // One line, for the places that have room for one. What `:set` and the settings page
             // print is not this — see `Settings::describe`, which gives a dict a line per pair.
             Value::Dict(map) => write!(f, "{} entries", map.len()),
@@ -369,6 +551,25 @@ enum Backing {
     /// on its own — `adblock.rs` says in as many words that it is "the only thing in bru that
     /// reaches the network on its own account, and it does it because somebody typed the command".
     AdblockLists,
+    // --- unhardcoded ---------------------------------------------------------------------------
+    /// Read out of this store at the moment it is wanted, and pushed nowhere.
+    ///
+    /// This is the backing of every value that was a `const` in the file that used it: the hint
+    /// characters, the editor command, the download directory, the message timeout, the zoom
+    /// levels. There is nothing to apply because there was nothing to apply before — the code read
+    /// the constant where it stood, and now it reads the setting in the same place.
+    ///
+    /// **A session-shaped reader is still a reader.** `hints.rs` snapshots its five into the
+    /// `Session` when `f` starts one, exactly as it already snapshots the `hint:` bindings, so
+    /// changing `hints.chars` mid-session does not relabel a page that is already labelled. That is
+    /// a property of the reader and not of this arm; nothing here has to know about it.
+    Read,
+    /// `scroll.rs`'s cached step. **The one setting in this group that is on the key path**, and
+    /// the only reason it is not [`Backing::Read`]: `j` must not take the settings mutex, so the
+    /// value lives in an `AtomicI32` beside the wheel code and this pushes it there. Measured — see
+    /// `scroll::the_key_path_cost_of_reading_the_step`.
+    ScrollStep,
+    // --- end unhardcoded -----------------------------------------------------------------------
 }
 
 /// The content settings bru drives. Kept as bru's own enum rather than `ContentSettingTypes` so
@@ -485,9 +686,14 @@ pub static SEARCH_ENGINES: DictShape = DictShape {
 
 /// Every setting bru has, and nothing else.
 ///
-/// The list is short on purpose: bru has eleven, because eleven is how many it can currently change the
-/// behaviour of. Adding a name here without adding the
-/// behaviour behind it would make `:set` a place where things are typed and forgotten.
+/// The list is exactly as long as the behaviour behind it: every name here moves something, and
+/// adding one without that would make `:set` a place where things are typed and forgotten.
+///
+/// **The cheapest of them are the ones that were already behaviour.** The block fenced
+/// `unhardcoded` is fourteen values that were `const`s in the files that read them — the hint
+/// characters, the message timeout, the zoom levels, the wheel step. Each already moved something
+/// observable, so this file's own rule was satisfied before the name was typed; what changed is
+/// only that a person can now reach the number.
 ///
 /// **Two of the six are dictionaries**, and they are the first settings in bru whose value is not a
 /// scalar — see [`Kind::Dict`] and [`DictShape`]. DESIGN.md asked for Lua as the config language
@@ -761,6 +967,163 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Chrome,
     },
 // --- end tabs and statusbar --------------------------------------------------------------------
+// --- unhardcoded -------------------------------------------------------------------------------
+// Fourteen values that were already behaviour and were nailed shut: a `const` in the file that
+// used it, with qutebrowser exposing every one of them as an option. Every default here is **the
+// value bru had on 2026-08-07 and not qutebrowser's**, and where the two differ the `Def` says so —
+// adopting qutebrowser's on the way past would be a behaviour change smuggled inside a refactor.
+//
+// The rule `settings.rs` opens with is satisfied before the name is typed: each of these already
+// moved something observable, which is why they are the cheapest configurability bru can buy.
+    Def {
+        // `hints.chars`, configdata.yml:1714. Same name, same default, same type — qutebrowser's is
+        // a `UniqueCharString` with `minlen: 2`, which is [`Kind::Chars`].
+        name: "hints.chars",
+        kind: Kind::Chars,
+        default: Some("asdfghjkl"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `hints.min_chars`, configdata.yml:1747. Same name, same default of 1. bru's range has a
+        // ceiling qutebrowser's does not — see [`HINT_MIN_CHARS`], where the number is an exponent.
+        name: "hints.min_chars",
+        kind: Kind::Int(&HINT_MIN_CHARS),
+        default: Some("1"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `hints.auto_follow`, configdata.yml:1673. All four of qutebrowser's values, at
+        // qutebrowser's default — and the default is the behaviour bru already had, hard-coded,
+        // with a doc comment saying so. `never` is what gives `hint-follow` (`<Return>` in hint
+        // mode) a job; it had none, and `hints::WHY_HINT_FOLLOW_IS_REFUSED` said in as many words
+        // that it would have one "only if following on a unique match could be turned off, and bru
+        // has no such setting". It has one now, so that refusal is gone and the binding is live.
+        name: "hints.auto_follow",
+        kind: Kind::Choice(&["always", "unique-match", "full-match", "never"]),
+        default: Some("unique-match"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `hints.uppercase`, configdata.yml:1878. Same name, same default of false.
+        name: "hints.uppercase",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `hints.scatter`, configdata.yml:1795. Same name, same default of true — `hint_strings`
+        // was `_hint_scattered` and only that, and `_hint_linear` (dwb's order) is what false now
+        // selects.
+        name: "hints.scatter",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `editor.command`, configdata.yml:1569. **bru's default is not qutebrowser's, and the
+        // difference is deliberate.** qutebrowser ships `["gvim", "-f", "{file}", "-c", …]`; bru has
+        // never had gvim on the machine it is built for, and `editor.rs` has read
+        // `$BRU_EDITOR`/`$VISUAL`/`$EDITOR` and then `nvim` since it was written. Unsetting is what
+        // leaves that chain standing — the same shape `start_page` has and for the same reason, so
+        // a bru with no config still opens the editor the rest of this desktop opens.
+        //
+        // It is one string rather than qutebrowser's list because `spawn::shlex` is what
+        // `editor_argv` already parses it with, and because a list in bru *appends* (see
+        // [`ListShape`]) — an override that added `--flag` to the end of somebody else's editor is
+        // not what anyone means by setting their editor.
+        name: "editor.command",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `downloads.location.directory`, configdata.yml:1468. qutebrowser's default is `null` and
+        // so is bru's: unset means the desktop's answer — `$XDG_DOWNLOAD_DIR`, then
+        // `user-dirs.dirs`, then `~/Downloads` — which is what `downloads::download_dir` has always
+        // done and what its own doc comment predicted this setting would sit in front of.
+        name: "downloads.location.directory",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `downloads.location.prompt`, configdata.yml:1478. Same name, same default of true, which
+        // is the behaviour `src/prompt.rs` gave bru and hard-coded. False is qutebrowser's own
+        // meaning: use `downloads.location.directory` without asking.
+        name: "downloads.location.prompt",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `downloads.remove_finished`, configdata.yml:1557. Same name, same default of -1, which is
+        // "never" and is exactly what bru did: a finished row stayed until `:download-clear`.
+        name: "downloads.remove_finished",
+        kind: Kind::Int(&REMOVE_FINISHED),
+        default: Some("-1"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `messages.timeout`, configdata.yml:2052. Same name, same default of 3000, and 0 means
+        // "never clear" as it does there — which is new behaviour, since `message::TIMEOUT_MS` had
+        // no way to say it.
+        name: "messages.timeout",
+        kind: Kind::Int(&MESSAGE_TIMEOUT),
+        default: Some("3000"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // **bru's own name**: `message::LOG_LIMIT` cited `configdata.yml:2044` for a
+        // `messages.limit` that does not exist — that line is `keyhint.delay`. The 100 is bru's own
+        // and is unchanged; only the name is now something a person can type.
+        name: "messages.limit",
+        kind: Kind::Int(&MESSAGE_LIMIT),
+        default: Some("100"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `zoom.default`, configdata.yml:2695. qutebrowser spells the value `100%`; bru's is the
+        // number, because `:zoom 150` and `:zoom 150%` are already one command here. The level is
+        // the same 100 `exec::ZOOM_DEFAULT` was.
+        name: "zoom.default",
+        kind: Kind::Int(&ZOOM_DEFAULT),
+        default: Some("100"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // `zoom.levels`, configdata.yml:2700 — qutebrowser's sixteen, which is where
+        // `exec::ZOOM_LEVELS` copied them from. A list's defaults are its shape's; see
+        // [`ZOOM_LEVELS`] for why the order in it does not matter.
+        name: "zoom.levels",
+        kind: Kind::List(&ZOOM_LEVELS),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // **bru's own name for the number this project exists for.** qutebrowser has no option here
+        // — it scrolls by lines through `window.scrollBy`, the mechanism DESIGN.md rejects — so
+        // there was nothing to copy. 120 is `scroll::STEP` unchanged, and it is the one default in
+        // this block that must not move: see [`SCROLL_STEP`].
+        name: "scroll.step_px",
+        kind: Kind::Int(&SCROLL_STEP),
+        default: Some("120"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::ScrollStep,
+    },
+// --- end unhardcoded ---------------------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -982,12 +1345,18 @@ pub fn value_of(name: &str) -> Option<String> {
     // would be a statement about a copy Chromium does not keep.
     if !matches!(
         def.backing,
-        // --- tabs and statusbar: `Backing::Chrome` is bru's own too ----------------------------
         Backing::Bar
             | Backing::Insert
             | Backing::SearchEngines
             | Backing::AdblockLists
+            // --- tabs and statusbar: `Backing::Chrome` is bru's own too ------------------------
             | Backing::Chrome
+            // --- unhardcoded -------------------------------------------------------------------
+            // Every one of these is read out of this store when it is wanted, so bru knows its
+            // own value and "not read yet" would be a statement about a copy Chromium never had.
+            | Backing::Read
+            | Backing::ScrollStep
+            // --- end unhardcoded ---------------------------------------------------------------
     ) {
         return None;
     }
@@ -995,6 +1364,9 @@ pub fn value_of(name: &str) -> Option<String> {
     Some(match live {
         Some(Value::Text(text)) => text,
         Some(Value::Bool(flag)) => flag.to_string(),
+        // --- unhardcoded -----------------------------------------------------------------------
+        Some(Value::Int(number)) => number.to_string(),
+        // --- end unhardcoded -------------------------------------------------------------------
         // A dictionary has no one-line value. Nothing asks `value_of` for one — `bar_json` reads
         // `dict_of` and the settings page prints a row per pair — and the count is the honest
         // answer for anywhere that insists on a scalar. A list is the same.
@@ -1162,6 +1534,59 @@ impl Def {
                  rather than replacing them.",
                 self.name
             )),
+            // --- unhardcoded -------------------------------------------------------------------
+            Kind::Int(shape) => {
+                // `150%` as well as `150`, so that `:set zoom.default 150%` — which is how
+                // qutebrowser spells its own value and how `:zoom` already takes one — is not an
+                // error about a character the rest of bru accepts.
+                let text = text.trim();
+                let text = if shape.unit == "percent" {
+                    text.trim_end_matches('%').trim()
+                } else {
+                    text
+                };
+                let number: i64 = text.parse().map_err(|_| {
+                    format!(
+                        "{}: {text:?} is not a whole number of {}",
+                        self.name, shape.unit
+                    )
+                })?;
+                shape.check(self.name, number)?;
+                Ok(Value::Int(number))
+            }
+            Kind::Chars => {
+                let text = text.trim();
+                // qutebrowser's `minlen: 2` — and here it is not a style rule: `hint_strings`
+                // divides by `chars.len() - 1`.
+                if text.chars().count() < 2 {
+                    return Err(format!(
+                        "{}: {text:?} is too short — hint labels are built by dividing the label \
+                         space by one less than the number of characters, so there have to be at \
+                         least two",
+                        self.name
+                    ));
+                }
+                if text.chars().any(char::is_whitespace) {
+                    return Err(format!(
+                        "{}: {text:?} has whitespace in it, and a label cannot be typed with a \
+                         space in the middle of it",
+                        self.name
+                    ));
+                }
+                let mut seen: Vec<char> = text.chars().collect();
+                seen.sort_unstable();
+                let before = seen.len();
+                seen.dedup();
+                if seen.len() != before {
+                    return Err(format!(
+                        "{}: {text:?} uses a character twice, which would give two elements the \
+                         same label",
+                        self.name
+                    ));
+                }
+                Ok(Value::Text(text.to_string()))
+            }
+            // --- end unhardcoded ---------------------------------------------------------------
         }
     }
 
@@ -1844,6 +2269,21 @@ impl Settings {
                 def.name
             ));
         }
+        // --- unhardcoded -----------------------------------------------------------------------
+        // **What `config-cycle` with no values does for a number**: it says what to type instead.
+        // A `Kind::Bool` has two values and a `Kind::Choice` has its list, so both can be walked
+        // without being told what to walk; a number does not, and "the next one" is not something
+        // `messages.timeout` means. Falling through to the generic "needs at least two values"
+        // below would read as a complaint about the command rather than a fact about the option,
+        // which is the same failure `REFUSED` exists to avoid one level up.
+        if let (true, Kind::Int(shape)) = (values.is_empty(), def.kind) {
+            return Err(format!(
+                "{0} is a number in {1}..{2} {3}, and there is no next one to step to — name the \
+                 values to walk, as in `:config-cycle {0} {1} {2}`",
+                def.name, shape.min, shape.max, shape.unit
+            ));
+        }
+        // --- end unhardcoded -------------------------------------------------------------------
         let owned: Vec<String>;
         let values = if values.is_empty() && def.kind == Kind::Bool {
             owned = vec!["true".to_string(), "false".to_string()];
@@ -2019,29 +2459,87 @@ pub fn is_on(name: &str) -> bool {
 // --- end src/focus.rs --------------------------------------------------------------------------
 
 // --- tabs and statusbar ------------------------------------------------------------------------
-/// One [`Kind::Choice`] or [`Kind::Text`] setting's value in force globally, falling back to its
+/// One [`Kind::Text`] or [`Kind::Chars`] setting's value in force globally, falling back to its
 /// compiled-in default.
 ///
 /// [`is_on`]'s twin, and it exists for the same reason: a `Backing::Chrome` setting has no Chromium
 /// side to read back from, so this is the whole interface between the store and the two strips. A
 /// name this file does not know answers with the empty string rather than panicking — the callers'
-/// names are all `const` in `tabs.rs` and `window.rs`, and a typo in one should not take the browser
-/// down with it.
+/// names are all `const` in `tabs.rs`, and a typo in one should not take the browser down with it.
+///
+/// This is [`text_of`] with the default filled in, and the split between the two is not decoration:
+/// three settings ship **no** default, and for each of them the absence is the behaviour —
+/// `editor.command` unset is the `$BRU_EDITOR` chain, `downloads.location.directory` unset is the
+/// desktop's XDG answer. Those callers want the `None`; a caller whose setting always has a value
+/// wants this and should not have to spell an `unwrap` that can never fire.
 ///
 /// **Not on the key path**, and that is worth saying twice for this one: it takes the settings mutex
-/// and `tabs_json_in` calls it four times per push. A push happens when a tab is added, closed,
-/// selected, retitled or re-addressed — never per keystroke, because `keys.rs` reaches
-/// `set_keystring`, which pushes the *bar*.
-pub fn text_of(name: &str) -> String {
-    match with_live(|settings| settings.get(name, None)) {
-        Ok(Some(Value::Text(text))) => text,
-        _ => def(name)
+/// and `tabs_json_in` calls it per push. A push happens when a tab is added, closed, selected,
+/// retitled or re-addressed — never per keystroke, because `keys.rs` reaches `set_keystring`, which
+/// pushes the *bar*.
+pub fn text_or_default(name: &str) -> String {
+    text_of(name).unwrap_or_else(|| {
+        def(name)
             .and_then(|def| def.default)
             .unwrap_or_default()
-            .to_string(),
-    }
+            .to_string()
+    })
 }
 // --- end tabs and statusbar --------------------------------------------------------------------
+
+// --- unhardcoded -------------------------------------------------------------------------------
+/// One [`Kind::Int`] setting's value in force globally, falling back to its compiled-in default.
+///
+/// [`is_on`]'s twin, and the same warning applies with more force: **it takes the settings mutex,
+/// so it is not for the key path.** `scroll.step_px` is the one of these that a keypress needs, and
+/// it does not come through here — see [`Backing::ScrollStep`] and `scroll::step`.
+///
+/// A name this file does not know, or one that is not a number, answers `0`. None of the callers
+/// can reach that: every one of them passes a `&'static str` that is a `Def` in this file, and
+/// `every_setting_bru_names_has_something_behind_it` walks them. Answering rather than panicking is
+/// what keeps a typo in a caller from taking the browser down mid-download.
+pub fn int_of(name: &str) -> i64 {
+    match with_live(|settings| settings.get(name, None)) {
+        Ok(Some(Value::Int(number))) => number,
+        _ => 0,
+    }
+}
+
+/// One [`Kind::Text`] or [`Kind::Chars`] setting's value in force globally.
+///
+/// `None` means nothing has set it **and bru ships no default for it**, which for the three
+/// settings that use it is meaningful rather than missing: `editor.command` unset is the
+/// `$BRU_EDITOR`/`$VISUAL`/`$EDITOR`/`nvim` chain, `downloads.location.directory` unset is the
+/// desktop's XDG answer. Not for the key path, for [`int_of`]'s reason.
+pub fn text_of(name: &str) -> Option<String> {
+    match with_live(|settings| settings.get(name, None)) {
+        Ok(Some(Value::Text(text))) => Some(text),
+        _ => None,
+    }
+}
+
+/// One [`Kind::Choice`] setting's value in force globally, or bru's own when nothing has set it.
+///
+/// A `Choice` is stored as a [`Value::Text`] — the parse is what checks it is one of the choices —
+/// so this is [`text_of`] with the default filled in, which every `Choice` has by construction.
+pub fn choice_of(name: &str) -> &'static str {
+    let default = def(name).and_then(|def| def.default).unwrap_or("");
+    let Some(live) = text_of(name) else {
+        return default;
+    };
+    // Back to a `&'static str`: the value came out of the setting's own `Kind::Choice` list, so one
+    // of those is what it is. Falling back to the default rather than leaking is what keeps this
+    // from being a slow leak on a setting somebody cycles.
+    match def(name).map(|def| def.kind) {
+        Some(Kind::Choice(choices)) => choices
+            .iter()
+            .find(|choice| **choice == live)
+            .copied()
+            .unwrap_or(default),
+        _ => default,
+    }
+}
+// --- end unhardcoded ---------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------------------------
 // The commands
@@ -2305,6 +2803,19 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             return Ok(());
         }
         // --- end tabs and statusbar ------------------------------------------------------------
+        // --- unhardcoded -----------------------------------------------------------------------
+        // Nothing to push: the file that used to hold the constant reads the setting where the
+        // constant stood. See `Backing::Read`.
+        Backing::Read => return Ok(()),
+        // The one exception, and the reason it is its own arm: `j` may not take this mutex, so the
+        // step is kept in an atomic beside the wheel code and this is what puts it there.
+        Backing::ScrollStep => {
+            if let Value::Int(px) = applied.value {
+                crate::scroll::set_step(px as i32);
+            }
+            return Ok(());
+        }
+        // --- end unhardcoded -------------------------------------------------------------------
         Backing::Content(kind) => kind,
     };
     let Value::Bool(allow) = applied.value else {
@@ -2363,7 +2874,12 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
         | Backing::SearchEngines
         | Backing::AdblockLists
         // --- tabs and statusbar ----------------------------------------------------------------
-        | Backing::Chrome => {
+        | Backing::Chrome
+        // --- unhardcoded -----------------------------------------------------------------------
+        | Backing::Read
+        | Backing::ScrollStep
+        // --- end unhardcoded -------------------------------------------------------------------
+        => {
             return None;
         }
     };
@@ -2565,13 +3081,12 @@ mod tests {
         // make a failing build pass.
         // Twelve since `content.blocking.adblock.lists`, which is bru's first `Kind::List` and was
         // `adblock::DEFAULT_LISTS` before it was a setting.
-        // --- tabs and statusbar ----------------------------------------------------------------
-        // Twenty-four: the twelve above plus the nine `tabs.*` and three `statusbar.*` that make
-        // the two strips bru draws itself configurable. **This number is this branch's alone** —
-        // two other workstreams are adding settings to the same table in the same round, and the
-        // merge adds the three deltas rather than any one of them guessing the others'.
-        assert_eq!(SETTINGS.len(), 24);
-        // --- end tabs and statusbar ------------------------------------------------------------
+        // Twenty-six since two workstreams landed together on the same twelve: **+12** for the
+        // nine `tabs.*` and three `statusbar.*` that make the two strips bru draws itself
+        // configurable, and **+14** for the block fenced `unhardcoded`, every one of which was a
+        // `const` in the file that read it. Raise this with the setting, never to make a failing
+        // build pass.
+        assert_eq!(SETTINGS.len(), 38);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
@@ -3368,6 +3883,203 @@ mod tests {
         settings.set("start_page", "a\"b").unwrap();
         assert_eq!(settings.diff(), [r#"bru.set("start_page", "a\"b")"#]);
     }
+
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // -- the whole-number kind --------------------------------------------------------------------
+
+    /// **A default this file changed is a behaviour it broke**, so this asserts every one of the
+    /// fourteen against the constant it was lifted out of, by name.
+    ///
+    /// It is the most important test in this block and the least clever: the whole risk of turning
+    /// a `const` into a setting is that the number moves on the way past, and nothing else here
+    /// would notice. `crate::scroll::STEP` and the rest are still compiled in as the fallbacks
+    /// their store-less processes use, so both sides of each of these is a real value and not a
+    /// restatement of one literal.
+    #[test]
+    fn every_lifted_default_is_the_value_the_constant_had() {
+        let settings = Settings::default();
+        let number = |name: &str| match settings.get(name, None).unwrap() {
+            Some(Value::Int(number)) => number,
+            other => panic!("{name} is {other:?}, not a number"),
+        };
+        let text = |name: &str| match settings.get(name, None).unwrap() {
+            Some(Value::Text(text)) => text,
+            other => panic!("{name} is {other:?}, not text"),
+        };
+        let flag = |name: &str| settings.get(name, None).unwrap() == Some(Value::Bool(true));
+
+        // hints.rs
+        assert_eq!(text("hints.chars"), crate::hints::CHARS);
+        assert_eq!(number("hints.min_chars"), 1);
+        assert_eq!(text("hints.auto_follow"), "unique-match");
+        assert!(!flag("hints.uppercase"));
+        assert!(flag("hints.scatter"), "hint_strings was _hint_scattered and only that");
+        // editor.rs and downloads.rs: unset, which is what leaves the environment and the XDG
+        // answer standing. An absence is the default here, exactly as it is for `start_page`.
+        assert_eq!(settings.get("editor.command", None).unwrap(), None);
+        assert_eq!(settings.get("downloads.location.directory", None).unwrap(), None);
+        assert!(flag("downloads.location.prompt"), "src/prompt.rs asks, and asked unconditionally");
+        assert_eq!(number("downloads.remove_finished"), -1, "a finished row stayed until cd");
+        // message.rs
+        assert_eq!(number("messages.timeout"), 3000);
+        assert_eq!(number("messages.limit"), 100);
+        // exec.rs
+        assert_eq!(number("zoom.default"), 100);
+        let levels: Vec<u32> = ZOOM_LEVELS
+            .defaults
+            .iter()
+            .filter_map(|entry| percent_of(entry))
+            .collect();
+        assert_eq!(
+            levels,
+            [25, 33, 50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500]
+        );
+        // scroll.rs — the one the project exists for.
+        assert_eq!(number("scroll.step_px"), i64::from(crate::scroll::STEP));
+        assert_eq!(number("scroll.step_px"), 120);
+        // And nothing in the block has been given a Chromium side it does not have. Safe to call
+        // with no CEF behind it (trap 13) exactly because of that: `chromium_value` answers `None`
+        // for these two backings before it reaches for a request context.
+        for def in SETTINGS {
+            if matches!(def.backing, Backing::Read | Backing::ScrollStep) {
+                assert!(
+                    chromium_value(def.name, "https://example.com/").is_none(),
+                    "{} claims a Chromium value",
+                    def.name
+                );
+                assert!(value_of(def.name).is_some(), "{} answers nothing", def.name);
+            }
+        }
+    }
+
+    /// `Kind::Int`: what it accepts, what it refuses, and what the refusal says.
+    #[test]
+    fn a_number_is_typed_and_bounded_and_says_what_the_bounds_were() {
+        let mut settings = Settings::default();
+        assert!(settings.set("messages.timeout", "500").is_ok());
+        assert_eq!(settings.get("messages.timeout", None).unwrap(), Some(Value::Int(500)));
+
+        // Not a number at all.
+        let error = settings.set("messages.timeout", "soon").unwrap_err();
+        assert!(error.contains("is not a whole number of milliseconds"), "{error}");
+        // A number outside the range, with the range and the sentinel in the message.
+        let error = settings.set("messages.timeout", "-1").unwrap_err();
+        assert!(error.contains("outside 0..86400000 milliseconds"), "{error}");
+        assert!(error.contains("(0 is never clear)"), "{error}");
+        // The sentinel is the *end* of the range where there is one, so -1 is legal there.
+        assert!(settings.set("downloads.remove_finished", "-1").is_ok());
+        assert!(settings.set("downloads.remove_finished", "-2").is_err());
+        // `hints.min_chars` has a ceiling qutebrowser has not, because the number is an exponent.
+        assert!(settings.set("hints.min_chars", "5").is_ok());
+        let error = settings.set("hints.min_chars", "20").unwrap_err();
+        assert!(error.contains("outside 1..5 characters"), "{error}");
+        assert!(settings.set("hints.min_chars", "0").is_err());
+        // A percent takes qutebrowser's own spelling as well as bru's, because `:zoom 150%` does.
+        assert!(settings.set("zoom.default", "150%").is_ok());
+        assert_eq!(settings.get("zoom.default", None).unwrap(), Some(Value::Int(150)));
+        assert!(settings.set("zoom.default", "150").is_ok());
+        // ...and only where the unit is percent: a timeout with a % in it is a typo.
+        assert!(settings.set("messages.timeout", "500%").is_err());
+
+        // What it prints is the number and nothing else, which is the spelling `:set` takes back.
+        assert_eq!(
+            settings.describe("scroll.step_px", None).unwrap(),
+            "scroll.step_px = 120"
+        );
+        settings.set("scroll.step_px", "200").unwrap();
+        assert_eq!(
+            settings.set_scoped("scroll.step_px", "240", None).unwrap().describe(),
+            "scroll.step_px = 240"
+        );
+        // And it is global-only, like every setting in this block: Chromium scopes content
+        // settings, and none of these is one.
+        assert!(settings
+            .set_scoped("scroll.step_px", "240", Some("*://*.example.com/*"))
+            .is_err());
+    }
+
+    /// **What `config-cycle` with no values does for a number**: it refuses, and names the values
+    /// to type. A `Bool` has two and a `Choice` has its list; a number has neither.
+    #[test]
+    fn config_cycle_needs_the_values_for_a_number_and_says_so() {
+        let mut settings = Settings::default();
+        let error = settings.cycle("messages.timeout", &[], None).unwrap_err();
+        assert!(error.contains("there is no next one to step to"), "{error}");
+        assert!(error.contains(":config-cycle messages.timeout 0 86400000"), "{error}");
+
+        // Spelled out, it walks them and wraps like any other kind.
+        let values = vec!["1000".to_string(), "3000".to_string()];
+        assert_eq!(
+            settings.cycle("messages.timeout", &values, None).unwrap().value,
+            Value::Int(1000),
+            "3000 is the default and is in the list at 1, so the next is 0"
+        );
+        assert_eq!(
+            settings.cycle("messages.timeout", &values, None).unwrap().value,
+            Value::Int(3000)
+        );
+        // A value the setting could not hold is refused before anything is stored.
+        assert!(settings
+            .cycle("hints.min_chars", &["1".to_string(), "99".to_string()], None)
+            .is_err());
+        assert_eq!(settings.get("hints.min_chars", None).unwrap(), Some(Value::Int(1)));
+
+        // The four values of `hints.auto_follow` cycle with no values, because a Choice can.
+        assert_eq!(
+            settings.cycle("hints.auto_follow", &[], None).unwrap().value,
+            Value::Text("full-match".to_string()),
+            "unique-match is at 1 in the list, so the next is at 2"
+        );
+    }
+
+    /// `Kind::Chars`: the three things a one-character or repeating `hints.chars` would do.
+    #[test]
+    fn hint_chars_refuses_what_would_divide_by_zero_or_label_twice() {
+        let mut settings = Settings::default();
+        assert!(settings.set("hints.chars", "aoeuidnths").is_ok());
+        assert_eq!(
+            settings.get("hints.chars", None).unwrap(),
+            Some(Value::Text("aoeuidnths".to_string()))
+        );
+
+        // One character: `hint_strings` divides the label space by `len - 1`.
+        let error = settings.set("hints.chars", "a").unwrap_err();
+        assert!(error.contains("at least two"), "{error}");
+        // A character twice: two elements with one label.
+        let error = settings.set("hints.chars", "asdfa").unwrap_err();
+        assert!(error.contains("uses a character twice"), "{error}");
+        // A space: not typeable as part of a label.
+        assert!(settings.set("hints.chars", "as df").is_err());
+        assert!(settings.set("hints.chars", "").is_err());
+        // Non-ASCII is fine — it is a character set, not an alphabet.
+        assert!(settings.set("hints.chars", "фыва").is_ok());
+    }
+
+    /// `zoom.levels` is a list whose entries are percentages, in either spelling, and whose order
+    /// does not matter because its reader sorts.
+    #[test]
+    fn zoom_levels_takes_both_spellings_and_refuses_what_is_not_a_level() {
+        let mut settings = Settings::default();
+        let name = "zoom.levels";
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 16);
+
+        assert!(settings.list_add(name, "133%").is_ok());
+        assert!(settings.list_add(name, "133").is_ok(), "bru's own spelling is taken too");
+        let error = settings.list_add(name, "big").unwrap_err();
+        assert!(error.contains("not a zoom level"), "{error}");
+        assert!(settings.list_add(name, "0%").is_err());
+        assert!(settings.list_add(name, "20000%").is_err());
+        // Removing one of bru's own is the only way to lose it, as for every bru list.
+        settings.list_remove(name, "25%").unwrap();
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 17);
+
+        // Both spellings read back as the same number, which is what stops `133` and `133%` from
+        // becoming two levels once `exec::zoom_levels` has deduplicated them.
+        assert_eq!(percent_of("133%"), Some(133));
+        assert_eq!(percent_of(" 133 "), Some(133));
+        assert_eq!(percent_of("x"), None);
+    }
+    // --- end unhardcoded -------------------------------------------------------------------------
 
     #[test]
     fn variables_expand_against_nothing_when_there_is_no_page() {
