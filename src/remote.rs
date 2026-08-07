@@ -76,10 +76,46 @@ const JS_TIMEOUT: Duration = Duration::from_secs(5);
 /// first. A second bru finds the name taken, says so once, and runs without a socket — which is the
 /// honest behaviour: two browsers and one address means one of them answers.
 ///
+/// **`--socket=<path>` overrides it, and that switch exists because the default cost real damage.**
+/// Measured 2026-08-07: a second bru was started to test a build, found the name taken, ran without
+/// a socket exactly as designed — and every `--remote` in the session went to the *first* browser,
+/// which was the user's. It changed their settings and navigated their tab, and nothing in either
+/// process was wrong. The default is right for the common case and there was no way to say "not
+/// that one"; now there is. Overriding `$XDG_RUNTIME_DIR` instead is not the workaround it looks
+/// like — the Wayland display socket lives there too, so a private runtime directory starts a
+/// browser that cannot open a window.
+///
 /// `$XDG_RUNTIME_DIR` rather than `/tmp`: it is mode 0700, owned by this user, and cleared by the
 /// session rather than by anybody. A socket in `/tmp` is one whose name every account can see.
 pub fn socket_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty())?;
+    let args: Vec<String> = std::env::args().collect();
+    socket_from(&args, std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+}
+
+/// The switch that names a different socket: `--socket=<path>`.
+pub const SOCKET_SWITCH: &str = "--socket=";
+
+/// [`socket_path`] as a function of its inputs, so it can be tested.
+///
+/// **`--socket=` is read only from the arguments BEFORE `--remote`,** and that is not tidiness.
+/// `--remote` takes the whole rest of the line as the message — that is what makes
+/// `bru --remote :open -t https://x` work — so anything after it is text, not a switch, and a URL
+/// with `--socket=` in its query string is a URL. The spelling is therefore
+/// `bru --socket=/tmp/x --remote :open https://y`, switch first.
+///
+/// The last one wins, which is Chromium's rule for its own switches and the one a person who
+/// appends to a wrapper script expects.
+fn socket_from(args: &[String], runtime_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let before = args.iter().position(|arg| arg == "--remote").unwrap_or(args.len());
+    let named = args[..before]
+        .iter()
+        .filter_map(|arg| arg.strip_prefix(SOCKET_SWITCH))
+        .filter(|path| !path.is_empty())
+        .next_back();
+    if let Some(path) = named {
+        return Some(PathBuf::from(path));
+    }
+    let dir = runtime_dir.filter(|dir| !dir.is_empty())?;
     Some(PathBuf::from(dir).join("bru").join("ipc.sock"))
 }
 
@@ -158,7 +194,11 @@ pub fn listen() {
     let listener = match bind(&path) {
         Ok(listener) => listener,
         Err(why) => {
-            eprintln!("bru[remote]: {why} — this browser has no remote");
+            eprintln!(
+                "bru[remote]: {why} — this browser has no remote, and every `--remote` on this \
+                 machine will reach the one that has it. Start this browser with \
+                 `{SOCKET_SWITCH}<path>` and pass the same switch to `--remote` to script this one."
+            );
             return;
         }
     };
@@ -417,5 +457,78 @@ wrap_task! {
 pub fn cleanup() {
     if let Some(path) = socket_path() {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    fn rt(dir: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(dir)
+    }
+
+    /// The default is the one address on the machine, and nothing about it changed.
+    #[test]
+    fn without_the_switch_it_is_the_runtime_directory() {
+        let path = socket_from(&args(&["bru"]), Some(&rt("/run/user/1000"))).expect("a path");
+        assert_eq!(path, PathBuf::from("/run/user/1000/bru/ipc.sock"));
+    }
+
+    /// No runtime directory is no socket, rather than a socket somewhere every account can see.
+    #[test]
+    fn without_a_runtime_directory_there_is_nowhere_for_it() {
+        assert_eq!(socket_from(&args(&["bru"]), None), None);
+        assert_eq!(socket_from(&args(&["bru"]), Some(&rt(""))), None);
+    }
+
+    /// The switch names another socket, which is the whole point of it.
+    #[test]
+    fn the_switch_wins_over_the_default() {
+        let path = socket_from(&args(&["bru", "--socket=/tmp/a.sock"]), Some(&rt("/run/user/1000")))
+            .expect("a path");
+        assert_eq!(path, PathBuf::from("/tmp/a.sock"));
+    }
+
+    /// It works with no runtime directory at all: naming the socket is naming it.
+    #[test]
+    fn the_switch_does_not_need_a_runtime_directory() {
+        let path = socket_from(&args(&["bru", "--socket=/tmp/a.sock"]), None).expect("a path");
+        assert_eq!(path, PathBuf::from("/tmp/a.sock"));
+    }
+
+    /// **The trap this switch is most likely to fall into.** `--remote` takes the rest of the line
+    /// as its message, so a `--socket=` after it is text — part of a command, or a URL's query
+    /// string — and reading it as a switch would send the message somewhere nobody asked for.
+    #[test]
+    fn a_socket_after_remote_is_part_of_the_message() {
+        let line = args(&["bru", "--remote", ":open", "https://x/?q=--socket=/tmp/evil.sock"]);
+        let path = socket_from(&line, Some(&rt("/run/user/1000"))).expect("a path");
+        assert_eq!(path, PathBuf::from("/run/user/1000/bru/ipc.sock"));
+    }
+
+    /// Before `--remote` it is a switch, which is the spelling the doc comment prescribes.
+    #[test]
+    fn a_socket_before_remote_is_the_switch() {
+        let line = args(&["bru", "--socket=/tmp/a.sock", "--remote", ":open", "https://x"]);
+        assert_eq!(socket_from(&line, None), Some(PathBuf::from("/tmp/a.sock")));
+    }
+
+    /// Last wins, so appending to a wrapper script overrides what the script already passed.
+    #[test]
+    fn the_last_switch_wins() {
+        let line = args(&["bru", "--socket=/tmp/a.sock", "--socket=/tmp/b.sock"]);
+        assert_eq!(socket_from(&line, None), Some(PathBuf::from("/tmp/b.sock")));
+    }
+
+    /// An empty value is not a path. Falling through to the default beats binding to "".
+    #[test]
+    fn an_empty_switch_is_ignored() {
+        let path = socket_from(&args(&["bru", "--socket="]), Some(&rt("/run/user/1000")));
+        assert_eq!(path, Some(PathBuf::from("/run/user/1000/bru/ipc.sock")));
     }
 }
