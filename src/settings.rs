@@ -2510,6 +2510,26 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let context = request_context_get_global_context()?;
     let url = CefString::from(url);
     let value = context.content_setting(Some(&url), None, kind.cef());
+// --- content settings --------------------------------------------------------------------------
+    // **The one row whose Chromium word reads as its own opposite.** `content.mute` is `true` when
+    // Chromium's SOUND rule is `block`, so `bru://chrome/settings` drew "content.mute … block" for
+    // a tab that had just been muted — seen on the page 2026-08-07, not reasoned about — and
+    // "block" beside the word "mute" is read as "muting is blocked" by anyone who has not just
+    // finished reading `ContentKind::inverted`. Chromium's word stays, because this column is
+    // Chromium's answer and uniformity is what makes it worth reading; what is added is the two
+    // words that say which way round it is for this one setting.
+    if kind.inverted() {
+        return Some(
+            match value {
+                v if v == ContentSettingValues::ALLOW => "allow (audible)",
+                v if v == ContentSettingValues::BLOCK => "block (silent)",
+                v if v == ContentSettingValues::DEFAULT => "default (audible)",
+                _ => "other",
+            }
+            .to_string(),
+        );
+    }
+// --- end content settings ----------------------------------------------------------------------
     Some(
         match value {
             v if v == ContentSettingValues::ALLOW => "allow",
