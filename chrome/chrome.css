@@ -207,8 +207,11 @@ body[data-view="bottom"] {
        the width of the word in it, the command line's column is what absorbs
        the slack, and the status fields keep the right-hand end. */
     grid-template-columns: auto minmax(0, 1fr) minmax(0, auto);
-    background: var(--statusbar-normal-bg);
-    color: var(--statusbar-normal-fg);
+    /* The bar's own pair, not normal mode's. Those were the same variable until
+       the pills were aligned with the statusline, which made
+       `--statusbar-normal-bg` green — and the whole strip went green with it. */
+    background: var(--statusbar-bg);
+    color: var(--statusbar-fg);
 }
 
 /* In command mode the row belongs to the command line, and the status group
@@ -228,7 +231,11 @@ body[data-view="bottom"] {
  * while the line is open, so the line always has at least 60%. Above about
  * 900px the group's own content is the smaller of the two and nothing changes. */
 body.mode-command {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 40%);
+    /* Three tracks, like the row above — this said two, and the mode indicator
+       then took the `1fr` while the command line took 40% and `:` appeared in
+       the middle of the bar. The indicator is `auto` in both: it is exactly as
+       wide as the word in it and nothing else. */
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, 40%);
 }
 
 /* Completion --------------------------------------------------------------
@@ -604,6 +611,38 @@ body.mode-caret #mode {
 body.mode-command #mode {
     color: var(--statusbar-command-fg);
     background: var(--statusbar-command-bg);
+}
+
+/* The modes qutebrowser has no colours for. bru has more modes than it does —
+   hint, the two register modes, and the two macro ones — and a mode indicator
+   that cannot tell them apart is a mode indicator for five of the ten. The
+   theme grew a pair for each; see `extra/desktop/bru.lua` in lvim-colorscheme,
+   which is the *target* file and the only place a colour question is answered
+   for bru. The palettes those read are never touched. */
+
+body.mode-hint #mode {
+    color: var(--statusbar-hint-fg);
+    background: var(--statusbar-hint-bg);
+}
+
+body.mode-set_mark #mode {
+    color: var(--statusbar-set-mark-fg);
+    background: var(--statusbar-set-mark-bg);
+}
+
+body.mode-jump_mark #mode {
+    color: var(--statusbar-jump-mark-fg);
+    background: var(--statusbar-jump-mark-bg);
+}
+
+body.mode-record_macro #mode {
+    color: var(--statusbar-record-macro-fg);
+    background: var(--statusbar-record-macro-bg);
+}
+
+body.mode-run_macro #mode {
+    color: var(--statusbar-run-macro-fg);
+    background: var(--statusbar-run-macro-bg);
 }
 
 /* ------------------------------------------------------------------------- */

@@ -178,15 +178,13 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     if name == "start_page" {
         return crate::open::start_page();
     }
-    // --- src/focus.rs --------------------------------------------------------------------------
-    // Same case, different module: bru's three insert-mode settings move bru's own mode and are
-    // never written to Chromium, so there is no reading to wait for and "not read yet" would be a
-    // lie about a value that is in force right now. Answered from bru's own store, which is the
-    // only store there is for them.
-    if crate::focus::NAMES.contains(&name) {
-        return crate::settings::is_on(name).to_string();
+    // The same for every setting bru answers itself. "not read yet" is a statement about
+    // *Chromium's* copy, and printing it against a setting Chromium has never heard of says the
+    // browser does not know its own value — which it does. `settings::value_of` is where it lives,
+    // and `focus.rs`'s four `input.insert_mode.*` are answered through it too.
+    if let Some(value) = crate::settings::value_of(name) {
+        return value;
     }
-    // --- end src/focus.rs ----------------------------------------------------------------------
     match snapshot.and_then(|snapshot| snapshot.value(name)) {
         Some(value) => value.to_string(),
         // Before the first reading — a unit test, or a browser that has not run `refresh` yet.
@@ -198,6 +196,9 @@ fn kind(kind: Kind) -> &'static str {
     match kind {
         Kind::Bool => "true or false",
         Kind::Text => "text",
+        // Leaked as a `&'static str` because this returns one and the list is compiled in: one
+        // allocation per settings-page render, of a string that would have been a literal anyway.
+        Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
     }
 }
 
@@ -319,7 +320,8 @@ mod tests {
         let html = page(None);
         assert!(html.contains("nothing has been read yet"));
         assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 2);
-        // `start_page` is answered in Rust and needs no reading, so it is never one of them.
+        // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
+        // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
         // Nor are the four insert-mode settings: they are bru's own and always in force. Their
         // rows are the only `true`/`false` cells on the page, which is what this counts.
