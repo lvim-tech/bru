@@ -526,6 +526,19 @@ static SCROLLBAR_WIDTH: IntShape =
     IntShape { min: 1, max: 64, unit: "pixels", sentinel: "" };
 // --- end src/scrollbar.rs ----------------------------------------------------------------------
 
+// --- src/chrome.rs: fonts ----------------------------------------------------------------------
+/// `fonts.default_size`, in CSS pixels.
+///
+/// qutebrowser spells its font sizes in **points** (`10pt`) because Qt does; a browser chrome drawn
+/// as an HTML page spells them in pixels, and the two are not the same number — 10pt is 13.33px at
+/// the 96dpi CSS reference. bru keeps pixels rather than translating, because the value has to mean
+/// the same thing as every other length in `chrome.css`, all of which are px.
+///
+/// 6 is where the completion's rows stop being readable; 40 is past the height the strips reserve
+/// (28px and 24px), so a font above it would be clipped rather than large.
+static FONT_SIZE: IntShape = IntShape { min: 6, max: 40, unit: "pixels", sentinel: "" };
+// --- end src/chrome.rs: fonts ------------------------------------------------------------------
+
 // --- setting functions ---------------------------------------------------------------------------
 /// The table `tabs.title.format` and `tabs.title.format_pinned` hand their function.
 ///
@@ -1621,6 +1634,44 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Read,
     },
 // --- end lua runtime -----------------------------------------------------------------------------
+    // --- src/chrome.rs: fonts --------------------------------------------------------------------
+    Def {
+        // qutebrowser's `fonts.default_family`, configdata.yml:1745. **A CSS family list, not a Qt
+        // font string.** Qt takes `"Ubuntu Font Bold"` and resolves family and weight together; CSS
+        // cannot, which is why the weight is its own setting below. Measured 2026-08-07 on this
+        // machine: `fc-match "Ubuntu Font Bold"` answers `Roboto-Regular.ttf` — that family does not
+        // exist and fontconfig falls through — so a name copied out of a Qt config is worth checking
+        // with `fc-match` before it is trusted.
+        //
+        // The default is `monospace`, and the reason is written in `chrome.css`: the completion is a
+        // table, and columns that do not line up read as a bug. A proportional family is a fair
+        // choice and it is the user's to make; it is not one bru should ship.
+        name: "fonts.default_family",
+        kind: Kind::Text,
+        default: Some("monospace"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // qutebrowser's `fonts.default_size`, in **pixels** rather than points — see [`FONT_SIZE`].
+        name: "fonts.default_size",
+        kind: Kind::Int(&FONT_SIZE),
+        default: Some("13"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // The half of a Qt font string that CSS keeps separate. qutebrowser has no setting for it
+        // because Qt does not need one.
+        name: "fonts.default_weight",
+        kind: Kind::Choice(&[
+            "normal", "bold", "100", "200", "300", "400", "500", "600", "700", "800", "900",
+        ]),
+        default: Some("normal"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    // --- end src/chrome.rs: fonts ----------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -3747,6 +3798,16 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             crate::tabs::push_tabs_everywhere();
             crate::ipc::push_bar_everywhere();
             crate::window::apply_chrome_layout_everywhere();
+            // --- src/chrome.rs: fonts ----------------------------------------------------------
+            // The three `fonts.*` settings reach the chrome through a **served stylesheet**, and a
+            // browser reads a stylesheet when it loads the document rather than when a setting
+            // moves — so the three pushes above cannot carry them and a reload is what applies one.
+            // Only for those three: reloading both strips of every window on a `tabs.title.format`
+            // change would be paying for something the push already did.
+            if applied.def.name.starts_with("fonts.") {
+                crate::ipc::reload_chrome_everywhere();
+            }
+            // --- end src/chrome.rs: fonts ------------------------------------------------------
             return Ok(());
         }
         // --- end tabs and statusbar ------------------------------------------------------------
@@ -4371,7 +4432,10 @@ mod tests {
         // - **+1** — `plugins.enabled`, the block fenced `lua runtime`.
         //
         // Raise this with the setting, never to make a failing build pass.
-        assert_eq!(SETTINGS.len(), 58);
+        // **Sixty-one**, +3 for the `fonts.*` block: a family, a size and a weight. They are
+        // one workstream's and split three ways because CSS keeps them apart — Qt's
+        // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
+        assert_eq!(SETTINGS.len(), 61);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

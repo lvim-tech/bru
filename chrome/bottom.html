@@ -8,6 +8,10 @@
              ~/.config/bru/theme.css, so swapping the theme is swapping a file. -->
         <link rel="stylesheet" href="chrome.css" />
         <link rel="stylesheet" href="theme.css" />
+        <!-- user.css is bru's own settings that are lengths and names rather than
+             colours: the font family, size and weight. Served, not pushed, because the
+             four generated bru:// pages wear the same chrome and receive no push. -->
+        <link rel="stylesheet" href="user.css" />
     </head>
     <!-- data-view, not a class: bottom.js owns className — it puts the current
          mode there as `mode-normal`, `mode-command`, … — and would overwrite a

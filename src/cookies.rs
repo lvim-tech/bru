@@ -281,6 +281,7 @@ pub fn page() -> String {
 <title>bru — cookies</title>
 <link rel="stylesheet" href="chrome.css">
 <link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="user.css">
 <body data-view="cookies">
 <main id="cookies">
 <h1>Cookies</h1>

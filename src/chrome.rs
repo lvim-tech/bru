@@ -131,6 +131,20 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/cookies.js" => Some(("text/javascript", COOKIES_JS.to_vec())),
 // --- end src/cookies.rs ----------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
+// --- src/chrome.rs: fonts --------------------------------------------------
+        // Three custom properties built from three settings, served rather than embedded.
+        //
+        // **Why a served stylesheet and not the JSON push the strips already get.** Six documents
+        // wear this chrome — `top.html`, `bottom.html` and the four generated pages — and only the
+        // two strips receive a push. A page like `bru://chrome/help` is built once per request and
+        // has nowhere for a pushed value to land, so the font would have reached the bar and not the
+        // page it is read on. A stylesheet reaches all six by the one route they already share.
+        //
+        // It is separate from `theme.css` on purpose: that file is themer's and carries **colours
+        // and not one rule**, which is what lets a theme be swapped by replacing one file. A font is
+        // not a colour and must not make that file bru's.
+        "/user.css" => Some(("text/css", user_css().into_bytes())),
+// --- end src/chrome.rs: fonts ----------------------------------------------
 // --- src/utilcmds.rs -------------------------------------------------------
         // `:version`, `:messages` and `:process`. Generated per request from what the running
         // browser knows, for the same reason `/help` is — and `/messages` is the one page here that
@@ -158,6 +172,31 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
 /// be restarted to notice.
 /// The theme in force, as bytes. `scrollbar.rs` reads it to resolve two colours into a page
 /// that will never load `theme.css` itself.
+// --- src/chrome.rs: fonts --------------------------------------------------
+/// `bru://chrome/user.css` — the settings that are lengths and names rather than colours.
+///
+/// Built per request, like `theme_css`, so `:set fonts.default_size 15` and a reload is the whole
+/// of applying it. The strips are reloaded for the user by `Backing::Chrome`; the generated pages
+/// need no help because they are built per request already.
+///
+/// The values are quoted the way CSS needs and nothing else: a family list is handed through as the
+/// user wrote it, because `Roboto, sans-serif` is a legal value and quoting it whole would break it.
+/// A family with a space in it is the user's to quote, which is CSS's own rule and not bru's.
+fn user_css() -> String {
+    let family = crate::settings::text_or_default("fonts.default_family");
+    let size = crate::settings::int_of("fonts.default_size");
+    let weight = crate::settings::choice_of("fonts.default_weight");
+    // A store-less process — a renderer, a unit test — answers 0 for an unset int, and a 0px font
+    // is a chrome nobody can read. The compiled-in default is the honest answer there.
+    let size = if (6..=40).contains(&size) { size } else { 13 };
+    format!(
+        "/* GENERATED from bru's own settings. Not themer's file: theme.css carries colours and \
+         not one rule, and a font is not a colour. */\n:root {{\n    --chrome-font-family: {family};\n\
+             \x20   --chrome-font-size: {size}px;\n    --chrome-font-weight: {weight};\n}}\n"
+    )
+}
+// --- end src/chrome.rs: fonts ----------------------------------------------
+
 pub(crate) fn theme_css() -> Vec<u8> {
     match theme_path().and_then(|path| std::fs::read(path).ok()) {
         Some(bytes) => bytes,

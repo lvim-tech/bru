@@ -82,10 +82,16 @@ body {
 }
 
 body {
-    /* Monospace throughout, like qutebrowser's default family: the completion
-       is a table, and columns that do not line up read as a bug. */
-    font-family: monospace;
-    font-size: 13px;
+    /* The three come from user.css, which bru generates from `fonts.default_*`.
+       The fallbacks are the same values bru compiles in, so a document served
+       before those settings exist still draws.
+
+       Monospace is the default and the reason is the completion: it is a table,
+       and columns that do not line up read as a bug. A proportional family is a
+       fair choice and it is the user's to make, not one to ship. */
+    font-family: var(--chrome-font-family, monospace);
+    font-size: var(--chrome-font-size, 13px);
+    font-weight: var(--chrome-font-weight, normal);
     /* Not 1. At line-height 1 the line box is exactly the font size, which is
        smaller than the font's own ascent + descent, so the glyphs overflow it
        and sit low — flexbox centres the *box*, and the box is not where the

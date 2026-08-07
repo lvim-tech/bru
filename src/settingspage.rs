@@ -122,6 +122,7 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
 <title>bru — settings</title>
 <link rel="stylesheet" href="chrome.css">
 <link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="user.css">
 <body data-view="help">
 <main id="help">
 "#,

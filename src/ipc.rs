@@ -902,6 +902,54 @@ fn tabindex_of(window: u32) -> String {
 
 /// A named window's bottom frame. There is a `ModeManager` per window, so two windows can be in
 /// command mode at once and every call that drives a command line has to say which one it means.
+// --- src/chrome.rs: fonts --------------------------------------------------
+/// Reload both strips of every window, so a stylesheet bru **serves** is fetched again.
+///
+/// The values pushed as JSON take effect on the next push; `user.css` does not, because a browser
+/// reads a stylesheet when it loads the document and not when a setting moves. So the one thing that
+/// applies a font change without a restart is a reload of the two documents that link it.
+///
+/// Cheap, and it is not the shape it looks like: these are `bru://` documents served from memory, no
+/// network is touched, and each strip re-announces itself with a `ready` query on load — which is
+/// what pulls its state back. So the bar is repopulated by the handshake it already has rather than
+/// by anything added here.
+///
+/// The four generated pages need none of this: they are built per request, so opening
+/// `bru://chrome/help` again is already a fresh fetch of `user.css`.
+pub fn reload_chrome_everywhere() {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let windows: Vec<u32> = {
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        state.window_ids()
+    };
+    for window in windows {
+        for frame in [bottom_frame_for(window), top_frame_for(window)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(browser) = frame.browser() {
+                // `reload` takes `&self` in this binding, so nothing here has to be `mut`.
+                browser.reload();
+            }
+        }
+    }
+}
+// --- end src/chrome.rs: fonts ----------------------------------------------
+
+/// The top strip's frame, [`bottom_frame_for`]'s twin. Both are recorded by the `ready` handshake.
+fn top_frame_for(window: u32) -> Option<Frame> {
+    let chrome = chrome().lock().ok()?;
+    chrome
+        .iter()
+        .find(|entry| entry.window == window)
+        .and_then(|entry| entry.frames.top.clone())
+}
+
 fn bottom_frame_for(window: u32) -> Option<Frame> {
     let chrome = chrome().lock().ok()?;
     chrome
