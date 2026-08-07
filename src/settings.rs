@@ -289,9 +289,14 @@ pub static SEARCH_ENGINES: DictShape = DictShape {
 
 /// Every setting bru has, and nothing else.
 ///
-/// The list is short on purpose. qutebrowser has some 400 options; bru has three, because three is
+/// The list is short on purpose. qutebrowser has some 400 options; bru has six, because six is
 /// how many it can currently change the behaviour of. Adding a name here without adding the
 /// behaviour behind it would make `:set` a place where things are typed and forgotten.
+///
+/// **Two of the six are dictionaries**, and they are the first settings in bru whose value is not a
+/// scalar — see [`Kind::Dict`] and [`DictShape`]. DESIGN.md asked for Lua as the config language
+/// "so that a setting can hold a function, not only a scalar"; these are the first two to spend
+/// that, and `bru.set("statusbar.mode.labels", { normal = "NOR" })` is what it buys.
 pub const SETTINGS: &[Def] = &[
     Def {
         name: "start_page",
@@ -398,7 +403,8 @@ pub const REFUSED: &[(&str, &str)] = &[
 /// pair that has been changed and `(added)` against one bru does not ship.
 ///
 /// The one-line alternative was rejected on the data rather than on taste: `url.searchengines`'s
-/// nine templates are 314 characters together, which is four wrapped terminal lines with no column
+/// nine templates are **321 characters** together, 386 with their keys and separators — measured
+/// 2026-08-07, not guessed — which is three wrapped lines in an 132-column terminal with no column
 /// to read down and no way to see which of them is not bru's. Naming the option on every line costs
 /// nine repetitions and buys a line that can be grepped, copied into a `:config-dict-add`, and read
 /// against its neighbour.
