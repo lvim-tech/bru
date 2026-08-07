@@ -702,4 +702,75 @@ mod tests {
         assert_eq!(repeat(Some(10)), 10);
         assert_eq!(repeat(Some(99_999)), MAX_COUNT);
     }
+
+    // --- unhardcoded -----------------------------------------------------------------------
+    /// The step a `j` uses is the one bru has always used, and it is bru's own until something
+    /// sets it.
+    ///
+    /// The `const` is still there and is still 120; this says the cache starts on it, which is
+    /// what makes `apply_at_startup` — which only ever visits settings somebody *has* set —
+    /// enough. A bru whose `config.lua` says nothing about scrolling never calls `set_step`.
+    #[test]
+    fn the_step_starts_on_brus_own_and_is_bounded() {
+        assert_eq!(STEP, 120);
+        assert_eq!(step(), 120, "nothing has set it, so it is bru's own");
+
+        set_step(200);
+        assert_eq!(step(), 200);
+        // The `Kind::Int` range is 1..10000 and the store cannot hold anything outside it; this is
+        // the belt to that's braces, because a step of 0 is a `j` that does nothing at all and a
+        // negative one is a `j` that scrolls up.
+        set_step(0);
+        assert_eq!(step(), 1);
+        set_step(-40);
+        assert_eq!(step(), 1);
+        set_step(1_000_000);
+        assert_eq!(step(), 10_000);
+        set_step(STEP);
+        assert_eq!(step(), 120);
+    }
+
+    /// **`j` must not get slower, and this is the only setting that lands on its path.**
+    ///
+    /// The shape is `state::the_key_path_cost_of_a_per_window_chain`'s: a ratio against a baseline
+    /// taken in the same test, on the same machine, in the same build, because `cargo test` is a
+    /// debug build and an absolute bound would mean two different things in the two profiles.
+    ///
+    /// The baseline is `settings::int_of`, which is how every *other* value lifted this round is
+    /// read — one settings-mutex lock and a `HashMap` lookup. That is the thing `scroll.step_px`
+    /// has its own `Backing` to avoid, so it is the comparison worth making: the number this
+    /// prints is what a `j` would have paid if the step had been read like the message timeout.
+    #[test]
+    fn the_key_path_cost_of_reading_the_step() {
+        const ROUNDS: u32 = 500_000;
+
+        for _ in 0..20_000 {
+            std::hint::black_box(step());
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(step());
+        }
+        let cached = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        for _ in 0..20_000 {
+            std::hint::black_box(crate::settings::int_of("scroll.step_px"));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(crate::settings::int_of("scroll.step_px"));
+        }
+        let through_the_store = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        println!(
+            "step: `j` reads the step in {cached:.1} ns against {through_the_store:.1} ns through \
+             the settings mutex — {:.0}x",
+            through_the_store / cached.max(0.001)
+        );
+        assert!(
+            cached * 4.0 < through_the_store,
+            "the cache is not buying anything: {cached:.1} ns against {through_the_store:.1} ns"
+        );
+    }
+    // --- end unhardcoded -------------------------------------------------------------------
 }
