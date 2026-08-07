@@ -250,6 +250,7 @@ fn kind(kind: Kind) -> &'static str {
         Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
         Kind::Dict(shape) if shape.open_keys => "a dictionary, any key",
         Kind::Dict(_) => "a dictionary, fixed keys",
+        Kind::List(_) => "a list",
     }
 }
 

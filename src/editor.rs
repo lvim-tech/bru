@@ -229,6 +229,66 @@ pub fn edit_text(browser: &mut Browser) {
     });
 }
 
+// --- config commands -----------------------------------------------------------------------
+/// Run `$EDITOR` on a file that already exists on disk, and say when it is done.
+///
+/// [`edit_text`]'s sibling, and deliberately not built on it: `edit_text` owns a temporary file it
+/// writes, reads back and deletes, and the one caller of this one — `:config-edit` — is editing a
+/// file that is **not bru's**. So nothing here writes, creates or deletes the path; the editor is
+/// pointed at it and the callback is told whether the editor exited cleanly.
+///
+/// The thread is the same shape and for the same reason: a real editor sits there for minutes, and
+/// blocking the UI thread on `wait` freezes the window. The callback is handed back **on the UI
+/// thread** — it re-reads the config and installs it over the running browser, which touches
+/// `BruState` and Chromium and may not happen on a random thread.
+pub fn edit_file(path: std::path::PathBuf, then: impl FnOnce(bool) + Send + 'static) {
+    std::thread::spawn(move || {
+        let argv = match editor_argv(&editor_spec(), &path.display().to_string(), 1, 1) {
+            Ok(argv) => argv,
+            Err(error) => {
+                crate::spawn::error(&format!("config-edit: {error}"));
+                return;
+            }
+        };
+        let status = std::process::Command::new(&argv[0]).args(&argv[1..]).status();
+        let ok = match status {
+            Ok(status) if status.success() => true,
+            Ok(status) => {
+                crate::spawn::error(&format!("config-edit: the editor exited with {status}"));
+                false
+            }
+            Err(error) => {
+                crate::spawn::error(&format!("config-edit: could not run {:?}: {error}", argv[0]));
+                false
+            }
+        };
+        let mut task = AfterEditor::new(std::sync::Arc::new(Mutex::new(Some(
+            Box::new(move || then(ok)) as EditorDone,
+        ))));
+        post_task(ThreadId::UI, Some(&mut task));
+    });
+}
+
+type EditorDone = Box<dyn FnOnce() + Send>;
+
+// `wrap_task!` takes no doc comment on the struct it declares — CEF-NOTES trap 8, and its fields
+// have to be `Clone`, which is why the closure is behind an `Arc` rather than a bare `Mutex`.
+wrap_task! {
+    struct AfterEditor {
+        done: std::sync::Arc<Mutex<Option<EditorDone>>>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let done = self.done.lock().ok().and_then(|mut done| done.take());
+            if let Some(done) = done {
+                done();
+            }
+        }
+    }
+}
+// --- end config commands ---------------------------------------------------------------------
+
 /// Put `text` into the focused field and tell the page's own handlers about it.
 ///
 /// The `input` event is what makes a React or Vue field notice — qutebrowser dispatches the same

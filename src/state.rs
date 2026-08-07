@@ -338,6 +338,21 @@ impl BruState {
         self.bindings.clone()
     }
 
+// --- config commands -----------------------------------------------------------------------
+    /// The two halves of the key table, mutably — what `:bind` and `:unbind` change while bru runs.
+    ///
+    /// They are two accessors and not one method because the caller changes both under one lock and
+    /// `config.rs` is where the argument for what "both" means lives. Nothing on the key path calls
+    /// either: `handle_key` reaches `parsers` through its own field.
+    pub fn bindings_mut(&mut self) -> Option<&mut crate::config::Bindings> {
+        self.bindings.as_mut()
+    }
+
+    pub fn parsers_mut(&mut self) -> Option<&mut crate::bindings::KeyParsers> {
+        self.parsers.as_mut()
+    }
+// --- end config commands ---------------------------------------------------------------------
+
     /// Feed one keypress to the parser for the current window's mode. `None` before the bindings
     /// are loaded, which is every process that is not the browser process.
     ///

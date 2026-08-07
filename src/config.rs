@@ -455,6 +455,47 @@ impl Bindings {
         self.per_mode.get(&mode).map_or(0, HashMap::len)
     }
 
+// --- config commands -----------------------------------------------------------------------
+    /// Every binding that is not one of bru's own, as the Lua that would reproduce it.
+    ///
+    /// The bindings half of `:config-diff`; the settings half is `settings::Settings::diff`. Three
+    /// shapes, and the third is the one a diff against a *table of defaults* has to have and a
+    /// diff against an empty config does not: a key bru ships and the user has taken away is a
+    /// difference, and `bru.unbind` is how a config file says it.
+    pub fn diff(&self) -> Vec<String> {
+        let defaults = Bindings::defaults();
+        let mut out = Vec::new();
+        for (mode, keys, command) in self.all() {
+            match defaults.command_for(mode, &keys) {
+                Some(default) if default == command => {}
+                _ => out.push(format!(
+                    "bru.bind({:?}, {:?}, {:?})",
+                    mode.name(),
+                    keys,
+                    command
+                )),
+            }
+        }
+        for (mode, keys, _) in defaults.all() {
+            if self.command_for(mode, &keys).is_none() {
+                out.push(format!("bru.unbind({:?}, {:?})", mode.name(), keys));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// What bru's own table binds `keys` to in `mode` — `:bind --default`'s destination.
+    ///
+    /// Built from [`DEFAULT_BINDINGS`] rather than from a copy taken at startup, because the
+    /// default is a fact about bru and not about the config that was loaded over it.
+    pub fn default_command_for(mode: Mode, keys: &str) -> Option<String> {
+        Bindings::defaults()
+            .command_for(mode, keys)
+            .map(str::to_string)
+    }
+// --- end config commands ---------------------------------------------------------------------
+
     /// Parse every command string and build one trie per mode.
     ///
     /// **This is where "unknown strings warn at startup, never at keypress" is enforced.** A
@@ -706,6 +747,16 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
                     .lock()
                     .expect("the config.lua mutex is never poisoned");
                 match value {
+                    // --- config commands ---------------------------------------------------
+                    // A list setting's table is a Lua *array* — `{ "https://…", "https://…" }` —
+                    // and an array is a table whose keys are 1..n. Which one a table is cannot be
+                    // read off the table (an empty one is both), so the setting is asked. See
+                    // `settings::is_list`.
+                    mlua::Value::Table(table) if crate::settings::is_list(&key) => {
+                        let values = lua_table_sequence(&key, &table)?;
+                        config.settings.set_list(&key, &values).map(|_| ())
+                    }
+                    // --- end config commands -----------------------------------------------
                     mlua::Value::Table(table) => {
                         let pairs = lua_table_pairs(&key, &table)?;
                         config.settings.set_dict(&key, &pairs).map(|_| ())
@@ -753,6 +804,35 @@ fn lua_table_pairs(option: &str, table: &mlua::Table) -> mlua::Result<Vec<(Strin
     Ok(pairs)
 }
 
+// --- config commands -----------------------------------------------------------------------
+/// A Lua array as the entries a list setting takes, **in the order they were written**.
+///
+/// Order is the difference between this and [`lua_table_pairs`], which sorts: a dictionary has no
+/// order and sorting it makes two spellings of one table print alike, while a list's order is the
+/// order its entries are fetched and compiled in. `Table::sequence_values` walks 1..n and stops at
+/// the first hole, which is Lua's own definition of an array; a table with a string key in it is
+/// therefore not silently half-read — the length check below refuses it by name.
+fn lua_table_sequence(option: &str, table: &mlua::Table) -> mlua::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for (index, value) in table.clone().sequence_values::<mlua::Value>().enumerate() {
+        let value = value?;
+        out.push(scalar_to_string(&format!("{option}[{}]", index + 1), &value)?);
+    }
+    // `pairs` counts every key; `sequence_values` counts 1..n. A difference means the table has
+    // something in it that a list cannot hold — `{ "a", nope = "b" }` — and reading only the array
+    // half would drop the rest without a word.
+    let total = table.pairs::<mlua::Value, mlua::Value>().count();
+    if total != out.len() {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{option}: expected a list of values like {{ \"a\", \"b\" }}, got a table with \
+             {} entry/entries that are not in the list part",
+            total - out.len()
+        )));
+    }
+    Ok(out)
+}
+// --- end config commands -------------------------------------------------------------------
+
 /// A Lua scalar as the string a setting stores. Booleans keep Lua's spelling, which is also the
 /// spelling `settings.rs` parses.
 fn scalar_to_string(what: &str, value: &mlua::Value) -> mlua::Result<String> {
@@ -767,6 +847,303 @@ fn scalar_to_string(what: &str, value: &mlua::Value) -> mlua::Result<String> {
         ))),
     }
 }
+
+// -----------------------------------------------------------------------------------------------
+// --- config commands ---------------------------------------------------------------------------
+// The four commands that reach this file while bru is running: `:config-source`, `:config-edit`,
+// `:bind` and `:unbind`.
+// -----------------------------------------------------------------------------------------------
+
+/// **A second Lua state, at runtime, and why that does not break the rule.**
+///
+/// DESIGN.md's rule is "Lua rebinds keys; it is never on the key path", and this module's own first
+/// paragraph puts it sharply: "Pressing `j` cannot reach an interpreter because by then there is no
+/// interpreter to reach." Both are about the *key path*, and both stay true here for exactly the
+/// reason they were true at startup: [`apply_lua`] creates the `Lua` inside its own body, runs the
+/// file, and drops it before it returns. What comes out is a [`Config`] — plain `HashMap`s and a
+/// plain settings store. There is no interpreter to reach after this function returns any more than
+/// there was after `Config::load`, because it is the same function doing the same thing a second
+/// time.
+///
+/// What *is* new is the cost, and it is worth stating rather than waving through: building an
+/// `mlua::Lua` and running a config file takes as long as it takes, and it happens when somebody
+/// types `:config-source`. That is a keypress that is allowed to be slow — it is a command, not a
+/// movement — and it is on the UI thread, so a `config.lua` with a ten-second loop in it freezes the
+/// window. So does one at startup; the difference is that at startup nothing is drawn yet.
+///
+/// Reads the file over what is **already live**, which is qutebrowser's own behaviour
+/// (`configcommands.py:407-429`): the settings come from [`crate::settings::snapshot`] and the
+/// bindings from the running table, so a `:set` typed five minutes ago survives a `:config-source`.
+/// `clear` is the spelling that asks for the other thing.
+pub fn source_over(current: Config, path: &Path, clear: bool) -> Result<Config, String> {
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let base = if clear { Config::default_config() } else { current };
+    Ok(apply_lua(base, &source, &path.display().to_string()))
+}
+
+/// Resolve `:config-source`'s optional argument the way qutebrowser resolves it
+/// (`configcommands.py:415-421`): no name is bru's own config file, a relative name is relative to
+/// the directory that file is in, an absolute name is itself. `~` is expanded, because a command
+/// line is not a shell and nothing else would.
+pub fn source_path(filename: Option<&str>) -> Option<PathBuf> {
+    let default = config_path()?;
+    let Some(filename) = filename else {
+        return Some(default);
+    };
+    let expanded = match filename.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => PathBuf::from(filename),
+    };
+    if expanded.is_absolute() {
+        return Some(expanded);
+    }
+    Some(default.parent()?.join(expanded))
+}
+
+/// Install a re-read config over the running browser: the engines, the start page, the settings and
+/// the key tables, in that order.
+///
+/// **The bindings are replaced, not patched**, and the half-typed keychain goes with them: a `g`
+/// pending against a table that no longer has `gg` in it would be waiting for a key that cannot
+/// come. `KeyParsers::new` starts every mode empty, which is the same clearing `mode-leave` does.
+fn install_over_the_running_browser(config: Config) {
+    let bindings = config.bindings.clone();
+    // Engines, start page and settings — the same call `app.rs` makes at startup, so there is one
+    // install path rather than two that can drift.
+    let parsers = config.into_parsers();
+    if let Some(state) = crate::state::BruState::instance() {
+        let mut state = state.lock().expect("state mutex poisoned");
+        state.set_bindings(bindings);
+        state.set_parsers(parsers);
+    }
+    // What the file set, pushed into Chromium. `into_parsers` only stores it.
+    crate::settings::apply_at_startup();
+    crate::ipc::push_bar_everywhere();
+}
+
+/// `:config-source [filename] [--clear]`.
+pub fn run_source(filename: Option<&str>, clear: bool) {
+    let Some(path) = source_path(filename) else {
+        crate::message::error("config-source: there is no configuration directory to read from");
+        return;
+    };
+    let current = Config {
+        bindings: crate::state::BruState::instance()
+            .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()))
+            .unwrap_or_else(Bindings::defaults),
+        settings: crate::settings::snapshot(),
+    };
+    match source_over(current, &path, clear) {
+        Ok(config) => {
+            install_over_the_running_browser(config);
+            crate::message::info(&format!("sourced {}", path.display()));
+        }
+        Err(error) => crate::message::error(&format!("config-source: {error}")),
+    }
+}
+
+/// `:config-edit [--no-source]` — open `config.lua` in `$EDITOR` and re-read it when the editor
+/// exits.
+///
+/// **bru does not create the file and does not create its directory.** DESIGN.md gives
+/// `~/.config/bru/config.lua` to configer and says bru writes neither it nor `theme.css`; an editor
+/// started on a path inside a directory bru had just made would be bru creating configer's
+/// directory with one extra step in between. So a missing directory is refused, by name, and a
+/// missing *file* is not: the editor creates that when the user saves, which is a person
+/// hand-writing a hand-written file and is exactly what is supposed to happen.
+pub fn run_edit(no_source: bool) {
+    let Some(path) = config_path() else {
+        crate::message::error("config-edit: there is no configuration directory");
+        return;
+    };
+    let Some(dir) = path.parent().map(Path::to_path_buf) else {
+        crate::message::error("config-edit: the configuration path has no directory");
+        return;
+    };
+    if !dir.is_dir() {
+        crate::message::error(&format!(
+            "config-edit: {} does not exist. That directory is configer's, and bru does not create \
+             it — make it yourself and bru will read what you put in it.",
+            dir.display()
+        ));
+        return;
+    }
+    let existed = path.exists();
+    crate::editor::edit_file(path.clone(), move |ok| {
+        if !ok {
+            return;
+        }
+        if no_source {
+            return;
+        }
+        if !path.exists() {
+            // The editor was opened on a file that did not exist and was left that way. Nothing to
+            // read, and nothing went wrong.
+            return;
+        }
+        if !existed {
+            crate::message::info(&format!("config-edit: {} is new", path.display()));
+        }
+        run_source(None, false);
+    });
+}
+
+// -----------------------------------------------------------------------------------------------
+// `:bind` and `:unbind`, at runtime
+// -----------------------------------------------------------------------------------------------
+
+/// Change the running browser's key table, both halves of it, under one lock.
+///
+/// The two halves are `BruState::bindings` — the whole table, which `bru://chrome/help`,
+/// `hints.rs` and `prompt.rs` all read back — and `BruState::parsers`, the tries the key path
+/// matches against. A change that reached one and not the other would be a help page that
+/// disagreed with the browser, which `help.rs`'s own module docs call worse than no help page.
+///
+/// `command` is `None` for `:unbind`. This is [`crate::bindings::BindingTrie::remove`]'s first
+/// production caller: it has been written and tested since the trie was, waiting for a command that
+/// takes a binding away while bru runs, and `bru.unbind` in `config.lua` never needed it because a
+/// config-time unbind happens before any trie exists.
+fn change_live_binding(mode: Mode, keys: &str, command: Option<&str>) -> Result<bool, String> {
+    let sequence = parse_key_sequence(keys).map_err(|e| e.to_string())?;
+    let parsed = match command {
+        Some(command) => Some(commands::parse(command).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let Some(state) = crate::state::BruState::instance() else {
+        return Err("there is no browser to rebind".to_string());
+    };
+    let mut state = state.lock().expect("state mutex poisoned");
+    // The whole table first: if the mode name is wrong this is where it is refused, before
+    // anything has been touched.
+    let existed = match command {
+        Some(command) => {
+            state
+                .bindings_mut()
+                .ok_or("the bindings are not loaded yet")?
+                .bind(mode.name(), keys, command)?;
+            true
+        }
+        None => state
+            .bindings_mut()
+            .ok_or("the bindings are not loaded yet")?
+            .unbind(mode.name(), keys)?,
+    };
+    if let Some(parsers) = state.parsers_mut() {
+        let trie = parsers.parser_mut(mode).bindings_mut();
+        match parsed {
+            Some(parsed) => {
+                trie.insert(&sequence, parsed);
+            }
+            None => {
+                trie.remove(&sequence);
+            }
+        }
+        // A pending `g` matched against the old table has nothing to complete against the new one.
+        parsers.clear(mode);
+    }
+    Ok(existed)
+}
+
+/// `:bind [--default] [--mode <mode>] [<key> [<command>]]`.
+///
+/// Four shapes, all qutebrowser's (`configcommands.py:124-169`), and one of them is bru's own
+/// destination for the same idea: no key at all opens the page listing every binding, which is
+/// `qute://bindings` there and `bru://chrome/help` here.
+pub fn run_bind(mode: &str, keys: Option<&str>, command: Option<&str>, default: bool) {
+    let Some(keys) = keys else {
+        // Handled in `exec.rs`, which is the only place that can navigate. Reaching here means the
+        // parser built a shape the dispatcher does not know about.
+        crate::message::error("bind: no key given");
+        return;
+    };
+    let Some(mode_enum) = Mode::from_name(mode) else {
+        crate::message::error(&format!("bind: unknown mode {mode:?}"));
+        return;
+    };
+    // Normalised through the parser, so `<ctrl-a>` and `<Ctrl-A>` name one binding and the message
+    // prints the spelling the rest of bru uses.
+    let spelled = match parse_key_sequence(keys) {
+        Ok(sequence) => sequence_to_string(&sequence),
+        Err(e) => {
+            crate::message::error(&format!("bind: {e}"));
+            return;
+        }
+    };
+
+    if command.is_none() {
+        if default {
+            // `:bind --default <key>` — put bru's own binding back, or take the key away when bru
+            // ships none. The second half is what makes this the exact inverse of `:bind <key>
+            // <command>` on a key bru does not bind, rather than a no-op on one.
+            let default_command = Bindings::default_command_for(mode_enum, keys);
+            let outcome = change_live_binding(mode_enum, keys, default_command.as_deref());
+            match (outcome, default_command) {
+                (Ok(_), Some(command)) => crate::message::info(&format!(
+                    "{spelled} is back to bru's own in {mode} mode: {command}"
+                )),
+                (Ok(_), None) => crate::message::info(&format!(
+                    "bru binds nothing to {spelled} in {mode} mode, so it is unbound"
+                )),
+                (Err(e), _) => crate::message::error(&format!("bind: {e}")),
+            }
+            return;
+        }
+        // No command and no `--default`: show what is bound, which is what `sk` was for all along.
+        let bound = crate::state::BruState::instance()
+            .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()))
+            .and_then(|bindings| bindings.command_for(mode_enum, keys).map(str::to_string));
+        match bound {
+            Some(command) => {
+                crate::message::info(&format!("{spelled} is bound to '{command}' in {mode} mode"))
+            }
+            None => crate::message::info(&format!("{spelled} is unbound in {mode} mode")),
+        }
+        return;
+    }
+
+    match change_live_binding(mode_enum, keys, command) {
+        Ok(_) => crate::message::info(&format!(
+            "{spelled} is bound to '{}' in {mode} mode",
+            command.unwrap_or_default()
+        )),
+        Err(e) => crate::message::error(&format!("bind: {e}")),
+    }
+}
+
+/// `:unbind [--mode <mode>] <key>`.
+pub fn run_unbind(mode: &str, keys: &str) {
+    let Some(mode_enum) = Mode::from_name(mode) else {
+        crate::message::error(&format!("unbind: unknown mode {mode:?}"));
+        return;
+    };
+    let spelled = match parse_key_sequence(keys) {
+        Ok(sequence) => sequence_to_string(&sequence),
+        Err(e) => {
+            crate::message::error(&format!("unbind: {e}"));
+            return;
+        }
+    };
+    match change_live_binding(mode_enum, keys, None) {
+        // qutebrowser raises "Can't find binding … in … mode" here; bru says it plainly, because a
+        // key that is already unbound has ended up where the command was asking it to be.
+        Ok(false) => crate::message::info(&format!("{spelled} was already unbound in {mode} mode")),
+        Ok(true) => crate::message::info(&format!("{spelled} is unbound in {mode} mode")),
+        Err(e) => crate::message::error(&format!("unbind: {e}")),
+    }
+}
+
+/// `:config-diff` — the bindings half, read out of the running table.
+pub fn binding_diff() -> Vec<String> {
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()))
+        .map(|bindings| bindings.diff())
+        .unwrap_or_default()
+}
+// --- end config commands -----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
