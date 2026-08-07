@@ -264,6 +264,40 @@ impl BrowserSideHandler for BruQueryHandler {
                 succeed(&callback, "");
             }
 
+            // --- src/prompt.rs ------------------------------------------------------------------
+            // The mirror of the prompt's own `<input>`, exactly like `text-changed` above and for
+            // the same reason: the DOM is where the letters land and Rust has to be told. It is
+            // only ever a *mirror* — `prompt-accept` reads the DOM's text through `bru.accept()`'s
+            // sibling rather than this, so the last character typed cannot be lost to a race with
+            // the `<Return>` after it.
+            Some("prompt-text") => {
+                let Some(window) = window_of(browser.as_ref()) else {
+                    fail(&callback, -9, "a prompt that belongs to no window");
+                    return true;
+                };
+                crate::prompt::on_text_changed(
+                    window,
+                    &json_field(request, "text").unwrap_or_default(),
+                    json_number_field(request, "cursor"),
+                );
+                succeed(&callback, "");
+            }
+            // The answer to `bru.promptAccept()`, and the only thing that may finish a prompt with
+            // a line in it. Everything it leads to is posted — the callbacks a question closes can
+            // start a navigation, and this is a query handler (trap 12).
+            Some("prompt-accept") => {
+                let Some(window) = window_of(browser.as_ref()) else {
+                    fail(&callback, -9, "a prompt that belongs to no window");
+                    return true;
+                };
+                crate::prompt::on_accept(
+                    window,
+                    &json_field(request, "text").unwrap_or_default(),
+                );
+                succeed(&callback, "");
+            }
+            // --- end src/prompt.rs --------------------------------------------------------------
+
             // --- src/cookies.rs -----------------------------------------------------------------
             // `bru://chrome/cookies` reading the cookie jar and deleting from it. It is below the
             // `bru://` check on purpose and is the first thing that check has ever had to refuse
@@ -408,6 +442,11 @@ pub fn forget_window(window: u32) {
     // The command line that window was holding goes with it — there is one per window now, and a
     // closed window's half-typed text has nowhere left to be shown.
     crate::cmdline::forget_window(window);
+// --- src/prompt.rs ---------------------------------------------------------
+    // And its questions, which are cancelled rather than dropped: something is waiting on each of
+    // them — a page, a login, a download — and a window closing must not leave it waiting for ever.
+    crate::prompt::forget_window(window);
+// --- end src/prompt.rs -----------------------------------------------------
 }
 
 /// From `DisplayHandler::on_address_change` on the main frame, for the window the tab is in.
@@ -438,6 +477,11 @@ pub fn set_mode_for(window: u32, mode: String) {
     // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
     // the command line out of `exec.rs`.
     crate::cmdline::on_mode_changed(window, &mode);
+// --- src/prompt.rs ---------------------------------------------------------
+    // The same funnel, and for the prompt it is the whole of "a question can be left": whatever
+    // takes the mode away from an open question cancels it. `PromptQueue._on_mode_left`.
+    crate::prompt::on_mode_changed(window, &mode);
+// --- end src/prompt.rs -----------------------------------------------------
     // A message and a command line share one cell, so opening the line takes the message's turn
     // away — **in this window**. This used to call `message::clear()`, which dropped the message
     // for the whole process, so `:` typed in one window emptied a message the other window was
@@ -696,6 +740,11 @@ fn bar_json_for(window: u32) -> String {
     // is asked here rather than pushed in so that a table can never be one edit behind the text it
     // is completing.
     let completion = crate::completers::json_for(window);
+// --- src/prompt.rs ---------------------------------------------------------
+    // The open question, or `null`. Outside the bar lock like the two above, and it sets this
+    // window's *other* strip-height slot on the way past — see `window::PROMPT_HEIGHTS`.
+    let prompt = crate::prompt::json_for(window);
+// --- end src/prompt.rs -----------------------------------------------------
     // Outside the bar lock for the same reason as `cmdline` above: `message::json` takes its own.
     let message = if with_window(window, |entry| entry.message_taken)
         == Some(crate::message::sequence())
@@ -719,7 +768,7 @@ fn bar_json_for(window: u32) -> String {
             // which ignores a key it has no element for: `search` is the find handler's match count,
             // `download` a running download's progress, `message` one line with a level and its own
             // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
-            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"prompt\":{prompt},\"message\":{message}}}",
             json_escape(&bar.url),
             json_escape(&bar.title),
             json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -843,6 +892,15 @@ pub fn ask_cmdline(window: u32, what: &str) {
     let code = format!("window.bru && window.bru.{what} && window.bru.{what}();");
     frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
 }
+
+// --- src/prompt.rs ---------------------------------------------------------
+/// The same for the prompt's own `<input>`. `ask_cmdline` under the name of its caller: they are
+/// two different inputs in the one strip, and a call site that read `ask_cmdline` while finishing a
+/// prompt would be a line to misread later.
+pub fn ask_prompt(window: u32, what: &str) {
+    ask_cmdline(window, what);
+}
+// --- end src/prompt.rs -----------------------------------------------------
 
 /// `--cmdline-script=…`, read once the bottom strip is up. See `cmdline::schedule_script`.
 ///

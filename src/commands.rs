@@ -276,6 +276,26 @@ pub enum Command {
     CompletionItemYank { sel: bool },
 // --- end src/completers.rs -----------------------------------------------------------------
 
+// --- src/prompt.rs -------------------------------------------------------------------------
+    /// `prompt-accept [--save] [<value>]` — `<Return>` in both prompt modes, and `y`/`n`/`Y`/`N`
+    /// in `yesno`, where the value is the answer and `--save` is "and remember it for this site".
+    ///
+    /// The value is optional because `<Return>` means "what is in the line edit", or for a yes/no
+    /// question with a default, that default (`YesNoPrompt.accept`, prompt.py:971-983).
+    PromptAccept { value: Option<String>, save: bool },
+    /// `prompt-item-focus <next|prev>` — `<Tab>`, `<Shift-Tab>`, `<Up>`, `<Down>` in `prompt`.
+    /// Walks the file list of a filename prompt, and the two fields of a login.
+    PromptItemFocus { which: FocusWhich },
+    /// `prompt-open-download [--pdfjs] [<cmdline>]` — `<Ctrl-X>` and `<Ctrl-P>`. Answers a
+    /// download's filename question with "somewhere temporary, and open it when it lands".
+    PromptOpenDownload { cmdline: Option<String>, pdfjs: bool },
+    /// `prompt-yank [--sel]` — `<Alt-Y>`, `<Alt-Shift-Y>`. The URL the question is *about*, which
+    /// is the one thing a modal question otherwise puts out of reach.
+    PromptYank { sel: bool },
+    /// `prompt-fileselect-external` — `<Alt-E>`. Hands the choosing to a real file browser.
+    PromptFileselectExternal,
+// --- end src/prompt.rs ---------------------------------------------------------------------
+
 // --- adblock ---------------------------------------------------------------------------------
     /// `adblock-update` — fetch the filter lists and recompile. qutebrowser's own command name.
     AdblockUpdate,
@@ -803,8 +823,18 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
                 return Err(bad("needs a mode"));
             };
             match Mode::from_name(mode) {
+                // `modeman.mode_enter` (modeman.py:401-405) raises "Mode X can't be entered
+                // manually!" for hint, command, yesno, prompt and register. Four of those five are
+                // `Mode`s here, and refusing them at *parse* time is what keeps the promise this
+                // file makes everywhere else: an unknown string is reported at startup, never at
+                // the keypress. A `config.lua` writing `mode-enter yesno` learns so before the
+                // browser is up rather than by finding the bar stuck in a mode with no question
+                // behind it and nothing but `<Escape>` to get out.
+                Some(mode) if !mode.can_be_entered_by_command() => {
+                    return Err(bad(&format!("mode {} can't be entered manually", mode.name())));
+                }
                 Some(mode) => Command::ModeEnter(mode),
-                // hint, caret, set_mark, … — real qutebrowser modes bru has not built yet.
+                // `register` — a real qutebrowser name that is a bindings section and not a mode.
                 None => Command::Unimplemented(s.trim().to_string()),
             }
         }
@@ -1319,6 +1349,43 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "completion-item-yank" => Command::CompletionItemYank { sel: args.has("sel") },
 // --- end src/completers.rs -----------------------------------------------------------------
 
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // The five of `bindings.default.prompt` and `.yesno`. `prompt-accept`'s value is left as a
+        // string here rather than parsed into a yes/no: `YesNoPrompt.accept` is what raises
+        // "Invalid value X - expected yes/no!" (prompt.py:983), and it raises it *at the prompt*,
+        // where the user can see it — a parse error would instead drop the binding at startup and
+        // leave `y` doing nothing at the one moment it matters.
+        "prompt-accept" => Command::PromptAccept {
+            value: args.arg(0).map(str::to_string),
+            save: args.has("save"),
+        },
+        "prompt-item-focus" => {
+            let Some(which) = args.arg(0) else {
+                return Err(bad("needs next or prev"));
+            };
+            let which = match which {
+                "next" => FocusWhich::Next,
+                "prev" => FocusWhich::Prev,
+                // `cmdutils.argument('which', choices=['next', 'prev'])` (prompt.py:424) — the two
+                // page and category spellings `completion-item-focus` takes are not choices here,
+                // and accepting them would mean inventing a meaning for them.
+                other => return Err(bad(&format!("invalid direction {other:?}"))),
+            };
+            Command::PromptItemFocus { which }
+        }
+        // `maxsplit=0` (prompt.py:401), because the argument is a command line: `prompt-open-download
+        // mpv --no-video {}` is one string and not three arguments.
+        "prompt-open-download" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::PromptOpenDownload {
+                cmdline: args.arg(0).map(str::to_string),
+                pdfjs: args.has("pdfjs"),
+            }
+        }
+        "prompt-yank" => Command::PromptYank { sel: args.has("sel") },
+        "prompt-fileselect-external" => Command::PromptFileselectExternal,
+// --- end src/prompt.rs ---------------------------------------------------------------------
+
 // --- adblock ---------------------------------------------------------------------------------
         "adblock-update" => Command::AdblockUpdate,
         "adblock-toggle" => Command::AdblockToggle,
@@ -1749,12 +1816,74 @@ mod tests {
         assert_eq!(parse("mode-enter caret").unwrap(), Command::ModeEnter(Mode::Caret));
         assert_eq!(parse("mode-enter set_mark").unwrap(), Command::ModeEnter(Mode::SetMark));
         assert_eq!(parse("mode-enter jump_mark").unwrap(), Command::ModeEnter(Mode::JumpMark));
-        // prompt is a real qutebrowser mode bru has not built; it is not an error, it is unbuilt.
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // The four modes `mode-enter` refuses — `modeman.mode_enter` raises "Mode X can't be
+        // entered manually!" for each (modeman.py:401-405). It is a parse error rather than an
+        // `Unimplemented`, so a `config.lua` writing one hears about it at startup instead of by
+        // finding the bar in a mode with no question behind it.
+        for mode in ["prompt", "yesno", "hint", "command"] {
+            let e = parse(&format!("mode-enter {mode}")).unwrap_err();
+            assert!(e.0.contains("can't be entered manually"), "{mode}: {e}");
+        }
+        // `register` is not a `Mode` at all — it is the name of a *bindings section* — so it stays
+        // the unknown-command case rather than joining the four above.
         assert_eq!(
-            parse("mode-enter prompt").unwrap(),
-            Command::Unimplemented("mode-enter prompt".to_string())
+            parse("mode-enter register").unwrap(),
+            Command::Unimplemented("mode-enter register".to_string())
+        );
+// --- end src/prompt.rs ---------------------------------------------------------------------
+    }
+
+// --- src/prompt.rs -------------------------------------------------------------------------
+    /// The five `prompt-*` commands, in every spelling `bindings.default.prompt` and `.yesno` use.
+    /// A command string that does not parse is a binding that is dropped at startup, and a dropped
+    /// binding in a modal mode is a question with one fewer way out of it.
+    #[test]
+    fn prompt_commands() {
+        assert_eq!(
+            parse("prompt-accept").unwrap(),
+            Command::PromptAccept { value: None, save: false }
+        );
+        assert_eq!(
+            parse("prompt-accept yes").unwrap(),
+            Command::PromptAccept { value: Some("yes".to_string()), save: false }
+        );
+        assert_eq!(
+            parse("prompt-accept --save no").unwrap(),
+            Command::PromptAccept { value: Some("no".to_string()), save: true }
+        );
+        assert_eq!(
+            parse("prompt-item-focus prev").unwrap(),
+            Command::PromptItemFocus { which: FocusWhich::Prev }
+        );
+        // `next-category` is a `completion-item-focus` spelling; `prompt-item-focus` takes two
+        // choices and nothing else (prompt.py:424), so accepting it would be inventing a meaning.
+        assert!(parse("prompt-item-focus next-category").is_err());
+        assert!(parse("prompt-item-focus").is_err());
+        assert_eq!(
+            parse("prompt-open-download").unwrap(),
+            Command::PromptOpenDownload { cmdline: None, pdfjs: false }
+        );
+        assert_eq!(
+            parse("prompt-open-download --pdfjs").unwrap(),
+            Command::PromptOpenDownload { cmdline: None, pdfjs: true }
+        );
+        // `maxsplit=0`: the argument is a command line and stays one string.
+        assert_eq!(
+            parse("prompt-open-download mpv --no-video {}").unwrap(),
+            Command::PromptOpenDownload {
+                cmdline: Some("mpv --no-video {}".to_string()),
+                pdfjs: false,
+            }
+        );
+        assert_eq!(parse("prompt-yank").unwrap(), Command::PromptYank { sel: false });
+        assert_eq!(parse("prompt-yank --sel").unwrap(), Command::PromptYank { sel: true });
+        assert_eq!(
+            parse("prompt-fileselect-external").unwrap(),
+            Command::PromptFileselectExternal
         );
     }
+// --- end src/prompt.rs ---------------------------------------------------------------------
 
     #[test]
     fn caret_commands() {

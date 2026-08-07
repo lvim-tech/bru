@@ -177,11 +177,44 @@ static COMPLETION_HEIGHTS: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex:
 /// Store a window's extra height and answer what it was. `completers::resize_bar` compares the two
 /// and relayouts only when they differ.
 pub fn set_completion_height(window: u32, height: i32) -> i32 {
-    let Ok(mut heights) = COMPLETION_HEIGHTS.lock() else {
+    set_height_in(&COMPLETION_HEIGHTS, window, height)
+}
+
+fn completion_height(window: u32) -> i32 {
+    height_in(&COMPLETION_HEIGHTS, window)
+}
+// --- end src/completers.rs -----------------------------------------------------------------
+
+// --- src/prompt.rs -------------------------------------------------------------------------
+/// The same, for the prompt block — `src/prompt.rs`.
+///
+/// **A second slot rather than a second writer of the first.** The completion table and a prompt
+/// are the only two things that make the bottom strip grow, and the obvious arrangement — one
+/// height per window, whoever last had something to draw writes it — is wrong the moment both are
+/// open at once: `bar_json_for` asks the completion and then the prompt on every push, so the last
+/// writer wins and a prompt raised over an open completion is drawn inside the completion's height
+/// or the other way round. Two slots added together in [`BruChromeViewDelegate::preferred_size`]
+/// cannot do that, and neither module has to know the other exists.
+static PROMPT_HEIGHTS: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Store a window's prompt height and answer what it was, so `prompt::resize_bar` relayouts only
+/// when it moved.
+pub fn set_prompt_height(window: u32, height: i32) -> i32 {
+    set_height_in(&PROMPT_HEIGHTS, window, height)
+}
+
+fn prompt_height(window: u32) -> i32 {
+    height_in(&PROMPT_HEIGHTS, window)
+}
+// --- end src/prompt.rs ---------------------------------------------------------------------
+
+// --- src/completers.rs ---------------------------------------------------------------------
+fn set_height_in(slot: &std::sync::Mutex<Vec<(u32, i32)>>, window: u32, height: i32) -> i32 {
+    let Ok(mut heights) = slot.lock() else {
         return height;
     };
     match heights.iter_mut().find(|(id, _)| *id == window) {
-        Some(slot) => std::mem::replace(&mut slot.1, height),
+        Some(found) => std::mem::replace(&mut found.1, height),
         None => {
             heights.push((window, height));
             0
@@ -189,9 +222,8 @@ pub fn set_completion_height(window: u32, height: i32) -> i32 {
     }
 }
 
-fn completion_height(window: u32) -> i32 {
-    COMPLETION_HEIGHTS
-        .lock()
+fn height_in(slot: &std::sync::Mutex<Vec<(u32, i32)>>, window: u32) -> i32 {
+    slot.lock()
         .ok()
         .and_then(|heights| {
             heights
@@ -221,6 +253,11 @@ fn forget_completion_height(window: u32) {
     if let Ok(mut heights) = COMPLETION_HEIGHTS.lock() {
         heights.retain(|(id, _)| *id != window);
     }
+    // --- src/prompt.rs ---------------------------------------------------------------------
+    if let Ok(mut heights) = PROMPT_HEIGHTS.lock() {
+        heights.retain(|(id, _)| *id != window);
+    }
+    // --- end src/prompt.rs -----------------------------------------------------------------
 }
 // --- end src/completers.rs -----------------------------------------------------------------
 
@@ -521,8 +558,10 @@ wrap_browser_view_delegate! {
             // This strip's own window, not whichever one is current: a layout pass runs for the
             // window being relayouted, and reading a shared value would make window 0's bar as tall
             // as window 1's table.
+            // Two slots, added: the completion table's and — src/prompt.rs — the prompt block's.
+            // Either can be zero and both can be open at once; see `PROMPT_HEIGHTS`.
             let extra = if self.grows {
-                completion_height(self.window_id)
+                completion_height(self.window_id) + prompt_height(self.window_id)
             } else {
                 0
             };

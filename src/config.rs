@@ -25,9 +25,10 @@ use std::sync::{Arc, Mutex};
 ///
 /// Generated from `/usr/lib/python3.13/site-packages/qutebrowser/config/configdata.yml`,
 /// `bindings.default:` — normal 3679–3878, insert 3879, hint 3884, passthrough 3890,
-/// command 3892–3924, caret 3961–3989, and register 3991 written out under both of the modes that
-/// read it. The `prompt` and `yesno` sections are left out because bru has no such modes yet; they
-/// come back with the modes.
+/// command 3892–3924, prompt 3925–3950, yesno 3951–3959, caret 3961–3989, and register 3991
+/// written out under all four of the modes that read it. Every section `configdata.yml` has is now
+/// here — the `prompt` and `yesno` sections came back with `src/prompt.rs`, which is the milestone
+/// their note here was waiting for.
 ///
 /// Command strings that bru does not implement are kept verbatim rather than removed: dropping
 /// them would change the shape of the trie, so `;` would report NoMatch instead of PartialMatch.
@@ -318,6 +319,53 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("command", "<Escape>", "mode-leave"),
     // -- passthrough ---------------------------------------------------------------------------
     ("passthrough", "<Shift-Escape>", "mode-leave"),
+// --- src/prompt.rs -------------------------------------------------------------------------
+    // -- prompt --------------------------------------------------------------------------------
+    // configdata.yml:3925-3950, transcribed in its own order. Fifteen of these twenty-six are
+    // `rl-*` rows: qutebrowser registers the readline commands for command **and** prompt mode,
+    // and so does bru — `cmdline::run_named_inner` offers each one to `prompt::run_readline`
+    // first, and the prompt edits the same `CmdLine` the command line does.
+    ("prompt", "<Return>", "prompt-accept"),
+    ("prompt", "<Ctrl-X>", "prompt-open-download"),
+    ("prompt", "<Ctrl-P>", "prompt-open-download --pdfjs"),
+    ("prompt", "<Shift-Tab>", "prompt-item-focus prev"),
+    ("prompt", "<Up>", "prompt-item-focus prev"),
+    ("prompt", "<Tab>", "prompt-item-focus next"),
+    ("prompt", "<Down>", "prompt-item-focus next"),
+    ("prompt", "<Alt-Y>", "prompt-yank"),
+    ("prompt", "<Alt-Shift-Y>", "prompt-yank --sel"),
+    ("prompt", "<Alt-E>", "prompt-fileselect-external"),
+    ("prompt", "<Ctrl-B>", "rl-backward-char"),
+    ("prompt", "<Ctrl-F>", "rl-forward-char"),
+    ("prompt", "<Alt-B>", "rl-backward-word"),
+    ("prompt", "<Alt-F>", "rl-forward-word"),
+    ("prompt", "<Ctrl-A>", "rl-beginning-of-line"),
+    ("prompt", "<Ctrl-E>", "rl-end-of-line"),
+    ("prompt", "<Ctrl-U>", "rl-unix-line-discard"),
+    ("prompt", "<Ctrl-K>", "rl-kill-line"),
+    ("prompt", "<Alt-D>", "rl-kill-word"),
+    ("prompt", "<Ctrl-W>", "rl-rubout \" \""),
+    ("prompt", "<Ctrl-Shift-W>", "rl-filename-rubout"),
+    ("prompt", "<Alt-Backspace>", "rl-backward-kill-word"),
+    ("prompt", "<Ctrl-?>", "rl-delete-char"),
+    ("prompt", "<Ctrl-H>", "rl-backward-delete-char"),
+    ("prompt", "<Ctrl-Y>", "rl-yank"),
+    ("prompt", "<Escape>", "mode-leave"),
+    // -- yesno ---------------------------------------------------------------------------------
+    // configdata.yml:3951-3959. `Y` and `N` are `--save`, which bru answers with the reason it
+    // cannot: there is nowhere for it to write the answer — `~/.config/bru/` is configer's file
+    // and bru must not create it (DESIGN.md). They are still bound, and still act, because a key
+    // that says why is a key that did something and because unbinding them here would be bru
+    // quietly disagreeing with `configdata.yml`.
+    ("yesno", "<Return>", "prompt-accept"),
+    ("yesno", "y", "prompt-accept yes"),
+    ("yesno", "n", "prompt-accept no"),
+    ("yesno", "Y", "prompt-accept --save yes"),
+    ("yesno", "N", "prompt-accept --save no"),
+    ("yesno", "<Alt-Y>", "prompt-yank"),
+    ("yesno", "<Alt-Shift-Y>", "prompt-yank --sel"),
+    ("yesno", "<Escape>", "mode-leave"),
+// --- end src/prompt.rs ---------------------------------------------------------------------
 ];
 
 /// Key bindings as a flat, owned, Lua-free table: mode → key sequence → command string.
@@ -693,15 +741,18 @@ mod tests {
         }
         // 189 normal + 4 insert + 5 hint + 32 command + 1 passthrough, from configdata.yml, plus
         // stage 3's 29 caret rows and the one-line `register:` section under each of the four modes
-        // that read it — `set_mark`, `jump_mark`, `record_macro` and `run_macro`.
-        assert_eq!(total, 264, "the default table is not the one transcribed from configdata.yml");
+        // that read it — `set_mark`, `jump_mark`, `record_macro` and `run_macro`. 264 until
+        // src/prompt.rs; **+34 with it**, which is `bindings.default.prompt`'s 26 rows and
+        // `.yesno`'s 8 — the two sections this table's own comment said would come back with the
+        // modes.
+        assert_eq!(total, 298, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
     #[test]
     fn defaults_are_all_parseable_and_none_collide() {
         let bindings = Bindings::defaults();
-        // 264 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
+        // 298 rows in DEFAULT_BINDINGS; if any two normalised to the same key sequence within a
         // mode, one would have silently overwritten the other and the counts would not add up.
         // <Ctrl-A> and <ctrl-a> are the same binding, so this really is checking something. Caret
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
@@ -719,6 +770,13 @@ mod tests {
         assert_eq!(bindings.len(Mode::RecordMacro), 1);
         assert_eq!(bindings.len(Mode::RunMacro), 1);
 // --- end src/macros.rs ---------------------------------------------------------------------------
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // The two sections that were left out until there were modes to hang them on. `yesno` is
+        // where the collision check earns its keep twice over: `y`/`Y` and `n`/`N` are the same
+        // two keys with and without Shift, so eight rows collapse to six if the Shift bit is lost.
+        assert_eq!(bindings.len(Mode::Prompt), 26);
+        assert_eq!(bindings.len(Mode::YesNo), 8);
+// --- end src/prompt.rs ---------------------------------------------------------------------
     }
 
     #[test]
@@ -903,8 +961,18 @@ mod tests {
         assert!(b.bind("caret", "f", "hint").is_ok(), "caret is a mode as of stage 3");
         assert!(b.bind("set_mark", "<Ctrl-J>", "mode-leave").is_ok(), "so are the two mark modes");
         assert!(b.bind("jump_mark", "<Ctrl-J>", "mode-leave").is_ok());
-        // `prompt` and `yesno` are the modes still to come, and naming one is still an error.
-        assert!(b.bind("prompt", "f", "hint").is_err(), "prompt mode is not implemented yet");
+        // --- src/prompt.rs -------------------------------------------------------------------
+        // Both prompt modes are real sections now, so a `config.lua` may rebind inside them.
+        assert!(b.bind("prompt", "<Ctrl-J>", "prompt-accept").is_ok());
+        assert!(b.bind("yesno", "j", "prompt-accept yes").is_ok());
+        // What is still refused is entering one by command — `modeman.mode_enter`'s own rule,
+        // enforced by `commands::parse` so a `config.lua` hears about it at startup.
+        assert!(commands::parse("mode-enter prompt").is_err());
+        assert!(commands::parse("mode-enter yesno").is_err());
+        assert!(commands::parse("mode-enter hint").is_err());
+        assert!(commands::parse("mode-enter command").is_err());
+        assert!(commands::parse("mode-enter insert").is_ok());
+        // --- end src/prompt.rs ---------------------------------------------------------------
         assert!(b.bind("nonsense", "f", "hint").is_err());
         assert!(b.bind("normal", "<Ctrl-Nonsense>", "tab-next").is_err());
         assert!(b.bind("normal", "j", "  ").is_err());

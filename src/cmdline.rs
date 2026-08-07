@@ -608,9 +608,10 @@ pub fn run_command(command: &Command, count: Option<u32>) -> bool {
 
 /// The readline and history commands, matched by name.
 ///
-/// Registered in qutebrowser for command *and* prompt mode; bru has no prompt mode, so outside
-/// command mode they are accepted and do nothing, which is what `cmdutils` does with a command
-/// whose `modes=` does not include the current one.
+/// Registered in qutebrowser for command *and* prompt mode, and now for both here too: an open
+/// prompt with a line to edit gets first refusal on every `rl-*` name — see
+/// `prompt::run_readline`. Outside either mode they are accepted and do nothing, which is what
+/// `cmdutils` does with a command whose `modes=` does not include the current one.
 fn run_named(text: &str) -> bool {
     let mut parts = text.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
@@ -650,6 +651,14 @@ fn is_named(text: &str) -> bool {
 }
 
 fn run_named_inner(name: &str, arg: String) -> bool {
+// --- src/prompt.rs -------------------------------------------------------------------------
+    // A prompt with a line edit open takes the readline commands first. It edits a `CmdLine` of
+    // its own — the same struct, so `rl-filename-rubout` cannot mean two different things in the
+    // two places it is bound — and answers `false` when there is nothing of its to edit.
+    if crate::prompt::run_readline(name, &arg) {
+        return true;
+    }
+// --- end src/prompt.rs ---------------------------------------------------------------------
     if mode() != Mode::Command {
         return true;
     }
@@ -1555,9 +1564,37 @@ fn inject_key(spec: &str) {
                 None => (c.to_ascii_uppercase() as i32, typed as u16),
             }
         }
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // `<Return>`, `<Escape>`, `<Tab>`, the arrows. This used to print "only character keys can
+        // be injected so far" and give up, which made every mode whose keys are *named* undrivable
+        // from a script — prompt mode's `<Return>: prompt-accept` above all, which is the one key
+        // a question is normally answered with.
+        //
+        // The same trick as the character search above, and for the same reason: a virtual key
+        // code names a physical key, so it has to be looked up rather than derived.
+        // `KeyInfo::from_cef(vkey, 0, 0)` is the forward direction — it is what the real key path
+        // calls — so searching it backwards cannot disagree with what a real press produces.
         crate::bindings::Key::Named(_) => {
-            eprintln!("cmdline-script: only character keys can be injected so far");
-            return;
+            let found = (0x08..=0xDF).find(|vkey| {
+                crate::bindings::KeyInfo::from_cef(*vkey, 0, 0).map(|found| found.key)
+                    == Some(info.key)
+            });
+            let Some(vkey) = found else {
+                eprintln!("cmdline-script: {spec:?} names no virtual key");
+                return;
+            };
+            // The character a real press of that key carries. CEF sends one for the five keys that
+            // type something and zero for the rest — see `KeyInfo::text`. Without it `<Return>`
+            // reaches `on_pre_key_event` and an input never sees the Enter.
+            let character = match vkey {
+                0x0D => '\r' as u16,
+                0x09 => '\t' as u16,
+                0x1B => 0x1b,
+                0x08 => 0x08,
+                0x20 => ' ' as u16,
+                _ => 0,
+            };
+            (vkey, character)
         }
     };
     // `cef_event_flags_t`, sys bindings x86_64_unknown_linux_gnu.rs:2699–2724 — the same values

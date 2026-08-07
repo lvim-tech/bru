@@ -17,6 +17,13 @@
              document is exactly as tall as the bar until there is something to
              show; that height is what the window layout reads. -->
         <div id="completion"></div>
+        <!-- src/prompt.rs: the question bru is waiting on, above the bar and
+             above the completion table, where qutebrowser puts its prompt
+             container. Empty means nothing is being asked, and
+             `#prompt:empty { display: none }` is what takes its height back —
+             the same rule #completion follows, and the reason prompt.js clears
+             it with textContent = "" rather than with blank markup. -->
+        <div id="prompt"></div>
         <!-- One row, like qutebrowser's statusbar: the status group sits on the
              right always, the command line takes the left when the mode is
              command. They are grid-placed, so the row is theirs whichever way
@@ -68,8 +75,10 @@
             <span id="download"></span>
         </div>
         <input id="cmdline" type="text" spellcheck="false" autocomplete="off" />
-        <!-- Before bottom.js, which calls into window.bruCompletion when it renders. -->
+        <!-- Before bottom.js, which calls into window.bruCompletion and
+             window.bruPrompt when it renders. -->
         <script src="completion.js"></script>
+        <script src="prompt.js"></script>
         <script src="bottom.js"></script>
     </body>
 </html>

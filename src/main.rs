@@ -37,6 +37,7 @@ mod navigate;
 mod open;
 mod popups;
 mod profile;
+mod prompt;
 mod scroll;
 mod spawn;
 mod session;

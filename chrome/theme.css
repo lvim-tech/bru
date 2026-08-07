@@ -164,6 +164,18 @@
     --mode-jump-mark-bg: var(--cyan);
     --mode-record-macro-bg: var(--magenta);
     --mode-run-macro-bg: var(--teal);
+    /* The two prompt modes — bru is asking and the browser is waiting.
+       Every one of the palette's nine hues was already spent by the ten modes
+       above, and a tenth *palette* key cannot be added here: not every colours/
+       file defines the `*_dark` siblings, so a theme picked at random would get
+       an empty variable and an unpainted pill. So this one is derived, from the
+       colour whose job is closest — command purple, because a prompt is the
+       other half of "the bar is talking to you" — brightened until it is
+       plainly a different pill beside it rather than a shade of it.
+       Both modes share it, exactly as set_mark and jump_mark share cyan: they
+       are one situation with two shapes, and the word in the pill says which. */
+    --mode-prompt-bg: #a18ec9;
+    --mode-yesno-bg: #a18ec9;
     --statusbar-progress-bg: var(--cyan);
     --statusbar-url-fg: var(--ui-fg);
     --statusbar-url-error-fg: var(--red);

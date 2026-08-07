@@ -28,6 +28,9 @@ const CHROME_CSS: &[u8] = include_bytes!("../chrome/chrome.css");
 const TOP_JS: &[u8] = include_bytes!("../chrome/top.js");
 const BOTTOM_JS: &[u8] = include_bytes!("../chrome/bottom.js");
 const COMPLETION_JS: &[u8] = include_bytes!("../chrome/completion.js");
+// --- src/prompt.rs ---------------------------------------------------------
+const PROMPT_JS: &[u8] = include_bytes!("../chrome/prompt.js");
+// --- end src/prompt.rs -----------------------------------------------------
 // --- src/cookies.rs --------------------------------------------------------
 const COOKIES_JS: &[u8] = include_bytes!("../chrome/cookies.js");
 // --- end src/cookies.rs ----------------------------------------------------
@@ -101,6 +104,9 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/top.js" => Some(("text/javascript", TOP_JS.to_vec())),
         "/bottom.js" => Some(("text/javascript", BOTTOM_JS.to_vec())),
         "/completion.js" => Some(("text/javascript", COMPLETION_JS.to_vec())),
+        // --- src/prompt.rs -----------------------------------------------------------------
+        "/prompt.js" => Some(("text/javascript", PROMPT_JS.to_vec())),
+        // --- end src/prompt.rs -------------------------------------------------------------
         // Generated per request from the live binding table, so it can never drift from the keys
         // the browser is actually running on. See src/help.rs.
         "/help" | "/help.html" => Some(("text/html", crate::help::current_page().into_bytes())),

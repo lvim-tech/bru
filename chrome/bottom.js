@@ -199,6 +199,18 @@
     accept: accept,
     cancel: cancel,
 
+    // --- src/prompt.rs ------------------------------------------------------
+    // Rust asks the prompt's own input what it holds, the way it asks the
+    // command line above. Forwarded rather than implemented here: prompt.js
+    // owns that input and this file does not know which of a login's two
+    // fields has the focus.
+    promptAccept: function () {
+      if (window.bruPrompt) {
+        window.bruPrompt.promptAccept();
+      }
+    },
+    // --- end src/prompt.rs --------------------------------------------------
+
     // state = {url, title, mode, keystring, scroll, tabindex, search, download,
     //          cmdline, completion, message}
     //
@@ -270,6 +282,13 @@
 
       renderMessage(state.message);
       renderCompletion(state.completion);
+      // --- src/prompt.rs ----------------------------------------------------
+      // The open question, or null. prompt.js owns every string in it, because
+      // every string in it may have come from a web page.
+      if (window.bruPrompt) {
+        window.bruPrompt.render(state.prompt);
+      }
+      // --- end src/prompt.rs ------------------------------------------------
       renderCmdline(state.cmdline);
 
       // The title is not a status-line field — the window wears it — but it is
