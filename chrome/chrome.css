@@ -190,6 +190,24 @@ body[data-view="top"] {
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+    /* src/settings.rs `tabs.title.alignment`. The span is `min-width: 0` inside
+       a flex row and grows to fill what is left, so text-align has something to
+       align inside; without the `flex: 1 1 auto` below the box would be exactly
+       as wide as the words and `right` would look identical to `left`. */
+    flex: 1 1 auto;
+    text-align: left;
+}
+
+/* src/settings.rs `tabs.title.alignment` — the two rules that are not the
+   default. top.js puts the value on `data-align`, so the stylesheet holds every
+   spelling and the page holds none. `tabs.title.elide` has no rules here and is
+   refused in settings.rs: CSS can only elide at the end. */
+body[data-align="right"] #tabs .title {
+    text-align: right;
+}
+
+body[data-align="center"] #tabs .title {
+    text-align: center;
 }
 
 /* --------------------------------------------------------------- bottom.html
@@ -631,6 +649,14 @@ body.mode-command #message {
    :empty, and bottom.js writing a space where it means nothing. The latter is
    why `put` writes `text || ""`. */
 #statusline > span:empty {
+    display: none;
+}
+
+/* src/settings.rs `statusbar.widgets`: a field the list does not name. Separate
+   from the :empty rule above on purpose — that one says "this field has nothing
+   to say right now", this one says "this field was not asked for", and a field
+   that is off must stay off while it has plenty to say. */
+#statusline > span.off {
     display: none;
 }
 

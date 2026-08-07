@@ -302,8 +302,29 @@ mod tests {
     /// same escape as everything else, and the page carries the escaped form.
     #[test]
     fn a_refusal_reason_cannot_escape_its_cell() {
-        let html = page(&bindings());
-        for (_, why) in crate::settings::REFUSED {
+        let b = bindings();
+        let html = page(&b);
+// --- tabs and statusbar ----------------------------------------------------
+        // Only the refusals a binding names reach this page, and that is what the page is: one row
+        // per binding, with the reason inside the row. `REFUSED` used to hold exactly the two the
+        // twelve `t**` bindings name, so walking all of it was walking those two; it now also holds
+        // `tabs.*` and `statusbar.*` names, which no default binding types, and those are printed by
+        // `bru://chrome/settings` instead — `settingspage.rs::every_refused_reason_is_escaped` is
+        // this same assertion over the page that does show them.
+        //
+        // Which ones those are is asked of the bindings rather than listed here, so that a binding
+        // added or taken away moves this check with it instead of leaving a hard-coded two.
+        let commands = b.all();
+        let named: Vec<&(&str, &str)> = crate::settings::REFUSED
+            .iter()
+            .filter(|(name, _)| commands.iter().any(|(_, _, cmd)| cmd.contains(name)))
+            .collect();
+        assert!(
+            named.len() >= 2,
+            "the two content settings the t** bindings name must still reach the page"
+        );
+        for (_, why) in named {
+// --- end tabs and statusbar ------------------------------------------------
             assert!(html.contains(&escape(why)), "the escaped reason is not on the page");
             // The plugins reason contains ASCII quotes, so this is not a vacuous check: the raw
             // string must *not* be there.

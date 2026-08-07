@@ -425,7 +425,14 @@ mod tests {
         // Nor are the four insert-mode settings: they are bru's own and always in force. Their
         // rows are the only `true`/`false` cells on the page, which is what this counts.
         assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 4);
+// --- tabs and statusbar ----------------------------------------------------
+        // Seven, not four. Every boolean whose backing is bru's own rather than Chromium's shows
+        // its value here rather than "not read yet", and `tabs.background`, `tabs.wrap` and
+        // `tabs.tooltips` are three more of them — all three default to true, so the `false` count
+        // above is untouched. This number moves with every bru-backed boolean setting; it is not a
+        // fact about the insert-mode four.
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 7);
+// --- end tabs and statusbar ------------------------------------------------
     }
 
     /// **A dict is not one line, and this is what the value column does about it.** One row per

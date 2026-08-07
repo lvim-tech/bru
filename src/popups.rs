@@ -86,6 +86,20 @@ pub enum Where {
 ///
 /// Every arm is deliberate; the enum has thirteen values and `NUM_VALUES` is a sentinel.
 pub fn decide(target_url: &str, disposition: WindowOpenDisposition) -> Where {
+    // --- tabs and statusbar ---------------------------------------------------------------------
+    // `tabs.background`, the setting the head of this file said would swap two arms and touch
+    // nothing else. It is read here rather than passed in because `decide` is called from one place
+    // and tested from six, and `decide_with` is what the tests drive.
+    decide_with(target_url, disposition, crate::settings::is_on("tabs.background"))
+}
+
+/// [`decide`] with the setting spelled out, so the tests can put it either way without a store.
+pub fn decide_with(
+    target_url: &str,
+    disposition: WindowOpenDisposition,
+    background: bool,
+) -> Where {
+    // --- end tabs and statusbar -----------------------------------------------------------------
     // `window.open()` with no URL wants a blank document the opener then scripts through the handle
     // it gets back. bru cancels the popup, so there is no handle to give and nothing would ever be
     // written into that tab. An empty tab the opener cannot reach is worse than no tab: the page has
@@ -102,10 +116,17 @@ pub fn decide(target_url: &str, disposition: WindowOpenDisposition) -> Where {
     }
 
     match disposition {
-        // The two that matter, and the two the reported bug is about. See the head of this file for
-        // why no `tabs.background` inversion belongs here yet.
+        // --- tabs and statusbar -----------------------------------------------------------------
+        // The two that matter, and the two the reported bug is about — and the two `tabs.background`
+        // swaps, which is exactly what qutebrowser's `webview.py:113-121` does with the same
+        // setting: `WebBrowserTab` becomes a background tab and `WebBrowserBackgroundTab` a
+        // foreground one when it is false. With the default (true) this is the direct mapping the
+        // head of this file argued for, so nothing about the measured behaviour changes.
+        WindowOpenDisposition::NEW_FOREGROUND_TAB if !background => Where::Background,
+        WindowOpenDisposition::NEW_BACKGROUND_TAB if !background => Where::Foreground,
         WindowOpenDisposition::NEW_FOREGROUND_TAB => Where::Foreground,
         WindowOpenDisposition::NEW_BACKGROUND_TAB => Where::Background,
+        // --- end tabs and statusbar -------------------------------------------------------------
 
         // A real window request. `NEW_POPUP` is `window.open(url, name, "width=400,height=300")`;
         // `NEW_WINDOW` is a shift-click or `window.open` asking for a full browser window.
@@ -301,6 +322,45 @@ mod tests {
             Where::Background
         );
     }
+
+    // --- tabs and statusbar ---------------------------------------------------------------------
+    /// `tabs.background false` swaps exactly the two arms the head of this file said it would, and
+    /// nothing else. The four other dispositions are asserted with it: a setting about where a *tab*
+    /// goes must not move a download or a refusal.
+    #[test]
+    fn tabs_background_false_swaps_the_two_tab_arms_and_only_those() {
+        assert_eq!(
+            decide_with(URL, WindowOpenDisposition::NEW_FOREGROUND_TAB, false),
+            Where::Background
+        );
+        assert_eq!(
+            decide_with(URL, WindowOpenDisposition::NEW_BACKGROUND_TAB, false),
+            Where::Foreground
+        );
+        // And true is the mapping that was measured through the real click path.
+        assert_eq!(
+            decide_with(URL, WindowOpenDisposition::NEW_FOREGROUND_TAB, true),
+            Where::Foreground
+        );
+        assert_eq!(
+            decide_with(URL, WindowOpenDisposition::NEW_BACKGROUND_TAB, true),
+            Where::Background
+        );
+        for disposition in [
+            WindowOpenDisposition::NEW_WINDOW,
+            WindowOpenDisposition::NEW_POPUP,
+            WindowOpenDisposition::SAVE_TO_DISK,
+            WindowOpenDisposition::OFF_THE_RECORD,
+        ] {
+            assert_eq!(
+                decide_with(URL, disposition, false),
+                decide_with(URL, disposition, true),
+                "{} is not a tab and must not move with tabs.background",
+                disposition_name(disposition)
+            );
+        }
+    }
+    // --- end tabs and statusbar -----------------------------------------------------------------
 
     /// `window.open(url, "_blank", "width=400")` and a shift-click. One window (DESIGN.md).
     #[test]

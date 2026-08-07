@@ -265,6 +265,360 @@ fn forget_completion_height(window: u32) {
 }
 // --- end src/completers.rs -----------------------------------------------------------------
 
+// --- tabs and statusbar ------------------------------------------------------------------------
+//
+// Where the two strips go and whether they are drawn at all. Four settings decide it —
+// `tabs.position`, `tabs.show`, `statusbar.position`, `statusbar.show` — and this is the only place
+// that reads them, so `tabs.rs` asks one question (`leading_strip_count`) and nothing else in bru
+// has an opinion about child order.
+//
+// **Placement and visibility are separate, and that is not a style choice.** A hidden strip stays a
+// child of the window; only its `set_visible` flag and its preferred height change. If hiding
+// removed it, every tab's index in `Window::add_child_view_at` would shift underneath
+// `tabs::attach`, and `xt` would renumber the strip it was hiding.
+
+/// One window's two chrome views, kept so a `:set` can reorder and hide them without going through
+/// the delegate that made them.
+///
+/// A `BrowserView` in a `Mutex` is the same move `ipc.rs` makes with `Frame` and for the same
+/// reason: `RefGuard<T>` is `unsafe impl Send + Sync` (CEF-NOTES). Everything below runs on the UI
+/// thread anyway; the mutex is here because the list is reached from `settings::apply`, which is not
+/// a window callback.
+struct Strips {
+    window: u32,
+    top: BrowserView,
+    bottom: BrowserView,
+    /// What was last handed to CEF. `apply_chrome_layout` compares against it and returns without
+    /// touching a view when nothing moved — `ipc::set_tabs_for` calls it on every address change,
+    /// and reordering a Views tree on each of those would be a relayout per navigation.
+    applied: Option<Layout>,
+    /// Which tab switch this window is currently showing the strip for, under `tabs.show
+    /// switching`. Bumped on every switch so that a second switch inside the delay does not get its
+    /// strip taken away by the first one's task.
+    switch_generation: u64,
+    /// Whether that delay is still running.
+    switching: bool,
+}
+
+/// Where the two strips are and whether they are drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Layout {
+    tabs_at_top: bool,
+    status_at_top: bool,
+    tabs_visible: bool,
+    status_visible: bool,
+}
+
+static STRIPS: std::sync::Mutex<Vec<Strips>> = std::sync::Mutex::new(Vec::new());
+
+/// How long `tabs.show switching` keeps the strip up. qutebrowser's own
+/// `tabs.show_switching_delay` default (`configdata.yml:2354`), compiled in rather than settable:
+/// bru has no integer setting kind, and a millisecond count spelled as text would be a number
+/// validated nowhere. See REFUSED in `settings.rs`.
+const SWITCHING_DELAY_MS: i64 = 800;
+
+/// How many strips sit above the pages — 0, 1 or 2.
+///
+/// `tabs::attach` adds a tab's view at `index + this`, so it is the offset that used to be the
+/// literal `1` meaning "the tab strip is child 0".
+pub fn leading_strip_count() -> i32 {
+    let places = places();
+    i32::from(places.tabs_at_top) + i32::from(places.status_at_top)
+}
+
+/// Only the placement half, which is a pure function of two settings and the same for every window.
+fn places() -> Layout {
+    Layout {
+        tabs_at_top: crate::settings::text_of("tabs.position") != "bottom",
+        status_at_top: crate::settings::text_of("statusbar.position") == "top",
+        // Not asked here — `wanted` fills these in per window.
+        tabs_visible: true,
+        status_visible: true,
+    }
+}
+
+/// The whole layout one window should be in right now.
+fn wanted(window: u32) -> Layout {
+    let mut layout = places();
+    layout.tabs_visible = strip_shown(window, true);
+    layout.status_visible = strip_shown(window, false);
+    layout
+}
+
+/// Whether a strip should be drawn. `tabs` picks which of the two settings answers.
+///
+/// **`statusbar.show never` still shows the bar while something is being typed into it**, and that
+/// is measured rather than preferred. qutebrowser's `StatusBar.maybe_hide` hides it outright, and it
+/// can: its command line is a `QLineEdit` it shows on demand. bru's is an `<input>` inside a
+/// `BrowserView`, and a Views child that is not visible cannot take focus — so the literal reading
+/// would make `:` a key that changes the mode, moves the focus nowhere, and leaves the user with no
+/// way to type the `:set statusbar.show always` that undoes it. Three modes keep it: command, and
+/// the two prompt modes, which are the three that own the strip's own inputs.
+fn strip_shown(window: u32, tabs: bool) -> bool {
+    if tabs {
+        return match crate::settings::text_of("tabs.show").as_str() {
+            "never" => false,
+            "multiple" => tab_count_in(window) > 1,
+            "switching" => is_switching(window),
+            // `always`, and anything a later CEF or a typo could produce: a strip that is there is
+            // the safe answer, because a strip that is not cannot be brought back by clicking it.
+            _ => true,
+        };
+    }
+    match crate::settings::text_of("statusbar.show").as_str() {
+        "never" => strip_holds_the_keyboard(window),
+        "in-mode" => {
+            crate::state::BruState::instance()
+                .and_then(|state| state.lock().ok().map(|state| state.mode_in(window)))
+                .unwrap_or(crate::modes::Mode::Normal)
+                != crate::modes::Mode::Normal
+        }
+        _ => true,
+    }
+}
+
+/// Whether this window's bottom strip is the thing keys are going into — command mode, or one of
+/// the two prompt modes.
+fn strip_holds_the_keyboard(window: u32) -> bool {
+    let mode = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().map(|state| state.mode_in(window)))
+        .unwrap_or(crate::modes::Mode::Normal);
+    matches!(
+        mode,
+        crate::modes::Mode::Command | crate::modes::Mode::Prompt | crate::modes::Mode::YesNo
+    )
+}
+
+fn tab_count_in(window: u32) -> usize {
+    crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().map(|state| state.tab_count_in(window)))
+        .unwrap_or(0)
+}
+
+/// Remember one window's two strips. Called from `on_window_created`, before anything can ask.
+fn remember_strips(window: u32, top: &BrowserView, bottom: &BrowserView) {
+    if let Ok(mut strips) = STRIPS.lock() {
+        strips.retain(|entry| entry.window != window);
+        strips.push(Strips {
+            window,
+            top: top.clone(),
+            bottom: bottom.clone(),
+            applied: None,
+            switch_generation: 0,
+            switching: false,
+        });
+    }
+}
+
+fn forget_strips(window: u32) {
+    if let Ok(mut strips) = STRIPS.lock() {
+        strips.retain(|entry| entry.window != window);
+    }
+}
+
+/// Whether this window is inside a `tabs.show switching` delay.
+fn is_switching(window: u32) -> bool {
+    STRIPS
+        .lock()
+        .ok()
+        .and_then(|strips| {
+            strips
+                .iter()
+                .find(|entry| entry.window == window)
+                .map(|entry| entry.switching)
+        })
+        .unwrap_or(false)
+}
+
+/// A tab was selected in this window — `tabs::select_in` says so.
+///
+/// Under `tabs.show switching` it puts the strip up and posts the task that takes it away again;
+/// under every other value it does nothing at all, so the common path is one string compare.
+pub fn note_tab_switch(window: u32) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    if crate::settings::text_of("tabs.show") != "switching" {
+        return;
+    }
+    let generation = {
+        let Ok(mut strips) = STRIPS.lock() else {
+            return;
+        };
+        let Some(entry) = strips.iter_mut().find(|entry| entry.window == window) else {
+            return;
+        };
+        entry.switching = true;
+        entry.switch_generation += 1;
+        entry.switch_generation
+    };
+    apply_chrome_layout(window);
+    let mut task = HideSwitchingStrip::new(window, generation);
+    post_delayed_task(ThreadId::UI, Some(&mut task), SWITCHING_DELAY_MS);
+}
+
+wrap_task! {
+    struct HideSwitchingStrip {
+        window: u32,
+        generation: u64,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let stale = {
+                let Ok(mut strips) = STRIPS.lock() else { return };
+                let Some(entry) = strips.iter_mut().find(|entry| entry.window == self.window) else {
+                    return;
+                };
+                // A switch that happened after this task was posted owns the strip now, and its own
+                // task will take it away 800 ms after *it* happened. Without this, holding `J` would
+                // leave the strip hidden while the tabs were still changing.
+                if entry.switch_generation != self.generation {
+                    true
+                } else {
+                    entry.switching = false;
+                    false
+                }
+            };
+            if !stale {
+                apply_chrome_layout(self.window);
+            }
+        }
+    }
+}
+
+/// Put one window's strips where the settings say, and hide the ones the settings say to hide.
+///
+/// Cheap when nothing moved, which is almost always: it is called from `ipc::set_tabs_for` (every
+/// address change) and `ipc::set_mode_for` (every mode change) so that `tabs.show multiple` and
+/// `statusbar.show in-mode` are true of the moment rather than of the last `:set`.
+pub fn apply_chrome_layout(window: u32) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+    let want = wanted(window);
+    let (top, bottom, was) = {
+        let Ok(mut strips) = STRIPS.lock() else {
+            return;
+        };
+        let Some(entry) = strips.iter_mut().find(|entry| entry.window == window) else {
+            return;
+        };
+        if entry.applied == Some(want) {
+            return;
+        }
+        let was = entry.applied.replace(want);
+        (entry.top.clone(), entry.bottom.clone(), was)
+    };
+
+    let handle = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.window_handle(window)));
+    let Some(handle) = handle else {
+        return;
+    };
+
+    // Order first, then visibility: reordering an invisible view is legal and reordering a visible
+    // one is one repaint, so doing it in this order costs at most one extra frame of the old
+    // arrangement and never a frame of a strip drawn twice.
+    let reordered = was.map(|was| (was.tabs_at_top, was.status_at_top))
+        != Some((want.tabs_at_top, want.status_at_top));
+    if reordered {
+        reorder(&handle, &top, &bottom, want);
+    }
+
+    View::from(&top).set_visible(i32::from(want.tabs_visible));
+    View::from(&bottom).set_visible(i32::from(want.status_visible));
+    // Belt and braces, and it is not redundant: `set_visible(0)` is what stops a strip being
+    // painted, and `preferred_size` answering 0 is what stops the box layout keeping its 40 px. A
+    // `BoxLayout` skips an invisible child, so either alone should do — this way a CEF that changes
+    // its mind about one of them cannot leave a blank band where the strip was.
+    View::from(&top).invalidate_layout();
+    View::from(&bottom).invalidate_layout();
+    View::from(&handle).invalidate_layout();
+
+    debug_strips(window, want, reordered);
+}
+
+/// `Panel::reorder_child_view` for both strips, which is what makes `tabs.position` live rather than
+/// something that needs a new window.
+///
+/// The leading strips are moved to 0 and 1 in order; the trailing ones are each moved to the last
+/// index in turn, so applying them in order leaves them in that order at the end. The pages in
+/// between are never touched — a reorder is a remove-and-insert, and everything else slides.
+fn reorder(handle: &Window, top: &BrowserView, bottom: &BrowserView, want: Layout) {
+    // qutebrowser's own order, `mainwindow.py::_add_widgets`: a status bar asked for the top is
+    // inserted at 0, which puts it *above* the tab strip; one asked for the bottom is appended,
+    // which puts it below.
+    let mut leading: Vec<&BrowserView> = Vec::new();
+    let mut trailing: Vec<&BrowserView> = Vec::new();
+    if want.status_at_top {
+        leading.push(bottom);
+    } else {
+        trailing.push(bottom);
+    }
+    if want.tabs_at_top {
+        leading.push(top);
+    } else {
+        trailing.insert(0, top);
+    }
+
+    for (index, view) in leading.iter().enumerate() {
+        handle.reorder_child_view(Some(&mut View::from(*view)), index as i32);
+    }
+    let last = handle.child_view_count() as i32 - 1;
+    for view in trailing {
+        handle.reorder_child_view(Some(&mut View::from(view)), last);
+    }
+}
+
+/// Whether a strip is currently hidden, for the preferred height its delegate answers with.
+fn strip_hidden(window: u32, grows: bool) -> bool {
+    STRIPS
+        .lock()
+        .ok()
+        .and_then(|strips| {
+            strips
+                .iter()
+                .find(|entry| entry.window == window)
+                .and_then(|entry| entry.applied)
+                .map(|applied| {
+                    if grows {
+                        !applied.status_visible
+                    } else {
+                        !applied.tabs_visible
+                    }
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// `BRU_DEBUG_STRIPS=1` prints what each window's strips were just put into.
+///
+/// It is the only way to read the decision without a screenshot, and a screenshot of this is not
+/// self-evident: six brus share this compositor, and "the strip is not there" and "the window is not
+/// the one in the picture" look the same. Off by default; a line per change, not per layout pass.
+fn debug_strips(window: u32, layout: Layout, reordered: bool) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_STRIPS").is_some()) {
+        eprintln!(
+            "bru[strips]: window {window} tabs={} at {} status={} at {} reordered={reordered}",
+            if layout.tabs_visible { "shown" } else { "hidden" },
+            if layout.tabs_at_top { "top" } else { "bottom" },
+            if layout.status_visible { "shown" } else { "hidden" },
+            if layout.status_at_top { "top" } else { "bottom" },
+        );
+    }
+}
+
+/// Every window's, for a `:set` that changed one of the four.
+pub fn apply_chrome_layout_everywhere() {
+    let windows: Vec<u32> = match STRIPS.lock() {
+        Ok(strips) => strips.iter().map(|entry| entry.window).collect(),
+        Err(_) => return,
+    };
+    for window in windows {
+        apply_chrome_layout(window);
+    }
+}
+// --- end tabs and statusbar --------------------------------------------------------------------
+
 /// A `CefString` that survives being written into a struct CEF reads back.
 ///
 /// `CefString::from(&str)` allocates and marks itself owned, and cef-rs's conversion back to the C
@@ -369,8 +723,31 @@ wrap_window_delegate! {
             };
             let layout = window.set_to_box_layout(Some(&settings));
 
-            let mut top = View::from(top);
-            window.add_child_view(Some(&mut top));
+            // --- tabs and statusbar --------------------------------------------------------
+            // The two strips are remembered before either is added: `leading_strip_count`, which
+            // `tabs::attach_all_in` is about to ask, is a pure function of the settings and does
+            // not need them — but `apply_chrome_layout` at the end of this function does.
+            remember_strips(self.window_id, top, bottom);
+            // Which strips go above the pages, and in what order. `tabs.position` and
+            // `statusbar.position` decide it; the default is the arrangement this function had
+            // hard-coded — tab strip, pages, status bar.
+            let places = places();
+            let mut leading: Vec<View> = Vec::new();
+            let mut trailing: Vec<View> = Vec::new();
+            if places.status_at_top {
+                leading.push(View::from(bottom));
+            } else {
+                trailing.push(View::from(bottom));
+            }
+            if places.tabs_at_top {
+                leading.push(View::from(top));
+            } else {
+                trailing.insert(0, View::from(top));
+            }
+            for mut view in leading {
+                window.add_child_view(Some(&mut view));
+            }
+            // --- end tabs and statusbar ----------------------------------------------------
 
             // Nothing else is ever handed the window or its layout; keep both where a tab opened
             // later can find them. The lock is let go before any tab is placed — see tabs.rs.
@@ -384,8 +761,11 @@ wrap_window_delegate! {
             // opened before handing the slot over.
             tabs::attach_all_in(&self.state, self.window_id);
 
-            let mut bottom = View::from(bottom);
-            window.add_child_view(Some(&mut bottom));
+            // --- tabs and statusbar --------------------------------------------------------
+            for mut view in trailing {
+                window.add_child_view(Some(&mut view));
+            }
+            // --- end tabs and statusbar ----------------------------------------------------
 
             // A name before the first page has one. Without it the toplevel is mapped with an empty
             // title for as long as the first load takes, and a compositor that reads the title once
@@ -402,6 +782,12 @@ wrap_window_delegate! {
                 .expect("state mutex poisoned")
                 .active_tab_in(self.window_id);
             tabs::select_in(&self.state, self.window_id, active);
+
+            // --- tabs and statusbar --------------------------------------------------------
+            // Now that the tabs are in and the window knows its own mode: `tabs.show never` has to
+            // hide the strip a window has only just grown, and `tabs.show multiple` has to count.
+            apply_chrome_layout(self.window_id);
+            // --- end tabs and statusbar ----------------------------------------------------
         }
 
         // Focus follows the compositor. `keys.rs` also names the window from the browser a key
@@ -425,6 +811,11 @@ wrap_window_delegate! {
                 .forget_window(self.window_id);
             crate::ipc::forget_window(self.window_id);
             forget_completion_height(self.window_id);
+            // --- tabs and statusbar --------------------------------------------------------
+            // Before the views are dropped below: the list holds clones of both of them, and a row
+            // left behind would keep a window's chrome alive after the window had gone.
+            forget_strips(self.window_id);
+            // --- end tabs and statusbar ----------------------------------------------------
             // Drop the views here, or the window outlives the browsers it holds.
             *self.top_view.borrow_mut() = None;
             *self.bottom_view.borrow_mut() = None;
@@ -572,6 +963,15 @@ wrap_browser_view_delegate! {
             if self.grows {
                 debug_bar(self.window_id, self.height + extra);
             }
+// --- tabs and statusbar --------------------------------------------------------------------
+            // `tabs.show` / `statusbar.show`. `set_visible(0)` is the first half and this is the
+            // second: a `BoxLayout` skips an invisible child, so either alone should reclaim the
+            // band — asking for nothing as well means a CEF that lays an invisible view out anyway
+            // still lays it out zero pixels tall.
+            if strip_hidden(self.window_id, self.grows) {
+                return Size { width: 1280, height: 0 };
+            }
+// --- end tabs and statusbar ----------------------------------------------------------------
             Size { width: 1280, height: self.height + extra }
 // --- end src/completers.rs -----------------------------------------------------------------
         }
