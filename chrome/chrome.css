@@ -573,76 +573,59 @@ body.mode-command #message {
     background: var(--downloads-start-bg);
 }
 
-/* Mode colouring ----------------------------------------------------------
+/* The mode pill ------------------------------------------------------------
  *
- * **The bar keeps one colour; the indicator is what changes.** qutebrowser
- * repaints the whole statusbar by mode and bru did the same until the user
- * said otherwise 2026-08-07: a bar that turns green under the page is a large
- * moving thing at the bottom of the eye, and it says only "something is
- * different" — the word in the box says which. So the mode's own pair from the
- * theme is spent on the box, where it is a badge, and the bar itself never
- * moves.
+ * **Its own variables, and nothing else reads them.** The first attempt spent
+ * `--statusbar-normal-bg` and `--statusbar-command-bg` on the pill, and both
+ * were already the background of something: the first turned the whole strip
+ * green, the second turned the command line purple. `--mode-*` belongs to this
+ * one element.
  *
- * Normal mode uses the same pair as the bar, so its badge reads as plain text
- * rather than as a block. That is deliberate: normal is the mode you are in
- * when nothing is happening, and it should look like nothing is happening.
+ * The bar itself never changes colour — qutebrowser repaints the whole status
+ * bar by mode and bru did too until the user said otherwise: a bar that turns
+ * green under the page is a large moving thing at the edge of the eye, and it
+ * says only that something is different. The word in the pill says which.
  */
 
 #mode {
-    color: var(--statusbar-normal-fg);
-    background: var(--statusbar-normal-bg);
+    color: var(--mode-fg);
+    background: var(--mode-normal-bg);
 }
 
 body.mode-insert #mode {
-    color: var(--statusbar-insert-fg);
-    background: var(--statusbar-insert-bg);
-}
-
-body.mode-passthrough #mode {
-    color: var(--statusbar-passthrough-fg);
-    background: var(--statusbar-passthrough-bg);
+    background: var(--mode-insert-bg);
 }
 
 body.mode-caret #mode {
-    color: var(--statusbar-caret-fg);
-    background: var(--statusbar-caret-bg);
+    background: var(--mode-caret-bg);
 }
 
 body.mode-command #mode {
-    color: var(--statusbar-command-fg);
-    background: var(--statusbar-command-bg);
+    background: var(--mode-command-bg);
 }
 
-/* The modes qutebrowser has no colours for. bru has more modes than it does —
-   hint, the two register modes, and the two macro ones — and a mode indicator
-   that cannot tell them apart is a mode indicator for five of the ten. The
-   theme grew a pair for each; see `extra/desktop/bru.lua` in lvim-colorscheme,
-   which is the *target* file and the only place a colour question is answered
-   for bru. The palettes those read are never touched. */
+body.mode-passthrough #mode {
+    background: var(--mode-passthrough-bg);
+}
 
 body.mode-hint #mode {
-    color: var(--statusbar-hint-fg);
-    background: var(--statusbar-hint-bg);
+    background: var(--mode-hint-bg);
 }
 
 body.mode-set_mark #mode {
-    color: var(--statusbar-set-mark-fg);
-    background: var(--statusbar-set-mark-bg);
+    background: var(--mode-set-mark-bg);
 }
 
 body.mode-jump_mark #mode {
-    color: var(--statusbar-jump-mark-fg);
-    background: var(--statusbar-jump-mark-bg);
+    background: var(--mode-jump-mark-bg);
 }
 
 body.mode-record_macro #mode {
-    color: var(--statusbar-record-macro-fg);
-    background: var(--statusbar-record-macro-bg);
+    background: var(--mode-record-macro-bg);
 }
 
 body.mode-run_macro #mode {
-    color: var(--statusbar-run-macro-fg);
-    background: var(--statusbar-run-macro-bg);
+    background: var(--mode-run-macro-bg);
 }
 
 /* ------------------------------------------------------------------------- */
