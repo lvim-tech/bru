@@ -101,6 +101,13 @@ enum Which {
     /// `/` and `?` — everything searched for before, newest first. See [`partition`] for why this
     /// exists at all, and `src/find.rs` for the store behind it.
     SearchHistory,
+    /// `:mode-enter <mode>` — the modes a command may put a window into, which is eight of the
+    /// twelve. bru's own: qutebrowser declares no completion for `:mode-enter`, and the four it
+    /// would have to leave out are the four `Mode::can_be_entered_by_command` already names.
+    ModeName,
+    /// `:session-save`, `:session-load`, `:session-delete` — the files under `sessions/`
+    /// (`miscmodels.py:76-87`).
+    Session,
 }
 
 /// Which settings an option model offers — `configmodel.py`'s four, less the customized one.
@@ -180,6 +187,20 @@ const SPECS: &[Spec] = &[
     Spec { name: "config-list-remove", argpos: 0, which: Which::Setting(Only::Lists), rest_from: None, vararg: false },
     Spec { name: "config-list-remove", argpos: 1, which: Which::ListEntry, rest_from: None, vararg: false },
     // --- end the settings -----------------------------------------------------------------------
+
+    // `:bind <key> <command…>` — the key is a word and the command is everything after it, which is
+    // `maxsplit=1` (`configcommands.py:119`). The **key** is deliberately not completed: a `:bind`
+    // usually names a key that is not bound yet, so there is no set to offer, and qutebrowser
+    // offers the current binding for it as part of the *command* model instead
+    // (`configmodel._bind_current_default`) — which bru does not, because that model is one
+    // category of 166 rows here and a two-row Current/Default in front of it would push the list
+    // down for something the status bar can say.
+    Spec { name: "bind", argpos: 1, which: Which::Commands, rest_from: Some(1), vararg: false },
+
+    Spec { name: "mode-enter", argpos: 0, which: Which::ModeName, rest_from: None, vararg: false },
+    Spec { name: "session-save", argpos: 0, which: Which::Session, rest_from: None, vararg: false },
+    Spec { name: "session-load", argpos: 0, which: Which::Session, rest_from: None, vararg: false },
+    Spec { name: "session-delete", argpos: 0, which: Which::Session, rest_from: None, vararg: false },
 ];
 
 /// The command line cut into the part being completed and the parts around it.
@@ -774,6 +795,28 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
         // reason rather than a new one: this *is* a history, it is offered newest first, and the
         // newest 25 that match are the answer. The file's own bound is 100 — see
         // `find.rs::HISTORY_MAX` — which is what stops the list growing without end.
+        // One column each, for `Which::SearchHistory`'s reason: there is nothing to put beside them.
+        // A mode's name is the whole of what `mode-enter` takes, and what each mode *is* belongs on
+        // `bru://chrome/help`, which lists every mode's bindings under its own heading. A session is
+        // a file name; its size and its date are `ls`'s answer, not a completion's.
+        Which::ModeName => {
+            let rows = Mode::ALL
+                .iter()
+                .filter(|mode| mode.can_be_entered_by_command())
+                .map(|mode| vec![mode.name().to_string()])
+                .collect();
+            completion::list_category_max("Modes", &[100], rows, pattern, usize::MAX)
+                .into_iter()
+                .collect()
+        }
+
+        Which::Session => {
+            let rows = crate::session::list().into_iter().map(|name| vec![name]).collect();
+            completion::list_category_max("Sessions", &[100], rows, pattern, usize::MAX)
+                .into_iter()
+                .collect()
+        }
+
         Which::SearchHistory => {
             let rows = crate::find::history().into_iter().map(|term| vec![term]).collect();
             completion::list_category("Search history", &[100], rows, pattern)
@@ -1898,6 +1941,70 @@ mod tests {
         let entries = build(&part(":config-list-remove zoom.levels ").unwrap());
         let names: Vec<&str> = entries[0].items.iter().map(|i| i.cols[0].as_str()).collect();
         assert!(names.contains(&"100%"), "{names:?}");
+    }
+
+    // ---- the last three finite sets ----
+
+    #[test]
+    fn bind_completes_the_command_it_is_binding_and_not_the_key() {
+        // `maxsplit=1`: the key is a word, the command is everything after it.
+        assert!(part(":bind j").is_none(), "a key that is not bound yet is not a set");
+        let command = part(":bind j scroll do").unwrap();
+        assert_eq!(command.which, Which::Commands);
+        assert_eq!(command.center, "scroll do");
+        assert_eq!(command.before, ["bind", "j"]);
+        // Column 0 is the command's name, so the arguments the user was part-way through typing go
+        // — which is what `_change_completed_part` does to a maxsplit part in qutebrowser too.
+        assert_eq!(command.line_with("scroll"), ":bind j scroll");
+        // A flag before the key stays with the command.
+        let moded = part(":bind -d j scroll down").unwrap();
+        assert_eq!(moded.which, Which::Commands);
+        assert_eq!(moded.center, "scroll down");
+        assert_eq!(moded.line_with("scroll"), ":bind -d j scroll");
+
+        // **And the flaw, stated rather than hidden.** A flag's *value* is counted as a positional,
+        // because the only thing either completion knows about a flag is its leading `-`
+        // (`completer.py:97`) — so `--mode caret` shifts everything one place and the part under
+        // the cursor comes out one argument early. It is qutebrowser's behaviour to the letter, and
+        // the `=` spelling is the one that keeps the count: it is one token and it starts with `-`.
+        assert_eq!(part(":bind --mode caret j move-to-next-line").unwrap().center, "j move-to-next-line");
+        assert_eq!(part(":bind --mode=caret j move-to-next-line").unwrap().center, "move-to-next-line");
+    }
+
+    #[test]
+    fn mode_enter_offers_the_modes_a_command_may_enter() {
+        assert_eq!(part(":mode-enter ").unwrap().which, Which::ModeName);
+        let cats = build_which(Which::ModeName, "");
+        let names: Vec<&str> = cats[0].items.iter().map(|i| i.cols[0].as_str()).collect();
+        assert_eq!(
+            names,
+            ["normal", "insert", "passthrough", "caret", "set_mark", "jump_mark", "record_macro", "run_macro"]
+        );
+        // The four a question or a keypress puts you in are not on offer, because `commands.rs`
+        // refuses them at parse time — offering one would offer a line that does not parse.
+        for refused in ["command", "hint", "prompt", "yesno"] {
+            assert!(!names.contains(&refused), "{refused} can be typed but not entered");
+            assert!(crate::commands::parse(&format!("mode-enter {refused}")).is_err());
+        }
+        // And every one that is offered does parse.
+        for name in &names {
+            assert!(
+                crate::commands::parse(&format!("mode-enter {name}")).is_ok(),
+                "mode-enter {name} is offered and does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_session_commands_offer_the_files_that_are_there() {
+        for text in [":session-load ", ":session-delete ", ":session-save "] {
+            assert_eq!(part(text).unwrap().which, Which::Session, "{text}");
+        }
+        // `session::list` reads a directory, so what it answers under `cargo test` is whatever the
+        // scratch data directory holds — which is nothing. An empty source is a closed bar, and
+        // that is the whole claim testable without a disk here.
+        let cats = build_which(Which::Session, "");
+        assert!(cats.iter().all(|cat| !cat.items.is_empty()), "a bare header would be drawn");
     }
 
     /// `rest_from` is the command's `maxsplit` and not one argument's, so two rows for one command
