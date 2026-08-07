@@ -21,6 +21,17 @@
  * document never changes height, so it states its 28px outright.
  */
 
+/* TEXT IS PAINTED WITH --ui-fg AND --ui-fg-dim, NEVER WITH --fg OR --comment.
+ *
+ * --fg and --comment are the palette's own values, passed through unchanged so
+ * that a hand-written override still gets the answer the palette gives. They are
+ * tuned for reading code in an editor, and against bru's own background they
+ * measure 2.31:1 and 2.14:1 — WCAG AA for body text is 4.5:1. --ui-fg is that
+ * same colour with its hsluv LIGHTNESS walked up until it clears 4.5, hue and
+ * saturation intact, and --ui-fg-dim is the quieter tier floored at 3:1.
+ * The flooring is done in extra/desktop/bru.lua, in lvim-colorscheme, because
+ * the palette itself is never edited to fix one target. */
+
 * {
     box-sizing: border-box;
 }
@@ -852,7 +863,7 @@ body[data-view="help"] {
     height: auto;
     overflow: auto;
     background: var(--bg);
-    color: var(--fg);
+    color: var(--ui-fg);
 }
 
 #help {
@@ -869,7 +880,7 @@ body[data-view="help"] {
 
 #help .summary {
     margin: 0 0 2rem;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 #help h2 {
@@ -900,12 +911,12 @@ body[data-view="help"] {
     color: var(--completion-match-fg);
 }
 
-#help .cmd { color: var(--fg); }
+#help .cmd { color: var(--ui-fg); }
 
 #help .state {
     width: 8ch;
     text-align: right;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 /* A binding that is bound but does nothing yet reads as quieter, not as broken. */
@@ -925,7 +936,7 @@ body[data-view="help"] {
     max-width: 46rem;
     font-size: 0.85em;
     line-height: 1.35;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
     opacity: 1;
 }
 
@@ -936,7 +947,7 @@ body[data-view="help"] {
 #help .note {
     margin: 0 0 0.75rem;
     font-size: 0.85em;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 /* Wider than .keys: `prompt-fileselect-external` is 26 characters and wrapping
@@ -952,7 +963,7 @@ body[data-view="help"] {
 #help .alias {
     display: block;
     font-size: 0.85em;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 #help .sig {
@@ -966,7 +977,7 @@ body[data-view="help"] {
     display: block;
     max-width: 46rem;
     line-height: 1.35;
-    color: var(--fg);
+    color: var(--ui-fg);
 }
 
 /* The join. Right-aligned so the keys line up against the state column and can
@@ -979,7 +990,7 @@ body[data-view="help"] {
 
 /* A key that opens the command line with the command in it rather than running
    it. Quieter, because it is a weaker claim — see `Reached` in src/help.rs. */
-#help .typed { color: var(--comment); }
+#help .typed { color: var(--ui-fg-dim); }
 
 /* ------------------------------------------------- bru://chrome/cookies
  *
@@ -1029,7 +1040,7 @@ body[data-view="cookies"] {
 
 #cookies .summary {
     margin: 0 0 0.75rem;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 #cookies kbd {
@@ -1068,7 +1079,7 @@ body[data-view="cookies"] {
     padding: 0.3rem 0.7rem;
     font: inherit;
     background: var(--completion-even-bg);
-    color: var(--fg);
+    color: var(--ui-fg);
     border: 1px solid var(--completion-border);
     border-radius: 2px;
     cursor: pointer;
@@ -1097,7 +1108,7 @@ body[data-view="cookies"] {
     padding-bottom: 0.25rem;
 }
 
-#cookies h2 .count { color: var(--comment); }
+#cookies h2 .count { color: var(--ui-fg-dim); }
 
 #cookies .row {
     display: flex;
@@ -1164,9 +1175,9 @@ body[data-view="cookies"] {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--comment);
+    color: var(--ui-fg-dim);
 }
 
 #cookies .path   { width: 12ch; flex: none; overflow: hidden; white-space: nowrap; }
 #cookies .flags  { width: 17ch; flex: none; white-space: nowrap; color: var(--completion-category-fg); }
-#cookies .expiry { width: 11ch; flex: none; text-align: right; white-space: nowrap; color: var(--comment); }
+#cookies .expiry { width: 11ch; flex: none; text-align: right; white-space: nowrap; color: var(--ui-fg-dim); }
