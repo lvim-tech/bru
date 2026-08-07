@@ -67,7 +67,7 @@
 
 use cef::*;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::cmdline::CmdLine;
@@ -254,8 +254,19 @@ struct Open {
     /// The second field of a login. `on_password` says which of the two the keys are going to.
     password: CmdLine,
     on_password: bool,
-    /// A filename prompt's directory listing, and the row `prompt-item-focus` is on.
+    /// A filename prompt's directory listing, the directory it is a listing **of**, and the row
+    /// `prompt-item-focus` is on.
+    ///
+    /// The directory is kept beside the list rather than derived from the line, and that is not
+    /// redundancy. `<Tab>` writes the selected entry into the line, so deriving it would mean the
+    /// second `<Tab>` joining the *first* one's answer with an entry of the old directory —
+    /// measured 2026-08-07: two `<Tab>`s on a listing of `dl/` produced `…/prompt/music/`, a path
+    /// that does not exist, out of `..` followed by `music`. qutebrowser does not re-root on
+    /// `<Tab>` either: `_set_fileview_root(path, tabbed=True)` (prompt.py:703-720) falls through
+    /// every branch and returns, so its view keeps listing the same directory and `<Tab>` cycles
+    /// siblings. This is that behaviour, written down instead of emergent.
     items: Vec<String>,
+    items_dir: PathBuf,
     selected: Option<usize>,
     /// The key hints, resolved against the live binding table **once**, when the question opened.
     ///
@@ -339,10 +350,10 @@ pub fn ask(window: u32, question: Question) {
 fn open_of(question: Question) -> Open {
     let mut line = CmdLine::new();
     line.set_text(&question.default);
-    let items = if question.kind == Kind::Download {
+    let (items_dir, items) = if question.kind == Kind::Download {
         list_dir(&question.default)
     } else {
-        Vec::new()
+        (PathBuf::new(), Vec::new())
     };
     let keys = key_hints(&question);
     Open {
@@ -351,6 +362,7 @@ fn open_of(question: Question) -> Open {
         password: CmdLine::new(),
         on_password: false,
         items,
+        items_dir,
         selected: None,
         keys,
     }
@@ -901,7 +913,9 @@ pub fn run_readline(name: &str, arg: &str) -> bool {
         // A filename prompt's listing follows the line it is completing.
         if open.question.kind == Kind::Download {
             let text = open.line.text();
-            open.items = list_dir(&text);
+            let (dir, items) = list_dir(&text);
+            open.items_dir = dir;
+            open.items = items;
             open.selected = None;
         }
         true
@@ -1017,6 +1031,20 @@ fn accept_open(
             if path.as_os_str().is_empty() {
                 return Err(Some("invalid filename".to_string()));
             }
+            // A path that names a *directory* keeps the name the download came with — the whole
+            // point of `<Tab>` is to choose where, not to rename to nothing. `downloads.transform_path`
+            // does the same (downloads.py, reached from `FilenamePrompt.accept`).
+            // Measured 2026-08-07 without it: three `<Tab>`s and `<Return>` answered
+            // `…/dl/papers/`, Chromium was handed a directory as a filename, and no file appeared.
+            let path = if text.ends_with('/') || path.is_dir() {
+                let name = Path::new(&open.question.default)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "download".to_string());
+                path.join(name)
+            } else {
+                path
+            };
             Ok(Answer::Text(path.to_string_lossy().to_string()))
         }
         Kind::UserPwd => {
@@ -1078,7 +1106,9 @@ fn item_focus(window: u32, which: FocusWhich) {
                 // Selecting a row puts it in the line, the way `_insert_path` does — the point of
                 // `<Tab>` is completion, not a torch shone along a list.
                 if let Some(at) = open.selected {
-                    let joined = join_dir(&open.line.text(), &open.items[at]);
+                    // Against the directory the listing is **of**, never against the line: the
+                    // line already holds whatever the previous `<Tab>` put there.
+                    let joined = join_dir(&open.items_dir, &open.items[at]);
                     open.line.set_text(&joined);
                 }
                 true
@@ -1225,7 +1255,9 @@ wrap_task! {
                     return false;
                 }
                 open.line.set_text(&self.chosen);
-                open.items = list_dir(&self.chosen);
+                let (dir, items) = list_dir(&self.chosen);
+                open.items_dir = dir;
+                open.items = items;
                 open.selected = None;
                 true
             });
@@ -1256,18 +1288,18 @@ fn expand_path(text: &str) -> PathBuf {
 /// The directories under whatever `text` names, sorted, with `..` first — `_set_fileview_root`
 /// plus `DownloadFilenamePrompt`'s `QDir.Filter.AllDirs` (`prompt.py:863-864`). Directories only:
 /// the thing being chosen is where a file goes, and the file's own name is typed.
-fn list_dir(text: &str) -> Vec<String> {
+fn list_dir(text: &str) -> (PathBuf, Vec<String>) {
     let path = expand_path(text);
     let dir = if path.is_dir() {
         path
     } else {
         match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => return Vec::new(),
+            _ => return (PathBuf::new(), Vec::new()),
         }
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+        return (dir, Vec::new());
     };
     let mut out: Vec<String> = entries
         .filter_map(Result::ok)
@@ -1277,15 +1309,13 @@ fn list_dir(text: &str) -> Vec<String> {
         .collect();
     out.sort();
     out.insert(0, "..".to_string());
-    out
+    (dir, out)
 }
 
 /// Where selecting `item` takes the line. `..` goes up; anything else goes down.
-fn join_dir(text: &str, item: &str) -> String {
-    let path = expand_path(text);
-    let dir = if path.is_dir() { path } else { path.parent().map(PathBuf::from).unwrap_or_default() };
+fn join_dir(dir: &Path, item: &str) -> String {
     let joined = if item == ".." {
-        dir.parent().map(PathBuf::from).unwrap_or(dir)
+        dir.parent().map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf())
     } else {
         dir.join(item)
     };
@@ -1764,6 +1794,42 @@ mod tests {
         let mut open = opened(Kind::Alert);
         assert_eq!(accept_open(&mut open, None, false), Ok(Answer::Cancelled));
         assert!(accept_open(&mut open, Some("yes"), false).is_err());
+    }
+
+    /// `<Tab>` cycles the entries of **one** directory and writes each into the line, so the join
+    /// has to be against the directory the listing is of and never against the line — which the
+    /// previous `<Tab>` has already rewritten. Measured on a real download before this was split
+    /// out: `..` then `music` produced `…/prompt/music/`, a path that does not exist.
+    #[test]
+    fn tabbing_through_a_listing_joins_against_the_listing_and_not_the_line() {
+        let dir = Path::new("/home/someone/Downloads");
+        assert_eq!(join_dir(dir, ".."), "/home/someone/");
+        assert_eq!(join_dir(dir, "papers"), "/home/someone/Downloads/papers/");
+        // The second `<Tab>` starts from the same directory as the first, whatever the first put
+        // in the line. This is the assertion the bug would have failed.
+        assert_eq!(join_dir(dir, "music"), "/home/someone/Downloads/music/");
+        // `..` at the root has nowhere to go and stays put rather than producing an empty path.
+        assert_eq!(join_dir(Path::new("/"), ".."), "//");
+    }
+
+    /// Accepting a *directory* keeps the name the download came with. Without it `<Tab>` to a
+    /// folder and `<Return>` hands Chromium a directory as a filename and nothing is written —
+    /// measured 2026-08-07, `…/dl/papers/` accepted and no file anywhere.
+    #[test]
+    fn accepting_a_directory_keeps_the_downloads_own_name() {
+        let mut open =
+            open_of(question(Kind::Download).defaulting_to("/tmp/bru-test-dl/report.pdf"));
+        assert_eq!(
+            accept_open(&mut open, Some("/tmp/bru-test-dl/papers/"), false),
+            Ok(Answer::Text("/tmp/bru-test-dl/papers/report.pdf".to_string()))
+        );
+        // A path that names a file is taken as it stands.
+        assert_eq!(
+            accept_open(&mut open, Some("/tmp/bru-test-dl/other.pdf"), false),
+            Ok(Answer::Text("/tmp/bru-test-dl/other.pdf".to_string()))
+        );
+        // And an empty one is refused rather than turned into the current directory.
+        assert!(accept_open(&mut open, Some("   "), false).is_err());
     }
 
     /// The strip's height is a row count times the stylesheet's own row height, and nothing else —
