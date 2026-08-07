@@ -243,6 +243,10 @@ wrap_browser_process_handler! {
             // fetches its stylesheets when it loads. This is what closes that gap; see
             // `src/theme_watch.rs` for the signal, the command and the polling that came before it.
             crate::theme_watch::start();
+            // --- src/remote.rs -----------------------------------------------------------------
+            // The socket, once there is a UI thread for a command to be posted to.
+            crate::remote::listen();
+            // --- end src/remote.rs -------------------------------------------------------------
             // --- end src/chrome.rs: themes -----------------------------------------------------
 
 // --- lua runtime -------------------------------------------------------------------------------

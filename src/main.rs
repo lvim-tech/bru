@@ -58,6 +58,8 @@ mod state;
 mod tabs;
 // How bru learns that ~/.config/bru/theme.css has been rewritten under it.
 mod theme_watch;
+// `bru --remote <line>` — the one door into a running browser from outside it.
+mod remote;
 mod utilcmds;
 mod window;
 
@@ -66,6 +68,26 @@ use cef::*;
 fn main() -> Result<(), &'static str> {
     // Has to run before any other CEF call.
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+
+    // --- src/remote.rs --------------------------------------------------------------------------
+    // **Read off the raw argv, before CEF sees the command line, and taking everything after it.**
+    //
+    // `bru --remote :open -t https://x` has to work: that is the shape `lvim-preview`'s `browser`
+    // option produces — an argv list with the URL appended — and CEF's parser would take `-t` for a
+    // switch of its own and the URL for a positional. So the rest of the line is the message,
+    // joined with spaces, and nothing else on it is looked at.
+    let raw: Vec<String> = std::env::args().collect();
+    if let Some(at) = raw.iter().position(|arg| arg == "--remote") {
+        let line = raw[at + 1..].join(" ");
+        return match remote::send(&line) {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                eprintln!("bru: {why}");
+                Err("the remote call failed")
+            }
+        };
+    }
+    // --- end src/remote.rs ----------------------------------------------------------------------
 
     let args = args::Args::new();
     let Some(cmd_line) = args.as_cmd_line() else {
@@ -171,6 +193,7 @@ fn main() -> Result<(), &'static str> {
 
     run_message_loop();
     shutdown();
+    crate::remote::cleanup();
 
     // After shutdown, so nothing is still writing to the directory being let go of.
     if let Some(profile) = profile {

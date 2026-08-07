@@ -263,6 +263,21 @@ impl BruState {
         self.current_slot().map(|slot| slot.tabs.len()).unwrap_or(0)
     }
 
+    // --- src/remote.rs -------------------------------------------------------------------------
+    /// One window's tabs as `(url, title)`, in strip order.
+    ///
+    /// For `bru --remote tabs`, which is how `lvim-tex`'s `is_alive` asks whether the PDF it opened
+    /// is still on screen. The views and the browsers stay behind this: a caller over a socket wants
+    /// two strings, and handing out a `BrowserView` to answer that would be handing out the tab.
+    pub fn tabs_in(&self, window: u32) -> Vec<(String, String)> {
+        self.slot(window)
+            .map(|slot| {
+                slot.tabs.iter().map(|tab| (tab.url.clone(), tab.title.clone())).collect()
+            })
+            .unwrap_or_default()
+    }
+    // --- end src/remote.rs ---------------------------------------------------------------------
+
     pub fn tab_count_in(&self, window: u32) -> usize {
         self.slot(window).map(|slot| slot.tabs.len()).unwrap_or(0)
     }
