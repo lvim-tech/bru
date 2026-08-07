@@ -1088,6 +1088,16 @@ pub fn refusal(command: &Command) -> Option<&'static str> {
         // the second half of the chain. A `config.lua` writing `reload ;; config-cycle …` would
         // have reached it with nothing stubbed at all.
         Command::Chain(parts) => parts.iter().filter(|part| !is_live(part)).find_map(refusal),
+// --- src/utilcmds.rs -------------------------------------------------------
+        // The three that carry a command are exactly a chain one link long, so they answer the same
+        // way: `:later 1s config-cycle … content.plugins` is refused for the reason the carried
+        // command is refused for, and not "not yet". No default binding is any of these — the
+        // reader who reaches this line wrote it in `config.lua`, which is precisely the case the
+        // three-state page exists for.
+        Command::Later { command, .. }
+        | Command::Repeat { command, .. }
+        | Command::RunWithCount { command, .. } => refusal(command),
+// --- end src/utilcmds.rs ---------------------------------------------------
         _ => None,
     }
 }

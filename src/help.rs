@@ -276,6 +276,18 @@ mod tests {
         // A refused row is not a "not yet" row, or the third state is decoration.
         assert!(!html.contains(r#"<td class="cmd">hint-follow</td><td class="state">not yet</td>"#));
 
+// --- src/utilcmds.rs -------------------------------------------------------
+        // A command carried by `:later`, `:repeat` or `:run-with-count` keeps its own state, which
+        // for a refused one is the reason and not "not yet". Only reachable from a `config.lua`;
+        // the default table binds none of the three.
+        assert!(matches!(
+            State::of("later 1s config-cycle -p -u *://x/* content.plugins"),
+            State::Refused(_)
+        ));
+        assert_eq!(State::of("repeat 2 scroll down"), State::Live);
+        assert_eq!(State::of("repeat 2 debug-dump-page /tmp/x"), State::NotYet);
+// --- end src/utilcmds.rs ---------------------------------------------------
+
         // The twelve are chains — `config-cycle … ;; reload` — and the reason must come from the
         // half that is refused whichever half is written first. Asking `exec::refusal` for the
         // reversed spelling is what proves it does not depend on the order, which it did until a
