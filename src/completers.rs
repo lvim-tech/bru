@@ -98,6 +98,9 @@ enum Which {
     /// `:config-list-add <option> <value>` and `:config-list-remove <option> <value>`, for the
     /// same reason as [`Which::DictKey`]: the entries a list holds are a list.
     ListEntry,
+    /// `/` and `?` — everything searched for before, newest first. See [`partition`] for why this
+    /// exists at all, and `src/find.rs` for the store behind it.
+    SearchHistory,
 }
 
 /// Which settings an option model offers — `configmodel.py`'s four, less the customized one.
@@ -185,7 +188,7 @@ const SPECS: &[Spec] = &[
 /// line without re-running the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Partition {
-    /// `:` — the only prefix that completes. `/` and `?` are a search (`completer.py:213-219`).
+    /// `:`, `/` or `?` — the three prefixes bru's command line takes, and all three complete.
     prefix: char,
     /// The command name and any flags before the cursor, in order.
     before: Vec<String>,
@@ -264,12 +267,35 @@ fn quote(s: &str) -> String {
 fn partition(text: &str, cursor: usize) -> Option<Partition> {
     let chars: Vec<char> = text.chars().collect();
     let prefix = *chars.first()?;
-    if prefix != ':' {
+    if !matches!(prefix, ':' | '/' | '?') {
         return None;
     }
     // Positions from here on are into the body, which is what the cursor is measured against too.
     let body = &chars[1..];
     let at = cursor.saturating_sub(1).min(body.len());
+
+    // **`/` and `?` complete, and this is the departure.** The line these two replace said
+    // "`/` and `?` are a search (`completer.py:213-219`)" and refused, which was a true reading of
+    // qutebrowser: `_update_completion` sets no model for a prefix that is not `:`, over a comment
+    // reading "FIXME complete searches" and its issue #32. The user asked for the opposite on
+    // 2026-08-07 — typing `/` should offer what has been searched for before — so bru keeps a
+    // search history and offers it here. `src/find.rs` owns the store and says why it is shaped the
+    // way it is.
+    //
+    // The whole line after the prefix is one part, never split, and that is not a shortcut: a
+    // search term is the rest of the line, spaces included, exactly as `Cmdline::accept` hands it
+    // to `search -- <rest>`. `maxsplit0` is what stops `<Tab>` quoting a two-word term into
+    // something `search` would then look for literally.
+    if prefix != ':' {
+        return Some(Partition {
+            prefix,
+            before: Vec::new(),
+            center: body.iter().collect(),
+            after: Vec::new(),
+            which: Which::SearchHistory,
+            maxsplit0: true,
+        });
+    }
 
     // Runs of non-whitespace, with where each starts and ends.
     let mut tokens: Vec<(usize, usize)> = Vec::new();
@@ -738,6 +764,22 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
 
         // Answered by `build`, which has the option named in the argument before this one.
         Which::SettingValue | Which::DictKey | Which::ListEntry => Vec::new(),
+
+        // One column, because a search term is one thing and there is nothing to put beside it: no
+        // page it was found on (the same term is searched for on many), no count (Chromium's is per
+        // page and per session), no time (bru would have to keep one to show one). A second column
+        // holding nothing would take 60% of the bar to say it.
+        //
+        // Capped at `MAX_ITEMS` unlike the two catalogue models above, and for `:open`'s History
+        // reason rather than a new one: this *is* a history, it is offered newest first, and the
+        // newest 25 that match are the answer. The file's own bound is 100 — see
+        // `find.rs::HISTORY_MAX` — which is what stops the list growing without end.
+        Which::SearchHistory => {
+            let rows = crate::find::history().into_iter().map(|term| vec![term]).collect();
+            completion::list_category("Search history", &[100], rows, pattern)
+                .into_iter()
+                .collect()
+        }
 
         // **Uncapped, unlike every other category here.** `completion::MAX_ITEMS` bounds a source
         // that has no bound of its own — the history table grows with every page load — and 25 of
@@ -1486,8 +1528,32 @@ mod tests {
     fn a_command_with_no_model_completes_nothing() {
         // A command that has no model for the argument being typed.
         assert!(part(":scroll down").is_none());
-        assert!(part("/duck").is_none(), "a search is not a command");
         assert!(part("").is_none());
+        // A prefix bru's command line cannot be in.
+        assert!(part("xduck").is_none());
+    }
+
+    // ---- the search history ----
+
+    #[test]
+    fn a_search_completes_against_what_was_searched_for_before() {
+        // This is the departure: on master both of these were `None`, with the comment "`/` and `?`
+        // are a search" citing the qutebrowser line that refuses them.
+        for prefix in ['/', '?'] {
+            let typed = part(&format!("{prefix}duck")).unwrap();
+            assert_eq!(typed.prefix, prefix);
+            assert_eq!(typed.which, Which::SearchHistory);
+            assert_eq!(typed.center, "duck");
+            assert_eq!(typed.line_with("duckling"), format!("{prefix}duckling"));
+            // And the bare prefix opens the whole history.
+            assert_eq!(part(&prefix.to_string()).unwrap().center, "");
+        }
+        // A term is the rest of the line, spaces and leading dashes included, and completing it
+        // never quotes: `search` is maxsplit-0 and `accept` hands it `search -- <rest>`.
+        let spaced = part("/rust vec").unwrap();
+        assert_eq!(spaced.center, "rust vec");
+        assert_eq!(spaced.line_with("two words"), "/two words");
+        assert_eq!(part("/-x").unwrap().center, "-x");
     }
 
     // ---- the command-name model ----
