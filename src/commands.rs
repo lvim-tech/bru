@@ -423,6 +423,11 @@ pub enum Command {
     /// `adblock-toggle` — blocking on or off for this session. bru's, not qutebrowser's, which
     /// spells it `:set content.blocking.enabled false` and needs a settings system to do it.
     AdblockToggle,
+    // --- src/userstyles.rs -----------------------------------------------------------------------
+    /// `styles-toggle` — the per-site stylesheets on or off, and it changes the page that is showing
+    /// rather than the next one. bru's own; qutebrowser has no command for its `user_stylesheets`.
+    StylesToggle,
+    // --- end src/userstyles.rs -------------------------------------------------------------------
     /// `adblock-info` — what is loaded, what it has blocked, and what it costs per request.
     AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------
@@ -1679,6 +1684,9 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
 
 // --- adblock ---------------------------------------------------------------------------------
         "adblock-update" => Command::AdblockUpdate,
+        // --- src/userstyles.rs -----------------------------------------------------------------
+        "styles-toggle" => Command::StylesToggle,
+        // --- end src/userstyles.rs -------------------------------------------------------------
         "adblock-toggle" => Command::AdblockToggle,
         "adblock-info" => Command::AdblockInfo,
 // --- end adblock -----------------------------------------------------------------------------

@@ -77,8 +77,15 @@ wrap_load_handler! {
             // injects and where `document.documentElement` is still null.
             if let Some(mut frame) = browser.main_frame() {
                 crate::scrollbar::inject(&mut frame);
-            }
             // --- end src/scrollbar.rs ---------------------------------------------------------
+            // --- src/userstyles.rs ------------------------------------------------------------
+                // The user's own CSS for this site, if there is a folder named after it. After the
+                // scrollbar's on purpose: that one goes in first so a page's own rules win, and
+                // this one is the user overriding the page.
+                let url = CefString::from(&frame.url()).to_string();
+                crate::userstyles::inject(&mut frame, &url);
+            }
+            // --- end src/userstyles.rs --------------------------------------------------------
 
             // The position belongs to the document that is going away; the next one reports its own
             // as soon as it is scrolled.

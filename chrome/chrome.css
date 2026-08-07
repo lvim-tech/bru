@@ -42,30 +42,6 @@ body {
     padding: 0;
 }
 
-/* THE BOTTOM STRIP IS ANCHORED TO ITS BOTTOM EDGE, AND THAT IS NOT COSMETIC.
- *
- * The document is as tall as its contents, and the view it lives in is resized
- * to match — but not in the same instant. The completion table enters the DOM
- * first, and for the frame or two before CEF has grown the view, an 85px
- * document is being shown in a 24px viewport. Laid out from the top, what those
- * 24 pixels contain is the completion's first row: the bar vanishes and its
- * category header stands where the bar was, which is the flash that was chased
- * through four wrong explanations before the user named it — "the bar itself is
- * being pushed up".
- *
- * Anchored to the bottom, a document taller than its viewport overflows off the
- * TOP instead. The bar is what the 24 pixels contain, unmoved, and the panel is
- * revealed above it as the view grows. Nothing is ever drawn in the wrong place;
- * the only difference between the two frames is how much of the panel is
- * visible.
- *
- * The top strip is a fixed 28px and never resizes, so this costs it nothing. */
-body {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-}
 
 /* The panel ------------------------------------------------------- src/window.rs
  *

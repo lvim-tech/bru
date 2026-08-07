@@ -80,6 +80,11 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "<Ctrl-F5>", "reload -f"),
     ("normal", "H", "back"),
     ("normal", "<back>", "back"),
+    // --- src/userstyles.rs -----------------------------------------------------------------------
+    // `ts` — the per-site stylesheets. bru's own key for bru's own command; `t` is qutebrowser's
+    // prefix for "toggle something" and `s` was the only letter in it nothing had taken.
+    ("normal", "ts", "styles-toggle"),
+    // --- end src/userstyles.rs -------------------------------------------------------------------
     ("normal", "th", "back -t"),
     ("normal", "wh", "back -w"),
     ("normal", "L", "forward"),
@@ -1343,7 +1348,10 @@ mod tests {
         // src/prompt.rs; **+34 with it**, which is `bindings.default.prompt`'s 26 rows and
         // `.yesno`'s 8 — the two sections this table's own comment said would come back with the
         // modes.
-        assert_eq!(total, 298, "the default table is not the one transcribed from configdata.yml");
+        // **299, not 298.** qutebrowser's table is 298; the extra one is bru's own `ts`
+        // (`styles-toggle`), which qutebrowser has no command for. A number that grows is a number
+        // that has to say which of the two it is counting.
+        assert_eq!(total, 299, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1356,7 +1364,7 @@ mod tests {
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
         // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
-        assert_eq!(bindings.len(Mode::Normal), 189);
+        assert_eq!(bindings.len(Mode::Normal), 190);
         assert_eq!(bindings.len(Mode::Insert), 4);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
@@ -1654,7 +1662,7 @@ mod tests {
             "a syntax error means nothing in the file ran, so J is still the default"
         );
         assert_eq!(config.bindings.command_for(Mode::Normal, "j"), Some("scroll down"));
-        assert_eq!(config.bindings.len(Mode::Normal), 189);
+        assert_eq!(config.bindings.len(Mode::Normal), 190);
     }
 
     #[test]

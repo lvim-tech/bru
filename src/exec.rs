@@ -893,6 +893,25 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // `:adblock-update` in particular is the one thing in bru that reaches the network of its
         // own accord — it should take a decision, not a keystroke.
         Command::AdblockUpdate => crate::adblock::update(),
+        // --- src/userstyles.rs -------------------------------------------------------------------
+        Command::StylesToggle => {
+            // Through `:set`'s own path rather than beside it: `Backing::UserStyles` is what
+            // re-runs the injection in every tab, and a second way to write the value is a second
+            // way to forget that.
+            let on = crate::settings::is_on("content.user_styles");
+            crate::settings::run_set(
+                Some("content.user_styles"),
+                Some(if on { "false" } else { "true" }),
+                None,
+                false,
+            );
+            crate::message::info(if on {
+                "per-site styles off"
+            } else {
+                "per-site styles on"
+            });
+        }
+        // --- end src/userstyles.rs ---------------------------------------------------------------
         Command::AdblockToggle => {
             let on = crate::adblock::toggle();
             eprintln!("bru[adblock]: blocking {}", if on { "on" } else { "off" });
@@ -950,6 +969,7 @@ pub fn is_live(command: &Command) -> bool {
 
         // --- src/chrome.rs: themes -------------------------------------------------------------
         Command::Colorscheme { .. } => true,
+        Command::StylesToggle => true,
         // --- end src/chrome.rs: themes ---------------------------------------------------------
 
         // All four directions live now: `scroll.rs` reaches the top and the bottom by sending many
@@ -1802,7 +1822,7 @@ mod tests {
         // `register:` (3991); 264 once macros brought the other two modes that read it.
         // 298 with src/prompt.rs, which brought `bindings.default.prompt`'s 26 rows and
         // `.yesno`'s 8 — the last two sections of `configdata.yml` bru had no mode for.
-        assert_eq!(DEFAULT_BINDINGS.len(), 298);
+        assert_eq!(DEFAULT_BINDINGS.len(), 299);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1856,7 +1876,7 @@ mod tests {
         // --- end unhardcoded -------------------------------------------------------------
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 286, "the live-binding count moved");
+        assert_eq!(live, 287, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1890,7 +1910,7 @@ mod tests {
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        assert_eq!(live, 286);
+        assert_eq!(live, 287);
         assert_eq!(
             refused,
             [

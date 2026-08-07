@@ -692,6 +692,13 @@ enum Backing {
     /// value lives in an `AtomicI32` beside the wheel code and this pushes it there. Measured — see
     /// `scroll::the_key_path_cost_of_reading_the_step`.
     ScrollStep,
+    // --- src/userstyles.rs -----------------------------------------------------------------------
+    /// The per-site stylesheets. Nothing in Chromium holds this — the value decides whether a
+    /// `<style>` is put into each document — so applying it means running that injection again in
+    /// every open tab, which is what makes `:styles-toggle` change the page under the user rather
+    /// than the next page they open.
+    UserStyles,
+    // --- end src/userstyles.rs -------------------------------------------------------------------
     // --- src/scrollbar.rs -----------------------------------------------------------------------
     /// The scrollbar bru draws down the side of a page. Nothing in Chromium holds this — the value
     /// becomes a `<style>` element the load handler puts into each document — so applying it means
@@ -1647,6 +1654,21 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Read,
     },
 // --- end lua runtime -----------------------------------------------------------------------------
+    // --- src/userstyles.rs -----------------------------------------------------------------------
+    Def {
+        // Whether `~/.config/bru/styles/<domain>/*.css` is applied. **bru's own name** —
+        // qutebrowser's nearest is `content.user_stylesheets`, a list of files, and bru's is a
+        // directory named after the site, so the name would have promised the wrong shape.
+        //
+        // On by default: a folder that exists was made on purpose, and a switch that has to be
+        // found before the thing you wrote does anything is a switch nobody finds.
+        name: "content.user_styles",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::UserStyles,
+    },
+    // --- end src/userstyles.rs -------------------------------------------------------------------
     // --- src/chrome.rs: fonts --------------------------------------------------------------------
     Def {
         // qutebrowser's `fonts.default_family`, configdata.yml:1745. **A CSS family list, not a Qt
@@ -2032,6 +2054,9 @@ pub fn value_of(name: &str) -> Option<String> {
             // --- src/scrollbar.rs --------------------------------------------------------------
             | Backing::Scrollbar
             // --- end src/scrollbar.rs ----------------------------------------------------------
+            // --- src/userstyles.rs -------------------------------------------------------------
+            | Backing::UserStyles
+            // --- end src/userstyles.rs ---------------------------------------------------------
     ) {
         return None;
     }
@@ -3880,6 +3905,12 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             crate::scrollbar::reinject_everywhere();
             return Ok(());
         }
+        // --- src/userstyles.rs -------------------------------------------------------------
+        Backing::UserStyles => {
+            crate::userstyles::reinject_everywhere();
+            return Ok(());
+        }
+        // --- end src/userstyles.rs ---------------------------------------------------------
         // --- end src/scrollbar.rs -----------------------------------------------------------
         // --- end unhardcoded -------------------------------------------------------------------
 // --- content settings --------------------------------------------------------------------------
@@ -4121,6 +4152,9 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
         // --- src/scrollbar.rs ------------------------------------------------------------------
         | Backing::Scrollbar
         // --- end src/scrollbar.rs --------------------------------------------------------------
+        // --- src/userstyles.rs -----------------------------------------------------------------
+        | Backing::UserStyles
+        // --- end src/userstyles.rs -------------------------------------------------------------
         => {
             return None;
         }
@@ -4485,7 +4519,7 @@ mod tests {
         // **Sixty-one**, +3 for the `fonts.*` block: a family, a size and a weight. They are
         // one workstream's and split three ways because CSS keeps them apart — Qt's
         // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
-        assert_eq!(SETTINGS.len(), 63);
+        assert_eq!(SETTINGS.len(), 64);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

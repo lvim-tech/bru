@@ -496,6 +496,11 @@ pub const COMMANDS: &[Doc] = &[
         what: "Fetch the filter lists and recompile them.", example: "adblock-update" },
     Doc { names: &["adblock-toggle"], args: "", flags: &[],
         what: "Turn blocking on or off for this session.", example: "adblock-toggle" },
+    // --- src/userstyles.rs -----------------------------------------------------------------------
+    Doc { names: &["styles-toggle"], args: "", flags: &[],
+        what: "Turn the per-site stylesheets in ~/.config/bru/styles/<domain>/ on or off, in the                tabs that are open as well as the next one.",
+        example: "styles-toggle" },
+    // --- end src/userstyles.rs -------------------------------------------------------------------
     Doc { names: &["adblock-info"], args: "", flags: &[],
         what: "What is loaded, what it has blocked, and what it costs per request.",
         example: "adblock-info" },
@@ -1487,7 +1492,7 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 170, "the scrape found a different number of commands");
+        assert_eq!(source.len(), 171, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1699,6 +1704,7 @@ mod tests {
                 Command::MarksReload { .. } => "MarksReload",
                 // --- src/chrome.rs: themes -----------------------------------------------------
                 Command::Colorscheme { .. } => "Colorscheme",
+                Command::StylesToggle => "StylesToggle",
                 // --- end src/chrome.rs: themes -------------------------------------------------
                 Command::Unimplemented(_) => "Unimplemented",
             }
@@ -1769,7 +1775,7 @@ mod tests {
         "CmdRepeatLast", "SettingsPage", "TabSelect", "TabTake", "WindowOnly", "Screenshot",
         "JsEval", "EditUrl", "EditCommand", "QuickmarkAdd", "HistoryClear", "Later", "Repeat",
         "RunWithCount", "Restart", "Version", "Messages", "Process", "ClickElement",
-        "ScrollToAnchor", "DownloadRemove", "ClearMessages", "MarksReload", "Colorscheme", "Unimplemented",
+        "ScrollToAnchor", "DownloadRemove", "ClearMessages", "MarksReload", "Colorscheme", "StylesToggle", "Unimplemented",
 // --- lua runtime -------------------------------------------------------------------------------
         "Plugin", "PluginList", "PluginReload", "PluginDisable",
 // --- end lua runtime ---------------------------------------------------------------------------

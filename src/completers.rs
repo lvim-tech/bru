@@ -1740,7 +1740,7 @@ mod tests {
         // this one exists so that a table which silently stopped growing is noticed.
         let names: usize = crate::help::COMMANDS.iter().map(|doc| doc.names.len()).sum();
         assert_eq!(cats[0].items.len(), names);
-        assert_eq!(names, 170);
+        assert_eq!(names, 171);
 
         let row = |name: &str| {
             cats[0]
@@ -1826,7 +1826,7 @@ mod tests {
     fn the_whole_command_list_does_not_ask_for_an_absurd_bar() {
         let cats = build_which(Which::Commands, "");
         let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
-        assert_eq!(rows, 170);
+        assert_eq!(rows, 171);
         // `resize_bar`'s arithmetic, which is `chrome.css:186-191`'s: 20px per row and per header,
         // capped at --completion-max-h and one pixel for the border. 166 rows want 3,340px and get
         // 301, because past the cap the table scrolls inside itself.

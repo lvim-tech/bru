@@ -60,6 +60,8 @@ mod tabs;
 mod theme_watch;
 // `bru --remote <line>` — the one door into a running browser from outside it.
 mod remote;
+// Per-site CSS from ~/.config/bru/styles/<domain>/.
+mod userstyles;
 mod utilcmds;
 mod window;
 
