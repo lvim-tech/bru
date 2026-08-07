@@ -817,7 +817,24 @@ pub fn on_accept(window: u32, text: &str) {
     // Before the line is appended, or `:save` would write this session's history over last
     // session's rather than after it.
     ensure_history_loaded();
-    let to_run = with_in(window, |cmd| cmd.accept(text));
+    // The prefix goes back on, exactly as it does in `on_text_changed` and for the same reason: the
+    // input holds the line **without** it (see `json_for`), and `accept` is defined in terms of the
+    // whole line — it reads the first character to tell a command from a search, and pushes the
+    // whole thing into the history. Without this it saw `open aw pipewire`, found no `:` and
+    // returned `None`, so every accepted line was dropped in silence. Measured 2026-08-07: `:open`
+    // typed and accepted did nothing at all, while the same command through `--cmd` worked, because
+    // that path never goes near the input.
+    let to_run = with_in(window, |cmd| {
+        match cmd.prefix() {
+            Some(first) => {
+                let mut whole = String::with_capacity(text.len() + first.len_utf8());
+                whole.push(first);
+                whole.push_str(text);
+                cmd.accept(&whole)
+            }
+            None => cmd.accept(text),
+        }
+    });
     // The accepted line belongs to every window's `<Ctrl-P>`, not only to this one's.
     sync_history(window);
 
