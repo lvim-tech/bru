@@ -783,15 +783,11 @@ pub fn command_accept(rapid: bool) {
 /// and the line are different strings.
 pub fn on_text_changed(window: u32, text: &str, cursor: Option<usize>) {
     with_in(window, |cmd| {
-        match cmd.prefix() {
-            Some(first) => {
-                let mut whole = String::with_capacity(text.len() + first.len_utf8());
-                whole.push(first);
-                whole.push_str(text);
-                cmd.sync(&whole, cursor.map(|at| at + first.len_utf16()));
-            }
-            None => cmd.sync(text, cursor),
-        }
+        let prefix = cmd.prefix();
+        cmd.sync(
+            &with_prefix(prefix, text),
+            cursor.map(|at| at + prefix.map_or(0, |first| first.len_utf16())),
+        );
     });
 }
 
@@ -825,15 +821,8 @@ pub fn on_accept(window: u32, text: &str) {
     // typed and accepted did nothing at all, while the same command through `--cmd` worked, because
     // that path never goes near the input.
     let to_run = with_in(window, |cmd| {
-        match cmd.prefix() {
-            Some(first) => {
-                let mut whole = String::with_capacity(text.len() + first.len_utf8());
-                whole.push(first);
-                whole.push_str(text);
-                cmd.accept(&whole)
-            }
-            None => cmd.accept(text),
-        }
+        let whole = with_prefix(cmd.prefix(), text);
+        cmd.accept(&whole)
     });
     // The accepted line belongs to every window's `<Ctrl-P>`, not only to this one's.
     sync_history(window);
@@ -1348,6 +1337,36 @@ pub fn text_in(window: u32) -> String {
 ///
 /// `rev` is what stops a push triggered by something else from rewriting a half-typed line: the
 /// chrome applies `text` only when the revision is one it has not seen.
+/// The two halves of "the input does not hold the prefix", named so that a test can hold them to
+/// each other.
+///
+/// [`json_for`] splits a line into `(prefix, rest)` on the way to the DOM; [`with_prefix`] puts it
+/// back on the way in. They are inverses, and **nothing checks that they are except
+/// `the_split_and_the_join_are_inverses`** — which exists because they were not. Measured
+/// 2026-08-07: `json_for` was changed to strip the prefix and only `on_text_changed` learned to put
+/// it back, so `on_accept` handed `accept` a line with no `:`, `accept` read the first character to
+/// tell a command from a search, found none, and returned `None`. Every typed command was dropped
+/// in silence, `441` tests stayed green, and the user found it.
+fn split_prefix(text: &str) -> (Option<char>, &str) {
+    match text.chars().next().filter(|first| STARTCHARS.contains(*first)) {
+        Some(first) => (Some(first), &text[first.len_utf8()..]),
+        None => (None, text),
+    }
+}
+
+/// The other half. See [`split_prefix`].
+fn with_prefix(prefix: Option<char>, text: &str) -> String {
+    match prefix {
+        Some(first) => {
+            let mut whole = String::with_capacity(text.len() + first.len_utf8());
+            whole.push(first);
+            whole.push_str(text);
+            whole
+        }
+        None => text.to_string(),
+    }
+}
+
 /// **The prefix is pushed apart from the text, and the input never holds it.** `:`, `/` and `?` are
 /// the first character of the line in Rust — `run_text` strips them, `prefix` reads them — but on
 /// screen they were a character sitting where the user's own typing begins. The mode indicator at
@@ -1362,11 +1381,8 @@ pub fn json_for(window: u32) -> String {
     let focus = mode_in(window) == Mode::Command;
     with_in(window, |cmd| {
         let text = cmd.text();
-        let prefix = cmd.prefix();
-        let shown = match prefix {
-            Some(first) => text[first.len_utf8()..].to_string(),
-            None => text,
-        };
+        let (prefix, shown) = split_prefix(&text);
+        let shown = shown.to_string();
         format!(
             "{{\"prefix\":\"{}\",\"text\":\"{}\",\"cursor\":{},\"rev\":{},\"focus\":{}}}",
             prefix.map(String::from).unwrap_or_default(),
@@ -1674,6 +1690,74 @@ fn inject_key(spec: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The whole path a typed command takes, in one test.**
+    ///
+    /// This is the test that was missing. `accept` had one, `run_text` had one, and the seam
+    /// between them — the prefix leaving the line on its way to the input and coming back on its
+    /// way in — had none, because until 2026-08-07 there was no seam: the input held the whole
+    /// line. When the prefix moved out, `on_text_changed` learned to put it back and `on_accept`
+    /// did not. `accept` then saw `open aw pipewire`, read `o` where it expects `:`, `/` or `?`,
+    /// and returned `None` — so every command typed and accepted did nothing at all, in silence,
+    /// with 441 tests green. The user found it by trying to use a search engine.
+    ///
+    /// What this holds is that the two halves are **inverses**, and that what comes out the far end
+    /// is what `exec` would have been handed. Change one half alone and this fails.
+    #[test]
+    fn the_split_and_the_join_are_inverses() {
+        // `(what the user typed, what `run_text` must be given)`. The last is the case a lone
+        // `accept` would still have passed, which is why the first three matter.
+        let lines = [
+            (":open aw pipewire", Some("open aw pipewire")),
+            (":open", Some("open")),
+            ("/pipewire", Some("search -- pipewire")),
+            ("?pipewire", Some("search -r -- pipewire")),
+            // Nothing but a prefix is not a command; qutebrowser drops it too.
+            (":", None),
+            ("/", None),
+        ];
+
+        for (typed, expected) in lines {
+            // What `json_for` hands the DOM.
+            let (prefix, shown) = split_prefix(typed);
+            assert_eq!(
+                prefix.is_some(),
+                STARTCHARS.contains(typed.chars().next().unwrap()),
+                "{typed:?}: the prefix was not recognised"
+            );
+            assert!(
+                !shown.starts_with(|c| STARTCHARS.contains(c)) || shown.is_empty(),
+                "{typed:?}: the input still holds the prefix — it is drawn where the user types"
+            );
+
+            // What the DOM hands back, and what `on_accept` makes of it.
+            let whole = with_prefix(prefix, shown);
+            assert_eq!(whole, typed, "{typed:?}: the join is not the split's inverse");
+
+            let mut cmd = CmdLine::default();
+            assert_eq!(
+                cmd.accept(&whole).as_deref(),
+                expected,
+                "{typed:?}: the far end of the path"
+            );
+        }
+    }
+
+    /// The cursor travels with the prefix, or the caret lands one character off every time the
+    /// line is pushed — which is the same bug wearing a smaller hat.
+    #[test]
+    fn the_cursor_moves_with_the_prefix() {
+        let mut cmd = CmdLine::default();
+        cmd.set_text(":open x");
+        let text = cmd.text();
+        let (prefix, shown) = split_prefix(&text);
+        assert_eq!(shown, "open x");
+        // `json_for` subtracts the prefix's width; `on_text_changed` adds it back.
+        let pushed = cmd.cursor_utf16() - prefix.map_or(0, |first| first.len_utf16());
+        assert_eq!(pushed, "open x".encode_utf16().count());
+        let back = pushed + prefix.map_or(0, |first| first.len_utf16());
+        assert_eq!(back, cmd.cursor_utf16());
+    }
 
     /// Build a line with the cursor written as `|`, the way the readline docstrings draw it.
     fn line(spec: &str) -> CmdLine {
