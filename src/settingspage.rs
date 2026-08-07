@@ -304,6 +304,21 @@ fn kind(kind: Kind) -> String {
         }
         Kind::Chars => "at least two different characters, no spaces".to_string(),
         // --- end unhardcoded -------------------------------------------------------------------
+        // --- setting functions -------------------------------------------------------------------
+        // **The cell that makes the value column's `<function config.lua:12>` readable.** That cell
+        // deliberately does not call the function — see `settings::value_of` — so on its own it says
+        // a thing is a function and nothing about how to write one. This is the other half: the
+        // fields the function is handed, and how often it is called, which is the number a person
+        // needs before they put work inside it.
+        //
+        // "text, or" first, because that is what the setting still is for everybody who has never
+        // written a function into a config file, and it is what the default column beside it shows.
+        Kind::TextOrFn(shape) => format!(
+            "text, or a function of ({}) — called {}",
+            shape.fields.join(", "),
+            shape.called
+        ),
+        // --- end setting functions -----------------------------------------------------------------
     }
 }
 

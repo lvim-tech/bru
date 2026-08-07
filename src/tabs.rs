@@ -133,8 +133,20 @@ impl BruState {
         // Read once for the whole strip rather than once per tab: `text_of` takes the settings
         // mutex, and a window with twenty tabs would take it eighty times for four answers that
         // cannot change in between.
-        let format = crate::settings::text_or_default("tabs.title.format");
-        let pinned_format = crate::settings::text_or_default("tabs.title.format_pinned");
+        // --- setting functions -----------------------------------------------------------------
+        // **Read once, called per tab**, and the two halves of that sentence are two different
+        // costs. Reading takes the settings mutex — 43.7 ns — and neither answer can change between
+        // the first tab and the twentieth, which is why this line was already outside the loop. A
+        // *function* is the other thing: what it answers depends on the tab, so it has to run once
+        // per tab, and `Template` is the split that lets the store be read once and the function be
+        // called many times. The number that costs is in `.claude/PLUGINS.md` under P2.
+        //
+        // `text_or_default` is gone from this file rather than kept beside the new call: it would
+        // have called the function once, for the whole strip, with no tab in its hand — every tab
+        // drawn with the answer for a tab that does not exist.
+        let format = crate::settings::template_of("tabs.title.format");
+        let pinned_format = crate::settings::template_of("tabs.title.format_pinned");
+        // --- end setting functions ---------------------------------------------------------------
         let count = slot.tabs.len();
         // --- end tabs and statusbar ------------------------------------------------------------
         let entries: Vec<String> = slot
@@ -148,13 +160,10 @@ impl BruState {
                 // the tooltip. `top.js` reads `label` and falls back to the old `title || url` when
                 // it is absent, so a strip that has not been reloaded after an upgrade still draws
                 // something.
-                let label = format_title(
-                    if tab.pinned { &pinned_format } else { &format },
-                    tab,
-                    index,
-                    slot.active,
-                    count,
-                );
+                // --- setting functions -------------------------------------------------------
+                let template = if tab.pinned { &pinned_format } else { &format };
+                let label = label_for(template, tab, index, slot.active, count);
+                // --- end setting functions ---------------------------------------------------
                 format!(
                     "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
                     crate::ipc::json_escape(&tab.title),
@@ -450,6 +459,63 @@ fn empty_tabs_json() -> String {
         crate::settings::is_on("tabs.tooltips"),
     )
 }
+
+// --- setting functions ---------------------------------------------------------------------------
+/// What one tab is labelled: the template filled in, or the function's answer.
+///
+/// **The placeholders are the template's and are not applied to a function's answer**, and that is
+/// the decision this function exists to carry. A function that answers `"{index}: hello"` gets a tab
+/// labelled `{index}: hello`, literally — because the function *had* the index and chose not to use
+/// it, and rewriting its answer behind its back would mean a page whose real title contained
+/// `{current_title}` came out different from every other page. The template and the function are two
+/// ways of saying what a tab is called, not one wrapped in the other.
+///
+/// `tabs.title.format_pinned` is handed the same table with `pinned = true`, so one function can
+/// serve both — which is what makes taking a function on the sibling setting a line rather than a
+/// second vocabulary.
+fn label_for(
+    template: &Option<crate::settings::Template>,
+    tab: &Tab,
+    index: usize,
+    active: usize,
+    count: usize,
+) -> String {
+    // Nothing stored and no default — unreachable for these two, which both ship one, and answered
+    // rather than unwrapped because a `Template` that is `None` is what a *third* setting taking a
+    // function would look like on the day somebody points this at one.
+    let Some(template) = template else {
+        return String::new();
+    };
+    if let Some(literal) = template.literal() {
+        return format_title(literal, tab, index, active, count);
+    }
+    let answered = template.call(&[
+        // 1-based, the number the strip counts by and the number `{index}` prints. A function that
+        // wants the 0-based one subtracts, which is the arithmetic having a function is for.
+        ("index", crate::lua::Arg::Int(index as i64 + 1)),
+        // bru's own fallback, kept from the template path: a tab that has not been given a title yet
+        // is its address rather than an empty string, so `tab.title` is never `""` for a real page
+        // and a config does not have to write the `or tab.url` itself.
+        (
+            "title",
+            crate::lua::Arg::Text(if tab.title.is_empty() {
+                tab.url.clone()
+            } else {
+                tab.title.clone()
+            }),
+        ),
+        ("url", crate::lua::Arg::Text(tab.url.clone())),
+        ("pinned", crate::lua::Arg::Bool(tab.pinned)),
+        ("muted", crate::lua::Arg::Bool(tab.muted)),
+    ]);
+    // **A function that did not answer falls back to bru's own format, substituted.** Not to the
+    // default *string*: `Template::default_text` is `{audio}{index}: {current_title}`, and handing
+    // that straight to the strip drew those very characters on a tab — seen 2026-08-07 on the run
+    // that was checking a throwing function did not take the browser down. What a person whose
+    // function is broken should see is the tab they had before they wrote it, which is this line.
+    answered.unwrap_or_else(|| format_title(template.default_text(), tab, index, active, count))
+}
+// --- end setting functions -------------------------------------------------------------------------
 
 /// `tabs.title.format` and `tabs.title.format_pinned`, filled in for one tab.
 ///

@@ -243,7 +243,8 @@ pub fn edit_text(browser: &mut Browser) {
 /// `BruState` and Chromium and may not happen on a random thread.
 pub fn edit_file(path: std::path::PathBuf, then: impl FnOnce(bool) + Send + 'static) {
     std::thread::spawn(move || {
-        let argv = match editor_argv(&editor_spec(), &path.display().to_string(), 1, 1) {
+        let file = path.display().to_string();
+        let argv = match editor_argv(&editor_spec(&file, 1, 1), &file, 1, 1) {
             Ok(argv) => argv,
             Err(error) => {
                 crate::spawn::error(&format!("config-edit: {error}"));
@@ -321,7 +322,8 @@ fn run_editor(text: &str, caret: usize) -> Result<String, String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
 
     let (line, column) = line_and_column(text, caret);
-    let argv = editor_argv(&editor_spec(), &path.display().to_string(), line, column)?;
+    let file = path.display().to_string();
+    let argv = editor_argv(&editor_spec(&file, line, column), &file, line, column)?;
 
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -385,13 +387,39 @@ pub fn edit_externally(text: &str) -> Result<String, String> {
 ///
 /// A command with no placeholder gets the filename appended, which is what `$EDITOR file` means
 /// everywhere else.
-fn editor_spec() -> String {
+fn editor_spec(file: &str, line: usize, column: usize) -> String {
     // --- unhardcoded ---------------------------------------------------------------------------
-    if let Some(command) = crate::settings::text_of("editor.command") {
-        if !command.trim().is_empty() {
+    // --- setting functions -----------------------------------------------------------------------
+    // **`editor.command` can be a function**, and this is the whole of what that costs here: the
+    // setting is read through `template_of` instead of `text_of`, and the three values the template
+    // would have substituted are handed over as the fields the function reads.
+    //
+    // The answer then goes through `editor_argv` exactly as a literal does, so a function that
+    // returns `"kitty -e nvim {file}"` still works and `{file}` still means what it means. That is
+    // deliberate: a function is a way of *choosing* the command line, not a second templating
+    // language, and a config that branches on the extension and then writes the same string it
+    // always wrote should not have to learn one.
+    //
+    // Why a function is worth it here at all, when a template already substitutes: a template cannot
+    // decide. `nvim` for a `.md` and something else for a `.json`, a terminal when `$TERM` is set
+    // and a window when it is not — none of those is a value a string can have. It is read once per
+    // `:open-editor`, so what it costs is a rounding error beside the process it is about to start.
+    if let Some(template) = crate::settings::template_of("editor.command") {
+        // `text` rather than `literal`/`call` by hand: this caller substitutes `{file}` afterwards
+        // either way, so the two paths differ only in where the string came from. A function that
+        // threw answers `None` and leaves the `$BRU_EDITOR` chain below standing, which is the same
+        // place an unset `editor.command` lands — a browser in the middle of `:open-editor` has to
+        // open *something*.
+        let command = template.text(&[
+            ("file", crate::lua::Arg::Text(file.to_string())),
+            ("line", crate::lua::Arg::Int(line as i64)),
+            ("column", crate::lua::Arg::Int(column as i64)),
+        ]);
+        if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             return command;
         }
     }
+    // --- end setting functions -------------------------------------------------------------------
     // --- end unhardcoded -----------------------------------------------------------------------
     ["BRU_EDITOR", "VISUAL", "EDITOR"]
         .iter()

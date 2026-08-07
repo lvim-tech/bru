@@ -308,6 +308,15 @@ wrap_browser_process_handler! {
             crate::spawn::set_message_sink(crate::message::info, crate::message::error);
 // --- end src/spawn.rs ------------------------------------------------------
 
+// --- setting functions -----------------------------------------------------
+            // A setting whose value is a Lua function can throw, and when it does the person who
+            // wrote it is looking at a tab strip rather than at a terminal. `settings.rs` cannot
+            // call `message::error` itself the way it calls `eprintln!`: `message::show` posts a
+            // delayed CEF task, and that file's tests run with no CEF behind them. So it is a sink,
+            // which is `spawn.rs`'s own answer to the same problem, installed on the same line.
+            crate::settings::set_fn_error_sink(crate::message::error);
+// --- end setting functions -------------------------------------------------
+
             // CEF asks for the client again through default_client when it creates popups, and
             // handing out a fresh one each time loses the handlers. It goes in the shared state
             // rather than in this handler because CEF builds a new handler object per callback.

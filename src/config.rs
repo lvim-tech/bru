@@ -673,7 +673,21 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
     let shared = Arc::new(Mutex::new(config));
 
     let result = (|| -> mlua::Result<()> {
-        let lua = mlua::Lua::new();
+        // --- setting functions -----------------------------------------------------------------
+        // **The state outlives this function now**, and it has to: a setting whose value is a Lua
+        // function keeps a handle into the interpreter, so a `Lua` dropped at the end of this body
+        // would leave that handle pointing at nothing — which mlua answers with a panic
+        // (`WeakLua::lock` is `.expect("Lua instance is destroyed")`) rather than an error.
+        //
+        // This is one line of workstream A's P1, done early because P2 cannot be measured without
+        // it. `crate::lua::shared` makes the state on first use and hands back an `Rc` clone of the
+        // same interpreter, so everything below reads exactly as it did.
+        //
+        // What it does *not* change is the rule this file's own head states: nothing that escapes
+        // `apply_lua` has a Lua type. A `FnRef` is an id and a `config.lua:12`, and pressing `j`
+        // still cannot reach an interpreter.
+        let lua = crate::lua::shared();
+        // --- end setting functions -------------------------------------------------------------
         let bru = lua.create_table()?;
 
         let target = Arc::clone(&shared);
@@ -761,6 +775,27 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
                         let pairs = lua_table_pairs(&key, &table)?;
                         config.settings.set_dict(&key, &pairs).map(|_| ())
                     }
+                    // --- setting functions -------------------------------------------------
+                    // **The line this file's own comment above has been promising since M9**: "Lua
+                    // is the language of that file so a setting can hold a function, not only a
+                    // scalar." Until now the paragraph was about tables, which is the smaller half.
+                    //
+                    // The function is kept in the shared state (`src/lua.rs`) and what the settings
+                    // store holds is an opaque `FnRef` — an id and a `config.lua:12`. That is what
+                    // keeps `settings.rs` free of `mlua` and keeps a type that is neither `Send`
+                    // nor `Sync` out of a store that lives in a `static Mutex`.
+                    //
+                    // A setting that does not take one is refused **by name**, with the list of the
+                    // ones that do — see `Settings::set_fn`. `scalar_to_string`'s "expected a
+                    // string, got function" would have been true and useless.
+                    mlua::Value::Function(function) => match crate::lua::register(&function) {
+                        Some(handle) => config.settings.set_fn(&key, handle).map(|_| ()),
+                        None => Err(format!(
+                            "{key}: there is no Lua state to keep the function in, so it could not \
+                             be stored"
+                        )),
+                    },
+                    // --- end setting functions ---------------------------------------------
                     other => {
                         let text = scalar_to_string(&key, &other)?;
                         config.settings.set(&key, &text)
@@ -882,7 +917,25 @@ pub fn source_over(current: Config, path: &Path, clear: bool) -> Result<Config, 
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let base = if clear { Config::default_config() } else { current };
-    Ok(apply_lua(base, &source, &path.display().to_string()))
+    let config = apply_lua(base, &source, &path.display().to_string());
+    // --- setting functions -------------------------------------------------------------------
+    // **Sweep the Lua state's function registry down to what is still named.** Two things want it
+    // and they are the same line.
+    //
+    // `--clear` means "back to bru's own", and a function no setting holds any more is part of what
+    // is being cleared. And *every* source, cleared or not, because re-running a config registers a
+    // second function for each function-valued setting it sets — the store then holds only the new
+    // handle, and the old one would sit in the registry for the life of the process. One entry per
+    // function-valued setting per `:config-source` is small and has no bound, and a thing with no
+    // bound is worth a line.
+    //
+    // **Anything else that registers a function has to be added to this list**, and being left out
+    // of it is not a small bug: the id is never reused, so the holder reads as "not reachable" from
+    // then on and quietly falls back to a default. Today the only registrar is `bru.set`; when
+    // plugin command handlers land they belong here beside the settings' own.
+    crate::lua::forget_functions_except(&config.settings.function_handles());
+    // --- end setting functions ---------------------------------------------------------------
+    Ok(config)
 }
 
 /// Resolve `:config-source`'s optional argument the way qutebrowser resolves it

@@ -66,7 +66,42 @@ pub enum Kind {
     /// that the value is not empty, which catches neither.
     Chars,
     // --- end unhardcoded ---------------------------------------------------------------------
+    // --- setting functions ---------------------------------------------------------------------
+    /// Free text **or a Lua function that answers it**. See [`FnShape`].
+    ///
+    /// **This is the kind DESIGN.md chose Lua for**, and it took fifty-seven settings to arrive:
+    /// "`~/.config/bru/config.lua` … is Lua **so that a setting can hold a function**". Every kind
+    /// above assumes a value is a scalar that can be written down; this one does not.
+    ///
+    /// A literal is still a literal and parses exactly as [`Kind::Text`] does — `:set` takes one,
+    /// `config-cycle` walks a list of them, and a bru with no `~/.config/bru/` is on one. The
+    /// function arrives by one door only, `bru.set(name, function(…) … end)` in `config.lua`,
+    /// because a command line has no spelling for a function and inventing one would be inventing a
+    /// second language for the file that already is one.
+    TextOrFn(&'static FnShape),
+    // --- end setting functions -----------------------------------------------------------------
 }
+
+// --- setting functions ---------------------------------------------------------------------------
+/// What a [`Kind::TextOrFn`] setting's function is handed and what it must give back.
+///
+/// It is a shape rather than prose in a doc comment because three surfaces print it: `:set <name>`,
+/// `bru://chrome/settings`'s "takes" column, and the error a function gets when it answers with the
+/// wrong thing. Three copies of a field list is three chances for one of them to be out of date.
+#[derive(PartialEq, Eq, Debug)]
+pub struct FnShape {
+    /// The keys of the one table the function is handed, in the order they are documented.
+    ///
+    /// **One table, not one argument each.** `function(tab) return tab.title:upper() end` survives a
+    /// field being added beside `title`; `function(index, title, url, pinned, muted)` does not, and
+    /// the day a sixth field arrives every config in the world shifts by one.
+    pub fields: &'static [&'static str],
+    /// How often it is called, in the words a person needs to judge what putting work in it costs.
+    /// Printed, so that "once per tab, per strip rebuild" is on the page rather than in a commit
+    /// message. The numbers behind those words are in `.claude/PLUGINS.md` under P2.
+    pub called: &'static str,
+}
+// --- end setting functions -------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------------------------
 // Dictionaries
@@ -491,6 +526,34 @@ static SCROLLBAR_WIDTH: IntShape =
     IntShape { min: 1, max: 64, unit: "pixels", sentinel: "" };
 // --- end src/scrollbar.rs ----------------------------------------------------------------------
 
+// --- setting functions ---------------------------------------------------------------------------
+/// The table `tabs.title.format` and `tabs.title.format_pinned` hand their function.
+///
+/// The five fields are the whole of what the strip knows about a tab that the function could not
+/// work out for itself, and every one of them is already in the payload `chrome/top.js` is pushed —
+/// so nothing here is a value bru had to go and find. `{aligned_index}`, `{relative_index}` and
+/// `{title_sep}` are deliberately **not** fields: they are arithmetic on `index`, and a function
+/// that wants them can do the arithmetic, which is what having a function instead of a template is
+/// for. `{perc}` and its neighbours are not here for `tabs::format_title`'s own reason — a
+/// background tab's scroll position is a number bru does not have.
+static TAB_TITLE: FnShape = FnShape {
+    fields: &["index", "title", "url", "pinned", "muted"],
+    called: "once per tab, every time a strip is rebuilt",
+};
+
+/// The table `editor.command` hands its function: the file being edited and where the cursor was.
+///
+/// The same three values `{file}`, `{line}` and `{column}` name in the literal form, under the same
+/// names — a person who has written the template can write the function without learning a second
+/// vocabulary. `line` and `column` are 1-based here, as they are in the template; `{line0}` and
+/// `{column0}` are the template's own spelling of "one less" and stay a substitution, because
+/// `line - 1` is not worth a field.
+static EDITOR_COMMAND: FnShape = FnShape {
+    fields: &["file", "line", "column"],
+    called: "once per :open-editor",
+};
+// --- end setting functions -------------------------------------------------------------------------
+
 /// A setting's value, already validated against its [`Kind`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value {
@@ -506,6 +569,20 @@ pub enum Value {
     /// A whole list, bru's defaults with the user's additions appended. Complete for the same
     /// reason a `Dict` is: what reads it wants the list, not a diff and a merge.
     List(Vec<String>),
+    // --- setting functions ---------------------------------------------------------------------
+    /// **A Lua function**, called when the value is wanted. Only a [`Kind::TextOrFn`] setting can
+    /// hold one.
+    ///
+    /// [`crate::lua::FnRef`] is opaque and this file never learns what is behind it — that is the
+    /// contract, and it is what keeps `mlua::Lua`, which is neither `Send` nor `Sync`, out of a
+    /// `Value` that lives in a `static Mutex`. What the handle carries is an id and the place the
+    /// function was written, both of which are plain data.
+    ///
+    /// **Reading one on a thread with no Lua state is not an error**: a renderer process and a unit
+    /// test both look like that (CEF-NOTES trap 13), and both fall back to bru's compiled-in
+    /// default. See [`Template::call`], which is the one place a call is made.
+    Fn(crate::lua::FnRef),
+    // --- end setting functions -------------------------------------------------------------------
 }
 
 impl std::fmt::Display for Value {
@@ -524,6 +601,14 @@ impl std::fmt::Display for Value {
             // print is not this — see `Settings::describe`, which gives a dict a line per pair.
             Value::Dict(map) => write!(f, "{} entries", map.len()),
             Value::List(entries) => write!(f, "{} entries", entries.len()),
+            // --- setting functions ---------------------------------------------------------------
+            // `<function config.lua:12>`, and the reasoning is [`crate::lua::FnRef`]'s `Display`:
+            // there is no value to print, because the value is what the function answers and that
+            // depends on which tab is being drawn. Calling it here to get something to show would
+            // print a string nothing used, and a `Display` that runs a user's code is a `Display`
+            // that can throw.
+            Value::Fn(handle) => write!(f, "{handle}"),
+            // --- end setting functions -----------------------------------------------------------
         }
     }
 }
@@ -1178,7 +1263,15 @@ pub const SETTINGS: &[Def] = &[
         // `cmdline.rs`'s `{url}`/`{title}` replacement is the pattern it copies rather than a
         // template engine.
         name: "tabs.title.format",
-        kind: Kind::Text,
+        // --- setting functions -------------------------------------------------------------------
+        // **The first setting in bru that can hold a function**, and it is first because it is the
+        // one where the difference is visible: its value is already a template, it is read once per
+        // tab per strip rebuild, and the strip is on the screen. A template can substitute and
+        // cannot decide — there is no spelling of `{current_title}` that shortens a title only when
+        // there are twelve tabs, or that draws a different mark for a URL that is not `https`. A
+        // function can, and that is the whole of what the kind buys.
+        kind: Kind::TextOrFn(&TAB_TITLE),
+        // --- end setting functions ---------------------------------------------------------------
         default: Some("{audio}{index}: {current_title}"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
@@ -1187,7 +1280,14 @@ pub const SETTINGS: &[Def] = &[
         // `configdata.yml:2419`. A pinned tab is `flex: 0 0 auto` in `chrome.css` — it shrinks to
         // its contents — so a short format is what makes pinning worth anything.
         name: "tabs.title.format_pinned",
-        kind: Kind::Text,
+        // --- setting functions -------------------------------------------------------------------
+        // The sibling, and it takes a function for one line's worth of code because leaving it out
+        // would be the worse thing: a strip where the unpinned tabs can be decided and the pinned
+        // ones cannot is a rule nobody could have predicted from either name. Same table, same
+        // fields — `tab.pinned` is `true` in every call that reaches this one, which is what makes
+        // one function usable for both.
+        kind: Kind::TextOrFn(&TAB_TITLE),
+        // --- end setting functions ---------------------------------------------------------------
         default: Some("{index}"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
@@ -1401,7 +1501,20 @@ pub const SETTINGS: &[Def] = &[
         // [`ListShape`]) — an override that added `--flag` to the end of somebody else's editor is
         // not what anyone means by setting their editor.
         name: "editor.command",
-        kind: Kind::Text,
+        // --- setting functions -------------------------------------------------------------------
+        // **The second setting to take a function, and the one that says why the kind is not about
+        // tab strips.** A template here can only substitute `{file}`, `{line}` and `{column}` into
+        // one command line; what people actually want is to branch — markdown in one editor and
+        // everything else in another, a terminal when the file is small and a window when it is not
+        // — and there is no value of a string that says that. It is read once per `:open-editor`,
+        // so the cost question `tabs.title.format` had to be measured for does not arise here at
+        // all: 138 ns against a process spawn is nothing.
+        //
+        // What the function answers is a command line, which then goes through `editor_argv`
+        // unchanged — so a function that returns `"kitty -e nvim {file}"` still works, and the
+        // placeholders keep their meaning rather than becoming the function's problem.
+        kind: Kind::TextOrFn(&EDITOR_COMMAND),
+        // --- end setting functions ---------------------------------------------------------------
         default: None,
         scopes: Scopes::GlobalOnly,
         backing: Backing::Read,
@@ -1820,6 +1933,25 @@ pub fn value_of(name: &str) -> Option<String> {
         // `dict_of` and the settings page prints a row per pair — and the count is the honest
         // answer for anywhere that insists on a scalar. A list is the same.
         Some(value @ (Value::Dict(_) | Value::List(_))) => value.to_string(),
+        // --- setting functions -------------------------------------------------------------------
+        // **What `bru://chrome/settings` prints for a function**, and it is not the value.
+        //
+        // The page could call it — it is on the UI thread and the Lua state is right there — and
+        // that is exactly what it must not do. `tabs.title.format`'s function is handed a *tab*, and
+        // the settings page is not drawing a tab; it would have to invent one, and the string that
+        // came back would be the title of a tab that does not exist, printed in a column headed "in
+        // force". A reader would take it for the value. That is trap 15's shape: the wrong answer a
+        // reader believes.
+        //
+        // Worse, the page reads every setting it lists, so calling would put a user's Lua on the
+        // path of opening a page — and a function with a loop in it would hang the browser on
+        // `bru://chrome/settings` rather than on the strip, which is the one place a person goes to
+        // find out what is wrong.
+        //
+        // So it prints `<function config.lua:12>`: what it is, and where to go and change it. The
+        // "takes" column beside it already names the fields — see `settingspage::kind`.
+        Some(value @ Value::Fn(_)) => value.to_string(),
+        // --- end setting functions -----------------------------------------------------------------
         None => def.default.unwrap_or_default().to_string(),
     })
 }
@@ -1919,6 +2051,21 @@ pub fn known_names() -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+// --- setting functions ---------------------------------------------------------------------------
+/// The settings that accept a Lua function, for the error a setting that does not accept one gets.
+///
+/// Walked rather than listed: a second list of names is a second thing to keep true, and
+/// `every_function_setting_says_what_it_hands_over` walks the same table to check the shapes.
+pub fn fn_setting_names() -> String {
+    SETTINGS
+        .iter()
+        .filter(|def| matches!(def.kind, Kind::TextOrFn(_)))
+        .map(|def| def.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+// --- end setting functions -------------------------------------------------------------------------
 
 /// The error a refused setting gets: it names the setting and says why, which is the whole reason
 /// [`REFUSED`] exists.
@@ -2036,6 +2183,20 @@ impl Def {
                 Ok(Value::Text(text.to_string()))
             }
             // --- end unhardcoded ---------------------------------------------------------------
+            // --- setting functions ---------------------------------------------------------------
+            // **A literal parses exactly as `Kind::Text` does**, which is the point of the kind: a
+            // `:set tabs.title.format {index}` typed at the command line does not have to know that
+            // the setting can also hold something a command line cannot spell, and neither does the
+            // config that has always written a string. There is no arm here for a function because
+            // there is no *text* that is one — `Settings::set_fn` is the only door, and `config.lua`
+            // is the only room it opens onto.
+            Kind::TextOrFn(_) => {
+                if text.trim().is_empty() {
+                    return Err(format!("{} cannot be empty", self.name));
+                }
+                Ok(Value::Text(text.to_string()))
+            }
+            // --- end setting functions -------------------------------------------------------------
         }
     }
 
@@ -2368,10 +2529,69 @@ impl Settings {
         let def = def(key).ok_or_else(|| unknown(key))?;
         let parsed = def.parse(value)?;
         let pattern = self.scope(def, pattern)?;
+        // --- setting functions -----------------------------------------------------------------
+        // The setting has just been given a literal, so whatever its function last said is history.
+        forget_fn_error(def.name);
+        // --- end setting functions -------------------------------------------------------------
         self.values
             .insert((pattern.as_ref().map(|p| p.text.clone()), def.name), parsed.clone());
         Ok(Applied { def, value: parsed, pattern })
     }
+
+    // --- setting functions -----------------------------------------------------------------------
+    /// `bru.set(key, function(…) … end)` — the one door a function comes through.
+    ///
+    /// Global only, and there is no `-u` form: a pattern scopes a value by the *page*, and a
+    /// function is not scoped, it decides. `function(tab) if tab.url:match("github") then … end`
+    /// is the same thing said in the place that can say it.
+    ///
+    /// The error names the settings that do take one rather than only refusing, because the mistake
+    /// this catches is a person who has read that a setting can be a function and picked the wrong
+    /// one — and the list is short enough to print.
+    pub fn set_fn(&mut self, key: &str, handle: crate::lua::FnRef) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let Kind::TextOrFn(shape) = def.kind else {
+            return Err(format!(
+                "{} does not take a function — the settings that do are {}. A function is handed \
+                 one table and answers a string; see `bru://chrome/settings` for what each one is \
+                 handed.",
+                def.name,
+                fn_setting_names()
+            ));
+        };
+        // The shape is not read here — it is what the printing surfaces and the error use — but
+        // matching on it is what refuses every other kind, so it is destructured rather than
+        // ignored with a wildcard.
+        let _ = shape;
+        forget_fn_error(def.name);
+        let value = Value::Fn(handle);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+    // --- end setting functions ---------------------------------------------------------------------
+
+    /// Every function this store is holding, so that the ones it is **not** holding can be let go
+    /// of.
+    ///
+    /// **This is the answer to the registry growing without a bound.** `crate::lua` keeps a
+    /// function alive by id and has no way to know when the last handle to one has gone: a `FnRef`
+    /// is `Copy`-cheap, `Send`, and lives in a store on another thread, so a `Drop` that counted
+    /// references would have to reach a `thread_local!` from wherever the last copy happened to die.
+    /// Sweeping is the shape that works — the store says what it has, and everything else goes.
+    ///
+    /// Without it, `:config-source` run twice registers two functions per function-valued setting
+    /// and the first of each is unreachable and immortal. Small — an `mlua::Function` is a weak
+    /// reference and the closure behind it — and unbounded, which is the half that matters.
+    pub fn function_handles(&self) -> Vec<crate::lua::FnRef> {
+        self.values
+            .values()
+            .filter_map(|value| match value {
+                Value::Fn(handle) => Some(handle.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    // --- end setting functions ---------------------------------------------------------------------
 
     /// `bru.set(key, { … })` — a Lua table, **merged** into whatever the dict already holds.
     ///
@@ -2651,6 +2871,22 @@ impl Settings {
                         if pattern.is_none() && Some(value) == def.default_value().as_ref() {
                             continue;
                         }
+                        // --- setting functions -------------------------------------------------
+                        // **`:config-diff` cannot print a function**, and says so rather than
+                        // printing `bru.set("tabs.title.format", "<function config.lua:12>")`,
+                        // which would be a line that runs and sets the literal text of the
+                        // placeholder. The whole promise of this command is that its output is Lua
+                        // you can paste back; a line that pasted back wrongly is worse than a line
+                        // that says it is not there. The comment is the same shape the per-URL and
+                        // removed-pair lines above already use.
+                        if let Value::Fn(handle) = value {
+                            out.push(format!(
+                                "-- a function, and it is already in a config file: {} is {}",
+                                def.name, handle
+                            ));
+                            continue;
+                        }
+                        // --- end setting functions ---------------------------------------------
                         out.push(match pattern {
                             Some(pattern) => format!(
                                 "-- per URL, and config.lua cannot say so: \
@@ -2792,6 +3028,29 @@ impl Settings {
         if let Some(Value::List(entries)) = &value {
             return Ok(describe_list(def, entries));
         }
+        // --- setting functions -------------------------------------------------------------------
+        // **What `:set tabs.title.format` prints for a function.** `value_of`'s argument for not
+        // calling it holds here word for word — there is no tab to hand it — and the command line
+        // has one thing the settings page does not: room for a sentence.
+        //
+        // So it says what it is, where it was written, and what it is handed. The last part is what
+        // makes the line worth printing rather than merely honest: somebody typing `:set
+        // tabs.title.format` is nine times out of ten about to change it, and the fields are what
+        // they need. The `bru.set` spelling is included because it is the only spelling that works
+        // — `:set` cannot take a function back, and a line that printed something unsettable
+        // without saying so would be the printed-form-that-looks-settable trap `Def::parse` refuses
+        // for dictionaries.
+        if let (Some(Value::Fn(handle)), Kind::TextOrFn(shape)) = (&value, def.kind) {
+            return Ok(format!(
+                "{} = {handle}\n  it is handed one table: {}\n  it is called {}\n  set it with \
+                 bru.set(\"{}\", function(t) … end) in config.lua; :set cannot take a function",
+                def.name,
+                shape.fields.join(", "),
+                shape.called,
+                def.name,
+            ));
+        }
+        // --- end setting functions -----------------------------------------------------------------
         let value = value.map_or_else(|| "<unset>".to_string(), |value| value.to_string());
         Ok(match scope {
             Some(pattern) => format!("{} = {value} for {}", def.name, pattern.describe()),
@@ -2926,6 +3185,14 @@ pub fn is_on(name: &str) -> bool {
 /// and `tabs_json_in` calls it per push. A push happens when a tab is added, closed, selected,
 /// retitled or re-addressed — never per keystroke, because `keys.rs` reaches `set_keystring`, which
 /// pushes the *bar*.
+// --- setting functions ---------------------------------------------------------------------------
+// **Nothing on this branch calls it**, and that is P2's doing: its two callers were `tabs_json_in`'s
+// reads of the two title formats, and both moved to `template_of` — which is the same read plus the
+// ability to call a function per tab. It is kept rather than deleted because it is [`is_on`]'s twin
+// and the pair is documented as a pair; deleting half of one because this branch's callers moved is
+// churn the next workstream to want it would have to undo.
+#[allow(dead_code)]
+// --- end setting functions -------------------------------------------------------------------------
 pub fn text_or_default(name: &str) -> String {
     text_of(name).unwrap_or_else(|| {
         def(name)
@@ -2935,6 +3202,204 @@ pub fn text_or_default(name: &str) -> String {
     })
 }
 // --- end tabs and statusbar --------------------------------------------------------------------
+
+// --- setting functions ---------------------------------------------------------------------------
+/// One [`Kind::TextOrFn`] setting's value, read out of the store **once** and then asked for its
+/// text as many times as the caller needs.
+///
+/// The split exists because the two costs are different and both matter. Reading the store takes the
+/// settings mutex, measured at 43.7 ns, and `tabs_json_in` would take it twice per tab for two
+/// answers that cannot change between the first tab and the twentieth — which is why it has always
+/// read the format once for the whole strip. Calling the function is the *other* cost, and it is per
+/// tab by definition: a function that answers the same string for every tab is a function nobody
+/// would have written.
+///
+/// So: `template_of` once per rebuild, `call` once per tab.
+pub struct Template {
+    def: &'static Def,
+    body: Body,
+}
+
+enum Body {
+    Literal(String),
+    Function(crate::lua::FnRef),
+}
+
+impl Template {
+    /// The literal this setting is on, or `None` when it is a function.
+    ///
+    /// A caller that fills its own placeholders — `tabs::label_for`, `editor::editor_spec` — asks
+    /// this first and only reaches [`Template::call`] when the answer is `None`. That is not an
+    /// optimisation: a literal has to go through the caller's substitution to mean anything, and a
+    /// function's answer must not, or a page whose real title contained `{index}` would come out
+    /// different from every other page.
+    pub fn literal(&self) -> Option<&str> {
+        match &self.body {
+            Body::Literal(text) => Some(text),
+            Body::Function(_) => None,
+        }
+    }
+
+    /// What bru ships for this setting, for a caller that has to fall back to it.
+    ///
+    /// It is **the template, unsubstituted** — `{audio}{index}: {current_title}` — because the
+    /// caller is the thing that knows how to substitute. See [`Template::call`] for why that
+    /// matters, and for what it looked like when this function did not exist.
+    pub fn default_text(&self) -> &'static str {
+        self.def.default.unwrap_or_default()
+    }
+
+    /// **The one place in bru a setting's function is called.** `None` when there was no answer.
+    ///
+    /// Every reader funnels through here — `text_of`, `text_or_default`, `tabs.rs` and `editor.rs`.
+    /// One call site rather than one each is the lesson this project has already paid for once: a
+    /// fix for a command-line bug shipped with a test that held the pure functions rather than the
+    /// call site, and it passed while the bug was reintroduced. Two places that call a function are
+    /// two places that have to agree about what happens when it throws.
+    ///
+    /// **`None` rather than the default, and that is a bug this shape had and no longer has.** The
+    /// obvious version answered `self.def.default` when the call failed, which is right in every
+    /// word and wrong in the one that matters: the default of `tabs.title.format` is a *template*,
+    /// and handing it back as an answer meant the strip drew the six literal characters
+    /// `{index}` — seen on 2026-08-07, with a `config.lua` whose function indexed a nil field, on
+    /// the very run that was checking the browser survived it. What the caller wants is to do what
+    /// it does for a literal, with [`Template::default_text`], so the tab drawn is the tab that was
+    /// there before the function was written.
+    ///
+    /// A `None` is never silent: the bar says what happened, once per distinct message per setting,
+    /// through [`report_fn_error`]. A thread with no Lua state — a renderer, a unit test
+    /// (CEF-NOTES trap 13) — takes the same path and says so once, because a strip drawn with bru's
+    /// own format in a process that cannot reach the config is worth a line.
+    pub fn call(&self, fields: &[(&'static str, crate::lua::Arg)]) -> Option<String> {
+        let Body::Function(handle) = &self.body else {
+            return None;
+        };
+        match crate::lua::call_string_fields(handle, fields) {
+            Ok(text) => Some(text),
+            Err(why) => {
+                report_fn_error(self.def, &why);
+                None
+            }
+        }
+    }
+
+    /// The setting's text, for a caller that has **no** placeholders to fill in: the literal as it
+    /// stands, or the function's answer.
+    ///
+    /// `None` means the same thing it means for [`text_of`] — nothing to say — and that covers both
+    /// a setting nothing has set and a function that did not answer. For `editor.command` the two
+    /// land in the same place and it is the right place: unset is the `$BRU_EDITOR` chain, and a
+    /// function that threw should leave the same chain standing rather than leave the user with no
+    /// editor.
+    pub fn text(&self, fields: &[(&'static str, crate::lua::Arg)]) -> Option<String> {
+        match &self.body {
+            Body::Literal(text) => Some(text.clone()),
+            Body::Function(_) => self.call(fields),
+        }
+    }
+}
+
+/// One [`Kind::Text`], [`Kind::Chars`] or [`Kind::TextOrFn`] setting, ready to be asked for its text.
+///
+/// `None` means nothing has set it **and bru ships no default**, which is [`text_of`]'s own
+/// contract and is meaningful for the three settings that use it — `editor.command` unset is the
+/// `$BRU_EDITOR` chain.
+pub fn template_of(name: &str) -> Option<Template> {
+    let def = def(name)?;
+    match with_live(|settings| settings.get(name, None)) {
+        Ok(Some(Value::Text(text))) => Some(Template { def, body: Body::Literal(text) }),
+        Ok(Some(Value::Fn(handle))) => Some(Template { def, body: Body::Function(handle) }),
+        _ => None,
+    }
+}
+
+/// The last thing said about each setting's function, so that a strip of twenty tabs whose function
+/// throws says it once rather than twenty times.
+///
+/// Keyed by the setting rather than global: two broken settings are two different things to fix, and
+/// the second one hiding behind the first is how a person fixes one and thinks they are done.
+static LAST_FN_ERROR: Mutex<Option<HashMap<&'static str, String>>> = Mutex::new(None);
+
+/// Where a broken function's message goes, beside stderr.
+///
+/// A function pointer rather than a call to `crate::message::error`, and it is `spawn.rs`'s own
+/// pattern (`set_message_sink`) for exactly this reason: `message::show` posts a delayed CEF task,
+/// and this file's tests run with no CEF behind them. Unset — a unit test, or a browser before
+/// `app.rs` has installed it — the line still reaches stderr.
+static FN_ERROR_SINK: Mutex<Option<fn(&str)>> = Mutex::new(None);
+
+/// Send a broken setting function's message to the bar as well. Called once from `app.rs`.
+pub fn set_fn_error_sink(sink: fn(&str)) {
+    *FN_ERROR_SINK.lock().expect("the settings mutex is never poisoned") = Some(sink);
+}
+
+/// Say what a setting's function did wrong, once per distinct message per setting.
+fn report_fn_error(def: &'static Def, why: &str) {
+    let text = format!("{}: {why}", def.name);
+    {
+        let mut guard = LAST_FN_ERROR
+            .lock()
+            .expect("the settings mutex is never poisoned");
+        let seen = guard.get_or_insert_with(HashMap::new);
+        if seen.get(def.name).is_some_and(|last| last == &text) {
+            return;
+        }
+        seen.insert(def.name, text.clone());
+    }
+    eprintln!("bru: {text}");
+    // **Posted rather than said here, and this was measured rather than reasoned about.** Said
+    // inline, the browser hung: `tabs_json_in` runs with `BruState`'s mutex held —
+    // `push_tabs_everywhere` takes it and maps every window through it — and `message::error`
+    // reaches `ipc::push_bar`, which takes the same mutex to find out which window is in front.
+    // Seen 2026-08-07 with a `config.lua` whose `tabs.title.format` indexes a nil field: the error
+    // printed once, on stderr, during the first window's creation, and nothing after it ever ran.
+    // No tab opened, no probe fired, and the process sat there until `--close-after-ms`.
+    //
+    // A posted task runs after the current one has returned and the lock is gone. It is the same
+    // shape `bru.cmd` takes in PLUGIN-CONTRACTS.md and the same trap 12 it is taking it for.
+    //
+    // The sink being installed is also the gate on posting at all: `app.rs` installs it in
+    // `on_context_initialized`, so a sink means CEF is up, and a unit test — where
+    // `post_delayed_task` has nothing behind it — never gets past this line.
+    if FN_ERROR_SINK
+        .lock()
+        .expect("the settings mutex is never poisoned")
+        .is_some()
+    {
+        let mut task = SayFnError::new(text);
+        post_delayed_task(ThreadId::UI, Some(&mut task), 0);
+    }
+}
+
+wrap_task! {
+    struct SayFnError {
+        text: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let sink = *FN_ERROR_SINK
+                .lock()
+                .expect("the settings mutex is never poisoned");
+            if let Some(sink) = sink {
+                sink(&self.text);
+            }
+        }
+    }
+}
+
+/// Forget what a setting's function last said, so that the next throw is reported again.
+///
+/// Called when the setting is set: a person who has just edited the function is about to find out
+/// whether they fixed it, and "you already told me" is the wrong answer to that.
+fn forget_fn_error(name: &'static str) {
+    if let Ok(mut guard) = LAST_FN_ERROR.lock() {
+        if let Some(seen) = guard.as_mut() {
+            seen.remove(name);
+        }
+    }
+}
+// --- end setting functions -------------------------------------------------------------------------
 
 // --- unhardcoded -------------------------------------------------------------------------------
 /// One [`Kind::Int`] setting's value in force globally, falling back to its compiled-in default.
@@ -2961,10 +3426,16 @@ pub fn int_of(name: &str) -> i64 {
 /// `$BRU_EDITOR`/`$VISUAL`/`$EDITOR`/`nvim` chain, `downloads.location.directory` unset is the
 /// desktop's XDG answer. Not for the key path, for [`int_of`]'s reason.
 pub fn text_of(name: &str) -> Option<String> {
-    match with_live(|settings| settings.get(name, None)) {
-        Ok(Some(Value::Text(text))) => Some(text),
-        _ => None,
-    }
+    // --- setting functions -----------------------------------------------------------------------
+    // Through [`Template`] rather than reading the store itself, so that a caller who does not know
+    // this setting can hold a function still gets the function's answer. It is called with **no
+    // fields**, which is the honest thing for a reader that has none to give — a function that
+    // wants `tab.title` gets `nil` and says so, in the bar, naming the setting.
+    //
+    // The callers that do have fields ask `template_of` and pass them; the callers that have none
+    // read exactly what they read before.
+    template_of(name).and_then(|template| template.text(&[]))
+    // --- end setting functions -------------------------------------------------------------------
 }
 
 /// One [`Kind::Choice`] setting's value in force globally, or bru's own when nothing has set it.
@@ -3344,7 +3815,13 @@ fn content_value(kind: ContentKind, value: &Value) -> Option<ContentSettingValue
         // `ContentSetting` is a four-valued enum, and the settings that carry a `Kind::Int` are all
         // `Backing::Read` or `Backing::ScrollStep`, which never reach here. Refused with the same
         // `None` a dictionary gets rather than rounded into `ALLOW`.
-        Value::Int(_) | Value::Dict(_) | Value::List(_) => None,
+        // --- setting functions -------------------------------------------------------------------
+        // A function is in the same list and for a sharper reason: the two settings that can hold
+        // one are `Backing::Chrome` and `Backing::Read`, so nothing here can be reached with one —
+        // and if something ever could, calling a user's Lua to decide what to write into Chromium's
+        // content-settings map is a decision, not a coercion. `None` says so.
+        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::Fn(_) => None,
+        // --- end setting functions -----------------------------------------------------------------
     }
 }
 
@@ -3375,9 +3852,15 @@ fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
         // none of the three bru drives is one, so there is no `set_int` call to reach. A number
         // arriving here means a setting was given `Backing::Preference` and a `Kind::Int` without
         // this arm being written, which is a mistake to say out loud rather than to coerce.
-        Value::Int(_) | Value::Dict(_) | Value::List(_) => {
+        // --- setting functions -------------------------------------------------------------------
+        // A function is in the same arm, and the wording covers it: none of the three preferences
+        // bru drives is a `Kind::TextOrFn`, so this is unreachable, and saying so is better than a
+        // coercion that would put `<function config.lua:12>` into Chromium's profile as text.
+        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::Fn(_) => {
+        // --- end setting functions -----------------------------------------------------------------
             return Err(format!(
-                "{}: a preference bru drives is a boolean or a string, not a number or a table",
+                "{}: a preference bru drives is a boolean or a string, not a number, a table or a \
+                 function",
                 pref.name()
             ));
         }
@@ -3564,6 +4047,9 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
 /// | `<setting>@<url>` | what Chromium enforces for one of bru's settings at one URL |
 /// | `prefs:<name>` | whether a Chromium preference exists and is settable, plus every top-level one whose name contains it — see [`dump_preferences`] |
 /// | `cookies:<third-party>\|<top-level>` | whether the rule `no-3rdparty` needs can be written at all — see [`probe_third_party_cookies`] |
+// --- setting functions ---------------------------------------------------------------------------
+/// | `strip:<iterations>` | what a tab-strip rebuild costs, with whatever `tabs.title.format` is set to — see [`time_strip_rebuild`] |
+// --- end setting functions -------------------------------------------------------------------------
 ///
 /// It exists because "the setting was stored" and "Chromium is enforcing it" are different claims,
 /// and only the second one is worth anything. `--cmd` already drives `:set` and `:config-cycle`
@@ -3595,6 +4081,12 @@ wrap_task! {
                     probe_third_party_cookies(spec);
                     continue;
                 }
+// --- setting functions ---------------------------------------------------------------------------
+                if let Some(spec) = pair.strip_prefix("strip:") {
+                    time_strip_rebuild(spec);
+                    continue;
+                }
+// --- end setting functions -------------------------------------------------------------------------
 // --- content settings --------------------------------------------------------------------------
                 if let Some(path) = pair.strip_prefix("prefkeys:") {
                     dump_preference_keys(path);
@@ -3623,6 +4115,62 @@ wrap_task! {
         }
     }
 }
+
+// --- setting functions ---------------------------------------------------------------------------
+/// `--settings-probe='strip:<iterations>'` — what one tab-strip rebuild costs, in the real browser.
+///
+/// **This is P2's measurement and the reason the switch grew a fourth form.** PLUGINS.md said in as
+/// many words that no number existed for "a setting can hold a function", and that if a function per
+/// tab per push turned out to be expensive the design would have to change. The only way to find out
+/// is to run the thing that runs: `tabs_json` is what `push_tabs_everywhere` calls, once per window,
+/// and inside it `tabs.title.format` is read once and — when it is a function — called once per tab.
+///
+/// It times **that function**, on the UI thread, with whatever tabs are open and whatever the
+/// setting is set to. Nothing here rebuilds a strip of its own out of parts, because a harness that
+/// reproduces the assumption is not a measurement: the two runs a number is worth anything from are
+/// the same binary with the same tabs and two different `config.lua` files.
+///
+/// A warm-up pass first, thrown away. The first rebuild pays for the settings mutex's first lock and
+/// for `mlua`'s first table allocation, and a number that includes those is a number about starting
+/// up rather than about drawing.
+fn time_strip_rebuild(spec: &str) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let iterations: u32 = spec.trim().parse().unwrap_or(1000);
+    let Some(state) = crate::state::BruState::instance() else {
+        eprintln!("settings-probe: strip: there is no browser state to rebuild a strip from");
+        return;
+    };
+    let guard = state.lock().expect("state mutex poisoned");
+    let tabs = guard.tab_count();
+
+    // Kept and summed so that the optimiser cannot decide the loop has no effect, and printed so
+    // that a payload which came out empty cannot be read as a fast rebuild.
+    let mut bytes = 0usize;
+    for _ in 0..iterations.min(50) {
+        bytes += guard.tabs_json().len();
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        bytes += guard.tabs_json().len();
+    }
+    let elapsed = start.elapsed();
+
+    let each = elapsed.as_nanos() as f64 / f64::from(iterations.max(1));
+    let value = value_of("tabs.title.format").unwrap_or_default();
+    eprintln!(
+        "settings-probe: strip: {tabs} tabs, {iterations} rebuilds, {:.3} ms total, \
+         {each:.0} ns per rebuild, {:.0} ns per tab; tabs.title.format = {value}; \
+         payload {} bytes",
+        elapsed.as_secs_f64() * 1000.0,
+        each / f64::from(u32::try_from(tabs.max(1)).unwrap_or(1)),
+        bytes / (iterations as usize + iterations.min(50) as usize),
+    );
+    // The payload itself, once. A count of nanoseconds says nothing about whether the strip is
+    // drawing what the config asked for, and a rebuild that produced the *default* label would be
+    // both fast and wrong. This is the same string `push_tabs_everywhere` hands `chrome/top.js`.
+    eprintln!("settings-probe: strip: {}", guard.tabs_json());
+}
+// --- end setting functions -------------------------------------------------------------------------
 
 // --- content settings ----------------------------------------------------------------------------
 /// `--settings-probe='prefkeys:intl'` — the keys **inside** one nested preference dictionary, with
@@ -4907,4 +5455,230 @@ mod tests {
         assert_eq!(expand("no placeholders"), "no placeholders");
         assert!(Pattern::parse(&expand("*://{url:host}/*")).is_err());
     }
+
+    // --- setting functions -----------------------------------------------------------------------
+    /// A `Kind::TextOrFn` setting still takes a literal, from `:set` and from `config.lua` alike,
+    /// and the empty string is still refused.
+    ///
+    /// It is first because it is the claim a new kind most easily breaks: everything that worked
+    /// before has to still work, and `tabs.title.format` is a setting the user already has a value
+    /// for.
+    #[test]
+    fn a_setting_that_can_hold_a_function_still_holds_a_literal() {
+        let mut settings = Settings::default();
+        assert!(settings.set("tabs.title.format", "{index}").is_ok());
+        assert!(settings.set("tabs.title.format", "").is_err());
+        assert!(settings.set("tabs.title.format_pinned", "{index}").is_ok());
+        assert!(settings.set("editor.command", "nvim {file}").is_ok());
+        assert_eq!(
+            settings.get("tabs.title.format", None).unwrap(),
+            Some(Value::Text("{index}".to_string()))
+        );
+        // And `config-cycle` still walks a list of them, which is what a key bound to one does.
+        let applied = settings
+            .cycle(
+                "tabs.title.format",
+                &["{index}".into(), "{current_title}".into()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(applied.value, Value::Text("{current_title}".to_string()));
+    }
+
+    /// **A setting that does not take a function says which ones do.**
+    ///
+    /// The mistake this catches is somebody who has read that a setting can be a function and
+    /// picked the wrong one; a bare refusal would leave them guessing, and the list is four names
+    /// long.
+    #[test]
+    fn a_setting_that_does_not_take_a_function_names_the_ones_that_do() {
+        let handle = a_function("return function() return 'x' end");
+        let mut settings = Settings::default();
+        let error = settings.set_fn("tabs.show", handle.clone()).unwrap_err();
+        assert!(error.contains("tabs.show does not take a function"), "{error}");
+        assert!(error.contains("tabs.title.format"), "{error}");
+        assert!(error.contains("editor.command"), "{error}");
+
+        // And an unknown name is still an unknown name rather than a complaint about functions.
+        let error = settings.set_fn("tabs.title.formta", handle).unwrap_err();
+        assert!(error.contains("unknown setting"), "{error}");
+    }
+
+    /// What `:set tabs.title.format` prints when it is a function: what it is, where it was
+    /// written, what it is handed, and the one spelling that can set it.
+    #[test]
+    fn what_set_prints_for_a_function_is_where_to_go_and_change_it() {
+        let mut settings = Settings::default();
+        settings
+            .set_fn("tabs.title.format", a_function("return function(t) return t.title end"))
+            .unwrap();
+        let printed = settings.describe("tabs.title.format", None).unwrap();
+        assert!(printed.contains("<function config.lua:1>"), "{printed}");
+        assert!(printed.contains("index, title, url, pinned, muted"), "{printed}");
+        assert!(printed.contains("once per tab"), "{printed}");
+        assert!(printed.contains(":set cannot take a function"), "{printed}");
+        // The one thing it must not be is the answer for a tab that does not exist.
+        assert!(!printed.contains("= \n"), "{printed}");
+    }
+
+    /// `:config-diff` says a function is a function rather than printing Lua that would set the
+    /// text `<function config.lua:1>`.
+    ///
+    /// The whole promise of the command is that its output is a config file you can paste back, and
+    /// a line that pasted back wrongly is worse than a line that says it is not there.
+    #[test]
+    fn config_diff_will_not_pretend_a_function_is_a_string() {
+        let mut settings = Settings::default();
+        settings
+            .set_fn("tabs.title.format", a_function("return function() return 'x' end"))
+            .unwrap();
+        let lines = settings.diff();
+        let line = lines
+            .iter()
+            .find(|line| line.contains("tabs.title.format"))
+            .unwrap_or_else(|| panic!("nothing about it in {lines:?}"));
+        assert!(line.starts_with("--"), "{line}");
+        assert!(line.contains("a function"), "{line}");
+        assert!(!line.contains("bru.set("), "{line}");
+    }
+
+    /// Every setting that takes a function says what it hands over and how often.
+    ///
+    /// Walked rather than listed, so a fourth one cannot arrive with an empty field list and a
+    /// settings page that says "a function of ()".
+    #[test]
+    fn every_function_setting_says_what_it_hands_over() {
+        let mut found = 0;
+        for def in SETTINGS {
+            let Kind::TextOrFn(shape) = def.kind else {
+                continue;
+            };
+            found += 1;
+            assert!(!shape.fields.is_empty(), "{}: no fields", def.name);
+            assert!(!shape.called.is_empty(), "{}: does not say how often", def.name);
+            for field in shape.fields {
+                assert!(
+                    field.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "{}: {field:?} is not a name a Lua table can be indexed by with a dot",
+                    def.name
+                );
+            }
+        }
+        // Three: the two tab titles and `editor.command`. Raise this with the setting.
+        assert_eq!(found, 3);
+        assert_eq!(
+            fn_setting_names(),
+            "tabs.title.format, tabs.title.format_pinned, editor.command"
+        );
+    }
+
+    /// **The whole of P2, through the live store, which is what every reader in bru actually
+    /// reads.**
+    ///
+    /// One test rather than six because it installs into the process-wide store and has to put it
+    /// back: `LIVE` is a `static` and `cargo test` runs threads in parallel, so a test that left a
+    /// function-valued `tabs.title.format` behind would be a test that changed another one's
+    /// answer.
+    ///
+    /// It covers, in order: a function's answer reaching a reader; a literal still reaching the
+    /// same reader; a throw falling back to bru's own default rather than to an empty string; an
+    /// answer that is not a string doing the same and naming the type; and the value the settings
+    /// page prints.
+    #[test]
+    fn the_live_readers_call_the_function_and_survive_it_throwing() {
+        let mut settings = Settings::default();
+        settings
+            .set_fn(
+                "tabs.title.format",
+                a_function("return function(t) return t.title:upper() end"),
+            )
+            .unwrap();
+        install(settings);
+
+        let template = template_of("tabs.title.format").expect("it ships a default");
+        assert!(template.literal().is_none(), "a function is not a literal");
+        assert_eq!(
+            template.call(&[("title", crate::lua::Arg::Text("example".to_string()))]),
+            Some("EXAMPLE".to_string())
+        );
+        // What `bru://chrome/settings` shows: what it is and where, never a call's answer.
+        assert_eq!(
+            value_of("tabs.title.format").as_deref(),
+            Some("<function config.lua:1>")
+        );
+
+        // **A throw is bru's own default, not an empty string.** A tab drawn with the default
+        // format is the tab that was there before the function was written; a blank one looks like
+        // a tab with nothing in it, which is a different bug to go looking for.
+        let mut settings = Settings::default();
+        settings
+            .set_fn("tabs.title.format", a_function("return function() error('no') end"))
+            .unwrap();
+        install(settings);
+        // **`None`, not the default**: the caller falls back with `default_text` and its own
+        // substitution, so a broken function draws the tab that was there before it was written
+        // rather than the six characters `{index}`. That is not hypothetical — see `Template::call`.
+        let template = template_of("tabs.title.format").unwrap();
+        assert_eq!(template.call(&[]), None);
+        assert_eq!(template.default_text(), "{audio}{index}: {current_title}");
+
+        // An answer that is not a string is the same fallback, and the message names the type.
+        let mut settings = Settings::default();
+        settings
+            .set_fn("tabs.title.format", a_function("return function() return {} end"))
+            .unwrap();
+        install(settings);
+        assert_eq!(template_of("tabs.title.format").unwrap().call(&[]), None);
+
+        // A literal, through the same reader, still substitutes rather than calls.
+        let mut settings = Settings::default();
+        settings.set("tabs.title.format", "{index}: {current_title}").unwrap();
+        install(settings);
+        assert_eq!(
+            template_of("tabs.title.format").unwrap().literal(),
+            Some("{index}: {current_title}")
+        );
+
+        install(Settings::default());
+    }
+
+    /// **The case a renderer process is in, and the one that must not panic.**
+    ///
+    /// A function registered on one thread, read on another that never loaded a config — which is
+    /// what a renderer and a `cargo test` binary both look like (CEF-NOTES trap 13). The answer is
+    /// bru's compiled-in default, in silence as far as the caller is concerned, and the browser goes
+    /// on.
+    #[test]
+    fn a_function_read_from_a_process_with_no_lua_is_brus_own_default() {
+        let mut settings = Settings::default();
+        settings
+            .set_fn(
+                "tabs.title.format_pinned",
+                a_function("return function() return 'never seen' end"),
+            )
+            .unwrap();
+
+        let answer = std::thread::spawn(move || {
+            let template = Template {
+                def: def("tabs.title.format_pinned").unwrap(),
+                body: match settings.get("tabs.title.format_pinned", None).unwrap() {
+                    Some(Value::Fn(handle)) => Body::Function(handle),
+                    other => panic!("it did not store a function: {other:?}"),
+                },
+            };
+            (template.call(&[]), template.default_text())
+        })
+        .join()
+        .expect("a renderer must not take the browser down");
+        assert_eq!(answer, (None, "{index}"));
+    }
+
+    /// A Lua function in the shared state, the way `config.rs` makes one, as the handle a setting
+    /// stores.
+    fn a_function(source: &str) -> crate::lua::FnRef {
+        let lua = crate::lua::shared();
+        let function: mlua::Function = lua.load(source).set_name("config.lua").eval().unwrap();
+        crate::lua::register(&function).expect("the state was just made")
+    }
+    // --- end setting functions ---------------------------------------------------------------------
 }

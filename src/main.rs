@@ -31,6 +31,11 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
+// --- setting functions -------------------------------------------------------------------------
+// The second file allowed to mention `mlua`. Workstream A creates it in P1; this line is here so
+// that P2 compiles on its own branch, and the two spellings are the same line.
+mod lua;
+// --- end setting functions ---------------------------------------------------------------------
 mod macros;
 mod message;
 mod modes;
