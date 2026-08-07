@@ -228,7 +228,11 @@ body[data-view="bottom"] {
  * while the line is open, so the line always has at least 60%. Above about
  * 900px the group's own content is the smaller of the two and nothing changes. */
 body.mode-command {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 40%);
+    /* Three tracks, like the row above — this said two, and the mode indicator
+       then took the `1fr` while the command line took 40% and `:` appeared in
+       the middle of the bar. The indicator is `auto` in both: it is exactly as
+       wide as the word in it and nothing else. */
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, 40%);
 }
 
 /* Completion --------------------------------------------------------------
