@@ -2097,10 +2097,21 @@ mod tests {
     ///
     /// A weak test of a strong kind: it cannot say the branch is right, only that nobody has
     /// deleted it and left `never` following on the last character of the label anyway.
+    ///
+    /// **It reads the file above `mod tests` and not the whole of it**, and that is not tidiness:
+    /// written the obvious way it passed with the branch deleted, because the needle it looks for
+    /// is a string literal *in this function* and `contains` found itself. Measured 2026-08-07 —
+    /// the branch was cut out of `handle_key`, `cargo test never_leaves` stayed green, and the only
+    /// thing the assertion had proved was that it was still written down. That is the round's own
+    /// lesson about a check that shares an assumption with its fix, in one line of source.
     #[test]
     fn never_leaves_an_exact_match_standing_for_return() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let source = std::fs::read_to_string(root.join("src/hints.rs")).expect("readable");
+        let whole = std::fs::read_to_string(root.join("src/hints.rs")).expect("readable");
+        let source = whole
+            .split_once("mod tests {")
+            .expect("hints.rs has a test module")
+            .0;
         assert!(
             source.contains("Match::Exact(_) if open.auto_follow == AutoFollow::Never"),
             "handle_key follows an exact match under `never`, which leaves <Return> nothing to do"
