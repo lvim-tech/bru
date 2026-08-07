@@ -47,7 +47,6 @@
 //! that is usually empty.
 
 use cef::*;
-use std::sync::{Mutex, OnceLock};
 
 /// `~/.config/bru/styles`, or `None` where there is no config directory.
 ///
@@ -159,10 +158,14 @@ static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// corrected it", and asking twice would be one message per document instead of one per process.
 static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The process message `settings.rs` sends when `content.user_styles` moves, and `:styles-reload`
-/// when the folder has been edited.
+/// The process message `settings.rs` sends when `content.user_styles` moves.
+///
+/// There was a `RELOAD` beside it, and a cache for it to drop. Both were dead — the cache was
+/// written in one place, the `RELOAD` arm that cleared it, and **never read**; and nothing ever
+/// sent `RELOAD`, because `:styles-reload` does not exist. It does not exist for a reason this
+/// module's own header gives: the folder is read on every navigation, so there is never a stale
+/// copy to drop. Removed 2026-08-07 rather than given the command it was waiting for.
 pub const SET_ENABLED: &str = "bru.userstyles.enabled";
-pub const RELOAD: &str = "bru.userstyles.reload";
 
 /// The process message a renderer sends when it has never been told whether the styles are on.
 ///
@@ -172,12 +175,6 @@ pub const RELOAD: &str = "bru.userstyles.reload";
 /// `scrollbar.rs` had the identical hole and this is the identical answer: apply the default at
 /// once, ask, and correct on the reply. One message per renderer process.
 pub const ASK: &str = "bru.userstyles.ask";
-
-/// What was read off the disk, so a page load is not a directory walk. Dropped by [`RELOAD`].
-fn cache() -> &'static Mutex<Option<Vec<(String, String)>>> {
-    static CACHE: OnceLock<Mutex<Option<Vec<(String, String)>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
 
 /// **The renderer's hook, and the only place a page is styled.**
 ///
@@ -284,13 +281,6 @@ pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessag
         return false;
     };
     let name = CefString::from(&message.name()).to_string();
-    if name == RELOAD {
-        *cache().lock().expect("the userstyles cache mutex is never poisoned") = None;
-        if let Some(frame) = frame {
-            apply(frame);
-        }
-        return true;
-    }
     if name == SET_ENABLED {
         let on = message.argument_list().map(|arguments| arguments.bool(0) != 0).unwrap_or(true);
         ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
