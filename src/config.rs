@@ -1555,6 +1555,187 @@ mod tests {
         assert_eq!(b.unbind("normal", "gg"), Ok(false));
     }
 
+// --- config commands -----------------------------------------------------------------------
+    /// A list setting's value is a Lua **array**, and it appends.
+    #[test]
+    fn a_lua_array_is_a_list_settings_value_and_it_appends() {
+        let cfg = TempConfig::new(
+            "list",
+            r#"
+                bru.set("content.blocking.adblock.lists", {
+                    "https://example.com/mine.txt",
+                    "https://example.com/other.txt",
+                })
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        let printed = config
+            .settings
+            .describe("content.blocking.adblock.lists", None)
+            .unwrap();
+        assert!(
+            printed.starts_with("content.blocking.adblock.lists — 4 entries, 2 added"),
+            "{printed}"
+        );
+        // Order is kept, which is the difference between reading an array and reading a map: the
+        // two lists bru ships come first and the file's two follow in the order it wrote them.
+        assert!(printed.contains("[2] = https://example.com/mine.txt"), "{printed}");
+        assert!(printed.contains("[3] = https://example.com/other.txt"), "{printed}");
+
+        // A table with a string key in it is not a list, and is refused by name rather than half
+        // read — the array part alone would have dropped `nope` without a word.
+        let cfg = TempConfig::new(
+            "list-with-a-key",
+            r#"bru.set("content.blocking.adblock.lists", { "https://x/a.txt", nope = "b" })"#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        assert!(config
+            .settings
+            .describe("content.blocking.adblock.lists", None)
+            .unwrap()
+            .starts_with("content.blocking.adblock.lists — 2 entries, 0 added"));
+    }
+
+    /// **`:config-source` builds a second Lua state, and the rule it looks like it breaks is about
+    /// the key path.**
+    ///
+    /// What is asserted here is the behaviour that makes the command worth having: it reads the
+    /// file *over* what is already live, so a `:set` typed since startup survives it, and
+    /// `--clear` is the spelling that does not.
+    #[test]
+    fn sourcing_a_file_again_reads_it_over_what_is_already_live() {
+        let cfg = TempConfig::new(
+            "source",
+            r#"
+                bru.bind("normal", "X", "tab-prev")
+                bru.set("start_page", "https://sourced/")
+            "#,
+        );
+        // A browser that has been running: one key rebound and one setting typed since startup.
+        let mut live = Config::load_from(None);
+        live.bindings.bind("normal", "Z", "tab-next").unwrap();
+        live.settings.set("content.images", "false").unwrap();
+
+        let after = source_over(live.clone(), &cfg.path(), false).expect("the file is there");
+        // The file's own two took effect...
+        assert_eq!(after.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+        assert_eq!(after.settings.start_page().as_deref(), Some("https://sourced/"));
+        // ...and what was live and unmentioned survived, which is the whole claim.
+        assert_eq!(after.bindings.command_for(Mode::Normal, "Z"), Some("tab-next"));
+        assert_eq!(
+            after.settings.describe("content.images", None).unwrap(),
+            "content.images = false"
+        );
+
+        // `--clear` is the other thing, and it is a different command spelling rather than a
+        // surprise: bru's defaults, then the file.
+        let after = source_over(live, &cfg.path(), true).expect("the file is there");
+        assert_eq!(after.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+        assert_eq!(after.bindings.command_for(Mode::Normal, "Z"), None);
+        assert_eq!(
+            after.settings.describe("content.images", None).unwrap(),
+            "content.images = true"
+        );
+
+        // A file that is not there is an error the typist reads, not a silent no-op.
+        let missing = cfg.dir.join("nothing.lua");
+        assert!(source_over(Config::default_config(), &missing, false).is_err());
+    }
+
+    /// `:config-source`'s argument, resolved the way qutebrowser resolves it.
+    #[test]
+    fn a_sourced_filename_is_resolved_against_the_config_directory() {
+        let default = config_path().expect("this machine has a config directory");
+        assert_eq!(source_path(None), Some(default.clone()));
+        assert_eq!(
+            source_path(Some("other.lua")),
+            Some(default.parent().unwrap().join("other.lua"))
+        );
+        assert_eq!(
+            source_path(Some("/etc/bru.lua")),
+            Some(PathBuf::from("/etc/bru.lua"))
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                source_path(Some("~/x.lua")),
+                Some(PathBuf::from(home).join("x.lua"))
+            );
+        }
+    }
+
+    /// `:config-diff`'s bindings half. Three shapes, and the third is the one only a browser that
+    /// ships defaults can have: a key bru binds and the user has taken away.
+    #[test]
+    fn the_binding_diff_is_the_lua_that_would_reproduce_the_table() {
+        let mut bindings = Bindings::defaults();
+        assert!(bindings.diff().is_empty(), "bru's own table differs from itself in nothing");
+
+        bindings.bind("normal", "J", "tab-prev").unwrap();
+        bindings.bind("normal", "ZX", "scroll down").unwrap();
+        bindings.unbind("normal", "d").unwrap();
+        let diff = bindings.diff();
+        assert!(diff.contains(&r#"bru.bind("normal", "J", "tab-prev")"#.to_string()), "{diff:?}");
+        assert!(diff.contains(&r#"bru.bind("normal", "ZX", "scroll down")"#.to_string()), "{diff:?}");
+        assert!(diff.contains(&r#"bru.unbind("normal", "d")"#.to_string()), "{diff:?}");
+        assert_eq!(diff.len(), 3, "and nothing else: {diff:?}");
+
+        // Pasting it back into a fresh bru reproduces the table it came from, which is the only
+        // claim a diff makes. Run through the same `bru.bind`/`bru.unbind` a config.lua would.
+        let mut rebuilt = Bindings::defaults();
+        rebuilt.bind("normal", "J", "tab-prev").unwrap();
+        rebuilt.bind("normal", "ZX", "scroll down").unwrap();
+        rebuilt.unbind("normal", "d").unwrap();
+        assert_eq!(rebuilt.all(), bindings.all());
+    }
+
+    /// `:bind --default` needs to know what bru's own table says, whatever has been loaded over it.
+    #[test]
+    fn brus_own_binding_for_a_key_is_read_from_brus_own_table() {
+        assert_eq!(
+            Bindings::default_command_for(Mode::Normal, "j").as_deref(),
+            Some("scroll down")
+        );
+        // Spelling does not matter: the lookup is by parsed sequence.
+        assert_eq!(
+            Bindings::default_command_for(Mode::Normal, "<ctrl-t>").as_deref(),
+            Some("open -t")
+        );
+        // A key bru binds nothing to has no default, which is what makes `:bind --default` on one
+        // an unbind rather than a no-op.
+        assert_eq!(Bindings::default_command_for(Mode::Normal, "ZX"), None);
+        assert_eq!(Bindings::default_command_for(Mode::Caret, "j").as_deref(), Some("move-to-next-line"));
+    }
+
+    /// **`BindingTrie::remove` prunes, and `:unbind` is why that matters.**
+    ///
+    /// Taking `gg` away must leave `g` a partial match, because `ga`, `go` and the rest are still
+    /// there; taking the last binding under a prefix away must leave the prefix answering
+    /// `NoMatch`, or a key would sit waiting for a chain that cannot complete.
+    #[test]
+    fn unbinding_the_last_key_under_a_prefix_frees_the_prefix() {
+        let mut trie: BindingTrie<Command> = BindingTrie::new();
+        let seq = |s: &str| crate::bindings::parse_key_sequence(s).unwrap();
+        trie.insert(&seq("gg"), Command::Nop);
+        trie.insert(&seq("ga"), Command::Nop);
+        assert_eq!(trie.matches(&seq("g")).match_type(), MatchType::PartialMatch);
+
+        trie.remove(&seq("gg"));
+        assert_eq!(trie.matches(&seq("gg")).match_type(), MatchType::NoMatch);
+        assert_eq!(
+            trie.matches(&seq("g")).match_type(),
+            MatchType::PartialMatch,
+            "ga is still there"
+        );
+        trie.remove(&seq("ga"));
+        assert_eq!(
+            trie.matches(&seq("g")).match_type(),
+            MatchType::NoMatch,
+            "the prefix has to go with its last child, or g waits for a key that cannot come"
+        );
+        assert!(trie.is_empty());
+    }
+// --- end config commands -----------------------------------------------------------------------
+
     #[test]
     fn the_defaults_survive_into_working_key_parsers() {
         // The end-to-end check of M6 + M7: default config in, keypresses out.

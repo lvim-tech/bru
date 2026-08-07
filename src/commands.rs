@@ -2760,4 +2760,181 @@ mod tests {
         assert!(parse("tab-focus middle").is_err());
         assert!(parse("").is_err());
     }
+
+// --- config commands ---------------------------------------------------------------------------
+    #[test]
+    fn the_eight_config_commands_parse() {
+        assert_eq!(
+            parse("config-unset content.images").unwrap(),
+            Command::ConfigUnset { option: "content.images".to_string(), pattern: None }
+        );
+        assert_eq!(
+            parse("config-unset -u *://*.example.com/* content.javascript.enabled").unwrap(),
+            Command::ConfigUnset {
+                option: "content.javascript.enabled".to_string(),
+                pattern: Some("*://*.example.com/*".to_string()),
+            }
+        );
+        assert!(parse("config-unset").is_err());
+
+        assert_eq!(parse("config-clear").unwrap(), Command::ConfigClear { save: false });
+        assert_eq!(parse("config-clear --save").unwrap(), Command::ConfigClear { save: true });
+        assert_eq!(parse("config-diff").unwrap(), Command::ConfigDiff);
+        assert_eq!(parse("config-write-py").unwrap(), Command::ConfigWritePy);
+        // qutebrowser's three flags are swallowed rather than refused: someone who typed
+        // `--force` is owed the refusal, not "unknown flag".
+        assert_eq!(parse("config-write-py --force --defaults").unwrap(), Command::ConfigWritePy);
+
+        assert_eq!(
+            parse("config-list-add content.blocking.adblock.lists https://x/list.txt").unwrap(),
+            Command::ConfigListAdd {
+                option: "content.blocking.adblock.lists".to_string(),
+                value: "https://x/list.txt".to_string(),
+                print: false,
+            }
+        );
+        assert_eq!(
+            parse("config-list-remove -p content.blocking.adblock.lists https://x/list.txt").unwrap(),
+            Command::ConfigListRemove {
+                option: "content.blocking.adblock.lists".to_string(),
+                value: "https://x/list.txt".to_string(),
+                print: true,
+            }
+        );
+        assert!(parse("config-list-add content.blocking.adblock.lists").is_err());
+        assert!(parse("config-list-remove").is_err());
+
+        assert_eq!(
+            parse("config-source").unwrap(),
+            Command::ConfigSource { filename: None, clear: false }
+        );
+        assert_eq!(
+            parse("config-source --clear").unwrap(),
+            Command::ConfigSource { filename: None, clear: true }
+        );
+        // maxsplit=0: a path with a space in it is one argument.
+        assert_eq!(
+            parse("config-source /home/x/my configs/config.lua").unwrap(),
+            Command::ConfigSource {
+                filename: Some("/home/x/my configs/config.lua".to_string()),
+                clear: false,
+            }
+        );
+        assert_eq!(parse("config-edit").unwrap(), Command::ConfigEdit { no_source: false });
+        assert_eq!(
+            parse("config-edit --no-source").unwrap(),
+            Command::ConfigEdit { no_source: true }
+        );
+        // Every one of them acts when typed, `config-write-py` included — what it does is explain.
+        for text in [
+            "config-unset content.images",
+            "config-clear",
+            "config-diff",
+            "config-write-py",
+            "config-list-add content.blocking.adblock.lists https://x/l.txt",
+            "config-list-remove content.blocking.adblock.lists https://x/l.txt",
+            "config-source",
+            "config-edit",
+        ] {
+            assert!(crate::exec::is_live(&parse(text).unwrap()), "{text} is inert");
+        }
+    }
+
+    /// **`:bind` does not split on `;;`**, which is what makes a chain bindable at all.
+    ///
+    /// qutebrowser registers it `maxsplit=1, no_cmd_split=True` (`configcommands.py:120-121`). The
+    /// second half is the one worth a test: without it `:bind X scroll down ;; reload` parses as a
+    /// two-part `Chain`, binds `X` to `scroll down`, and reloads the page as a side effect of
+    /// having typed a `bind`.
+    #[test]
+    fn bind_takes_the_rest_of_the_line_verbatim() {
+        assert_eq!(
+            parse("bind X scroll down ;; reload").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("X".to_string()),
+                command: Some("scroll down ;; reload".to_string()),
+                default: false,
+            }
+        );
+        // The quoting `<Ctrl-W>`'s own default binding depends on survives, which re-joining the
+        // tokens would not: `rl-rubout " "` would come back as `rl-rubout` and a lost space.
+        assert_eq!(
+            parse("bind --mode command <Ctrl-W> rl-rubout \" \"").unwrap(),
+            Command::Bind {
+                mode: "command".to_string(),
+                keys: Some("<Ctrl-W>".to_string()),
+                command: Some("rl-rubout \" \"".to_string()),
+                default: false,
+            }
+        );
+        // Both spellings of the mode flag, and the short one.
+        for text in ["bind --mode=insert a nop", "bind -m insert a nop"] {
+            let Command::Bind { mode, .. } = parse(text).unwrap() else {
+                panic!("{text} is not a bind")
+            };
+            assert_eq!(mode, "insert");
+        }
+        // The four shapes.
+        assert_eq!(
+            parse("bind").unwrap(),
+            Command::Bind { mode: "normal".to_string(), keys: None, command: None, default: false }
+        );
+        assert_eq!(
+            parse("bind j").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("j".to_string()),
+                command: None,
+                default: false,
+            }
+        );
+        assert_eq!(
+            parse("bind --default j").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("j".to_string()),
+                command: None,
+                default: true,
+            }
+        );
+        // A flag *after* the key belongs to the command being bound, or `:bind X open -t` could
+        // never be written.
+        assert_eq!(
+            parse("bind X open -t").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("X".to_string()),
+                command: Some("open -t".to_string()),
+                default: false,
+            }
+        );
+        // `-` is a key, not a flag — it is `zoom-out`'s own binding.
+        assert_eq!(
+            parse("bind - zoom-in").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("-".to_string()),
+                command: Some("zoom-in".to_string()),
+                default: false,
+            }
+        );
+        assert!(parse("bind --nonsense j nop").is_err());
+        assert!(parse("bind --mode").is_err());
+
+        // `:unbind`, whose key is required.
+        assert_eq!(
+            parse("unbind d").unwrap(),
+            Command::Unbind { mode: "normal".to_string(), keys: "d".to_string() }
+        );
+        assert_eq!(
+            parse("unbind --mode caret j").unwrap(),
+            Command::Unbind { mode: "caret".to_string(), keys: "j".to_string() }
+        );
+        assert!(parse("unbind").is_err());
+        assert!(parse("unbind --nonsense d").is_err());
+        assert!(crate::exec::is_live(&parse("bind j").unwrap()));
+        assert!(crate::exec::is_live(&parse("unbind d").unwrap()));
+    }
+// --- end config commands -----------------------------------------------------------------------
 }

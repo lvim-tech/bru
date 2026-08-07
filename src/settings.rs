@@ -2628,6 +2628,224 @@ mod tests {
         assert!(js.contains("search_forward") && js.contains("search_backward"), "{js}");
     }
 
+    // -- lists, unsetting and the diff -----------------------------------------------------------
+
+    /// **The append decision, asserted**, and it is [`DictShape`]'s merge decision in the other
+    /// container. A replace would pass every other test in this file and show up only as a bru that
+    /// blocks nothing because `config.lua` named one filter list.
+    #[test]
+    fn a_list_override_appends_to_brus_defaults_rather_than_replacing_them() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        // Nothing set: bru's own two, in the order they are written.
+        assert_eq!(
+            settings.list_vec(def(name).unwrap()),
+            crate::adblock::DEFAULT_LISTS.to_vec()
+        );
+
+        settings
+            .set_list(name, &["https://example.com/mine.txt".to_string()])
+            .unwrap();
+        let entries = settings.list_vec(def(name).unwrap());
+        assert_eq!(entries.len(), 3, "the two bru ships are still there");
+        assert_eq!(entries[2], "https://example.com/mine.txt", "and the new one is last");
+
+        // An entry already there is not appended twice: two identical URLs would be fetched twice
+        // into one file name.
+        settings
+            .set_list(name, &[crate::adblock::DEFAULT_LISTS[0].to_string()])
+            .unwrap();
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 3);
+        let error = settings
+            .list_add(name, crate::adblock::DEFAULT_LISTS[0])
+            .unwrap_err();
+        assert!(error.contains("already in"), "{error}");
+
+        // Removing is the only way to lose one of bru's own.
+        settings.list_remove(name, crate::adblock::DEFAULT_LISTS[0]).unwrap();
+        let entries = settings.list_vec(def(name).unwrap());
+        assert_eq!(entries.len(), 2);
+        assert!(!entries.contains(&crate::adblock::DEFAULT_LISTS[0].to_string()));
+        let error = settings.list_remove(name, "https://nowhere/").unwrap_err();
+        assert!(error.contains("is not in"), "{error}");
+    }
+
+    #[test]
+    fn a_list_refuses_what_bru_could_not_fetch_and_is_not_a_scalar() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        let error = settings.list_add(name, "easylist.txt").unwrap_err();
+        assert!(error.contains("http:// or https://"), "{error}");
+        assert!(settings.list_add(name, "   ").is_err());
+        // One bad entry leaves the whole list alone, exactly as one bad pair leaves a dict alone.
+        assert!(settings
+            .set_list(
+                name,
+                &["https://ok/a.txt".to_string(), "nope".to_string()]
+            )
+            .is_err());
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 2);
+
+        // No text spelling, no cycling, and the two list commands refuse a setting that is not one.
+        let error = settings.set(name, "https://x/a.txt").unwrap_err();
+        assert!(error.contains("config-list-add"), "{error}");
+        assert!(settings.cycle(name, &[], None).is_err());
+        let error = settings.list_add("start_page", "https://x/").unwrap_err();
+        assert!(error.contains("can only be used for lists"), "{error}");
+        let error = settings.dict_add(name, "a", "b", false).unwrap_err();
+        assert!(error.contains("can only be used for dicts"), "{error}");
+    }
+
+    #[test]
+    fn printing_a_list_is_a_line_per_entry_and_says_which_are_not_brus() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        settings.list_add(name, "https://example.com/mine.txt").unwrap();
+        let printed = settings.describe(name, None).unwrap();
+        let mut lines = printed.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "content.blocking.adblock.lists — 3 entries, 1 added and 0 of bru's own removed"
+        );
+        assert_eq!(printed.lines().count(), 4, "a header and one line per entry");
+        assert!(
+            printed.contains("content.blocking.adblock.lists[2] = https://example.com/mine.txt   (added)"),
+            "{printed}"
+        );
+        settings.list_remove(name, crate::adblock::DEFAULT_LISTS[0]).unwrap();
+        assert!(
+            settings
+                .describe(name, None)
+                .unwrap()
+                .starts_with("content.blocking.adblock.lists — 2 entries, 1 added and 1 of bru's own removed"),
+            "{printed}"
+        );
+    }
+
+    /// `:config-unset` and `:config-clear` — the two commands that need bru to *have* a default.
+    #[test]
+    fn unsetting_puts_a_setting_back_to_brus_own() {
+        let mut settings = Settings::default();
+        settings.set("content.images", "false").unwrap();
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(false)));
+
+        let unset = settings.unset("content.images", None).unwrap();
+        assert!(unset.was_customized);
+        // Back to bru's own — which is the whole point, and is a place rather than an absence.
+        assert_eq!(unset.value, Some(Value::Bool(true)));
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(true)));
+        assert_eq!(unset.describe(), "content.images = true (bru's own)");
+
+        // Unsetting what was never set is an answer, not an error.
+        let unset = settings.unset("content.images", None).unwrap();
+        assert!(!unset.was_customized);
+        assert!(unset.describe().contains("was already bru's own"), "{}", unset.describe());
+        assert!(settings.unset("content.nonsense", None).is_err());
+
+        // A per-URL value comes off on its own, leaving the global one standing.
+        let site = Some("*://*.example.com/*");
+        settings.set("content.images", "false").unwrap();
+        settings.set_scoped("content.images", "true", site).unwrap();
+        let unset = settings.unset("content.images", site).unwrap();
+        assert!(unset.was_customized);
+        assert_eq!(unset.value, Some(Value::Bool(false)), "the global value is what is left");
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(false)));
+
+        // A dict and a list go back whole.
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+        settings.list_add("content.blocking.adblock.lists", "https://x/l.txt").unwrap();
+        settings.unset("url.searchengines", None).unwrap();
+        settings.unset("content.blocking.adblock.lists", None).unwrap();
+        assert_eq!(settings.search_engines().iter().count(), 9);
+        assert_eq!(settings.list_vec(def("content.blocking.adblock.lists").unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn clearing_puts_everything_back_at_once() {
+        let mut settings = Settings::default();
+        settings.set("content.images", "false").unwrap();
+        settings.set("start_page", "example.com").unwrap();
+        settings
+            .set_scoped("content.javascript.enabled", "false", Some("*://*.example.com/*"))
+            .unwrap();
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+
+        let cleared = settings.clear();
+        assert_eq!(cleared.len(), 4, "one per stored value, pattern included: {cleared:?}");
+        assert!(cleared.iter().all(|one| one.was_customized));
+        // Deterministic, so two runs report the same order.
+        assert_eq!(
+            cleared.iter().map(|one| one.def.name).collect::<Vec<_>>(),
+            ["content.images", "content.javascript.enabled", "start_page", "url.searchengines"]
+        );
+
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(true)));
+        // `start_page` is the one whose default is an absence — `app::HOME` stands again.
+        assert_eq!(settings.get("start_page", None).unwrap(), None);
+        assert_eq!(settings.search_engines().iter().count(), 9);
+        assert!(settings.diff().is_empty());
+    }
+
+    /// **`:config-diff` prints Lua, and it is also the whole of what `:config-write-py` refused.**
+    #[test]
+    fn the_diff_is_the_lua_that_would_reproduce_it() {
+        let mut settings = Settings::default();
+        assert!(settings.diff().is_empty(), "a fresh bru differs from itself in nothing");
+
+        settings.set("start_page", "example.com").unwrap();
+        settings.set("content.images", "false").unwrap();
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+        settings.list_add("content.blocking.adblock.lists", "https://x/l.txt").unwrap();
+        let diff = settings.diff();
+
+        assert!(diff.contains(&r#"bru.set("start_page", "example.com")"#.to_string()), "{diff:?}");
+        assert!(diff.contains(&r#"bru.set("content.images", "false")"#.to_string()), "{diff:?}");
+        // Only the pair that is not bru's: pasting the whole table back would be pasting bru's own
+        // defaults into a file that is supposed to be a patch.
+        assert!(
+            diff.contains(&r#"bru.set("url.searchengines", { ["gh"] = "https://x/?q={}" })"#.to_string()),
+            "{diff:?}"
+        );
+        assert!(
+            diff.contains(&r#"bru.set("content.blocking.adblock.lists", { "https://x/l.txt" })"#.to_string()),
+            "{diff:?}"
+        );
+
+        // Setting something to the value bru already ships is not a difference.
+        let mut settings = Settings::default();
+        settings.set("content.images", "true").unwrap();
+        assert!(settings.diff().is_empty(), "{:?}", settings.diff());
+
+        // The two things `config.lua` cannot say are said as the commands that did them, marked.
+        let mut settings = Settings::default();
+        settings
+            .set_scoped("content.javascript.enabled", "false", Some("*://*.example.com/*"))
+            .unwrap();
+        settings.dict_remove("url.searchengines", "hoog").unwrap();
+        settings
+            .list_remove("content.blocking.adblock.lists", crate::adblock::DEFAULT_LISTS[1])
+            .unwrap();
+        let diff = settings.diff();
+        assert!(diff.iter().any(|line| line.contains(":set -u *://*.example.com/*")), "{diff:?}");
+        assert!(diff.iter().any(|line| line.contains(":config-dict-remove url.searchengines hoog")), "{diff:?}");
+        assert!(diff.iter().any(|line| line.contains(":config-list-remove")), "{diff:?}");
+        for line in &diff {
+            if line.starts_with("--") {
+                continue;
+            }
+            assert!(line.starts_with("bru."), "a diff line is Lua or a comment: {line}");
+        }
+    }
+
+    /// A value with a quote in it is a Lua string literal and not the end of one.
+    #[test]
+    fn a_diff_line_escapes_what_lua_would_choke_on() {
+        assert_eq!(lua_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        let mut settings = Settings::default();
+        settings.set("start_page", "a\"b").unwrap();
+        assert_eq!(settings.diff(), [r#"bru.set("start_page", "a\"b")"#]);
+    }
+
     #[test]
     fn variables_expand_against_nothing_when_there_is_no_page() {
         // `ipc::current_url` is empty outside a running browser, which is the case in a unit test.
