@@ -1601,6 +1601,26 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::ScrollStep,
     },
 // --- end unhardcoded ---------------------------------------------------------------------------
+// --- lua runtime ---------------------------------------------------------------------------------
+    Def {
+        // **bru's own, with no counterpart to copy** — qutebrowser has no plugins to switch off.
+        // It is read once, by `plugins::load_at_startup`, before the directory is opened; nothing
+        // reads it afterwards, so turning it off while bru runs does not unload what is loaded.
+        // `:plugin-disable <name>` is the runtime spelling and it is deliberately per plugin,
+        // because "switch every plugin off right now" is a thing a person wants roughly never and
+        // a restart already does.
+        //
+        // The default is `true`, and bru owns that: a directory the user has put a plugin in is a
+        // directory the user meant to put a plugin in. What the setting buys is a way to start a
+        // browser that reads none of them without moving the files — which is what you want at the
+        // moment a plugin is what broke the last start.
+        name: "plugins.enabled",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+// --- end lua runtime -----------------------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -3274,7 +3294,7 @@ impl Template {
         let Body::Function(handle) = &self.body else {
             return None;
         };
-        match crate::lua::call_string_fields(handle, fields) {
+        match crate::lua::call_string(handle, fields) {
             Ok(text) => Some(text),
             Err(why) => {
                 report_fn_error(self.def, &why);
@@ -4348,8 +4368,10 @@ mod tests {
         // - **+14** — the block fenced `content settings`: eleven Chromium content settings and
         //   three Chromium preferences.
         //
+        // - **+1** — `plugins.enabled`, the block fenced `lua runtime`.
+        //
         // Raise this with the setting, never to make a failing build pass.
-        assert_eq!(SETTINGS.len(), 57);
+        assert_eq!(SETTINGS.len(), 58);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
@@ -5677,7 +5699,7 @@ mod tests {
     /// stores.
     fn a_function(source: &str) -> crate::lua::FnRef {
         let lua = crate::lua::shared();
-        let function: mlua::Function = lua.load(source).set_name("config.lua").eval().unwrap();
+        let function: mlua::Function = lua.load(source).set_name("@config.lua").eval().unwrap();
         crate::lua::register(&function).expect("the state was just made")
     }
     // --- end setting functions ---------------------------------------------------------------------

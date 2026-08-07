@@ -1,10 +1,18 @@
 //! Startup configuration: the compiled-in default bindings, and the Lua that overrides them.
 //!
-//! **This is the only file in bru that may mention `mlua`.** DESIGN.md: "Config is Lua, through
-//! mlua. It rebinds keys; it does not run on the key path." The Lua state is created here, run
-//! here, and dropped here — before any browser exists. What leaves is [`Bindings`], a plain
-//! `HashMap`, which becomes the [`BindingTrie`]s that [`crate::bindings::KeyParsers`] owns.
-//! Pressing `j` cannot reach an interpreter because by then there is no interpreter to reach.
+//! **This and `src/lua.rs` are the only two files in bru that may mention `mlua`.** This line used
+//! to say "the only file", and it was true: the Lua state was created here, run here and dropped
+//! here, before any browser existed. P1 changed the **lifetime** and not the rule. DESIGN.md chose
+//! Lua for the config file "so that a setting can hold a function", and a function cannot be copied
+//! out of an interpreter and kept — it *is* the interpreter — so the state now lives in
+//! `src/lua.rs`, on the CEF UI thread, for as long as the process does. Everything else in bru still
+//! reaches it through `lua.rs`'s four functions and through an opaque `FnRef`.
+//!
+//! DESIGN.md: "Config is Lua, through mlua. It rebinds keys; it does not run on the key path." What
+//! leaves this file is still [`Bindings`], a plain `HashMap`, which becomes the [`BindingTrie`]s
+//! that [`crate::bindings::KeyParsers`] owns. **Pressing `j` still cannot reach an interpreter** —
+//! not because there is none left, but because nothing on the key path holds a handle to one.
+//! `grep -n mlua src/keys.rs` is empty and is the review-level check of it.
 //!
 //! The defaults are qutebrowser 3.7.0's, transcribed from `config/configdata.yml`
 //! (`bindings.default:` at line 3676) with no changes to either the keys or the command names —
@@ -631,14 +639,33 @@ impl Config {
     /// `settings::apply_at_startup`, which `app.rs` calls once CEF is up, because this function is
     /// also run by unit tests with no browser process behind them.
     pub fn into_parsers(self) -> KeyParsers {
-        // Built from the settings store rather than carried beside it — see `Config`. It is done
-        // here rather than left to `settings::apply_at_startup` because that only walks what has
-        // been *set*: a config that names no engine at all must still reach `open.rs` with bru's
-        // nine, and a bru with no `~/.config/bru/` is exactly that config.
-        crate::open::install(self.search(), self.settings.start_page());
-        crate::settings::install(self.settings);
+        self.install_stores();
         KeyParsers::new(self.bindings.into_tries())
     }
+
+// --- lua runtime -------------------------------------------------------------------------------
+    /// The two stores, without parsing the bindings — the first half of [`Config::into_parsers`].
+    ///
+    /// Split out because **the plugins have to load between the halves**, and each half needs a
+    /// different side of it:
+    ///
+    /// - a plugin's `bru.get("x")` must read the user's value, so the settings store has to be
+    ///   installed *before* the plugins load;
+    /// - `into_tries` is where a binding's command string is parsed, and `commands::parse` asks
+    ///   `plugins::is_registered`, so the bindings must be parsed *after*.
+    ///
+    /// `app.rs` therefore calls this, then `plugins::load_at_startup`, then `into_parsers`, which
+    /// runs this a second time. Installing twice is idempotent and costs a `SearchEngines` rebuild.
+    ///
+    /// Built from the settings store rather than carried beside it — see `Config`. It is done here
+    /// rather than left to `settings::apply_at_startup` because that only walks what has been
+    /// *set*: a config that names no engine at all must still reach `open.rs` with bru's nine, and
+    /// a bru with no `~/.config/bru/` is exactly that config.
+    pub fn install_stores(&self) {
+        crate::open::install(self.search(), self.settings.start_page());
+        crate::settings::install(self.settings.clone());
+    }
+// --- end lua runtime ---------------------------------------------------------------------------
 }
 
 /// `$XDG_CONFIG_HOME/bru/config.lua`, or `~/.config/bru/config.lua`.
@@ -655,9 +682,13 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Run a `config.lua` against a config and return the result.
 ///
-/// The `Lua` value is confined to this function's body and dropped before it returns. That is the
-/// enforcement of "Lua is never on the key path": there is no way to keep a handle to it, because
-/// nothing that escapes has a Lua type.
+/// **The state is not dropped when this returns — that is P1, and it is the one behaviour change.**
+/// What still holds is the sentence that mattered: nothing that escapes this function has a Lua
+/// type. A [`Bindings`] is a `HashMap` and a `Settings` value is a scalar or, since P2, an opaque
+/// `crate::lua::FnRef`. What is *new* is that the four config-time names have an outside now: they
+/// are installed on the shared `bru` table for the length of this one chunk and swapped back for
+/// stubs that say so, whether the chunk finished or threw. Before P1 there was no "afterwards" for
+/// them to be in.
 ///
 /// A syntax error, or a runtime error, is printed once and whatever was applied before it stands —
 /// which for a syntax error is all of the defaults and none of the config, since nothing ran.
@@ -669,27 +700,25 @@ pub fn config_path() -> Option<PathBuf> {
 /// - `bru.set(key, value)` — one of `crate::settings::SETTINGS`, and nothing else; an unknown key
 ///   raises with the list, so `start_pgae` is an error at startup rather than a line that does
 ///   nothing. The same store is what `:set` and `config-cycle` change while bru runs.
+///
+/// The rest of the `bru` table — `bru.command`, `bru.cmd`, `bru.get`, `bru.message`, `bru.error`,
+/// `bru.data_dir`, `bru.plugin_dir` — is `lua.rs`'s and is there whether or not a config is being
+/// read.
 fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
     let shared = Arc::new(Mutex::new(config));
 
+    // The shared state, made on first use. In the browser `app.rs` has already stood it up on the
+    // UI thread; under `cargo test` this is what makes one, which is deliberate — the tests then
+    // exercise the same shared state a running bru has, collisions and all.
+    let lua = crate::lua::shared();
+
     let result = (|| -> mlua::Result<()> {
-        // --- setting functions -----------------------------------------------------------------
-        // **The state outlives this function now**, and it has to: a setting whose value is a Lua
+        // **The state outlives this function**, and it has to: a setting whose value is a Lua
         // function keeps a handle into the interpreter, so a `Lua` dropped at the end of this body
         // would leave that handle pointing at nothing — which mlua answers with a panic
-        // (`WeakLua::lock` is `.expect("Lua instance is destroyed")`) rather than an error.
-        //
-        // This is one line of workstream A's P1, done early because P2 cannot be measured without
-        // it. `crate::lua::shared` makes the state on first use and hands back an `Rc` clone of the
-        // same interpreter, so everything below reads exactly as it did.
-        //
-        // What it does *not* change is the rule this file's own head states: nothing that escapes
-        // `apply_lua` has a Lua type. A `FnRef` is an id and a `config.lua:12`, and pressing `j`
-        // still cannot reach an interpreter.
-        let lua = crate::lua::shared();
-        // --- end setting functions -------------------------------------------------------------
-        let bru = lua.create_table()?;
-
+        // (`WeakLua::lock` is `.expect("Lua instance is destroyed")`) rather than an error. `lua`
+        // is `crate::lua::shared()`, bound above.
+        let bru = crate::lua::bru_table(&lua)?;
         let target = Arc::clone(&shared);
         bru.set(
             "bind",
@@ -805,10 +834,28 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
             })?,
         )?;
 
-        lua.globals().set("bru", bru)?;
-        lua.load(source).set_name(chunk_name).exec()
-        // `lua` is dropped here, along with every closure and its Arc.
+        // **The `@` is Lua's own "this is a file name" marker**, and without it every error from a
+        // config file reads `[string "/home/…/config.lua"]:12:` — Lua quotes the chunk as a literal
+        // and truncates it in the middle. With it the message is `/home/…/config.lua:12:`, which is
+        // what an editor's error format expects and what `FnRef`'s `origin` prints beside a
+        // function-valued setting. `mlua::Chunk::set_name` passes the string straight through.
+        lua.load(source).set_name(format!("@{chunk_name}")).exec()
     })();
+
+    // **Off again, whatever happened.** The four closures above hold an `Arc` to a `Config` that
+    // stops meaning anything the moment this function returns, and with a state that outlives the
+    // call there is now somewhere for them to be called from — a plugin handler, an hour later.
+    // Replacing them with the stubs both releases the `Arc` and gives that caller a sentence rather
+    // than a silent mutation of a config nobody is holding.
+    if let Err(e) = crate::lua::install_config_stubs(&lua) {
+        eprintln!("bru: could not put the config-time `bru` functions away: {e}");
+    }
+    // Replacing a table entry only makes the old function garbage; collecting is what actually drops
+    // the Rust closure and with it its `Arc<Mutex<Config>>`. Without this the `try_unwrap` below
+    // always fails and the config is cloned out instead of moved — correct either way, and the
+    // collection is what makes the ownership readable rather than accidental. `:config-source` is a
+    // typed command, so a full collection here costs nothing anybody can feel.
+    lua.gc_collect().ok();
 
     if let Err(e) = result {
         eprintln!("bru: {chunk_name}: {e}");
@@ -916,27 +963,54 @@ pub fn source_over(current: Config, path: &Path, clear: bool) -> Result<Config, 
     }
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    let base = if clear { Config::default_config() } else { current };
+    let base = if clear { clear_back_to_brus_own() } else { current };
     let config = apply_lua(base, &source, &path.display().to_string());
-    // --- setting functions -------------------------------------------------------------------
-    // **Sweep the Lua state's function registry down to what is still named.** Two things want it
-    // and they are the same line.
+    // **Sweep the Lua state's function registry down to what is still named**, and the list is the
+    // union of two workstreams' holders.
     //
-    // `--clear` means "back to bru's own", and a function no setting holds any more is part of what
-    // is being cleared. And *every* source, cleared or not, because re-running a config registers a
-    // second function for each function-valued setting it sets — the store then holds only the new
-    // handle, and the old one would sit in the registry for the life of the process. One entry per
-    // function-valued setting per `:config-source` is small and has no bound, and a thing with no
-    // bound is worth a line.
+    // Every source, cleared or not: re-running a config registers a second function for each
+    // function-valued setting it sets, the store then holds only the new handle, and the old one
+    // would sit in the registry for the life of the process. One entry per function-valued setting
+    // per `:config-source` is small and has **no bound**, and a thing with no bound is worth a line.
     //
     // **Anything else that registers a function has to be added to this list**, and being left out
-    // of it is not a small bug: the id is never reused, so the holder reads as "not reachable" from
-    // then on and quietly falls back to a default. Today the only registrar is `bru.set`; when
-    // plugin command handlers land they belong here beside the settings' own.
-    crate::lua::forget_functions_except(&config.settings.function_handles());
-    // --- end setting functions ---------------------------------------------------------------
+    // is not a small bug: the id is never reused, so the holder reads as "not reachable" from then
+    // on and quietly falls back to a default. There are two registrars today — `bru.set`, whose
+    // handles the settings store carries, and `bru.command`, whose handles `plugins` carries — and
+    // the merge of these two workstreams is exactly where forgetting one of them would have bitten.
+    let mut still_held = crate::plugins::handles();
+    still_held.extend(config.settings.function_handles());
+    crate::lua::forget_functions_except(&still_held);
     Ok(config)
 }
+
+// --- lua runtime -------------------------------------------------------------------------------
+/// `--clear`: bru's own configuration, **and bru's own Lua globals**.
+///
+/// **This is the behaviour P1 had to handle rather than discover.** Until the state was shared,
+/// every `:config-source` built a fresh `Lua`, so a config file that defined a global could not
+/// collide with its own previous run and `--clear` had nothing to clear but the `Config`. Sharing
+/// one state ends that: source a file twice and its `local`-less variables, its memo tables and its
+/// `if already_loaded then return end` guards are all still there from the first run. A `--clear`
+/// that cleared the `Config` and left those standing would make a session that sourced twice differ
+/// from one that sourced once, silently, and no test written before P1 could have seen it.
+///
+/// Two things go, and one deliberately does not:
+///
+/// - every global that is not in `lua::mark_baseline`'s set — the standard library, `bru`, and
+///   whatever the **plugins** left, because a plugin is not configuration;
+/// - every registered function except the ones a plugin's commands are holding, for the same
+///   reason. A `Value::Fn` a config set reads as "not reachable" afterwards and falls back to bru's
+///   own default, which is what `--clear` means.
+fn clear_back_to_brus_own() -> Config {
+    crate::lua::forget_functions_except(&crate::plugins::handles());
+    let gone = crate::lua::clear_added_globals();
+    if gone > 0 {
+        eprintln!("bru[config]: --clear also took away {gone} Lua global(s) a config file set");
+    }
+    Config::default_config()
+}
+// --- end lua runtime ---------------------------------------------------------------------------
 
 /// Resolve `:config-source`'s optional argument the way qutebrowser resolves it
 /// (`configcommands.py:415-421`): no name is bru's own config file, a relative name is relative to
@@ -1699,6 +1773,105 @@ mod tests {
         let missing = cfg.dir.join("nothing.lua");
         assert!(source_over(Config::default_config(), &missing, false).is_err());
     }
+
+// --- lua runtime -------------------------------------------------------------------------------
+    /// **The behaviour P1 changed, and the test that has to exist because of it.**
+    ///
+    /// Until the Lua state was shared, every `:config-source` built a fresh `Lua`, so a config file
+    /// could not collide with its own previous run. Sharing one state ends that: the second run of
+    /// this file sees `already_ran` still set from the first and takes the other branch. A
+    /// `--clear` that cleared the `Config` and left the globals standing would bind `X` to
+    /// `tab-next` the second time and to `tab-prev` the first, and **no test written before P1
+    /// could have seen it** — the difference is invisible from inside the `Config`.
+    ///
+    /// The guard shape here is not invented for the test: `if M then return end` at the top of a
+    /// file is how a Lua module says "do not run me twice", and a config file grown past a hundred
+    /// lines acquires one.
+    #[test]
+    fn sourcing_twice_with_clear_leaves_what_sourcing_once_leaves() {
+        let cfg = TempConfig::new(
+            "twice",
+            r#"
+                if already_ran then
+                    bru.bind("normal", "X", "tab-next")
+                else
+                    already_ran = true
+                    bru.bind("normal", "X", "tab-prev")
+                end
+            "#,
+        );
+        let once = source_over(Config::default_config(), &cfg.path(), true)
+            .expect("the file is there");
+        assert_eq!(once.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+
+        let twice = source_over(once.clone(), &cfg.path(), true).expect("the file is there");
+        assert_eq!(
+            twice.bindings.command_for(Mode::Normal, "X"),
+            Some("tab-prev"),
+            "sourcing twice with --clear has to leave what sourcing once leaves; the global the \
+             first run set was not cleared"
+        );
+        // ...and the whole table matches, not only the key the file mentions.
+        assert_eq!(once.bindings.all(), twice.bindings.all());
+
+        // **Without `--clear` it is the other thing, and that is the point of the flag.** The
+        // globals are the browser's now, so the second run takes the second branch — which is what
+        // a config file's own re-entry guard is *for*.
+        let again = source_over(twice, &cfg.path(), false).expect("the file is there");
+        assert_eq!(again.bindings.command_for(Mode::Normal, "X"), Some("tab-next"));
+    }
+
+    /// The four config-time names are put away when the chunk finishes, and they say so.
+    ///
+    /// Before P1 there was nowhere for them to be called from afterwards, because the whole state
+    /// went with the function that made it. Now a plugin handler could reach one an hour later, and
+    /// what it would reach is an `Arc` to a `Config` nobody is holding.
+    #[test]
+    fn the_config_time_functions_are_put_away_when_the_file_has_run() {
+        let cfg = TempConfig::new("put-away", r#"bru.bind("normal", "X", "tab-prev")"#);
+        let config = Config::load_from(Some(&cfg.path()));
+        assert_eq!(config.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+
+        for call in [
+            r#"bru.bind("normal", "Y", "tab-next")"#,
+            r#"bru.unbind("normal", "j")"#,
+            r#"bru.search("x", "https://x/?q={}")"#,
+            r#"bru.set("start_page", "https://nowhere/")"#,
+        ] {
+            let error = crate::lua::with(|lua| lua.load(call).exec().unwrap_err().to_string())
+                .expect("the state is on this thread");
+            assert!(
+                error.contains("only means something while a config file is being read"),
+                "{call}: {error}"
+            );
+        }
+        // And the long-lived half is untouched by any of that.
+        assert_eq!(
+            crate::lua::with(|lua| lua.load("return type(bru.cmd)").eval::<String>().unwrap()),
+            Some("function".to_string())
+        );
+    }
+
+    /// `bru.command` is a plugin's, and a config file that calls it is told so by name rather than
+    /// registering a command nothing would ever reach.
+    #[test]
+    fn a_config_file_cannot_register_a_plugin_command() {
+        let cfg = TempConfig::new(
+            "not-a-plugin",
+            r#"
+                bru.bind("normal", "X", "tab-prev")
+                bru.command("hello", function() return "hi" end)
+                bru.bind("normal", "Y", "tab-prev")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        // The bind before it took effect; the call raised; the one after did not run — the same
+        // shape as every other error in a config file.
+        assert_eq!(config.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+        assert_eq!(config.bindings.command_for(Mode::Normal, "Y"), None);
+        assert!(!crate::plugins::is_registered("hello"));
+    }
+// --- end lua runtime ---------------------------------------------------------------------------
 
     /// `:config-source`'s argument, resolved the way qutebrowser resolves it.
     #[test]

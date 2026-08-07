@@ -859,6 +859,17 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::GreasemonkeyReload { quiet } => crate::greasemonkey::reload(*quiet),
 // --- end src/greasemonkey.rs -------------------------------------------------------------------
 
+// --- lua runtime -------------------------------------------------------------------------------
+        // **One arm for every plugin command there will ever be**, which is the whole shape of the
+        // registry: `commands.rs` turns a registered name into this, and `plugins::run` does the
+        // lookup, the call and the error isolation. A handler that throws prints once and the
+        // browser goes on; three throws in one session switch the plugin off.
+        Command::Plugin { name, args } => crate::plugins::run(name, args),
+        Command::PluginList => crate::plugins::list(),
+        Command::PluginReload { name } => crate::plugins::reload(name.as_deref()),
+        Command::PluginDisable { name } => crate::plugins::disable(name),
+// --- end lua runtime ---------------------------------------------------------------------------
+
 // --- src/prompt.rs -------------------------------------------------------------------------
         // The five `prompt-*` commands, all of which act on the question open in the window the
         // key was pressed in. They take no browser: a prompt belongs to a window, and the browser
@@ -1142,6 +1153,17 @@ pub fn is_live(command: &Command) -> bool {
         // Live, and not part of the default-binding count: qutebrowser binds no key to it either.
         Command::GreasemonkeyReload { .. } => true,
 // --- end src/greasemonkey.rs -------------------------------------------------------------------
+
+// --- lua runtime -------------------------------------------------------------------------------
+        // Live, and none of them is bound to a key: they are typed, after a plugin has been edited.
+        // A `Command::Plugin` is live by construction — it only exists because a handler is
+        // registered for it — and whether that handler *does* anything is the plugin's business,
+        // which is exactly the line bru cannot and should not draw.
+        Command::Plugin { .. }
+        | Command::PluginList
+        | Command::PluginReload { .. }
+        | Command::PluginDisable { .. } => true,
+// --- end lua runtime ---------------------------------------------------------------------------
 
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
         Command::ViewSource | Command::Print => true,

@@ -31,17 +31,18 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
-// --- setting functions -------------------------------------------------------------------------
-// The second file allowed to mention `mlua`. Workstream A creates it in P1; this line is here so
-// that P2 compiles on its own branch, and the two spellings are the same line.
+// The second file allowed to mention `mlua`: the shared state, the plugin registry over it,
+// and the handles a function-valued setting holds. See `src/lua.rs`.
 mod lua;
-// --- end setting functions ---------------------------------------------------------------------
 mod macros;
 mod message;
 mod modes;
 mod navigate;
 mod open;
 mod popups;
+// --- lua runtime -------------------------------------------------------------------------------
+mod plugins;
+// --- end lua runtime ---------------------------------------------------------------------------
 mod profile;
 mod prompt;
 mod scroll;

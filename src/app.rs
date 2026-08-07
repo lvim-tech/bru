@@ -239,11 +239,48 @@ wrap_browser_process_handler! {
             // views below are the first things to ask.
             crate::chrome::register_factory();
 
+// --- lua runtime -------------------------------------------------------------------------------
+            // **The Lua state, before the config that runs in it.** This is where it used to be
+            // created and dropped inside `Config::load`; P1 moved the *lifetime* out to
+            // `src/lua.rs` and left the place alone, because a setting whose value is a Lua function
+            // has to reach the interpreter long after this callback has returned. The thread is
+            // asserted inside `init`, once, and this is the assertion's whole basis:
+            // `on_context_initialized` is the UI thread, and the `debug_assert_ne!(currently_on(…))`
+            // at the top of this function already says so.
+            crate::lua::init();
+
+            // `--plugin-dir=<path>` replaces `~/.local/share/bru/plugins`. Read before anything
+            // loads, and it exists because `wtype` segfaults CEF on this machine (CEF-NOTES): a
+            // check that a plugin works has to be driven by a switch rather than by a keystroke.
+            let plugin_dir =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("plugin-dir"))))
+                    .to_string();
+            if !plugin_dir.is_empty() {
+                crate::plugins::set_dir_override(&plugin_dir);
+            }
+// --- end lua runtime ---------------------------------------------------------------------------
+
             // The bindings, before any browser exists to press a key at. `Config::load` compiles in
             // qutebrowser's defaults, then runs ~/.config/bru/config.lua over them if it is there.
-            // The Lua state lives and dies inside that call: what comes back is plain tries of
-            // parsed commands, and nothing Lua-shaped survives into the key path.
+            // What comes back is plain tries of parsed commands, and nothing Lua-shaped reaches the
+            // key path.
             let config = crate::config::Config::load();
+// --- lua runtime -------------------------------------------------------------------------------
+            // **The plugins load between the two halves of `into_parsers`, and the order is forced
+            // from both sides.** A plugin's `bru.get("x")` must read the value `config.lua` set, so
+            // the settings store goes in first; and `into_tries` is where a binding's command string
+            // is parsed, and `commands::parse` asks `plugins::is_registered`, so the bindings must
+            // be parsed after. Measured 2026-08-07 by putting this line below the block instead: a
+            // `config.lua` binding `<Ctrl-J>` to a plugin command printed "1 bindings name commands
+            // that are not implemented yet" and the key did nothing.
+            config.install_stores();
+            // The plugins' own globals join what `:config-source --clear` clears back to, and
+            // `plugins::load_from` does that itself from the difference either side of the load.
+            // **It cannot be done here**: by this line `config.lua` has run, and a snapshot taken
+            // now would record its globals as part of the baseline too — measured, and the whole of
+            // `lua::mark_baseline`'s second paragraph.
+            crate::plugins::load_at_startup();
+// --- end lua runtime ---------------------------------------------------------------------------
             {
                 let mut state = self.state.lock().expect("state mutex poisoned");
                 // Kept whole as well as compiled into tries: `bru://help` lists what is bound, and
