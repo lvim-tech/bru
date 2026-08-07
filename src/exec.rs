@@ -763,9 +763,12 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             // `themer` writes exactly that path, which is why this flag exists: it is the one thing
             // between "the file on disk changed" and "the browser is wearing it".
             //
-            // Not automatic. Watching the file would mean a watcher on a path bru is forbidden to
-            // write, running for the life of the process, to save one command — and a browser that
-            // repaints itself because something else touched a file is a browser that surprises.
+            // **It is also automatic now**, and this flag stayed rather than being taken out with
+            // the argument that justified it. `chrome::watch_theme_file` looks at the file's
+            // modification time every two seconds and re-reads it when it moves, which is what
+            // makes `themer` work with no second operation in its target. This is the same thing
+            // asked for by hand: for the two seconds before the tick, and for a file whose mtime a
+            // copy did not move.
             let _ = name;
             crate::chrome::warn_if_incomplete();
             crate::ipc::reload_chrome_everywhere();

@@ -72,6 +72,7 @@ fn main() -> Result<(), &'static str> {
 
     let is_browser_process = cmd_line.has_switch(Some(&CefString::from("type"))) != 1;
 
+
     // The same App object goes to both execute_process and initialize. execute_process is what
     // gives the child processes an App at all, and two callbacks are only reachable that way:
     // on_register_custom_schemes, which has to run in every process for bru:// to be a real origin
@@ -164,6 +165,7 @@ fn main() -> Result<(), &'static str> {
         1,
         "CEF could not initialise"
     );
+
 
     run_message_loop();
     shutdown();

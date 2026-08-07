@@ -238,6 +238,12 @@ wrap_browser_process_handler! {
             // The factory has to exist before anything can ask for a bru:// URL, and the two chrome
             // views below are the first things to ask.
             crate::chrome::register_factory();
+            // --- src/chrome.rs: themes ---------------------------------------------------------
+            // `themer` writes ~/.config/bru/theme.css while bru is running, and a chrome document
+            // fetches its stylesheets when it loads. This is what closes that gap; see the function
+            // for the signal and the command that were tried before it.
+            crate::chrome::watch_theme_file();
+            // --- end src/chrome.rs: themes -----------------------------------------------------
 
 // --- lua runtime -------------------------------------------------------------------------------
             // **The Lua state, before the config that runs in it.** This is where it used to be
