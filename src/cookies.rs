@@ -891,7 +891,13 @@ fn inject_named(name: &str) {
         let event = KeyEvent {
             type_,
             windows_key_code: code,
-            native_key_code: code,
+            // **Zero, and never the Windows code.** This field is the *platform's* key code —
+            // an X11 keycode on this machine — and Chromium builds the DomKey from it when it is
+            // set. Filling it with the Windows virtual key made an injected `<Down>` type a
+            // character: measured 2026-08-07 with the `bg` layout active, `key:Down` put `т` in
+            // the filter box and `key:Return` put `Э`, because VKEY_DOWN is 0x28 and X11 keycode
+            // 0x28 is a letter key. `cmdline.rs::inject_key` has always written 0 here.
+            native_key_code: 0,
             character,
             unmodified_character: character,
             ..Default::default()

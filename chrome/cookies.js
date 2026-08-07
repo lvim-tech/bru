@@ -52,7 +52,6 @@
 
   var filterBox = document.getElementById("filter");
   var summary = document.getElementById("summary");
-  var keysLine = document.getElementById("keys");
   var rowsBox = document.getElementById("rows");
   var wipe = document.getElementById("wipe");
   var undo = document.getElementById("undo");
@@ -312,6 +311,5 @@
   // scroll it. Nothing here binds Escape, and that is deliberate rather than
   // an omission.
 
-  keysLine.hidden = false;
   load();
 })();
