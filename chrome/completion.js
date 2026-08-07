@@ -192,7 +192,31 @@
     // row it named must be on screen. "nearest" is what keeps a selection that
     // is already visible from jumping the list under it.
     if (chosen && chosen.scrollIntoView) {
-      chosen.scrollIntoView({ block: "nearest" });
+      // **On the first row of a category, scroll to the HEADER instead.** The header
+      // is an ordinary row in the flow, not sticky, so "nearest" on the item below it
+      // does exactly what it says: it brings the item to the edge and leaves the
+      // header one row above, off screen. Walk down past a header and back up and it
+      // never comes back — the selection is visible the whole time and the name of
+      // what you are looking at is not.
+      //
+      // **The header, not the category.** Scrolling the category was tried first and
+      // measured worse: a category is taller than the panel — 21 rows against 15 —
+      // and "nearest" on an element taller than the scrollport aligns whichever edge
+      // is nearer, which pushed the header further out. Measured in a real Blink on
+      // the same markup, panel top 845: the item gave 825, the category gave 725,
+      // the header gives 846. A header is one row and always fits, so "nearest" can
+      // only mean what it says.
+      //
+      // Only for that one row: everywhere else the item keeps "nearest", so the list
+      // does not jump under a selection that is already in view — and when the header
+      // is already fully visible this moves nothing, which is the same guarantee.
+      var target = chosen;
+      var cat = chosen.parentNode;
+      var header = cat && cat.firstElementChild;
+      if (header && header.nextElementSibling === chosen) {
+        target = header;
+      }
+      target.scrollIntoView({ block: "nearest" });
     } else {
       host.scrollTop = 0;
     }

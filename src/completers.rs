@@ -1210,26 +1210,56 @@ pub fn run_command(command: &Command) -> bool {
 /// Moving the selection is half of it; the other half is that the selected text goes into the
 /// command line, which is what makes `<Tab>` feel like completion rather than like a torch being
 /// shone along a list.
+/// Where `<Up>` and `<Down>` go in command mode: the completion table, or the command history.
+///
+/// **The table, unless there is no table.** That is the whole rule, and it is deliberately not
+/// qutebrowser's: `completionwidget.py:305-317` sends the arrows to the history on a bare `:` and
+/// on a line already recalled from it, keeping them for the table only once something is typed.
+///
+/// bru followed that, then departed from it once — "not when the history is empty" — and the
+/// departure was the mistake, not the rule it patched. It made the arrows mean **one thing or
+/// another depending on state the user cannot see**: with a fresh profile they moved in the table,
+/// and the moment a single command had been accepted the same key on the same bare `:` walked a
+/// history instead, in front of the same open list. Reported twice as a regression, and both times
+/// nothing had changed in the code — only whether a command had been run yet that session. A key
+/// whose meaning depends on invisible state does not have a bug in it; it has a design in it.
+///
+/// So: a panel that is open takes the arrows. Nothing is lost, because the history already has two
+/// keys of its own — `<Ctrl-P>` and `<Ctrl-N>`, bound in `config.rs` beside these two — and they
+/// are the ones a shell user reaches for anyway. When the completion has no rows at all the arrows
+/// fall through to the history, because then there is nothing else for them to do.
+fn arrows_walk_history(completion_is_empty: bool) -> bool {
+    completion_is_empty
+}
+
+#[cfg(test)]
+mod arrow_tests {
+    /// **A panel that is open takes the arrows**, whatever else is true. Nothing about the command
+    /// history, the text on the line or whether it was recalled comes into it — that is the point,
+    /// and the two regressions this pins were both "the same key did something else today".
+    #[test]
+    fn an_open_panel_takes_the_arrows() {
+        assert!(!super::arrows_walk_history(false));
+    }
+
+    /// With no rows there is nothing to move in, so the history is the only thing left to do.
+    #[test]
+    fn with_no_rows_they_fall_through_to_the_history() {
+        assert!(super::arrows_walk_history(true));
+    }
+}
+
 pub fn focus(which: FocusWhich, history: bool) {
     if mode() != Mode::Command {
         return;
     }
 
-    let (text, cursor, browsing) = crate::cmdline::state_for_completion();
+    let (text, cursor, _browsing) = crate::cmdline::state_for_completion();
 
-    // `--history` is `<Up>` and `<Down>`, and on a bare `:` or a line already recalled from the
-    // history they walk the history instead (`completionwidget.py:305-317`).
-    //
-    // **With one departure: not when the history is empty.** qutebrowser's rule sends `<Up>` on a
-    // bare `:` to a history that a fresh profile has nothing in, so the key does nothing while a
-    // table of 169 rows is standing open in front of the user — reported as broken, and rightly:
-    // a list on screen that ignores the arrow keys is a list that looks dead. Falling through to
-    // the table costs nothing, because the case it takes is exactly the case where the other
-    // branch had no answer to give. A user with history keeps the shell behaviour they expect.
+    // `--history` is `<Up>` and `<Down>`. Where they go is [`arrows_walk_history`]'s decision.
     if history {
         let empty = live().lock().map(|live| live.cats.is_empty()).unwrap_or(true);
-        let recall = !crate::cmdline::history_is_empty();
-        if (text == ":" && recall) || (browsing && recall) || empty {
+        if arrows_walk_history(empty) {
             let name = match which {
                 FocusWhich::Next => "command-history-next",
                 FocusWhich::Prev => "command-history-prev",
