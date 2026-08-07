@@ -514,7 +514,7 @@ pub enum Command {
     /// **bru's own; qutebrowser has no such command.** It cannot be `:set colors.scheme` and
     /// nothing else, because the choices are files on disk that change without bru being told, so
     /// the listing has to read the directory at the moment it is asked.
-    Colorscheme { name: Option<String> },
+    Colorscheme { name: Option<String>, reload: bool },
     // --- end src/chrome.rs: themes -------------------------------------------------------------
     /// `jseval [--file] [--url] [--quiet] <js>`.
     ///
@@ -1808,7 +1808,13 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "window-only" => Command::WindowOnly,
 
         // --- src/chrome.rs: themes -------------------------------------------------------------
-        "colorscheme" => Command::Colorscheme { name: tokens.get(1).map(|t| t.to_string()) },
+        "colorscheme" => {
+            let args = Flagged::new(&tokens[1..], &[])?;
+            Command::Colorscheme {
+                name: args.arg(0).map(str::to_string),
+                reload: args.any(&["r", "reload"]),
+            }
+        }
         // --- end src/chrome.rs: themes ---------------------------------------------------------
 
         "screenshot" => {

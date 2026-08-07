@@ -563,8 +563,8 @@ pub const COMMANDS: &[Doc] = &[
         what: "Write the showing page to a PNG; --rect WxH+X+Y takes part of it.",
         example: "screenshot /tmp/x.png" },
     // --- src/chrome.rs: themes -----------------------------------------------------------------
-    Doc { names: &["colorscheme"], args: "[<name>]", flags: &[],
-        what: "Paint the chrome with a theme from ~/.config/bru/themes/; with no name, list them.",
+    Doc { names: &["colorscheme"], args: "[<name>]", flags: &["-r/--reload"],
+        what: "Paint the chrome with a theme from ~/.config/bru/themes/; with no name, list them;                --reload re-reads ~/.config/bru/theme.css, which is what themer writes.",
         example: "colorscheme" },
     // --- end src/chrome.rs: themes -------------------------------------------------------------
     Doc { names: &["jseval"], args: "<javascript>",

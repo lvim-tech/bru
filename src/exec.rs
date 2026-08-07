@@ -754,7 +754,24 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::utilcmds::screenshot(browser, filename, rect.as_deref(), *force)
         }
         // --- src/chrome.rs: themes -------------------------------------------------------------
-        Command::Colorscheme { name } => match name {
+        Command::Colorscheme { name, reload } if *reload => {
+            // **Re-read `~/.config/bru/theme.css` without changing anything.**
+            //
+            // `chrome.rs` serves the stylesheet by reading that file on every request, so a theme
+            // written while bru is running is already the answer to the next fetch — and nothing
+            // ever asks for one, because a chrome document fetches its stylesheets when it loads.
+            // `themer` writes exactly that path, which is why this flag exists: it is the one thing
+            // between "the file on disk changed" and "the browser is wearing it".
+            //
+            // Not automatic. Watching the file would mean a watcher on a path bru is forbidden to
+            // write, running for the life of the process, to save one command — and a browser that
+            // repaints itself because something else touched a file is a browser that surprises.
+            let _ = name;
+            crate::chrome::warn_if_incomplete();
+            crate::ipc::reload_chrome_everywhere();
+            crate::message::info("re-read ~/.config/bru/theme.css");
+        }
+        Command::Colorscheme { name, .. } => match name {
             Some(name) => {
                 // Through `:set`'s own path rather than beside it: `colors.scheme` is a setting
                 // like any other, and a second way to write it is a second way to forget the
