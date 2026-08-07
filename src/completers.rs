@@ -1383,6 +1383,7 @@ fn mode_in(window: u32) -> Mode {
 /// | `key:<key>` | a real `<Tab>`, sent at the bottom strip through `send_key_event` |
 /// | `accept` | `command-accept` |
 /// | `dump` | print the line, the selection, and every row of the table |
+/// | `shot:<path>` | write **the bottom strip itself** to a PNG |
 pub fn schedule_script(steps: &str, interval_ms: i64) {
     for (i, step) in steps.split(';').filter(|s| !s.is_empty()).enumerate() {
         let mut task = ScriptStep::new(step.to_string());
@@ -1460,6 +1461,7 @@ wrap_task! {
                 "key" => inject_named_key(arg),
                 "accept" => crate::cmdline::command_accept(false),
                 "dump" => dump(),
+                "shot" => shoot(arg),
                 other => eprintln!("completion-script: no step named {other:?}"),
             }
         }
@@ -1524,6 +1526,30 @@ fn inject_named_key(spec: &str) {
         };
         host.send_key_event(Some(&event));
     }
+}
+
+/// Write the bottom strip to a PNG — the bar as it is actually drawn, and nothing else.
+///
+/// `:screenshot` captures the *page*, which is a different browser, so it cannot show the bar at
+/// all. This aims the same DevTools capture at the chrome browser the bar is, and that is the whole
+/// reason it exists: a completion table 166 rows long is a claim about a **height**, and a height in
+/// a debug line is not the same claim as a bar on screen.
+///
+/// It is also the only capture on this machine that cannot photograph the wrong window. A
+/// compositor screenshot has to find bru's toplevel, and there is routinely more than one bru
+/// running here — measured 2026-08-07, when `grim` over the focused window's geometry returned
+/// another bru showing `bru://chrome/help`, which looks exactly like a real answer. This one is
+/// taken by the process being checked, from the view being checked.
+///
+/// `Page.captureScreenshot` captures the browser's viewport, so the image is as tall as CEF has
+/// actually made the strip. A `resize_bar` that asked for nothing would produce a 24-pixel-tall
+/// picture, which is the failure this is looking for.
+fn shoot(path: &str) {
+    let Some(mut browser) = crate::ipc::bottom_chrome_browser() else {
+        eprintln!("completion-script: no bottom strip to photograph yet");
+        return;
+    };
+    crate::utilcmds::screenshot(&mut browser, path, None, true);
 }
 
 /// What the bar holds, in the form a screenshot has to agree with.
