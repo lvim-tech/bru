@@ -304,6 +304,14 @@ pub enum Command {
     /// `~/.config/bru/config.lua`, which is configer's hand-written file. Accepting the flag and
     /// ignoring it — the shape `:set`'s `-t` has, and rightly, since bru is always temporary — would
     /// leave a user believing their file had been emptied. See `settings::run_clear`.
+    ///
+    /// **It clears settings and leaves the bindings alone**, which is a divergence from
+    /// qutebrowser and a deliberate one. There `bindings.commands` *is* a setting, so
+    /// `:config-clear` takes the keys with it; in bru the binding table is its own structure and
+    /// `settings::SETTINGS` does not contain it. Sweeping the keys away as a side effect of a
+    /// command whose help says "settings" would be a very expensive surprise for one keystroke, and
+    /// the command that puts one key back is `:bind --default <key>` — which is a thing
+    /// qutebrowser's own `:bind` has and bru now has too.
     ConfigClear { save: bool },
     /// `config-diff` — everything this browser is running that is not bru's own, as the Lua that
     /// would reproduce it.
