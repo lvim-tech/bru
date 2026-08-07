@@ -544,6 +544,15 @@ pub fn push_bar() {
     push();
 }
 
+// --- src/prompt.rs ---------------------------------------------------------
+/// The same for a named window. A question queued behind another one belongs to the window it was
+/// raised in, which is not always the window in front — a page in a background window can raise a
+/// `confirm()` while the user is typing in this one.
+pub fn push_bar_for(window: u32) {
+    push_for(window);
+}
+// --- end src/prompt.rs -----------------------------------------------------
+
 /// The same for every window. A global setting the bar draws — `statusbar.mode.style` — changes what
 /// all of them show at once, and a window that is not in front has no reason to wait for a keypress
 /// to catch up.

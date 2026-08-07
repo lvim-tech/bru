@@ -324,8 +324,14 @@ pub fn ask(window: u32, question: Question) {
         entry.open = Some(open_of(question));
         true
     });
-    if show == Some(true) {
-        enter_mode(window);
+    match show {
+        Some(true) => enter_mode(window),
+        // Queued. The bar still has to be told, or the `+1` badge that says another question is
+        // waiting behind this one never appears — measured 2026-08-07 with two tabs each raising a
+        // `confirm()`: the queue worked and the count stayed at 0 on screen, which is the one thing
+        // a queue has to be able to say.
+        Some(false) => crate::ipc::push_bar_for(window),
+        None => {}
     }
 }
 
