@@ -1678,28 +1678,31 @@ mod tests {
     #[test]
     fn the_page_says_which_key_calls_a_command() {
         let by_key = reached(&bindings());
+        let of = |name: &str| {
+            by_key.get(name).unwrap_or_else(|| panic!("no key reaches {name} at all"))
+        };
 
         // Runs.
-        assert!(by_key["scroll"].runs.contains(&"j".to_string()));
-        assert!(by_key["scroll"].runs.contains(&"k".to_string()));
-        assert!(by_key["scroll"].types.is_empty(), "nothing prefills `:scroll`");
+        assert!(of("scroll").runs.contains(&"j".to_string()));
+        assert!(of("scroll").runs.contains(&"k".to_string()));
+        assert!(of("scroll").types.is_empty(), "nothing prefills `:scroll`");
         // A chain: `<Escape>` is `clear-keychain ;; search ;; fullscreen --leave` and names three.
         for name in ["clear-keychain", "search", "fullscreen"] {
             assert!(
-                by_key[name].runs.contains(&"<Escape>".to_string()),
+                of(name).runs.contains(&"<Escape>".to_string()),
                 "{name} does not know about <Escape>"
             );
         }
         // A mode that is not normal is named, because `j` is two different commands in two modes.
-        assert!(by_key["move-to-next-line"].runs.contains(&"j (caret)".to_string()));
+        assert!(of("move-to-next-line").runs.contains(&"j (caret)".to_string()));
 
         // Types.
-        assert!(by_key["cmd-set-text"].runs.contains(&"o".to_string()), "`o` runs cmd-set-text");
+        assert!(of("cmd-set-text").runs.contains(&"o".to_string()), "`o` runs cmd-set-text");
         for key in ["o", "O", "go"] {
-            assert!(by_key["open"].types.contains(&key.to_string()), "`{key}` types :open");
+            assert!(of("open").types.contains(&key.to_string()), "`{key}` types :open");
         }
-        assert!(!by_key["open"].runs.contains(&"o".to_string()), "`o` does not run :open");
-        assert!(by_key["tab-select"].types.contains(&"gt".to_string()), "`gt` types :tab-select");
+        assert!(!of("open").runs.contains(&"o".to_string()), "`o` does not run :open");
+        assert!(of("tab-select").types.contains(&"gt".to_string()), "`gt` types :tab-select");
 
         // And a command no key reaches at all has no cell to fill, which is the hole this whole
         // section was built for: `:screenshot` existed and was written down nowhere.
