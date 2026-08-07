@@ -178,6 +178,15 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     if name == "start_page" {
         return crate::open::start_page();
     }
+    // --- src/focus.rs --------------------------------------------------------------------------
+    // Same case, different module: bru's three insert-mode settings move bru's own mode and are
+    // never written to Chromium, so there is no reading to wait for and "not read yet" would be a
+    // lie about a value that is in force right now. Answered from bru's own store, which is the
+    // only store there is for them.
+    if crate::focus::NAMES.contains(&name) {
+        return crate::settings::is_on(name).to_string();
+    }
+    // --- end src/focus.rs ----------------------------------------------------------------------
     match snapshot.and_then(|snapshot| snapshot.value(name)) {
         Some(value) => value.to_string(),
         // Before the first reading — a unit test, or a browser that has not run `refresh` yet.
@@ -312,6 +321,10 @@ mod tests {
         assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 2);
         // `start_page` is answered in Rust and needs no reading, so it is never one of them.
         assert!(html.contains(&escape(&crate::open::start_page())));
+        // Nor are the four insert-mode settings: they are bru's own and always in force. Their
+        // rows are the only `true`/`false` cells on the page, which is what this counts.
+        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 3);
     }
 
     /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this
