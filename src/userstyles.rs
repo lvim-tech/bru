@@ -154,10 +154,24 @@ const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
 /// yet behaves as a configured one does.
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Whether this renderer has already asked. A bool rather than `Option<bool>` around `ENABLED`,
+/// because the default is a real answer and not an absence: the question is only ever "has anybody
+/// corrected it", and asking twice would be one message per document instead of one per process.
+static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The process message `settings.rs` sends when `content.user_styles` moves, and `:styles-reload`
 /// when the folder has been edited.
 pub const SET_ENABLED: &str = "bru.userstyles.enabled";
 pub const RELOAD: &str = "bru.userstyles.reload";
+
+/// The process message a renderer sends when it has never been told whether the styles are on.
+///
+/// **`ENABLED` starts `true` in every renderer, and nothing told the new ones otherwise.** So
+/// `:styles-toggle` off held for the pages that were open and was undone by the next site opened,
+/// because a cross-site navigation makes a renderer process and that one started at the default.
+/// `scrollbar.rs` had the identical hole and this is the identical answer: apply the default at
+/// once, ask, and correct on the reply. One message per renderer process.
+pub const ASK: &str = "bru.userstyles.ask";
 
 /// What was read off the disk, so a page load is not a directory walk. Dropped by [`RELOAD`].
 fn cache() -> &'static Mutex<Option<Vec<(String, String)>>> {
@@ -182,15 +196,7 @@ pub fn renderer_on_context_created(frame: Option<&Frame>) {
     let Some(frame) = frame else {
         return;
     };
-    // Only the main frame: an advert in an iframe is not the site the folder was named after, and
-    // styling every subframe is how a rule written for a page ends up inside somebody's embed.
-    if frame.is_main() == 0 {
-        return;
-    }
-    let url = CefString::from(&frame.url()).to_string();
-    // `bru://` chrome, `about:blank`, `data:` — bru's own pages link `chrome.css`, which already
-    // carries the theme, and a user stylesheet for a `bru://` host is not a thing anybody means.
-    if url.starts_with("bru://") || !url.contains("://") {
+    if !styleable(frame) {
         return;
     }
 
@@ -198,26 +204,26 @@ pub fn renderer_on_context_created(frame: Option<&Frame>) {
     // when there is no CSS to give it.
     crate::greasemonkey::evaluate(frame, KEEPER_JS, Some("bru://userstyle.js"));
 
-    if !ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::greasemonkey::evaluate(frame, "window.bruStyle && window.bruStyle.off();", None);
-        return;
+    // Ask once per renderer process, for [`ASK`]'s reason. The default is applied below meanwhile,
+    // which is the right answer for a bru nobody has configured and the wrong one only for the
+    // moment between the question and its answer.
+    if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(mut message) = process_message_create(Some(&CefString::from(ASK))) {
+            frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+        }
     }
-    let css = css_for(&url);
-    if css.trim().is_empty() {
-        return;
-    }
-    let code = format!(
-        "window.bruStyle && window.bruStyle.set(\"{}\");",
-        crate::ipc::json_escape(&css)
-    );
-    crate::greasemonkey::evaluate(frame, &code, None);
+
+    apply(frame);
 }
 
-/// Tell every renderer whether the styles are on, and reload the pages so the answer is seen.
+/// Tell every renderer whether the styles are on.
 ///
-/// **The browser process's side.** `Backing::UserStyles` calls it; the renderers act on it. The
-/// reload is what makes `:styles-toggle` change the page in front of the user: the styles are
-/// installed at context creation, and a document that already exists has had its.
+/// **The browser process's side.** `Backing::UserStyles` calls it; the renderers act on it — and
+/// *act* is the word, since `renderer_on_message` applies to the frame the message arrived on.
+/// There used to be a `browser.reload()` here, to make the toggle change the page in front of the
+/// user rather than the next one; it is gone with the same reasoning `scrollbar.rs` used, plus one
+/// of its own: reloading every tab to change a colour throws away whatever was typed into a form on
+/// any of them.
 pub fn push_enabled(on: bool) {
     let Some(state) = crate::state::BruState::instance() else {
         return;
@@ -236,36 +242,109 @@ pub fn push_enabled(on: bool) {
         let Some(frame) = view.browser().and_then(|browser| browser.main_frame()) else {
             continue;
         };
-        if let Some(mut message) = process_message_create(Some(&CefString::from(SET_ENABLED))) {
-            if let Some(arguments) = message.argument_list() {
-                arguments.set_bool(0, i32::from(on));
-            }
-            frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
-        }
-        // A reload rather than a second injection path: the keeper is installed when a context is
-        // created, so the honest way to re-run it is to create one.
-        if let Some(browser) = frame.browser() {
-            browser.reload();
-        }
+        send_enabled(&frame, on);
     }
 }
 
+/// One `SET_ENABLED` message, to one frame. The only place that message is built.
+fn send_enabled(frame: &Frame, on: bool) {
+    let Some(mut message) = process_message_create(Some(&CefString::from(SET_ENABLED))) else {
+        return;
+    };
+    if let Some(arguments) = message.argument_list() {
+        arguments.set_bool(0, i32::from(on));
+    }
+    frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+}
+
+/// Answer one renderer's [`ASK`]. The browser process's side, called from `ipc.rs`.
+pub fn on_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != ASK {
+        return false;
+    }
+    if let Some(frame) = frame {
+        send_enabled(frame, crate::settings::is_on("content.user_styles"));
+    }
+    true
+}
+
 /// The renderer's side of the two messages. Answers whether it was one of them.
-pub fn renderer_on_message(message: Option<&ProcessMessage>) -> bool {
+///
+/// **It applies as well as remembers.** Storing alone is what made the first version of [`ASK`]
+/// useless: the renderer asked, put the default in — 34,158 characters of stylesheet — and then
+/// learned the answer was `false` and did nothing with it. Measured 2026-08-07 on exactly that
+/// path, `:styles-toggle` off followed by a cross-site navigation back. The keeper is already in
+/// the page and takes both `set` and `off` at any time, so the correction lands on the document
+/// that is in front of the user.
+pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
     let Some(message) = message else {
         return false;
     };
     let name = CefString::from(&message.name()).to_string();
     if name == RELOAD {
         *cache().lock().expect("the userstyles cache mutex is never poisoned") = None;
+        if let Some(frame) = frame {
+            apply(frame);
+        }
         return true;
     }
     if name == SET_ENABLED {
         let on = message.argument_list().map(|arguments| arguments.bool(0) != 0).unwrap_or(true);
         ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+        if let Some(frame) = frame {
+            apply(frame);
+        }
         return true;
     }
     false
+}
+
+/// Put the right stylesheet — or none — into a frame that already has the keeper.
+///
+/// Split out of [`renderer_on_context_created`] so that an answer arriving after the page was drawn
+/// takes the same path as the page being drawn. Assumes the keeper is installed; every caller has
+/// installed it or is answering a message on a frame where it was.
+fn apply(frame: &Frame) {
+    if !styleable(frame) {
+        return;
+    }
+    if !ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::greasemonkey::evaluate(
+            frame,
+            "window.bruKeep && window.bruKeep(\"bru-userstyle\",\"last\").off();",
+            None,
+        );
+        return;
+    }
+    let css = css_for(&CefString::from(&frame.url()).to_string());
+    if css.trim().is_empty() {
+        crate::greasemonkey::evaluate(
+            frame,
+            "window.bruKeep && window.bruKeep(\"bru-userstyle\",\"last\").off();",
+            None,
+        );
+        return;
+    }
+    let code = format!(
+        "window.bruKeep && window.bruKeep(\"bru-userstyle\",\"last\").set(\"{}\");",
+        crate::ipc::json_escape(&css)
+    );
+    crate::greasemonkey::evaluate(frame, &code, None);
+}
+
+/// Whether this frame is a page bru styles at all: the main frame of a real document.
+///
+/// An advert in an iframe is not the site the folder was named after, and `bru://` chrome links
+/// `chrome.css`, which already carries the theme.
+fn styleable(frame: &Frame) -> bool {
+    if frame.is_main() == 0 {
+        return false;
+    }
+    let url = CefString::from(&frame.url()).to_string();
+    !url.starts_with("bru://") && url.contains("://")
 }
 
 #[cfg(test)]
@@ -314,7 +393,7 @@ mod tests {
     fn the_css_arrives_inside_a_string() {
         let css = "body { content: \"x\" }\nb { }";
         let code = format!(
-            "window.bruStyle && window.bruStyle.set(\"{}\");",
+            "window.bruKeep && window.bruKeep(\"bru-userstyle\",\"last\").set(\"{}\");",
             crate::ipc::json_escape(css)
         );
         assert!(code.contains(".set(\""), "the CSS is not quoted: {code}");
@@ -332,10 +411,17 @@ mod tests {
     /// **The keeper is the thing that survives a document being replaced**, and it has to be in the
     /// binary for that to be true. A `chrome/*` file is `include_str!`d, so a rename that missed
     /// this would be a compile error — but an emptied one would not.
+    ///
+    /// It is a **factory** since `scrollbar.rs` started asking for one too: `bruKeep(id, where)`
+    /// hands out one keeper per id, so the two never fight over an element, and `where` is which end
+    /// of the cascade that id wants. This file asks for `"last"`, where the user is meant to win.
     #[test]
     fn the_keeper_is_there_and_owns_one_element() {
         assert!(KEEPER_JS.contains("MutationObserver"), "no observer: the root swap is not handled");
-        assert!(KEEPER_JS.contains("window.bruStyle"), "nothing to call set() on");
+        assert!(KEEPER_JS.contains("window.bruKeep"), "nothing to call set() on");
         assert!(KEEPER_JS.contains("appendChild"), "the style is never put anywhere");
+        // Both ends, because one keeper that only ever appends would silently give the scrollbar
+        // the user's place in the cascade.
+        assert!(KEEPER_JS.contains("insertBefore"), "\"first\" cannot be honoured");
     }
 }

@@ -53,19 +53,29 @@
 //!
 //! ## Where it goes in, and where it must not
 //!
-//! `LoadHandler::on_load_start`, through `Frame::execute_java_script`. Not
-//! `RenderProcessHandler::on_context_created`, which is where `greasemonkey.rs` injects: measured
-//! 2026-08-07 with a userscript that did nothing but append a `<style>`, the script ran and threw
-//! `TypeError: Cannot read properties of null (reading 'appendChild')` — at that moment
-//! `document.head` and `document.documentElement` are **both null**, so there is no document to put
-//! a stylesheet into. `on_load_start` is after the document element exists and before the page's own
-//! `<head>` has been parsed, which is both halves of what this needs.
+//! `RenderProcessHandler::on_context_created`, in the **renderer**, through the keeper in
+//! `chrome/userstyle.js` — the same door and the same keeper `userstyles.rs` uses.
+//!
+//! `LoadHandler::on_load_start` was where this started, and it is subtly wrong in a way a
+//! screenshot found and no test would have: a browser that has only just been created **has no V8
+//! context**, so the script for the first page a window shows was handed over and evaporated. The
+//! start page was the one page in bru with Chromium's scrollbar on it.
+//!
+//! The objection that sent it to `on_load_start` in the first place was real and is answered
+//! elsewhere now. Measured 2026-08-07: a userscript that did nothing but append a `<style>` at
+//! context creation threw `TypeError: Cannot read properties of null (reading 'appendChild')`,
+//! because at that moment `document.head` and `document.documentElement` are **both null**. That is
+//! the keeper's first job — it waits for the root with a `MutationObserver` instead of assuming
+//! one. Two more failures come free with it: a single-page application that re-renders takes any
+//! `<style>` put into it with it, and the element has to be kept at the end of the cascade it was
+//! asked for. `bruKeep(id, "first")` is what this module asks for; see the file.
 //!
 //! bru's own `bru://chrome/*` pages are **not** served by this. They link `chrome.css`, which
 //! carries the same five rules as ordinary CSS, so the help page and the settings page get the
 //! scrollbar for the same reason the completion does and without a script running on them.
 
 use cef::*;
+use std::sync::Mutex;
 
 /// The width and the two colours, as [`css_with`] takes them.
 ///
@@ -165,85 +175,207 @@ pub fn css_with(theme: &str, page_wins: bool, look: &Look) -> String {
     )
 }
 
-/// The `<style>` element's id, so that a second injection replaces the first rather than stacking.
-///
-/// `:set scrollbar.style false` needs something to take *out*, and a page that has been through
-/// three `:set`s must not be carrying three stylesheets.
+/// The `<style>` element's id. The keeper takes it as a name, so that the scrollbar's element and
+/// the per-site stylesheet's are two elements and not one fought over.
 const STYLE_ID: &str = "bru-scrollbar";
 
-/// The script one frame is handed: remove bru's stylesheet if it is there, then put the current one
-/// in, unless there is nothing to put.
-///
-/// Written as an IIFE with no bindings that escape it, because it runs in the page's own world
-/// alongside whatever the page has declared.
-///
-/// **`ipc::json_escape` escapes the *contents* of a string literal and does not write the quotes
-/// around it.** Left off, the CSS arrived as bare source — `var c=::-webkit-scrollbar{…}` — which is
-/// a syntax error, so the whole script did nothing and did it silently. The quotes below are the
-/// fix and [`tests::a_quote_in_the_theme_cannot_close_the_string`] is what holds them there.
-pub fn script_with(theme: &str, on: bool, page_wins: bool, look: &Look) -> String {
-    let css = if on { css_with(theme, page_wins, look) } else { String::new() };
-    format!(
-        "(function(){{var d=document,o=d.getElementById(\"{id}\");if(o)o.remove();\
-         var c=\"{css}\";if(!c)return;var r=d.documentElement;if(!r)return;\
-         var s=d.createElement('style');s.id=\"{id}\";s.textContent=c;\
-         r.insertBefore(s,r.firstChild);}})()",
-        id = crate::ipc::json_escape(STYLE_ID),
-        css = crate::ipc::json_escape(&css),
-    )
-}
+/// The keeper that lives in the page — the same one `userstyles.rs` installs. See
+/// `chrome/userstyle.js`.
+const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
 
-/// [`script_with`] against the theme and the settings actually in force.
+/// [`css_with`] against the theme and the settings actually in force, or nothing at all when
+/// `scrollbar.style` is off.
 ///
 /// The theme is re-read per call rather than cached: `~/.config/bru/theme.css` is what `themer`
 /// rewrites to change the colours, and `chrome.rs` already re-reads it on every request for the same
 /// reason. A page load is not a hot path.
-pub fn script() -> String {
+///
+/// **It answers correctly in the renderer as well, and that is not luck.** `settings::get` falls
+/// back to the compiled-in `Def::default_value` when nothing has been stored, and nothing is ever
+/// stored in a renderer — so this reads bru's shipped defaults there and the user's values in the
+/// browser process, from one body of code. What it must not do is grow a reader that needs Lua: a
+/// `Value::Fn` lives in the browser process's `mlua` state and there is no such state here. None of
+/// these four settings can hold a function.
+fn rules() -> String {
+    if !crate::settings::is_on("scrollbar.style") {
+        return String::new();
+    }
     let theme = String::from_utf8_lossy(&crate::chrome::theme_css()).into_owned();
-    script_with(
-        &theme,
-        crate::settings::is_on("scrollbar.style"),
-        crate::settings::is_on("scrollbar.page_overrides"),
-        &Look::in_force(),
-    )
+    css_with(&theme, crate::settings::is_on("scrollbar.page_overrides"), &Look::in_force())
 }
 
-/// Put the stylesheet into one frame. The `on_load_start` caller, and the one below.
-pub fn inject(frame: &mut Frame) {
-    frame.execute_java_script(Some(&CefString::from(script().as_str())), None, 0);
-}
+// --- the renderer -----------------------------------------------------------------------------
+/// The rules the browser process last sent, or `None` if it has not spoken yet.
+///
+/// **The renderer has no settings store, and it needs four of them.** So the split is between what
+/// is true at startup and what a person has typed:
+///
+/// - Nothing pushed yet: [`rules`] runs here and answers with bru's compiled-in defaults against
+///   the theme off disk. That is exactly right for a bru nobody has configured, and it is what a
+///   renderer has before anybody has said anything.
+/// - `Backing::Scrollbar` sends the real rules over when a setting moves, and they are kept here
+///   until the next one.
+static PUSHED: Mutex<Option<String>> = Mutex::new(None);
 
-/// Re-run the injection in every tab of every window — what `Backing::Scrollbar` calls.
+/// The process message the browser sends when a `scrollbar.*` setting moves.
+pub const SET_RULES: &str = "bru.scrollbar.rules";
+
+/// The process message a renderer sends when it has never been told anything.
 ///
-/// **UI thread**, like every other `Backing` arm's push. A setting the user has just typed has to
-/// change the page under them rather than the next page they open, and the script is written to
-/// replace or remove what a previous run left, so calling it again is the whole of "apply".
+/// **A renderer that was never told used bru's compiled-in defaults and kept them.** Measured
+/// 2026-08-07, three ways: `:set scrollbar.style false` emptied the page under the cursor, and then
+/// the next site opened — a new renderer process — drew the scrollbar again, 251 characters of it,
+/// as did a new tab. `push_rules` reaches the renderers that exist; nothing reached the ones made
+/// afterwards, and a cross-site navigation makes one.
 ///
-/// The chrome strips are deliberately not in this walk. They are `bru://` documents that link
-/// `chrome.css`, which carries the rules already; injecting a second copy into them would put the
-/// page's answer where the stylesheet's belongs.
-pub fn reinject_everywhere() {
+/// So the renderer asks. It applies what it has straight away — the defaults, which is the right
+/// answer for a bru nobody has configured — and the reply corrects it if a person has said
+/// otherwise. Asking costs one message per renderer process, once.
+pub const ASK: &str = "bru.scrollbar.ask";
+
+/// Send the rules to every renderer. The browser process's side, called by `Backing::Scrollbar`.
+///
+/// **No reload.** The rules used to be followed by `browser.reload()`, because they were applied at
+/// context creation and a document that already existed had had its. The keeper in the page takes
+/// CSS at any time, so the renderer re-applies on the message instead — and a `:set` that reloads
+/// every tab is a `:set` that loses whatever was typed into a form on any of them.
+pub fn push_rules() {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let rules = rules();
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let code = script();
-    let Ok(mut state) = state.lock() else {
-        return;
+    let views = {
+        let Ok(guard) = state.lock() else {
+            return;
+        };
+        guard
+            .window_ids()
+            .into_iter()
+            .flat_map(|window| guard.tab_views_in(window))
+            .collect::<Vec<_>>()
     };
-    let ids: Vec<i32> = state
-        .window_ids()
-        .into_iter()
-        .flat_map(|window| state.tab_browser_ids_in(window))
-        .flatten()
-        .collect();
-    for id in ids {
-        let Some(frame) = state.browser_with_id(id).and_then(|b| b.main_frame()) else {
+    for view in views {
+        let Some(frame) = view.browser().and_then(|browser| browser.main_frame()) else {
             continue;
         };
-        frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
+        send_rules(&frame, &rules);
     }
 }
+
+/// Answer one renderer's [`ASK`]. The browser process's side, called from `ipc.rs`.
+///
+/// Returns whether it was that message.
+pub fn on_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != ASK {
+        return false;
+    }
+    let Some(frame) = frame else {
+        return true;
+    };
+    send_rules(frame, &rules());
+    true
+}
+
+/// One `SET_RULES` message, to one frame. The only place that message is built.
+fn send_rules(frame: &Frame, rules: &str) {
+    let Some(mut message) = process_message_create(Some(&CefString::from(SET_RULES))) else {
+        return;
+    };
+    if let Some(arguments) = message.argument_list() {
+        arguments.set_string(0, Some(&CefString::from(rules)));
+    }
+    frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+}
+
+/// The renderer's side of that message. Answers whether it was that message.
+///
+/// **It applies as well as remembers**, which is what lets `push_rules` drop its reload: the keeper
+/// already in the page is handed the new CSS, so the document under the user changes rather than
+/// the next one they open.
+pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != SET_RULES {
+        return false;
+    }
+    let css = message
+        .argument_list()
+        .map(|arguments| CefString::from(&arguments.string(0)).to_string())
+        .unwrap_or_default();
+    *PUSHED.lock().expect("the scrollbar rules mutex is never poisoned") = Some(css.clone());
+    if let Some(frame) = frame {
+        if styleable(frame) {
+            crate::greasemonkey::evaluate(frame, &keeper_call(&css), None);
+        }
+    }
+    true
+}
+
+/// Whether this frame is a page bru dresses at all: the main frame of a real document.
+///
+/// `bru://` chrome links `chrome.css`, which has carried these five rules for the completion since
+/// they were written; `about:blank` and `data:` are not a site. A subframe's scrollbar belongs to
+/// the advert in it.
+fn styleable(frame: &Frame) -> bool {
+    if frame.is_main() == 0 {
+        return false;
+    }
+    let url = CefString::from(&frame.url()).to_string();
+    !url.starts_with("bru://") && url.contains("://")
+}
+
+/// What one document is told: hand the keeper the rules, or take the element away when there are
+/// none.
+///
+/// **`ipc::json_escape` escapes the *contents* of a string literal and does not write the quotes
+/// around it.** Left off, the CSS arrived as bare source — `set(::-webkit-scrollbar{…})` — which is
+/// a syntax error, so the whole script did nothing and did it silently. The quotes below are the
+/// fix and [`tests::a_quote_in_the_theme_cannot_close_the_string`] is what holds them there.
+///
+/// Empty is [`off`](chrome/userstyle.js) rather than `set("")`, and the difference is real: `set`
+/// with nothing in it leaves an empty `<style>` in the page with a `MutationObserver` still holding
+/// it in place. `:set scrollbar.style false` means the element goes.
+fn keeper_call(css: &str) -> String {
+    let keeper = format!("window.bruKeep && window.bruKeep(\"{STYLE_ID}\",\"first\")");
+    if css.is_empty() {
+        return format!("{keeper}.off();");
+    }
+    format!("{keeper}.set(\"{}\");", crate::ipc::json_escape(css))
+}
+
+/// Draw the scrollbar in this document. The renderer's hook.
+pub fn renderer_on_context_created(frame: Option<&Frame>) {
+    let Some(frame) = frame else {
+        return;
+    };
+    if !styleable(frame) {
+        return;
+    }
+    // Nothing pushed means this renderer has never been told anything. Draw bru's own defaults —
+    // [`rules`] answers with them in a process that has no store, which is what a renderer is — and
+    // ask, so that a setting somebody changed before this process existed reaches it. See [`ASK`].
+    let known = PUSHED.lock().ok().and_then(|pushed| pushed.clone());
+    if known.is_none() {
+        if let Some(mut message) = process_message_create(Some(&CefString::from(ASK))) {
+            frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+        }
+    }
+    let css = known.unwrap_or_else(rules);
+    // **Through the same keeper the per-site stylesheets use, and `first` is the whole difference.**
+    // A document that is re-rendered takes any style put into it with it — measured on DuckDuckGo,
+    // whose results arrive after the style did — so the element has to be watched rather than
+    // inserted once. `first` puts it before everything the page brings, which is the whole of
+    // `scrollbar.page_overrides true`; `userstyles.rs` asks for `last`, where the user is meant to
+    // win. Both keepers are installed by the same file and cost one parse between them.
+    crate::greasemonkey::evaluate(frame, KEEPER_JS, Some("bru://userstyle.js"));
+    crate::greasemonkey::evaluate(frame, &keeper_call(&css), None);
+}
+// --- end the renderer -------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -343,19 +475,37 @@ mod tests {
         assert!(!css.contains(thumb), "the theme's colour survived an override: {css}");
     }
 
-    /// Off is not "inject nothing" — it is "take out what a previous injection left".
+    /// Off is not "hand over an empty stylesheet" — it is "take out what a previous run left".
+    ///
+    /// `set("")` would leave an empty `<style>` in the page with the keeper's observer still holding
+    /// it there, which is a scrollbar setting switched off and a mutation observer still running on
+    /// every page in the browser.
     #[test]
-    fn turning_it_off_still_removes_the_stylesheet() {
-        let off = script_with(&theme(), false, true, &shipped());
-        assert!(off.contains("o.remove()"), "{off}");
-        assert!(!off.contains("webkit-scrollbar"), "{off}");
+    fn turning_it_off_takes_the_element_away_rather_than_emptying_it() {
+        let off = keeper_call("");
+        assert!(off.contains(".off()"), "{off}");
+        assert!(!off.contains(".set("), "{off}");
     }
 
     /// The stylesheet goes in **first**, which is what makes the default mean anything: a page rule
     /// of equal specificity beats ours by coming later, and only document order decides that.
+    ///
+    /// The insertion itself is `chrome/userstyle.js`'s, so what this holds is the argument that asks
+    /// for it — the other keeper in the same file is handed `"last"` and must stay handed it.
     #[test]
-    fn the_stylesheet_is_the_first_child_of_the_document_element() {
-        assert!(script_with(&theme(), true, true, &shipped()).contains("r.insertBefore(s,r.firstChild)"));
+    fn the_stylesheet_is_asked_for_at_the_front_of_the_cascade() {
+        let code = keeper_call("::-webkit-scrollbar{width:12px}");
+        assert!(code.contains("\"first\""), "{code}");
+        assert!(!code.contains("\"last\""), "{code}");
+        assert!(KEEPER_JS.contains("insertBefore"), "the keeper cannot honour \"first\"");
+    }
+
+    /// The two keepers own two elements. One id for both would be the scrollbar and the user's CSS
+    /// overwriting each other, last writer winning, and on most pages the user's runs second.
+    #[test]
+    fn the_scrollbar_and_the_user_styles_are_not_the_same_element() {
+        assert_ne!(STYLE_ID, "bru-userstyle");
+        assert!(keeper_call("x").contains(STYLE_ID));
     }
 
     /// The CSS reaches the page as a JS string literal, so a theme holding a quote or a backslash
@@ -364,10 +514,10 @@ mod tests {
     #[test]
     fn a_quote_in_the_theme_cannot_close_the_string() {
         let theme = ":root{\n--completion-scrollbar-bg: #fff\"; } body { display:none;\n}";
-        let script = script_with(theme, true, true, &shipped());
+        let code = keeper_call(&css_with(theme, true, &shipped()));
         // The quote must arrive backslashed. Asserting the *absence* of `"; } body` would pass on a
         // script that never quoted the CSS at all, which is the bug this was written after.
-        assert!(script.contains("#fff\\\"; } body"), "the quote was not escaped: {script}");
-        assert!(script.contains("var c=\""), "the CSS is not inside a string at all: {script}");
+        assert!(code.contains("#fff\\\"; } body"), "the quote was not escaped: {code}");
+        assert!(code.contains(".set(\""), "the CSS is not inside a string at all: {code}");
     }
 }

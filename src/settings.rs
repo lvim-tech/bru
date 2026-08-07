@@ -3902,7 +3902,10 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         // Re-run the injection in every open tab. The script removes what a previous run left
         // before it puts anything in, so this is "apply" for both settings and for either value.
         Backing::Scrollbar => {
-            crate::scrollbar::reinject_everywhere();
+            // The rules go to the renderers, which is where they are applied — see
+            // `scrollbar::renderer_on_context_created` for why a browser-side injection cannot
+            // reach the first page a window shows.
+            crate::scrollbar::push_rules();
             return Ok(());
         }
         // --- src/userstyles.rs -------------------------------------------------------------

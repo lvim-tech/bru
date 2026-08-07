@@ -62,6 +62,20 @@ pub fn on_process_message_received(
     if crate::navigate::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/scrollbar.rs ---------------------------------------------------------------------
+    // A renderer asking what the scrollbar settings are, because it was made after the last time
+    // anybody said. Same shape and the same reason as the others here: not a query a page could
+    // have started, so it never reaches the router's `bru://`-only check.
+    if crate::scrollbar::on_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/scrollbar.rs -----------------------------------------------------------------
+    // --- src/userstyles.rs ---------------------------------------------------------------------
+    // The same question about the per-site stylesheets, and the same reason it is claimed here.
+    if crate::userstyles::on_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/userstyles.rs -----------------------------------------------------------------
     // --- src/focus.rs -------------------------------------------------------------------------
     // A page moved its focus, and the renderer says whether what has it now is editable. Same
     // shape and the same reason as the three above: it is not a query a page could have started,

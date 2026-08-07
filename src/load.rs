@@ -128,8 +128,11 @@ fn dress(browser: &mut Browser) {
     if url.starts_with("bru://") {
         return;
     }
-    let _ = &url;
-    crate::scrollbar::inject(&mut frame);
+    // Neither the scrollbar nor the per-site stylesheets are put in from here any more. Both are
+    // installed by the renderer at `on_context_created`, which is the one callback that fires when
+    // a V8 context exists — by definition, for every document, including the first a window shows.
+    // This hook could not reach that one, and the page it could not reach was the start page.
+    let _ = (&url, &mut frame);
     // The per-site stylesheets are **not** here. They are installed by the renderer at
     // `on_context_created` — see `src/userstyles.rs` for why this hook cannot do it for the first
     // page a window shows, and `chrome/userstyle.js` for the two other failures that answers.
