@@ -47,6 +47,7 @@
 //! that is usually empty.
 
 use cef::*;
+use std::sync::{Mutex, OnceLock};
 
 /// `~/.config/bru/styles`, or `None` where there is no config directory.
 ///
@@ -105,6 +106,17 @@ pub fn css_for(url: &str) -> String {
         return String::new();
     };
     let mut out = String::new();
+    // **The theme's own custom properties go in first**, so a stylesheet written for a site can say
+    // `background: var(--bg)` and follow the theme rather than freezing one.
+    //
+    // Without this the only way to colour a site is to write hex into the file, and then switching
+    // the theme leaves every hand-written stylesheet wearing the old one — which is the failure the
+    // whole `theme.css` arrangement exists to prevent everywhere else. A page never loads
+    // `theme.css`, so the properties have to travel with the rules that use them.
+    //
+    // Prepended only when something applies: `css_for` answers empty for a site with no folder, and
+    // the 9KB below is not put into a page nobody has styled.
+    let theme = String::from_utf8_lossy(&crate::chrome::theme_css()).into_owned();
     for candidate in candidates(&host) {
         let folder = dir.join(&candidate);
         let Ok(entries) = std::fs::read_dir(&folder) else {
@@ -120,6 +132,10 @@ pub fn css_for(url: &str) -> String {
         files.sort();
         for file in files {
             if let Ok(css) = std::fs::read_to_string(&file) {
+                if out.is_empty() {
+                    out.push_str("/* the theme in force, so a rule below can name a colour */\n");
+                    out.push_str(&theme);
+                }
                 out.push_str(&format!("\n/* {} */\n", file.display()));
                 out.push_str(&css);
             }
@@ -128,92 +144,128 @@ pub fn css_for(url: &str) -> String {
     out
 }
 
-/// The `<style>` element's id, so a second injection replaces the first rather than stacking.
-const STYLE_ID: &str = "bru-userstyle";
+/// The keeper that lives in the page. See `chrome/userstyle.js` for the three failures it exists to
+/// survive, and qutebrowser's `javascript/stylesheet.js`, which is where its shape comes from.
+const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
 
-/// The script one frame is handed.
+/// Whether the styles are switched on. **Read in the renderer, so it cannot ask the settings
+/// store** — that lives in the browser process. The value is pushed here by `settings.rs` through
+/// `Backing::UserStyles`, and it starts at the shipped default so a renderer that has not been told
+/// yet behaves as a configured one does.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The process message `settings.rs` sends when `content.user_styles` moves, and `:styles-reload`
+/// when the folder has been edited.
+pub const SET_ENABLED: &str = "bru.userstyles.enabled";
+pub const RELOAD: &str = "bru.userstyles.reload";
+
+/// What was read off the disk, so a page load is not a directory walk. Dropped by [`RELOAD`].
+fn cache() -> &'static Mutex<Option<Vec<(String, String)>>> {
+    static CACHE: OnceLock<Mutex<Option<Vec<(String, String)>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// **The renderer's hook, and the only place a page is styled.**
 ///
-/// **Last child of `<head>` if there is one, otherwise last of `<html>`** — the opposite of where
-/// `scrollbar.rs` puts its own. That one goes in first on purpose, so a page's own scrollbar rules
-/// win; this one is the user overriding the page and has to come after everything the page will
-/// bring. At `on_load_start` the page's `<head>` is empty, so "last" is a claim about the cascade
-/// and not about the DOM as it stands: a rule of equal specificity added later still loses to one
-/// the page adds afterwards, which is why a stylesheet written here will sometimes need
-/// `!important` and `scrollbar.rs`'s deliberately never does.
-pub fn script_for(url: &str) -> Option<String> {
-    let css = css_for(url);
-    if css.trim().is_empty() {
-        return None;
+/// `RenderProcessHandler::on_context_created` — the same door `greasemonkey.rs` uses, and for the
+/// same reason. It fires when, and only when, a V8 context exists for a document: by definition, for
+/// every document, including the first one a window ever shows. The browser-side
+/// `LoadHandler::on_load_start` was tried first and is subtly wrong — a browser that has only just
+/// been created has no context yet, so the script was handed over and evaporated, and the start page
+/// was never styled. Injecting a second time from `on_load_end` covered it up; this removes the
+/// thing being covered.
+///
+/// The directory is read **here**, in the renderer, exactly as `greasemonkey.rs` reads its own.
+/// There is no message carrying stylesheets across: the renderer can open a file, and a second
+/// transport would be a second thing to keep in step.
+pub fn renderer_on_context_created(frame: Option<&Frame>) {
+    let Some(frame) = frame else {
+        return;
+    };
+    // Only the main frame: an advert in an iframe is not the site the folder was named after, and
+    // styling every subframe is how a rule written for a page ends up inside somebody's embed.
+    if frame.is_main() == 0 {
+        return;
     }
-    Some(format!(
-        "(function(){{var d=document,o=d.getElementById({id});if(o)o.remove();\
-         var s=d.createElement('style');s.id={id};s.textContent={css};\
-         (d.head||d.documentElement).appendChild(s);}})()",
-        id = crate::ipc::json_escape(STYLE_ID),
-        css = crate::ipc::json_escape(&css),
-    ))
+    let url = CefString::from(&frame.url()).to_string();
+    // `bru://` chrome, `about:blank`, `data:` — bru's own pages link `chrome.css`, which already
+    // carries the theme, and a user stylesheet for a `bru://` host is not a thing anybody means.
+    if url.starts_with("bru://") || !url.contains("://") {
+        return;
+    }
+
+    // The keeper first, always: it is what `off` needs a handle on, and installing it costs nothing
+    // when there is no CSS to give it.
+    crate::greasemonkey::evaluate(frame, KEEPER_JS, Some("bru://userstyle.js"));
+
+    if !ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::greasemonkey::evaluate(frame, "window.bruStyle && window.bruStyle.off();", None);
+        return;
+    }
+    let css = css_for(&url);
+    if css.trim().is_empty() {
+        return;
+    }
+    let code = format!(
+        "window.bruStyle && window.bruStyle.set(\"{}\");",
+        crate::ipc::json_escape(&css)
+    );
+    crate::greasemonkey::evaluate(frame, &code, None);
 }
 
-/// Take the stylesheet out again — what the toggle does when it is switched off.
+/// Tell every renderer whether the styles are on, and reload the pages so the answer is seen.
 ///
-/// A separate script rather than [`script_for`] answering `None`, because those are two different
-/// facts: "this site has no folder" leaves the document alone, and "the user turned it off" has to
-/// remove what a previous load put in.
-fn removal_script() -> String {
-    format!(
-        "(function(){{var o=document.getElementById({id});if(o)o.remove();}})()",
-        id = crate::ipc::json_escape(STYLE_ID),
-    )
-}
-
-/// Re-run the injection in every tab of every window — what `Backing::UserStyles` calls.
-///
-/// **UI thread**, like every other `Backing` arm's push. `:styles-toggle` has to change the page the
-/// user is looking at rather than the next one they open, and each tab is asked about its own URL:
-/// a window with a styled site and an unstyled one in it must not have both answered the same way.
-pub fn reinject_everywhere() {
-    debug_assert_ne!(currently_on(ThreadId::UI), 0);
-    let on = crate::settings::is_on("content.user_styles");
+/// **The browser process's side.** `Backing::UserStyles` calls it; the renderers act on it. The
+/// reload is what makes `:styles-toggle` change the page in front of the user: the styles are
+/// installed at context creation, and a document that already exists has had its.
+pub fn push_enabled(on: bool) {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let Ok(mut state) = state.lock() else {
-        return;
+    let views = {
+        let Ok(guard) = state.lock() else {
+            return;
+        };
+        guard
+            .window_ids()
+            .into_iter()
+            .flat_map(|window| guard.tab_views_in(window))
+            .collect::<Vec<_>>()
     };
-    let ids: Vec<i32> = state
-        .window_ids()
-        .into_iter()
-        .flat_map(|window| state.tab_browser_ids_in(window))
-        .flatten()
-        .collect();
-    for id in ids {
-        let Some(frame) = state.browser_with_id(id).and_then(|b| b.main_frame()) else {
+    for view in views {
+        let Some(frame) = view.browser().and_then(|browser| browser.main_frame()) else {
             continue;
         };
-        let url = CefString::from(&frame.url()).to_string();
-        let code = if on {
-            match script_for(&url) {
-                Some(code) => code,
-                // Off by absence rather than by the switch: nothing to put in, and nothing a
-                // previous load could have left, so nothing to say.
-                None => removal_script(),
+        if let Some(mut message) = process_message_create(Some(&CefString::from(SET_ENABLED))) {
+            if let Some(arguments) = message.argument_list() {
+                arguments.set_bool(0, i32::from(on));
             }
-        } else {
-            removal_script()
-        };
-        frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
+            frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+        }
+        // A reload rather than a second injection path: the keeper is installed when a context is
+        // created, so the honest way to re-run it is to create one.
+        if let Some(browser) = frame.browser() {
+            browser.reload();
+        }
     }
 }
 
-/// Put the user's stylesheets into one frame, if it has any. The `on_load_start` caller.
-pub fn inject(frame: &mut Frame, url: &str) {
-    if !crate::settings::is_on("content.user_styles") {
-        return;
-    }
-    let Some(code) = script_for(url) else {
-        return;
+/// The renderer's side of the two messages. Answers whether it was one of them.
+pub fn renderer_on_message(message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
     };
-    frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
+    let name = CefString::from(&message.name()).to_string();
+    if name == RELOAD {
+        *cache().lock().expect("the userstyles cache mutex is never poisoned") = None;
+        return true;
+    }
+    if name == SET_ENABLED {
+        let on = message.argument_list().map(|arguments| arguments.bool(0) != 0).unwrap_or(true);
+        ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -253,9 +305,37 @@ mod tests {
         assert_eq!(candidates("localhost"), vec!["localhost"]);
     }
 
+    /// **The CSS reaches the page as a JS string literal**, and `ipc::json_escape` writes the
+    /// escapes but not the quotes around them. Without them 12KB of stylesheet arrived as bare
+    /// source: a syntax error that did nothing, said nothing, and was found by looking at a page.
+    /// The same omission was made in `scrollbar.rs` first; a guard in each is cheaper than
+    /// remembering.
+    #[test]
+    fn the_css_arrives_inside_a_string() {
+        let css = "body { content: \"x\" }\nb { }";
+        let code = format!(
+            "window.bruStyle && window.bruStyle.set(\"{}\");",
+            crate::ipc::json_escape(css)
+        );
+        assert!(code.contains(".set(\""), "the CSS is not quoted: {code}");
+        // A newline in the stylesheet must not end the literal, which is what multi-line CSS does.
+        assert!(!code.contains("}\nb {"), "a newline survived into the source: {code}");
+        assert!(code.contains("\\\"x\\\""), "a quote in the CSS was not escaped: {code}");
+    }
+
     /// Nothing to apply is the usual answer, and it must not be a `<style>` with nothing in it.
     #[test]
-    fn a_site_with_no_folder_gets_no_script() {
-        assert!(script_for("https://a-site-nobody-has-styled.example/").is_none());
+    fn a_site_with_no_folder_gets_nothing() {
+        assert!(css_for("https://a-site-nobody-has-styled.example/").trim().is_empty());
+    }
+
+    /// **The keeper is the thing that survives a document being replaced**, and it has to be in the
+    /// binary for that to be true. A `chrome/*` file is `include_str!`d, so a rename that missed
+    /// this would be a compile error — but an emptied one would not.
+    #[test]
+    fn the_keeper_is_there_and_owns_one_element() {
+        assert!(KEEPER_JS.contains("MutationObserver"), "no observer: the root swap is not handled");
+        assert!(KEEPER_JS.contains("window.bruStyle"), "nothing to call set() on");
+        assert!(KEEPER_JS.contains("appendChild"), "the style is never put anywhere");
     }
 }

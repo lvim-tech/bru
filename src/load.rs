@@ -42,6 +42,24 @@ wrap_load_handler! {
                 return;
             };
             let id = browser.identifier();
+
+            // --- src/scrollbar.rs and src/userstyles.rs ---------------------------------------
+            // **Above the `is_active_browser` guard, and that is a fix rather than a tidy-up.**
+            //
+            // How a page is painted belongs to the page, not to which tab is in front of the user.
+            // Below the guard, neither of these ran for the FIRST page a window shows: at startup
+            // the tab's browser reaches this handler before `select_in` has marked it the showing
+            // one, so the start page had no scrollbar of bru's and no user stylesheet until it was
+            // reloaded by hand — measured 2026-08-07, and it had been that way since the scrollbar
+            // was written. A tab opened with `:open -b` was the same: styled only once it was
+            // looked at.
+            //
+            // Everything below the guard is about the tab on screen — the scroll position the bar
+            // shows, the search `n` repeats, the mode a focused field put the window in — and those
+            // are right to be guarded.
+            dress(browser);
+            // --- end src/scrollbar.rs and src/userstyles.rs -----------------------------------
+
             let (is_active, window) = {
                 let state = self.state.lock().expect("state mutex poisoned");
                 (state.is_active_browser(id), state.window_of_browser(id))
@@ -70,22 +88,6 @@ wrap_load_handler! {
             });
 // --- end plugin events -----------------------------------------------------
 
-            // --- src/scrollbar.rs -------------------------------------------------------------
-            // The document element exists here and the page's own <head> has not been parsed yet,
-            // which is both halves of what the stylesheet needs — see `scrollbar.rs` for the
-            // measurement that rules out the renderer's `on_context_created`, where greasemonkey
-            // injects and where `document.documentElement` is still null.
-            if let Some(mut frame) = browser.main_frame() {
-                crate::scrollbar::inject(&mut frame);
-            // --- end src/scrollbar.rs ---------------------------------------------------------
-            // --- src/userstyles.rs ------------------------------------------------------------
-                // The user's own CSS for this site, if there is a folder named after it. After the
-                // scrollbar's on purpose: that one goes in first so a page's own rules win, and
-                // this one is the user overriding the page.
-                let url = CefString::from(&frame.url()).to_string();
-                crate::userstyles::inject(&mut frame, &url);
-            }
-            // --- end src/userstyles.rs --------------------------------------------------------
 
             // The position belongs to the document that is going away; the next one reports its own
             // as soon as it is scrolled.
@@ -102,8 +104,37 @@ wrap_load_handler! {
             }
             // --- end src/focus.rs -------------------------------------------------------------
         }
+
     }
 }
+
+// --- src/scrollbar.rs and src/userstyles.rs ---------------------------------------------------
+/// Put bru's own scrollbar and the user's own CSS into one page.
+///
+/// Called from both ends of a load — see `on_load_end` for the one navigation that needs the second
+/// call. Both scripts are written to be run more than once.
+///
+/// **Above the `is_active_browser` guard on purpose.** How a page is painted belongs to the page,
+/// not to which tab is in front: below the guard, a tab opened with `:open -b` was styled only once
+/// it was looked at.
+fn dress(browser: &mut Browser) {
+    let Some(mut frame) = browser.main_frame() else {
+        return;
+    };
+    let url = CefString::from(&frame.url()).to_string();
+    // bru's own pages link `chrome.css`, which already carries the scrollbar rules and the theme.
+    // Injecting into them would be a second copy of what the stylesheet says, and a user stylesheet
+    // for a `bru://` host is not a thing anybody means.
+    if url.starts_with("bru://") {
+        return;
+    }
+    let _ = &url;
+    crate::scrollbar::inject(&mut frame);
+    // The per-site stylesheets are **not** here. They are installed by the renderer at
+    // `on_context_created` — see `src/userstyles.rs` for why this hook cannot do it for the first
+    // page a window shows, and `chrome/userstyle.js` for the two other failures that answers.
+}
+// --- end src/scrollbar.rs and src/userstyles.rs -----------------------------------------------
 
 /// `BRU_DEBUG_LOAD=1` prints one line per navigation that got past both guards. It is how "did the
 /// hook fire at all" stops being a question that needs a rebuild.

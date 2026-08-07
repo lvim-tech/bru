@@ -1116,7 +1116,7 @@ pub fn renderer_on_message(frame: Option<&Frame>, message: Option<&ProcessMessag
 /// in a stack frame, in `V8Exception::script_resource_name`, and in the source of any console
 /// message the code writes. Injection passes [`script_name`]; the probe passes `None`, which leaves
 /// its behaviour exactly as it was.
-fn evaluate(frame: &Frame, code: &str, script_url: Option<&str>) -> Option<String> {
+pub(crate) fn evaluate(frame: &Frame, code: &str, script_url: Option<&str>) -> Option<String> {
     let context = frame.v8_context()?;
     if context.enter() == 0 {
         return None;

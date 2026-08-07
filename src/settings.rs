@@ -3907,7 +3907,11 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         }
         // --- src/userstyles.rs -------------------------------------------------------------
         Backing::UserStyles => {
-            crate::userstyles::reinject_everywhere();
+            // **A message to the renderers, not an injection from here.** The styles are installed
+            // by the renderer at context creation, so the value has to reach the process that acts
+            // on it; and the pages that are already open are re-read, which is what makes the
+            // toggle change what is on screen rather than the next page.
+            crate::userstyles::push_enabled(matches!(applied.value, Value::Bool(true)));
             return Ok(());
         }
         // --- end src/userstyles.rs ---------------------------------------------------------

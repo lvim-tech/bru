@@ -172,6 +172,12 @@ wrap_render_process_handler! {
             // and none of the page's own scripts have run. `document-end` and `document-idle` are
             // waited for inside the wrapper, which is what makes them right in a subframe too.
             crate::greasemonkey::renderer_on_context_created(gm_frame.as_ref());
+            // --- src/userstyles.rs -------------------------------------------------------------
+            // The per-site stylesheets, through the same door and for the same reason: this is the
+            // one callback that fires when a V8 context exists, for every document, including the
+            // first a window shows.
+            crate::userstyles::renderer_on_context_created(gm_frame.as_ref());
+            // --- end src/userstyles.rs ---------------------------------------------------------
             // --- end src/greasemonkey.rs ------------------------------------------------------
         }
 
@@ -210,6 +216,9 @@ wrap_render_process_handler! {
             // evaluate a probe expression. Claimed here rather than in `ipc.rs` because neither is
             // a query a page could have started, so neither goes near the message router or the
             // `bru://`-only check that guards it.
+            if crate::userstyles::renderer_on_message(message.as_deref()) {
+                return 1;
+            }
             if crate::greasemonkey::renderer_on_message(frame.as_deref(), message.as_deref()) {
                 return 1;
             }
