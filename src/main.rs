@@ -31,6 +31,10 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
+// --- lua runtime -------------------------------------------------------------------------------
+// The second file allowed to mention `mlua`. See `src/lua.rs`.
+mod lua;
+// --- end lua runtime ---------------------------------------------------------------------------
 mod macros;
 mod message;
 mod modes;

@@ -239,10 +239,21 @@ wrap_browser_process_handler! {
             // views below are the first things to ask.
             crate::chrome::register_factory();
 
+// --- lua runtime -------------------------------------------------------------------------------
+            // **The Lua state, before the config that runs in it.** This is where it used to be
+            // created and dropped inside `Config::load`; P1 moved the *lifetime* out to
+            // `src/lua.rs` and left the place alone, because a setting whose value is a Lua function
+            // has to reach the interpreter long after this callback has returned. The thread is
+            // asserted inside `init`, once, and this is the assertion's whole basis:
+            // `on_context_initialized` is the UI thread, and the `debug_assert_ne!(currently_on(…))`
+            // at the top of this function already says so.
+            crate::lua::init();
+// --- end lua runtime ---------------------------------------------------------------------------
+
             // The bindings, before any browser exists to press a key at. `Config::load` compiles in
             // qutebrowser's defaults, then runs ~/.config/bru/config.lua over them if it is there.
-            // The Lua state lives and dies inside that call: what comes back is plain tries of
-            // parsed commands, and nothing Lua-shaped survives into the key path.
+            // What comes back is plain tries of parsed commands, and nothing Lua-shaped reaches the
+            // key path.
             let config = crate::config::Config::load();
             {
                 let mut state = self.state.lock().expect("state mutex poisoned");
