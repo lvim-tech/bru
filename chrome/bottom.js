@@ -232,17 +232,34 @@
       // Filled triangles rather than ↑ ↓: at the bar's 13px an arrow's stem is
       // one pixel wide and the glyph reads as a smudge, which the user saw
       // immediately. A triangle is solid at any size.
-      var modeName = (state.mode || "").replace(/_/g, " ");
+      //
+      // --- src/settings.rs: `statusbar.mode.labels` ---------------------------
+      // The word itself is a setting now, so this picks a *key* and looks it up.
+      // The twelve keys are the ten mode names plus `search_forward` and
+      // `search_backward`, which are command mode's other two faces; Rust sends
+      // every one of them with bru's default already merged under the user's
+      // override, so a missing key here means a mode Rust knows and this dict
+      // does not \u2014 and falling back to the key itself draws the mode's name,
+      // which is what the bar did before the setting existed.
+      // --- end src/settings.rs ------------------------------------------------
+      var labels = state.modelabels || {};
+      // Empty until there is a mode to name, which `#mode:empty` reads to keep
+      // the command line at the left edge before the first push.
+      var labelKey = state.mode || "";
       var arrow = "";
       if (state.mode === "command") {
         var prefix = (state.cmdline && state.cmdline.prefix) || ":";
         if (prefix === "/") {
-          modeName = "search";
+          labelKey = "search_forward";
           arrow = " \u25bc";
         } else if (prefix === "?") {
-          modeName = "search";
+          labelKey = "search_backward";
           arrow = " \u25b2";
         }
+      }
+      var modeName = labels[labelKey];
+      if (modeName === undefined) {
+        modeName = labelKey.replace(/_/g, " ");
       }
       if (state.modestyle === "short" && modeName) {
         // The first letter of each word, so `set mark` is `SM` and not `S` —

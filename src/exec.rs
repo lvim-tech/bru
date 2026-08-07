@@ -540,6 +540,15 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::ConfigCycle { option, values, pattern, print } => {
             crate::settings::run_cycle(option, values, pattern.as_deref(), *print)
         }
+        // The two dictionary commands. No default binding names either — they are typed — so
+        // neither changes the live-binding count; what they change is that a dict setting can be
+        // edited at all while bru runs, which merging alone cannot do for a removal.
+        Command::ConfigDictAdd { option, key, value, replace, print } => {
+            crate::settings::run_dict_add(option, key, value, *replace, *print)
+        }
+        Command::ConfigDictRemove { option, key, print } => {
+            crate::settings::run_dict_remove(option, key, *print)
+        }
 // --- end src/settings.rs ---------------------------------------------------
 
         // --- the command line ---------------------------------------------------------------
@@ -768,6 +777,9 @@ pub fn is_live(command: &Command) -> bool {
         // reason. Nothing is bound to `set <option>`, so this adds no binding to the count; the
         // one binding that is bare `set` (`Ss`) parses to `Unimplemented` and stays inert.
         Command::Set { option, .. } => option.is_some(),
+        // Live, and bound to nothing — see the note on `Command::ConfigDictAdd`. The 264-row
+        // default table names neither, so the live-binding count is untouched by both.
+        Command::ConfigDictAdd { .. } | Command::ConfigDictRemove { .. } => true,
 // --- end src/settings.rs ---------------------------------------------------
 
 // --- src/completers.rs ---------------------------------------------------------------------

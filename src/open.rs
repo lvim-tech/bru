@@ -41,6 +41,32 @@ pub const DEFAULT_ENGINE_URL: &str = "https://duckduckgo.com/?q={}";
 /// answer and therefore bru's: the whole string is the term and `DEFAULT` is the engine.
 pub const DEFAULT_ENGINE: &str = "DEFAULT";
 
+/// The engines bru ships — **DECISIONS.md item 4, as corrected by the user 2026-08-06**.
+///
+/// The entry there once read "bru ships none of them; `config.lua` is configer's file". That
+/// followed the old reading of DESIGN.md and is wrong: bru holds every setting *and its default*,
+/// and `~/.config/bru/config.lua` holds the user's overrides on top. A bru with no
+/// `~/.config/bru/` at all must already search with all nine, and this is where that is true.
+///
+/// Transcribed from `~/.config/qutebrowser/config.py:97-107`, the file this user has typed at for
+/// years. It is read here as a *source for a default*, once, at compile time — not at runtime;
+/// DESIGN.md's "nothing of qutebrowser's is touched at runtime" is untouched by a transcription.
+///
+/// This is also the default of the `url.searchengines` **setting** (`settings.rs`), which is the
+/// other door to the same table. The list lives here rather than there because `open.rs` is what
+/// validates a template and what searches with one; `settings.rs` points at this constant.
+pub const DEFAULT_ENGINES: &[(&str, &str)] = &[
+    (DEFAULT_ENGINE, DEFAULT_ENGINE_URL),
+    ("am", "https://www.amazon.com/s?k={}"),
+    ("aw", "https://wiki.archlinux.org/?search={}"),
+    ("goog", "https://www.google.com/search?q={}"),
+    ("hoog", "https://hoogle.haskell.org/?hoogle={}"),
+    ("re", "https://www.reddit.com/r/{}"),
+    ("ub", "https://www.urbandictionary.com/define.php?term={}"),
+    ("wiki", "https://en.wikipedia.org/wiki/{}"),
+    ("yt", "https://www.youtube.com/results?search_query={}"),
+];
+
 // -- what a typed string turns out to mean ------------------------------------------------------
 
 /// What [`decide`] made of the string.
@@ -81,35 +107,59 @@ pub struct SearchEngines {
 }
 
 impl Default for SearchEngines {
-    /// Just `DEFAULT`, pointing where qutebrowser's does. A config that sets nothing still searches.
+    /// All nine of [`DEFAULT_ENGINES`]. A bru with no `~/.config/bru/` searches with every one of
+    /// them, which is what DECISIONS.md item 4 requires of it.
     fn default() -> SearchEngines {
-        let mut engines = BTreeMap::new();
-        engines.insert(DEFAULT_ENGINE.to_string(), DEFAULT_ENGINE_URL.to_string());
-        SearchEngines { engines }
+        SearchEngines::from_pairs(
+            DEFAULT_ENGINES
+                .iter()
+                .map(|(name, template)| (name.to_string(), template.to_string())),
+        )
     }
 }
 
+/// Whether `name` and `template` are a search engine that could be typed and would work.
+///
+/// Pulled out of [`SearchEngines::set`] so that the `url.searchengines` **setting** validates a
+/// pair exactly as `bru.search` does — the two are doors to one table, and a pair that one accepts
+/// and the other refuses would be a table with two rules.
+pub fn check_engine(name: &str, template: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a search engine needs a name".to_string());
+    }
+    // qutebrowser forbids spaces in the key (configdata.yml :2597) for the reason bru needs
+    // too: the first *word* of `:open` is what is looked up, so a name with a space in it could
+    // never be typed.
+    if name.chars().any(char::is_whitespace) {
+        return Err(format!("search engine name {name:?} contains whitespace"));
+    }
+    if !template.contains('{') {
+        return Err(format!(
+            "search engine {name:?} has no {{}} in {template:?}, so the term would be dropped"
+        ));
+    }
+    // Fail here rather than at the first search: a stray `{title}` is a typo, and startup is
+    // where the config author is looking.
+    format_template(template, "probe").map_err(|e| format!("search engine {name:?}: {e}"))?;
+    Ok(())
+}
+
 impl SearchEngines {
+    /// A table straight from `name -> template` pairs, unvalidated.
+    ///
+    /// The pairs come from the `url.searchengines` setting, which checked every one of them with
+    /// [`check_engine`] on the way in — validating twice would mean two chances to disagree.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> SearchEngines {
+        SearchEngines { engines: pairs.into_iter().collect() }
+    }
+
     /// Add or replace an engine. The error string is what `bru.search` raises into Lua, so it has to
     /// read as a message to whoever wrote `config.lua`.
+    // Kept for the tests and for anything that holds a table directly; `bru.search` itself now
+    // writes through the `url.searchengines` setting, so that both doors reach one store.
+    #[allow(dead_code)]
     pub fn set(&mut self, name: &str, template: &str) -> Result<(), String> {
-        if name.is_empty() {
-            return Err("a search engine needs a name".to_string());
-        }
-        // qutebrowser forbids spaces in the key (configdata.yml :2597) for the reason bru needs
-        // too: the first *word* of `:open` is what is looked up, so a name with a space in it could
-        // never be typed.
-        if name.chars().any(char::is_whitespace) {
-            return Err(format!("search engine name {name:?} contains whitespace"));
-        }
-        if !template.contains('{') {
-            return Err(format!(
-                "search engine {name:?} has no {{}} in {template:?}, so the term would be dropped"
-            ));
-        }
-        // Fail here rather than at the first search: a stray `{title}` is a typo, and startup is
-        // where the config author is looking.
-        format_template(template, "probe").map_err(|e| format!("search engine {name:?}: {e}"))?;
+        check_engine(name, template)?;
         self.engines.insert(name.to_string(), template.to_string());
         Ok(())
     }
@@ -629,6 +679,24 @@ pub fn install(engines: SearchEngines, start_page: Option<String>) {
         .expect("the open.rs config lock is never poisoned") = Some(Installed { engines, start_page });
 }
 
+/// Replace the engine table while bru runs, leaving the start page as it is.
+///
+/// This is what `settings::apply` calls for the `url.searchengines` setting, and it is why there is
+/// no second store: `:config-dict-add url.searchengines gh …` changes the setting, and the setting
+/// pushes the table here, which is the one place `:open` reads. A `:open gh rust` typed a second
+/// later searches GitHub without a restart.
+pub fn install_engines(engines: SearchEngines) {
+    let mut guard = INSTALLED
+        .write()
+        .expect("the open.rs config lock is never poisoned");
+    match guard.as_mut() {
+        Some(installed) => installed.engines = engines,
+        // Before `install` — a unit test, or a renderer process. Keeping it is still right: the
+        // start page is `None` there anyway, which is what leaves `app::HOME` standing.
+        None => *guard = Some(Installed { engines, start_page: None }),
+    }
+}
+
 /// The engines `config.lua` set, or just `DEFAULT` if it set none.
 ///
 /// Cloned rather than borrowed: the table has a handful of entries and this is on the `:open` path,
@@ -997,11 +1065,44 @@ mod tests {
                 url: "https://search.marginalia.nu/search?query=hello".to_string(),
             })
         );
-        // Listed in a stable order, for the completion category.
+        // Listed in a stable order, for the completion category — bru's nine, plus the one this
+        // test added.
         assert_eq!(
             engines.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-            vec!["DEFAULT", "w"]
+            vec!["DEFAULT", "am", "aw", "goog", "hoog", "re", "ub", "w", "wiki", "yt"]
         );
+    }
+
+    /// **DECISIONS.md item 4, as corrected: a bru with no `~/.config/bru/` searches with all
+    /// nine.** `SearchEngines::default()` is what a process with no config has, so this is that
+    /// browser asked directly.
+    #[test]
+    fn a_bru_with_no_config_at_all_already_has_the_nine_engines() {
+        let engines = SearchEngines::default();
+        assert_eq!(
+            engines.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            vec!["DEFAULT", "am", "aw", "goog", "hoog", "re", "ub", "wiki", "yt"]
+        );
+        // Each one searches, rather than merely being listed.
+        assert_eq!(
+            decide_with("yt cef 151", &engines, |_| false),
+            Some(Target::Search {
+                engine: "yt".to_string(),
+                term: "cef 151".to_string(),
+                url: "https://www.youtube.com/results?search_query=cef%20151".to_string(),
+            })
+        );
+        assert_eq!(
+            decide_with("aw pipewire", &engines, |_| false).map(|t| t.url().to_string()),
+            Some("https://wiki.archlinux.org/?search=pipewire".to_string())
+        );
+        // And a bare search still goes to DEFAULT, whole and unsplit.
+        assert_eq!(
+            decide_with("rust cef", &engines, |_| false).map(|t| t.url().to_string()),
+            Some("https://duckduckgo.com/?q=rust%20cef".to_string())
+        );
+        // The completion category is the other eight — DEFAULT is not a prefix anyone types.
+        assert_eq!(engines.for_completion().len(), 8);
     }
 
     // -- the pieces underneath ------------------------------------------------------------------
