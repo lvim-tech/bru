@@ -1490,37 +1490,68 @@ wrap_permission_handler! {
 
 /// What a `cef_permission_request_types_t` bitmask is asking for, in words.
 ///
-/// The bits are Chromium's own and there is no cef-rs enum for them, so the names are taken from
-/// `cef_permission_request_types_t` in `cef_types.h` and the ones this browser can actually meet
-/// are spelled out; anything else is reported as its number rather than guessed at, because a
-/// permission prompt that names the wrong permission is worse than one that names none.
+/// The bits are Chromium's own and cef-rs wraps no enum for them, so every one below is transcribed
+/// from `cef_permission_request_types_t` in `$CEF_PATH/include/internal/cef_types.h:3893-3931`. A
+/// bit that is not in that header's build is reported as its number rather than guessed at.
+///
+/// **Transcribed rather than recalled, and the first version was not.** Measured 2026-08-07 against
+/// a real `navigator.geolocation.getCurrentPosition()`: the prompt read "Allow this site to use
+/// your camera?" — the mask was `1 << 8`, which a table written from memory had as the camera and
+/// the header has as the location. A permission prompt that names the wrong permission is worse
+/// than one that names none, because the user answers the question they were shown.
 fn permission_names(mask: u32) -> String {
-    const KNOWN: &[(u32, &str)] = &[
-        (1 << 1, "read your clipboard"),
-        (1 << 6, "know your location"),
-        (1 << 8, "use your camera"),
-        (1 << 9, "use your microphone"),
-        (1 << 12, "read MIDI devices"),
-        (1 << 15, "show notifications"),
-        (1 << 20, "play protected content"),
-        (1 << 21, "store data on this device"),
-        (1 << 24, "open windows without asking"),
-    ];
-    let mut named: Vec<&str> = KNOWN
+    let known = permission_table();
+    let mut named: Vec<String> = known
         .iter()
         .filter(|(bit, _)| mask & bit != 0)
-        .map(|(_, name)| *name)
+        .map(|(_, name)| (*name).to_string())
         .collect();
-    let unknown = mask & !KNOWN.iter().map(|(bit, _)| bit).sum::<u32>();
-    let leftover;
+    // The two local-network bits carry the same words — the header gives that permission one name
+    // per API version and a build can hold either — so a mask with both must not say it twice.
+    named.dedup();
+    let unknown = mask & !known.iter().map(|(bit, _)| bit).sum::<u32>();
     if unknown != 0 {
-        leftover = format!("use permission {unknown:#x}");
-        named.push(&leftover);
+        named.push(format!("use permission {unknown:#x}"));
     }
     if named.is_empty() {
         return "do something it did not name".to_string();
     }
     named.join(", ")
+}
+
+/// The bits on their own, so a test can walk them against the header they were transcribed from.
+fn permission_table() -> &'static [(u32, &'static str)] {
+    &[
+        (1 << 0, "start an augmented-reality session"),
+        (1 << 1, "pan, tilt and zoom your camera"),
+        (1 << 2, "use your camera"),
+        (1 << 3, "control the surface you are sharing"),
+        (1 << 4, "read your clipboard"),
+        (1 << 5, "use its storage on other sites"),
+        (1 << 6, "use more disk space"),
+        (1 << 7, "see the fonts installed on this machine"),
+        (1 << 8, "know your location"),
+        (1 << 9, "track your hands"),
+        (1 << 10, "act as an identity provider"),
+        (1 << 11, "know when you are idle"),
+        (1 << 12, "use your microphone"),
+        (1 << 13, "send system-exclusive MIDI messages"),
+        (1 << 14, "download several files at once"),
+        (1 << 15, "show notifications"),
+        (1 << 16, "lock your keyboard"),
+        (1 << 17, "lock your pointer"),
+        (1 << 18, "identify this device for protected media"),
+        (1 << 19, "register itself as a protocol handler"),
+        (1 << 20, "use its storage here"),
+        (1 << 21, "start a virtual-reality session"),
+        (1 << 22, "install itself as an application"),
+        (1 << 23, "manage your windows"),
+        (1 << 24, "reach your file system"),
+        (1 << 25, "reach your local network"),
+        (1 << 26, "reach your local network"),
+        (1 << 27, "reach the loopback network"),
+        (1 << 28, "read this device's sensors"),
+    ]
 }
 
 /// `RequestHandler::auth_credentials` (bindings 26862) — HTTP basic auth and proxy auth.
@@ -1866,9 +1897,43 @@ mod tests {
     #[test]
     fn a_permission_is_named_or_numbered_but_never_guessed() {
         assert_eq!(permission_names(1 << 15), "show notifications");
-        assert_eq!(permission_names(1 << 8 | 1 << 9), "use your camera, use your microphone");
+        // The one a real page raised, and the one the first version of this table got wrong:
+        // `1 << 8` is `CEF_PERMISSION_TYPE_GEOLOCATION`, not the camera.
+        assert_eq!(permission_names(1 << 8), "know your location");
+        assert_eq!(permission_names(1 << 2), "use your camera");
+        assert_eq!(permission_names(1 << 12), "use your microphone");
+        assert_eq!(
+            permission_names(1 << 2 | 1 << 12),
+            "use your camera, use your microphone"
+        );
+        // A bit past the end of the header's enum is a number and never a guess.
         assert_eq!(permission_names(1 << 30), "use permission 0x40000000");
         assert_eq!(permission_names(0), "do something it did not name");
+    }
+
+    /// Every bit this table names is a bit `cef_types.h` names, checked against the header rather
+    /// than against memory — which is exactly how the geolocation row came to say "camera".
+    #[test]
+    fn every_permission_bit_is_the_headers() {
+        let header = std::path::PathBuf::from(
+            std::env::var("CEF_PATH").unwrap_or_else(|_| {
+                format!("{}/.local/share/cef", std::env::var("HOME").unwrap_or_default())
+            }),
+        )
+        .join("include/internal/cef_types.h");
+        let Ok(text) = std::fs::read_to_string(&header) else {
+            // Not every machine that runs the tests has the CEF distribution unpacked; the check
+            // is worth having where it can run and is not worth failing where it cannot.
+            return;
+        };
+        for (bit, name) in permission_table() {
+            let shift = bit.trailing_zeros();
+            assert!(
+                text.contains(&format!("= 1 << {shift},")),
+                "no CEF_PERMISSION_TYPE with `1 << {shift}` ({name}) in {}",
+                header.display()
+            );
+        }
     }
 
     /// The key hints are bru's rows, and a command nothing is bound to says so in the words

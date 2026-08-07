@@ -188,13 +188,17 @@ fn completion_height(window: u32) -> i32 {
 // --- src/prompt.rs -------------------------------------------------------------------------
 /// The same, for the prompt block — `src/prompt.rs`.
 ///
-/// **A second slot rather than a second writer of the first.** The completion table and a prompt
-/// are the only two things that make the bottom strip grow, and the obvious arrangement — one
-/// height per window, whoever last had something to draw writes it — is wrong the moment both are
-/// open at once: `bar_json_for` asks the completion and then the prompt on every push, so the last
-/// writer wins and a prompt raised over an open completion is drawn inside the completion's height
-/// or the other way round. Two slots added together in [`BruChromeViewDelegate::preferred_size`]
-/// cannot do that, and neither module has to know the other exists.
+/// **A second slot rather than a second writer of the first**, and deliberately belt and braces.
+/// The completion table and a prompt are the only two things that make the bottom strip grow, and
+/// today they cannot be open at the same time: the completion answers `null` outside command mode,
+/// and a prompt takes the mode away from command. So one shared slot would work — until it did not.
+/// `bar_json_for` asks the completion and then the prompt on **every** push, so with one slot the
+/// order of those two calls silently decides the strip's height, and the day something opens a
+/// completion in a mode a question can also be raised in, whichever ran last wins and the other is
+/// drawn inside a height that is not its own. Two slots added together in
+/// [`BruChromeViewDelegate::preferred_size`] cannot do that, neither module has to know the other
+/// exists, and the cost is one `Vec` lookup per layout pass. **Not measured, because it cannot be
+/// today** — it is here so that it never has to be.
 static PROMPT_HEIGHTS: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
 
 /// Store a window's prompt height and answer what it was, so `prompt::resize_bar` relayouts only
