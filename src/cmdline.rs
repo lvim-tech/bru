@@ -820,8 +820,16 @@ pub fn on_accept(window: u32, text: &str) {
     // returned `None`, so every accepted line was dropped in silence. Measured 2026-08-07: `:open`
     // typed and accepted did nothing at all, while the same command through `--cmd` worked, because
     // that path never goes near the input.
+    // **One place puts the prefix back, and this goes through it.** The DOM's text is authoritative
+    // for what was *typed*; the model is authoritative for the whole line, prefix included. Syncing
+    // first and then accepting what the model holds means `with_prefix` has exactly one call site —
+    // and one call site cannot be half-updated, which is what happened on 2026-08-07 when
+    // `json_for` learned to strip the prefix and only `on_text_changed` learned to put it back.
+    // `accept` then read `o` where it expects `:`, `/` or `?`, returned `None`, and every typed
+    // command was dropped in silence with 441 tests green.
+    on_text_changed(window, text, None);
     let to_run = with_in(window, |cmd| {
-        let whole = with_prefix(cmd.prefix(), text);
+        let whole = cmd.text();
         cmd.accept(&whole)
     });
     // The accepted line belongs to every window's `<Ctrl-P>`, not only to this one's.
@@ -1741,6 +1749,35 @@ mod tests {
                 "{typed:?}: the far end of the path"
             );
         }
+    }
+
+    /// **The one call site, exercised.** `on_text_changed` is where the prefix goes back on, and
+    /// `on_accept` reaches it by going through this function rather than repeating it — so this
+    /// test covers both paths, which is the whole reason the join was given a single home.
+    ///
+    /// The earlier version of this file's guard held `split_prefix` and `with_prefix` to each other
+    /// and passed while `on_accept` did not call either. A test of the pure halves is not a test of
+    /// the seam; measured 2026-08-07 by reintroducing the bug and watching 443 tests stay green.
+    #[test]
+    fn the_input_hands_back_a_line_without_its_prefix_and_gets_one_with_it() {
+        const WINDOW: u32 = 907;
+        for (typed, what_the_dom_holds) in
+            [(":open aw pipewire", "open aw pipewire"), ("/term", "term"), ("?term", "term")]
+        {
+            with_in(WINDOW, |cmd| cmd.set_text(typed));
+            // What `json_for` would push, fed back the way the chrome feeds it.
+            let text = with_in(WINDOW, |cmd| cmd.text());
+            let (_, shown) = split_prefix(&text);
+            assert_eq!(shown, what_the_dom_holds, "{typed:?}: the input holds the prefix");
+
+            on_text_changed(WINDOW, shown, None);
+            assert_eq!(
+                with_in(WINDOW, |cmd| cmd.text()),
+                typed,
+                "{typed:?}: the model lost its prefix on the way back in"
+            );
+        }
+        with_in(WINDOW, |cmd| cmd.set_text(""));
     }
 
     /// The cursor travels with the prefix, or the caret lands one character off every time the
