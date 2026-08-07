@@ -518,6 +518,17 @@ fn cmdlines() -> &'static Mutex<BTreeMap<u32, CmdLine>> {
 /// a worse answer than one list.
 static HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+// --- src/completers.rs -------------------------------------------------------------------------
+/// Whether there is any command history to walk.
+///
+/// One caller: `completers::focus`, deciding whether `<Up>` on a bare `:` should walk the history —
+/// which is what qutebrowser does — or move in the completion table that is standing open in front
+/// of the user. With nothing in here the first answer is a key that does nothing, and a key that
+/// does nothing while a list of 169 rows is on screen reads as broken rather than as faithful.
+pub fn history_is_empty() -> bool {
+    HISTORY.lock().map(|history| history.is_empty()).unwrap_or(true)
+}
+// --- end src/completers.rs ---------------------------------------------------------------------
 
 /// The window a call with nothing else to go on means. `u32::MAX` is "no window at all" — the
 /// renderer processes and the moment after the last window closes — and it gets a scratch line

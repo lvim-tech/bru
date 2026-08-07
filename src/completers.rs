@@ -1220,9 +1220,16 @@ pub fn focus(which: FocusWhich, history: bool) {
     // `--history` is `<Up>` and `<Down>`, and on a bare `:` or a line already recalled from the
     // history they walk the history instead (`completionwidget.py:305-317`).
     //
+    // **With one departure: not when the history is empty.** qutebrowser's rule sends `<Up>` on a
+    // bare `:` to a history that a fresh profile has nothing in, so the key does nothing while a
+    // table of 169 rows is standing open in front of the user — reported as broken, and rightly:
+    // a list on screen that ignores the arrow keys is a list that looks dead. Falling through to
+    // the table costs nothing, because the case it takes is exactly the case where the other
+    // branch had no answer to give. A user with history keeps the shell behaviour they expect.
     if history {
         let empty = live().lock().map(|live| live.cats.is_empty()).unwrap_or(true);
-        if text == ":" || browsing || empty {
+        let recall = !crate::cmdline::history_is_empty();
+        if (text == ":" && recall) || (browsing && recall) || empty {
             let name = match which {
                 FocusWhich::Next => "command-history-next",
                 FocusWhich::Prev => "command-history-prev",
