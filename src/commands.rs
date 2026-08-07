@@ -287,6 +287,106 @@ pub enum Command {
     ConfigDictRemove { option: String, key: String, print: bool },
 // --- end src/settings.rs ---------------------------------------------------
 
+// --- config commands ---------------------------------------------------------------------------
+    /// `config-unset [-t] [-u <pattern>] <option>` — `configcommands.py:234-266`.
+    ///
+    /// **This command had nothing to do under the earlier reading of DESIGN.md and has something to
+    /// do under the corrected one.** "Unset" needs a destination; when bru was thought to ship no
+    /// configuration there was none, and putting a setting "back" could only mean forgetting it.
+    /// bru holds every setting and its default value compiled in, so the destination is real: this
+    /// is the command that goes there, and `settings::reset` is the half that makes Chromium agree
+    /// — a content setting lives in the profile and survives being forgotten.
+    ConfigUnset { option: String, pattern: Option<String> },
+    /// `config-clear [--save]` — every setting back to bru's own, in one move.
+    ///
+    /// `save` is carried rather than dropped because it must be **refused out loud**. qutebrowser's
+    /// `--save` empties `autoconfig.yml`; bru's counterpart would be writing
+    /// `~/.config/bru/config.lua`, which is configer's hand-written file. Accepting the flag and
+    /// ignoring it — the shape `:set`'s `-t` has, and rightly, since bru is always temporary — would
+    /// leave a user believing their file had been emptied. See `settings::run_clear`.
+    ///
+    /// **It clears settings and leaves the bindings alone**, which is a divergence from
+    /// qutebrowser and a deliberate one. There `bindings.commands` *is* a setting, so
+    /// `:config-clear` takes the keys with it; in bru the binding table is its own structure and
+    /// `settings::SETTINGS` does not contain it. Sweeping the keys away as a side effect of a
+    /// command whose help says "settings" would be a very expensive surprise for one keystroke, and
+    /// the command that puts one key back is `:bind --default <key>` — which is a thing
+    /// qutebrowser's own `:bind` has and bru now has too.
+    ConfigClear { save: bool },
+    /// `config-diff` — everything this browser is running that is not bru's own, as the Lua that
+    /// would reproduce it.
+    ///
+    /// qutebrowser opens `qute://configdiff`; bru prints, and prints `config.lua`'s language rather
+    /// than a table. That is the same decision as [`Command::ConfigWritePy`]'s refusal seen from the
+    /// other side: what a reader of either command wants is the lines to put in the file that is
+    /// theirs, and the only difference between the two commands is who writes the file.
+    ConfigDiff,
+    /// `config-list-add [-t] [-p] <option> <value>` — `configcommands.py:286-307`.
+    ConfigListAdd { option: String, value: String, print: bool },
+    /// `config-list-remove [-t] [-p] <option> <value>` — `configcommands.py:341-367`.
+    ///
+    /// The other half of appending, and not optional for the same reason `ConfigDictRemove` is not:
+    /// an override that appends can never make one of bru's own entries stop existing.
+    ConfigListRemove { option: String, value: String, print: bool },
+    /// `config-source [<filename>] [--clear]` — `configcommands.py:407-429`.
+    ///
+    /// Re-reads `config.lua` over the running browser. It builds a **second Lua state** at runtime,
+    /// which is worth saying out loud beside the rule it looks like it breaks: see
+    /// `config::source_over`, which carries the argument. In one line — the rule is about the key
+    /// path, and the interpreter is created, run and dropped inside one function exactly as it is
+    /// at startup.
+    ConfigSource { filename: Option<String>, clear: bool },
+    /// `config-edit [--no-source]` — `configcommands.py:431-453`.
+    ///
+    /// **bru does not create the file and does not create its directory**; see `config::run_edit`.
+    /// What happens after the editor exits is `ConfigSource`'s question, and the answer is the same
+    /// as qutebrowser's: re-read it, unless `--no-source`.
+    ConfigEdit { no_source: bool },
+    /// `config-write-py` — **refused**, and it is the one command of this group that is.
+    ///
+    /// qutebrowser writes the running configuration to a `config.py`. Split that into its two
+    /// halves and bru can do one of them and must not do the other:
+    ///
+    /// - *Turn the running state into the text of a config file* — bru does this, as
+    ///   [`Command::ConfigDiff`], in Lua rather than Python because that is what bru's config file
+    ///   is written in.
+    /// - *Write that text to `~/.config/bru/config.lua`* — bru must never. DESIGN.md gives that
+    ///   file to configer and gives bru only the defaults; a bru that generated it would make it
+    ///   neither hand-written nor configer's, and the next `configer` run would fight it.
+    ///
+    /// Writing it *somewhere else* was considered and is not a rescue: the value of the command is
+    /// that the file it writes is the one that gets read, and a `config.lua` in `/tmp` is
+    /// `:config-diff` with a `>` in front of it. So the name is bound to a refusal that names
+    /// `:config-diff`, rather than left to the dispatcher's "not implemented yet" — which would be
+    /// a promise. The `-py` in the name is a second, smaller reason: bru's configuration language
+    /// is Lua, and there is no Python anywhere in this project to write.
+    ConfigWritePy,
+    /// `bind [--mode <mode>] [--default] [<key> [<command>]]` — `configcommands.py:120-169`.
+    ///
+    /// Four shapes: no key opens the page that lists every binding (`bru://chrome/help`, where
+    /// qutebrowser opens `qute://bindings`); a key alone prints what it is bound to; a key with
+    /// `--default` puts bru's own binding back; a key and a command bind it.
+    ///
+    /// **`command` is the rest of the line, verbatim, `;;` included.** qutebrowser registers this
+    /// with `maxsplit=1, no_cmd_split=True`, and both matter: `:bind X scroll down ;; reload` binds
+    /// a chain rather than running `reload` after a `bind`. `parse` short-circuits to
+    /// [`parse_bind`] before it splits on `;;` for that reason alone.
+    ///
+    /// It changes the **running** table. `bru.bind` in `config.lua` has worked since the file
+    /// existed and works only at startup; this is the same edit made to a browser that is already
+    /// up, which means the trie the key path matches against as well as the table
+    /// `bru://chrome/help`, `hints.rs` and `prompt.rs` read back. Nothing is written to disk —
+    /// qutebrowser's `save_yaml=True` has no counterpart here, for `ConfigWritePy`'s reason.
+    Bind {
+        mode: String,
+        keys: Option<String>,
+        command: Option<String>,
+        default: bool,
+    },
+    /// `unbind [--mode <mode>] <key>` — `configcommands.py:171-183`.
+    Unbind { mode: String, keys: String },
+// --- end config commands -----------------------------------------------------------------------
+
 // --- src/completers.rs ---------------------------------------------------------------------
     /// `completion-item-focus [--history] <which>` — the eight `<Tab>`/`<Ctrl-N>`/`<PgDown>`
     /// bindings command mode has.
@@ -722,9 +822,18 @@ impl fmt::Display for ParseError {
 /// Handles `;;` chaining, quoted arguments (`rl-rubout " "`), `--` as end-of-flags, and the short
 /// and long flags the implemented commands take.
 pub fn parse(s: &str) -> Result<Command, ParseError> {
+// --- config commands ---------------------------------------------------------------------------
+    // `:bind` is registered `no_cmd_split=True` (`configcommands.py:121`) and needs its own parser
+    // as well, so it is tested before the general guard below rather than listed in it:
+    // `:bind X scroll down ;; reload` has to bind the chain, not bind `scroll down` and then
+    // reload. Everything after the key belongs to the command being bound, separators included.
+    if s.trim_start().split_whitespace().next() == Some("bind") {
+        return parse_bind(s);
+    }
+// --- end config commands -----------------------------------------------------------------------
 // --- src/utilcmds.rs -------------------------------------------------------
-    // `no_cmd_split=True`: the five commands whose argument is itself a command line or a piece of
-    // JavaScript keep their own `;;`. See [`no_cmd_split`].
+    // The same rule for the five whose argument is a command line or a piece of JavaScript, which
+    // need no parser of their own. See [`no_cmd_split`].
     if no_cmd_split(s) {
         return parse_one(s.trim());
     }
@@ -1451,6 +1560,35 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
 // --- end src/settings.rs ---------------------------------------------------
 
+// --- config commands ---------------------------------------------------------------------------
+        // The same flag shape — `-t`, `-p` and `-u <pattern>` — so the same hand-written parser.
+        "config-unset" | "config-list-add" | "config-list-remove" => {
+            parse_config_command(name, &tokens[1..], s)?
+        }
+        // qutebrowser's `--save` (`configcommands.py:398`). Carried rather than ignored: see
+        // `Command::ConfigClear`.
+        "config-clear" => Command::ConfigClear { save: args.has("save") },
+        // qutebrowser takes `--include-hidden` here, for its own internal settings. bru has none —
+        // every name in `settings::SETTINGS` is one a person may type — so the flag would name
+        // nothing and is not accepted rather than accepted and ignored.
+        "config-diff" => Command::ConfigDiff,
+        // maxsplit=0: a path may contain spaces, and `--clear` is the only flag.
+        "config-source" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::ConfigSource {
+                filename: args.arg(0).filter(|f| !f.is_empty()).map(str::to_string),
+                clear: args.has("clear"),
+            }
+        }
+        "config-edit" => Command::ConfigEdit {
+            no_source: args.any(&["no-source", "no_source"]),
+        },
+        // Refused, and the arm in `exec.rs` says why. It takes qutebrowser's three flags without
+        // reading them: a user who types `--force` is owed the refusal, not "unknown flag --force".
+        "config-write-py" => Command::ConfigWritePy,
+        "unbind" => parse_unbind(&tokens[1..])?,
+// --- end config commands -----------------------------------------------------------------------
+
 // --- src/completers.rs ---------------------------------------------------------------------
         // `--history` is `-H` as well (`completionwidget.py:297`), and it is what `<Up>` and
         // `<Down>` carry so that they walk the command history when there is no completion.
@@ -2147,9 +2285,36 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
         if name.starts_with("config-dict-") {
             return Err(bad("needs an option and a key"));
         }
+// --- config commands -------------------------------------------------------------------
+        if name.starts_with("config-list-") {
+            return Err(bad("needs an option and a value"));
+        }
+        if name == "config-unset" {
+            return Err(bad("needs an option"));
+        }
+// --- end config commands ---------------------------------------------------------------
         return Ok(Command::Unimplemented(whole.trim().to_string()));
     };
 // --- end src/settingspage.rs ---------------------------------------------------------------
+
+// --- config commands ---------------------------------------------------------------------------
+    // Like the two dict commands and unlike `config-cycle`, these are typed rather than bound, so
+    // an option bru does not have is an error the typist reads rather than a binding left inert.
+    if name == "config-unset" {
+        return Ok(Command::ConfigUnset { option, pattern });
+    }
+    if let Some(what) = name.strip_prefix("config-list-") {
+        let value = positional
+            .get(1)
+            .cloned()
+            .ok_or_else(|| bad("needs an option and a value"))?;
+        return Ok(if what == "remove" {
+            Command::ConfigListRemove { option, value, print }
+        } else {
+            Command::ConfigListAdd { option, value, print }
+        });
+    }
+// --- end config commands -----------------------------------------------------------------------
 
     if let Some(what) = name.strip_prefix("config-dict-") {
         // Unlike `config-cycle`, these are never bound, so an option bru does not have is an error
@@ -2194,6 +2359,130 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
     })
 }
 // --- end src/settings.rs ---------------------------------------------------
+
+// --- config commands ---------------------------------------------------------------------------
+/// `bind [--mode <mode>] [--default] [<key> [<command>]]`.
+///
+/// Hand-written, and against the **string** rather than against tokens, because everything after
+/// the key is one verbatim argument and re-joining tokens would lose the quoting that
+/// `bind <Ctrl-W> rl-rubout " "` depends on. `tokenize` strips the quotes; the space between them
+/// is the argument.
+///
+/// `--mode` takes a value, which `Args` cannot express, and `-` is a legal key — the `zoom-out`
+/// binding is exactly that — which is why [`is_flag`] answering `false` for a bare `-` is load
+/// bearing here and not only for `tab-move`.
+fn parse_bind(whole: &str) -> Result<Command, ParseError> {
+    let bad = |what: &str| ParseError(format!("bind: {what}"));
+    let after = whole.trim_start();
+    let after = after.strip_prefix("bind").unwrap_or(after);
+
+    let mut mode = "normal".to_string();
+    let mut default = false;
+    let mut wants_mode = false;
+    let mut keys: Option<String> = None;
+    let mut command: Option<String> = None;
+
+    let mut index = 0usize;
+    while index < after.len() {
+        let start = match after[index..].find(|c: char| !c.is_whitespace()) {
+            Some(at) => index + at,
+            None => break,
+        };
+        let end = after[start..]
+            .find(char::is_whitespace)
+            .map_or(after.len(), |at| start + at);
+        let word = &after[start..end];
+        index = end;
+
+        if wants_mode {
+            mode = word.to_string();
+            wants_mode = false;
+            continue;
+        }
+        // Flags only before the key. After it, `-t` belongs to the command being bound.
+        if keys.is_none() && is_flag(word) {
+            if let Some(long) = word.strip_prefix("--") {
+                match long.split_once('=') {
+                    Some(("mode", value)) => mode = value.to_string(),
+                    Some((other, _)) => return Err(bad(&format!("unknown flag --{other}"))),
+                    None => match long {
+                        "default" => default = true,
+                        "mode" => wants_mode = true,
+                        other => return Err(bad(&format!("unknown flag --{other}"))),
+                    },
+                }
+            } else {
+                for c in word[1..].chars() {
+                    match c {
+                        'd' => default = true,
+                        'm' => wants_mode = true,
+                        other => return Err(bad(&format!("unknown flag -{other}"))),
+                    }
+                }
+            }
+            continue;
+        }
+        if keys.is_none() {
+            keys = Some(word.to_string());
+            continue;
+        }
+        // Everything from here on, exactly as it was written.
+        command = Some(after[start..].trim().to_string());
+        break;
+    }
+    if wants_mode {
+        return Err(bad("--mode needs a mode name"));
+    }
+    if keys.is_none() && command.is_some() {
+        return Err(bad("needs a key"));
+    }
+    Ok(Command::Bind { mode, keys, command, default })
+}
+
+/// `unbind [--mode <mode>] <key>`.
+fn parse_unbind(tokens: &[String]) -> Result<Command, ParseError> {
+    let bad = |what: &str| ParseError(format!("unbind: {what}"));
+    let mut mode = "normal".to_string();
+    let mut wants_mode = false;
+    let mut keys: Option<String> = None;
+
+    for token in tokens {
+        if wants_mode {
+            mode = token.clone();
+            wants_mode = false;
+            continue;
+        }
+        if keys.is_none() && is_flag(token) {
+            if let Some(long) = token.strip_prefix("--") {
+                match long.split_once('=') {
+                    Some(("mode", value)) => mode = value.to_string(),
+                    Some((other, _)) => return Err(bad(&format!("unknown flag --{other}"))),
+                    None if long == "mode" => wants_mode = true,
+                    None => return Err(bad(&format!("unknown flag --{long}"))),
+                }
+            } else {
+                for c in token[1..].chars() {
+                    match c {
+                        'm' => wants_mode = true,
+                        other => return Err(bad(&format!("unknown flag -{other}"))),
+                    }
+                }
+            }
+            continue;
+        }
+        if keys.is_none() {
+            keys = Some(token.clone());
+        }
+    }
+    if wants_mode {
+        return Err(bad("--mode needs a mode name"));
+    }
+    // Unlike `:bind`, there is no shape with no key: qutebrowser's `key` is positional and
+    // required (`configcommands.py:172`), and "unbind nothing" has no meaning to give it.
+    let keys = keys.ok_or_else(|| bad("needs a key"))?;
+    Ok(Command::Unbind { mode, keys })
+}
+// --- end config commands -----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -3270,4 +3559,181 @@ mod tests {
         assert!(parse("tab-focus middle").is_err());
         assert!(parse("").is_err());
     }
+
+// --- config commands ---------------------------------------------------------------------------
+    #[test]
+    fn the_eight_config_commands_parse() {
+        assert_eq!(
+            parse("config-unset content.images").unwrap(),
+            Command::ConfigUnset { option: "content.images".to_string(), pattern: None }
+        );
+        assert_eq!(
+            parse("config-unset -u *://*.example.com/* content.javascript.enabled").unwrap(),
+            Command::ConfigUnset {
+                option: "content.javascript.enabled".to_string(),
+                pattern: Some("*://*.example.com/*".to_string()),
+            }
+        );
+        assert!(parse("config-unset").is_err());
+
+        assert_eq!(parse("config-clear").unwrap(), Command::ConfigClear { save: false });
+        assert_eq!(parse("config-clear --save").unwrap(), Command::ConfigClear { save: true });
+        assert_eq!(parse("config-diff").unwrap(), Command::ConfigDiff);
+        assert_eq!(parse("config-write-py").unwrap(), Command::ConfigWritePy);
+        // qutebrowser's three flags are swallowed rather than refused: someone who typed
+        // `--force` is owed the refusal, not "unknown flag".
+        assert_eq!(parse("config-write-py --force --defaults").unwrap(), Command::ConfigWritePy);
+
+        assert_eq!(
+            parse("config-list-add content.blocking.adblock.lists https://x/list.txt").unwrap(),
+            Command::ConfigListAdd {
+                option: "content.blocking.adblock.lists".to_string(),
+                value: "https://x/list.txt".to_string(),
+                print: false,
+            }
+        );
+        assert_eq!(
+            parse("config-list-remove -p content.blocking.adblock.lists https://x/list.txt").unwrap(),
+            Command::ConfigListRemove {
+                option: "content.blocking.adblock.lists".to_string(),
+                value: "https://x/list.txt".to_string(),
+                print: true,
+            }
+        );
+        assert!(parse("config-list-add content.blocking.adblock.lists").is_err());
+        assert!(parse("config-list-remove").is_err());
+
+        assert_eq!(
+            parse("config-source").unwrap(),
+            Command::ConfigSource { filename: None, clear: false }
+        );
+        assert_eq!(
+            parse("config-source --clear").unwrap(),
+            Command::ConfigSource { filename: None, clear: true }
+        );
+        // maxsplit=0: a path with a space in it is one argument.
+        assert_eq!(
+            parse("config-source /home/x/my configs/config.lua").unwrap(),
+            Command::ConfigSource {
+                filename: Some("/home/x/my configs/config.lua".to_string()),
+                clear: false,
+            }
+        );
+        assert_eq!(parse("config-edit").unwrap(), Command::ConfigEdit { no_source: false });
+        assert_eq!(
+            parse("config-edit --no-source").unwrap(),
+            Command::ConfigEdit { no_source: true }
+        );
+        // Every one of them acts when typed, `config-write-py` included — what it does is explain.
+        for text in [
+            "config-unset content.images",
+            "config-clear",
+            "config-diff",
+            "config-write-py",
+            "config-list-add content.blocking.adblock.lists https://x/l.txt",
+            "config-list-remove content.blocking.adblock.lists https://x/l.txt",
+            "config-source",
+            "config-edit",
+        ] {
+            assert!(crate::exec::is_live(&parse(text).unwrap()), "{text} is inert");
+        }
+    }
+
+    /// **`:bind` does not split on `;;`**, which is what makes a chain bindable at all.
+    ///
+    /// qutebrowser registers it `maxsplit=1, no_cmd_split=True` (`configcommands.py:120-121`). The
+    /// second half is the one worth a test: without it `:bind X scroll down ;; reload` parses as a
+    /// two-part `Chain`, binds `X` to `scroll down`, and reloads the page as a side effect of
+    /// having typed a `bind`.
+    #[test]
+    fn bind_takes_the_rest_of_the_line_verbatim() {
+        assert_eq!(
+            parse("bind X scroll down ;; reload").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("X".to_string()),
+                command: Some("scroll down ;; reload".to_string()),
+                default: false,
+            }
+        );
+        // The quoting `<Ctrl-W>`'s own default binding depends on survives, which re-joining the
+        // tokens would not: `rl-rubout " "` would come back as `rl-rubout` and a lost space.
+        assert_eq!(
+            parse("bind --mode command <Ctrl-W> rl-rubout \" \"").unwrap(),
+            Command::Bind {
+                mode: "command".to_string(),
+                keys: Some("<Ctrl-W>".to_string()),
+                command: Some("rl-rubout \" \"".to_string()),
+                default: false,
+            }
+        );
+        // Both spellings of the mode flag, and the short one.
+        for text in ["bind --mode=insert a nop", "bind -m insert a nop"] {
+            let Command::Bind { mode, .. } = parse(text).unwrap() else {
+                panic!("{text} is not a bind")
+            };
+            assert_eq!(mode, "insert");
+        }
+        // The four shapes.
+        assert_eq!(
+            parse("bind").unwrap(),
+            Command::Bind { mode: "normal".to_string(), keys: None, command: None, default: false }
+        );
+        assert_eq!(
+            parse("bind j").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("j".to_string()),
+                command: None,
+                default: false,
+            }
+        );
+        assert_eq!(
+            parse("bind --default j").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("j".to_string()),
+                command: None,
+                default: true,
+            }
+        );
+        // A flag *after* the key belongs to the command being bound, or `:bind X open -t` could
+        // never be written.
+        assert_eq!(
+            parse("bind X open -t").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("X".to_string()),
+                command: Some("open -t".to_string()),
+                default: false,
+            }
+        );
+        // `-` is a key, not a flag — it is `zoom-out`'s own binding.
+        assert_eq!(
+            parse("bind - zoom-in").unwrap(),
+            Command::Bind {
+                mode: "normal".to_string(),
+                keys: Some("-".to_string()),
+                command: Some("zoom-in".to_string()),
+                default: false,
+            }
+        );
+        assert!(parse("bind --nonsense j nop").is_err());
+        assert!(parse("bind --mode").is_err());
+
+        // `:unbind`, whose key is required.
+        assert_eq!(
+            parse("unbind d").unwrap(),
+            Command::Unbind { mode: "normal".to_string(), keys: "d".to_string() }
+        );
+        assert_eq!(
+            parse("unbind --mode caret j").unwrap(),
+            Command::Unbind { mode: "caret".to_string(), keys: "j".to_string() }
+        );
+        assert!(parse("unbind").is_err());
+        assert!(parse("unbind --nonsense d").is_err());
+        assert!(crate::exec::is_live(&parse("bind j").unwrap()));
+        assert!(crate::exec::is_live(&parse("unbind d").unwrap()));
+    }
+// --- end config commands -----------------------------------------------------------------------
 }

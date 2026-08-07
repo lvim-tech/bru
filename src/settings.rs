@@ -42,6 +42,8 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// A map from key to text, with bru's own pairs compiled in. See [`DictShape`].
     Dict(&'static DictShape),
+    /// An ordered list of text, with bru's own entries compiled in. See [`ListShape`].
+    List(&'static ListShape),
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -141,6 +143,76 @@ impl DictShape {
     }
 }
 
+// -----------------------------------------------------------------------------------------------
+// Lists
+// -----------------------------------------------------------------------------------------------
+
+/// The shape of a [`Kind::List`] setting: the entries bru ships, and what an entry has to be.
+///
+/// ## An override **appends**, exactly as a dictionary's merges
+///
+/// The argument is [`DictShape`]'s, word for word, and it is not weaker for a list: "A patch that
+/// silently deleted the nine-tenths of a dictionary it did not mention would not be a patch."
+/// `bru.set("content.blocking.adblock.lists", { "https://…/mine.txt" })` therefore adds a third
+/// list and leaves EasyList and EasyPrivacy where they are, and
+/// [`crate::commands::Command::ConfigListRemove`] is the only way to make one of bru's own stop
+/// existing — the same division of labour the two dict commands already have.
+///
+/// **This kind exists because a setting already needed it**, which is `settings.rs`'s own rule
+/// applied to a `Kind` rather than to a name: `adblock::DEFAULT_LISTS` was a compiled-in `[&str; 2]`
+/// that `:adblock-update` fetched and nothing could change. It is this setting's `defaults` now, and
+/// `:config-list-add content.blocking.adblock.lists <url>` followed by `:adblock-update` fetches
+/// three. A `Kind::List` with no setting behind it would have been a kind typed and forgotten.
+#[derive(PartialEq, Eq, Debug)]
+pub struct ListShape {
+    /// The entries bru ships, in order. A bru with no `~/.config/bru/` has exactly these.
+    pub defaults: &'static [&'static str],
+    /// What an entry has to be.
+    pub value: ListValue,
+}
+
+/// What a list setting's entries are checked against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListValue {
+    /// An `http://` or `https://` URL bru will fetch. Checked here rather than at fetch time
+    /// because a typo that is only noticed by `:adblock-update` is a typo noticed on the network.
+    FetchableUrl,
+}
+
+impl ListShape {
+    /// The entries bru ships, as the vector a [`Value::List`] holds.
+    pub fn default_list(&self) -> Vec<String> {
+        self.defaults.iter().map(|entry| entry.to_string()).collect()
+    }
+
+    /// Whether one entry may go into this list, and why not when it may not.
+    fn check(&self, name: &str, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("{name}: an entry cannot be empty"));
+        }
+        match self.value {
+            ListValue::FetchableUrl => {
+                if value.starts_with("http://") || value.starts_with("https://") {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{name}: {value:?} is not a URL bru could fetch — it needs an http:// or \
+                         https:// scheme"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// The filter lists `:adblock-update` fetches. qutebrowser's own name and its own two defaults
+/// (`configdata.yml:886-889`), which is where `adblock::DEFAULT_LISTS` took them from.
+pub static ADBLOCK_LISTS: ListShape = ListShape {
+    defaults: &crate::adblock::DEFAULT_LISTS,
+    value: ListValue::FetchableUrl,
+};
+
 /// A setting's value, already validated against its [`Kind`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value {
@@ -149,6 +221,9 @@ pub enum Value {
     /// A whole dictionary, bru's defaults with the user's overrides merged over them. The map is
     /// complete rather than a diff, so reading one is one lookup and never a merge.
     Dict(BTreeMap<String, String>),
+    /// A whole list, bru's defaults with the user's additions appended. Complete for the same
+    /// reason a `Dict` is: what reads it wants the list, not a diff and a merge.
+    List(Vec<String>),
 }
 
 impl std::fmt::Display for Value {
@@ -160,6 +235,7 @@ impl std::fmt::Display for Value {
             // One line, for the places that have room for one. What `:set` and the settings page
             // print is not this — see `Settings::describe`, which gives a dict a line per pair.
             Value::Dict(map) => write!(f, "{} entries", map.len()),
+            Value::List(entries) => write!(f, "{} entries", entries.len()),
         }
     }
 }
@@ -182,6 +258,11 @@ enum Backing {
     /// Read by `focus.rs` when a page moves its focus; nothing to push. Chromium has no opinion
     /// about which of bru's modes a focused field means — that question only exists inside bru.
     Insert,
+    /// `adblock.rs`'s filter lists. Nothing to push and nothing to rebuild either: the value is
+    /// read when `:adblock-update` fetches, and changing the setting must **not** start a download
+    /// on its own — `adblock.rs` says in as many words that it is "the only thing in bru that
+    /// reaches the network on its own account, and it does it because somebody typed the command".
+    AdblockLists,
 }
 
 /// The content settings bru drives. Kept as bru's own enum rather than `ContentSettingTypes` so
@@ -413,6 +494,20 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Insert,
     },
     // --- end src/focus.rs ---------------------------------------------------------------------
+// --- config commands ---------------------------------------------------------------------------
+    Def {
+        // qutebrowser's name for qutebrowser's list (`configdata.yml:886`), and bru's own two
+        // defaults are the ones `adblock.rs` already shipped. It is the first `Kind::List` in bru
+        // and it exists because the list was already there and already unreachable — see
+        // [`ListShape`], which carries that argument at length.
+        name: "content.blocking.adblock.lists",
+        kind: Kind::List(&ADBLOCK_LISTS),
+        // A list's defaults are its shape's, for the same reason a dictionary's are.
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::AdblockLists,
+    },
+// --- end config commands -----------------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -498,6 +593,57 @@ fn describe_dict(def: &'static Def, map: &BTreeMap<String, String>) -> String {
     out
 }
 
+// --- config commands ---------------------------------------------------------------------------
+/// **What `:set` prints for a list** — [`describe_dict`]'s shape, one line per entry.
+///
+/// The index is 0-based and is not decoration: it is the only thing that tells two EasyList URLs
+/// differing in one path component apart at a glance, and the order is the order they are fetched
+/// and compiled in.
+fn describe_list(def: &'static Def, entries: &[String]) -> String {
+    let shape = match def.kind {
+        Kind::List(shape) => shape,
+        _ => return format!("{} is not a list", def.name),
+    };
+    let added = entries
+        .iter()
+        .filter(|entry| !shape.defaults.contains(&entry.as_str()))
+        .count();
+    let missing = shape
+        .defaults
+        .iter()
+        .filter(|entry| !entries.iter().any(|held| held == *entry))
+        .count();
+    let mut out = format!(
+        "{} — {} entries, {added} added and {missing} of bru's own removed",
+        def.name,
+        entries.len()
+    );
+    for (index, entry) in entries.iter().enumerate() {
+        out.push_str(&format!("\n  {}[{index}] = {entry}", def.name));
+        if !shape.defaults.contains(&entry.as_str()) {
+            out.push_str("   (added)");
+        }
+    }
+    out
+}
+
+/// Every entry of a list setting, bru's defaults with the user's additions appended.
+///
+/// Empty for a setting that is not a list. This is what `adblock.rs` reads when `:adblock-update`
+/// fetches — one reader, one store, exactly as [`dict_of`] is for the labels and the engines.
+pub fn list_of(name: &str) -> Vec<String> {
+    let Some(def) = def(name) else { return Vec::new() };
+    let Kind::List(shape) = def.kind else {
+        return Vec::new();
+    };
+    match with_live(|settings| settings.get(name, None).ok().flatten()) {
+        Some(Value::List(entries)) => entries,
+        // Before `install`, or in a unit test: bru's own are still the truth.
+        _ => shape.default_list(),
+    }
+}
+// --- end config commands -----------------------------------------------------------------------
+
 /// The value of a setting bru answers itself, rather than reading back from Chromium.
 ///
 /// `None` for the content settings, whose truth is Chromium's and is read there — see
@@ -511,7 +657,7 @@ pub fn value_of(name: &str) -> Option<String> {
     // would be a statement about a copy Chromium does not keep.
     if !matches!(
         def.backing,
-        Backing::Bar | Backing::Insert | Backing::SearchEngines
+        Backing::Bar | Backing::Insert | Backing::SearchEngines | Backing::AdblockLists
     ) {
         return None;
     }
@@ -521,8 +667,8 @@ pub fn value_of(name: &str) -> Option<String> {
         Some(Value::Bool(flag)) => flag.to_string(),
         // A dictionary has no one-line value. Nothing asks `value_of` for one — `bar_json` reads
         // `dict_of` and the settings page prints a row per pair — and the count is the honest
-        // answer for anywhere that insists on a scalar.
-        Some(value @ Value::Dict(_)) => value.to_string(),
+        // answer for anywhere that insists on a scalar. A list is the same.
+        Some(value @ (Value::Dict(_) | Value::List(_))) => value.to_string(),
         None => def.default.unwrap_or_default().to_string(),
     })
 }
@@ -587,6 +733,17 @@ pub fn is_known(name: &str) -> bool {
     def(name).is_some()
 }
 
+// --- config commands ---------------------------------------------------------------------------
+/// Whether this setting's value is a list rather than a map.
+///
+/// One caller: `config.rs`, which has a Lua table in its hand and has to decide whether to read it
+/// as `{ a = "b" }` or as `{ "a", "b" }`. Asking the setting is the only way — the two are the same
+/// Lua type, and a table with no entries is both.
+pub fn is_list(name: &str) -> bool {
+    matches!(def(name).map(|def| def.kind), Some(Kind::List(_)))
+}
+// --- end config commands -------------------------------------------------------------------
+
 /// The names `:set` accepts, for the message that lists them.
 pub fn known_names() -> String {
     SETTINGS
@@ -649,6 +806,16 @@ impl Def {
                  rather than replacing them.",
                 self.name
             )),
+            // The same refusal, for the same reason — see the dict arm above. An override appends,
+            // so a text form would be a way of writing an append one token wide, which is what
+            // `:config-list-add` already is and says more clearly.
+            Kind::List(_) => Err(format!(
+                "{0} is a list — add one entry with `:config-list-add {0} <value>`, remove one \
+                 with `:config-list-remove {0} <value>`, or write a Lua table in config.lua. A \
+                 whole list has no spelling here because an override appends to bru's defaults \
+                 rather than replacing them.",
+                self.name
+            )),
         }
     }
 
@@ -658,6 +825,9 @@ impl Def {
         // with no `~/.config/bru/` searches with nine engines and draws twelve labels.
         if let Kind::Dict(shape) = self.kind {
             return Some(Value::Dict(shape.default_map()));
+        }
+        if let Kind::List(shape) = self.kind {
+            return Some(Value::List(shape.default_list()));
         }
         let default = self.default?;
         self.parse(default).ok()
@@ -674,6 +844,20 @@ impl Def {
             )),
         }
     }
+
+// --- config commands ---------------------------------------------------------------------------
+    /// [`Def::dict_shape`]'s twin, with qutebrowser's own wording for lists
+    /// (`configcommands.py:296-298`).
+    fn list_shape(&self, command: &str) -> Result<&'static ListShape, String> {
+        match self.kind {
+            Kind::List(shape) => Ok(shape),
+            _ => Err(format!(
+                ":{command} can only be used for lists, and {} is not one",
+                self.name
+            )),
+        }
+    }
+// --- end config commands -------------------------------------------------------------------
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -868,6 +1052,58 @@ pub struct Applied {
     pub pattern: Option<Pattern>,
 }
 
+// --- config commands ---------------------------------------------------------------------------
+/// What `:config-unset` and `:config-clear` produced for one setting: enough for the caller to put
+/// Chromium back and to print what happened.
+#[derive(Debug)]
+pub struct Unset {
+    pub def: &'static Def,
+    /// Whether anything was stored under that scope at all. qutebrowser raises when nothing was
+    /// (`configcommands.py:259-263`); bru answers, because bru's default is a place you can be.
+    pub was_customized: bool,
+    /// What is in force now — bru's own, or the global value when a pattern was the thing unset.
+    pub value: Option<Value>,
+    pub pattern: Option<Pattern>,
+}
+
+impl Unset {
+    pub fn describe(&self) -> String {
+        let value = self
+            .value
+            .as_ref()
+            .map_or_else(|| "<unset>".to_string(), |value| value.to_string());
+        let scope = match &self.pattern {
+            Some(pattern) => format!(" for {}", pattern.describe()),
+            None => String::new(),
+        };
+        if self.was_customized {
+            format!("{} = {value}{scope} (bru's own)", self.def.name)
+        } else {
+            format!("{} was already bru's own: {value}{scope}", self.def.name)
+        }
+    }
+}
+
+/// A Lua string literal, for the lines `:config-diff` prints.
+///
+/// Double quotes and backslashes are the only two characters Lua's long-form needs escaped inside a
+/// `"…"` literal; a newline cannot reach here, because no setting's value survives `tokenize`.
+fn lua_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+// --- end config commands -------------------------------------------------------------------
+
 impl Applied {
     /// `content.javascript.enabled = false for *://*.example.com/*` — qutebrowser's own wording in
     /// `configcommands.py::_print_value`, with the scope bru used.
@@ -878,6 +1114,9 @@ impl Applied {
         // A dict is not one line — see `describe_dict`, which is what both print paths use.
         if let Value::Dict(map) = &self.value {
             return describe_dict(self.def, map);
+        }
+        if let Value::List(entries) = &self.value {
+            return describe_list(self.def, entries);
         }
         let mut out = format!("{} = {}", self.def.name, self.value);
         if let Some(pattern) = &self.pattern {
@@ -997,6 +1236,222 @@ impl Settings {
         Ok(Applied { def, value, pattern: None })
     }
 
+// --- config commands ---------------------------------------------------------------------------
+    /// `bru.set(key, { … })` for a **list** setting — a Lua array, **appended** to what the list
+    /// already holds.
+    ///
+    /// Appended rather than substituted for [`ListShape`]'s reason, which is [`DictShape`]'s. An
+    /// entry that is already there is skipped rather than duplicated: two identical filter-list
+    /// URLs would be fetched twice into one file name, so a duplicate is not a list with two
+    /// members but a list with one and a wasted request.
+    ///
+    /// Every entry is checked before any is stored, exactly as [`Settings::set_dict`] does it and
+    /// for the same reason — the whole table is one Lua statement.
+    pub fn set_list(&mut self, key: &str, values: &[String]) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let shape = def.list_shape("config-list-add")?;
+        for value in values {
+            shape.check(def.name, value)?;
+        }
+        let mut entries = self.list_vec(def);
+        for value in values {
+            let value = value.trim().to_string();
+            if !entries.contains(&value) {
+                entries.push(value);
+            }
+        }
+        let value = Value::List(entries);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-list-add <option> <value>` — one entry, appended.
+    ///
+    /// qutebrowser appends without looking (`configcommands.py:305-307`); bru refuses a duplicate,
+    /// because bru ships defaults and qutebrowser does not. Adding EasyList to a list that already
+    /// has EasyList is a typo in every case a person could have meant, and the error says so
+    /// instead of leaving two rows that download to one file.
+    pub fn list_add(&mut self, key: &str, value: &str) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let shape = def.list_shape("config-list-add")?;
+        shape.check(def.name, value)?;
+        let value_owned = value.trim().to_string();
+        let mut entries = self.list_vec(def);
+        if entries.contains(&value_owned) {
+            return Err(format!("{value_owned} is already in {}", def.name));
+        }
+        entries.push(value_owned);
+        let value = Value::List(entries);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-list-remove <option> <value>` — qutebrowser's own error when it is not there
+    /// (`configcommands.py:361-362`).
+    ///
+    /// The other half of appending, and the only way to lose one of bru's own two filter lists.
+    pub fn list_remove(&mut self, key: &str, value: &str) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        def.list_shape("config-list-remove")?;
+        let wanted = value.trim();
+        let mut entries = self.list_vec(def);
+        let Some(at) = entries.iter().position(|entry| entry == wanted) else {
+            return Err(format!("{wanted} is not in {}", def.name));
+        };
+        entries.remove(at);
+        let value = Value::List(entries);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// The list as it stands: whatever has been stored, or bru's defaults when nothing has.
+    fn list_vec(&self, def: &'static Def) -> Vec<String> {
+        match self.values.get(&(None, def.name)) {
+            Some(Value::List(entries)) => entries.clone(),
+            _ => match def.kind {
+                Kind::List(shape) => shape.default_list(),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// `:config-unset [-u <pattern>] <option>` — put one setting back to bru's own default.
+    ///
+    /// **This is the command the old reading of DESIGN.md had nothing for.** When bru shipped no
+    /// configuration there was no default to go back to and "unset" could only mean "forget",
+    /// which is a different thing; now every setting and its default value are bru's, compiled in,
+    /// so unsetting is a real destination rather than an absence.
+    ///
+    /// `Ok(false)` is qutebrowser's "not customized" (`configcommands.py:259-263`) and is an error
+    /// there. Here it is an answer, because bru's defaults are a thing you can be already on.
+    pub fn unset(&mut self, key: &str, pattern: Option<&str>) -> Result<Unset, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let pattern = self.scope(def, pattern)?;
+        let removed = self
+            .values
+            .remove(&(pattern.as_ref().map(|p| p.text.clone()), def.name))
+            .is_some();
+        // What is now in force — the global value if a pattern was unset, otherwise bru's own.
+        let value = self.get(key, pattern.as_ref().map(|p| p.text.as_str()))?;
+        Ok(Unset { def, was_customized: removed, value, pattern })
+    }
+
+    /// `:config-clear` — every setting back to bru's own default, in one move.
+    ///
+    /// Returns what was thrown away, so that the caller can push each one back into Chromium: a
+    /// content setting lives in the profile under `--user-data-dir` and survives forgetting.
+    pub fn clear(&mut self) -> Vec<Unset> {
+        let keys: Vec<(Option<String>, &'static str)> = self.values.keys().cloned().collect();
+        let mut out = Vec::new();
+        for (pattern, name) in keys {
+            if let Ok(unset) = self.unset(name, pattern.as_deref()) {
+                out.push(unset);
+            }
+        }
+        out.sort_by(|a, b| {
+            (a.def.name, a.pattern.as_ref().map(|p| &p.text))
+                .cmp(&(b.def.name, b.pattern.as_ref().map(|p| &p.text)))
+        });
+        out
+    }
+
+    /// Every setting that is not on bru's own value, as the Lua that would put it back.
+    ///
+    /// **This is `:config-diff`, and it is also the whole of what `:config-write-py` would have
+    /// been** — see [`crate::commands::Command::ConfigWritePy`], which is refused. qutebrowser's
+    /// `config-diff` opens `qute://configdiff` and its `config-write-py` writes the file; bru's
+    /// answer to both is the text, printed, for the user to paste into the file that is theirs.
+    ///
+    /// A dictionary or a list prints only the pairs and entries that are not bru's, because an
+    /// override merges: pasting the whole table back would be pasting bru's defaults into a patch.
+    /// A per-URL value has no Lua spelling at all — `bru.set` is global — so it is printed as the
+    /// `:set -u` line that produced it, marked as such rather than as Lua that would not run.
+    pub fn diff(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for def in SETTINGS {
+            match def.kind {
+                Kind::Dict(shape) => {
+                    let map = self.dict_map(def);
+                    let mut pairs: Vec<String> = map
+                        .iter()
+                        .filter(|(key, value)| shape.default_for(key) != Some(value.as_str()))
+                        .map(|(key, value)| format!("[{}] = {}", lua_string(key), lua_string(value)))
+                        .collect();
+                    for (key, _) in shape.defaults {
+                        if !map.contains_key(*key) {
+                            out.push(format!(
+                                "-- removed at runtime, and config.lua cannot say so: \
+                                 :config-dict-remove {} {key}",
+                                def.name
+                            ));
+                        }
+                    }
+                    if !pairs.is_empty() {
+                        pairs.sort();
+                        out.push(format!(
+                            "bru.set({}, {{ {} }})",
+                            lua_string(def.name),
+                            pairs.join(", ")
+                        ));
+                    }
+                }
+                Kind::List(shape) => {
+                    let entries = self.list_vec(def);
+                    let added: Vec<String> = entries
+                        .iter()
+                        .filter(|entry| !shape.defaults.contains(&entry.as_str()))
+                        .map(|entry| lua_string(entry))
+                        .collect();
+                    for entry in shape.defaults {
+                        if !entries.iter().any(|held| held == entry) {
+                            out.push(format!(
+                                "-- removed at runtime, and config.lua cannot say so: \
+                                 :config-list-remove {} {entry}",
+                                def.name
+                            ));
+                        }
+                    }
+                    if !added.is_empty() {
+                        out.push(format!(
+                            "bru.set({}, {{ {} }})",
+                            lua_string(def.name),
+                            added.join(", ")
+                        ));
+                    }
+                }
+                _ => {
+                    for (pattern, name) in self.values.keys() {
+                        if *name != def.name {
+                            continue;
+                        }
+                        let Some(value) = self.values.get(&(pattern.clone(), name)) else {
+                            continue;
+                        };
+                        // Already bru's own: `:set content.images true` on a bru that ships true.
+                        if pattern.is_none() && Some(value) == def.default_value().as_ref() {
+                            continue;
+                        }
+                        out.push(match pattern {
+                            Some(pattern) => format!(
+                                "-- per URL, and config.lua cannot say so: \
+                                 :set -u {pattern} {} {value}",
+                                def.name
+                            ),
+                            None => format!(
+                                "bru.set({}, {})",
+                                lua_string(def.name),
+                                lua_string(&value.to_string())
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+// --- end config commands -------------------------------------------------------------------
+
     /// The dict as it stands: whatever has been stored, or bru's defaults when nothing has.
     fn dict_map(&self, def: &'static Def) -> BTreeMap<String, String> {
         match self.values.get(&(None, def.name)) {
@@ -1034,6 +1489,12 @@ impl Settings {
         if matches!(def.kind, Kind::Dict(_)) {
             return Err(format!(
                 "{} is a dictionary; config-cycle walks the values of a single option",
+                def.name
+            ));
+        }
+        if matches!(def.kind, Kind::List(_)) {
+            return Err(format!(
+                "{} is a list; config-cycle walks the values of a single option",
                 def.name
             ));
         }
@@ -1092,6 +1553,9 @@ impl Settings {
         let value = self.get(key, pattern)?;
         if let Some(Value::Dict(map)) = &value {
             return Ok(describe_dict(def, map));
+        }
+        if let Some(Value::List(entries)) = &value {
+            return Ok(describe_list(def, entries));
         }
         let value = value.map_or_else(|| "<unset>".to_string(), |value| value.to_string());
         Ok(match scope {
@@ -1169,6 +1633,19 @@ static LIVE: Mutex<Option<Settings>> = Mutex::new(None);
 pub fn install(settings: Settings) {
     *LIVE.lock().expect("the settings mutex is never poisoned") = Some(settings);
 }
+
+// --- config commands ---------------------------------------------------------------------------
+/// A copy of the store the running browser is on.
+///
+/// One caller: `:config-source`, which runs a second `config.lua` **over** what is already set, the
+/// way qutebrowser's own `:config-source` reads `config.py` over the running config. It has to
+/// start from what is live rather than from bru's defaults, or sourcing a file would silently undo
+/// every `:set` typed since startup — and `:config-source --clear` is the spelling that asks for
+/// exactly that and says so.
+pub fn snapshot() -> Settings {
+    with_live(|settings| settings.clone())
+}
+// --- end config commands -------------------------------------------------------------------
 
 /// Run `f` against the live store.
 fn with_live<R>(f: impl FnOnce(&mut Settings) -> R) -> R {
@@ -1265,6 +1742,137 @@ pub fn run_cycle(option: &str, values: &[String], pattern: Option<&str>, print: 
     report(outcome);
 }
 
+// --- config commands ---------------------------------------------------------------------------
+/// `:config-list-add <option> <value>` — the arm `exec::run` calls.
+pub fn run_list_add(option: &str, value: &str, print: bool) {
+    let outcome = with_live(|settings| settings.list_add(option, value)).and_then(|applied| {
+        apply(&applied)?;
+        Ok(if print {
+            format!("{option} += {value}")
+        } else {
+            String::new()
+        })
+    });
+    report(outcome);
+}
+
+/// `:config-list-remove <option> <value>`.
+pub fn run_list_remove(option: &str, value: &str, print: bool) {
+    let outcome = with_live(|settings| settings.list_remove(option, value)).and_then(|applied| {
+        apply(&applied)?;
+        Ok(if print {
+            format!("{option} -= {value}")
+        } else {
+            String::new()
+        })
+    });
+    report(outcome);
+}
+
+/// `:config-unset [-u <pattern>] <option>` — one setting back to bru's own.
+pub fn run_unset(option: &str, pattern: Option<&str>) {
+    let pattern = pattern.map(expand);
+    let outcome = with_live(|settings| settings.unset(option, pattern.as_deref())).and_then(
+        |unset| {
+            let line = unset.describe();
+            reset(&unset)?;
+            Ok(line)
+        },
+    );
+    say(outcome);
+}
+
+/// `:config-clear` — every setting back to bru's own.
+///
+/// **`--save` is refused rather than ignored**, and the difference matters here more than it did
+/// for `:set`'s `-t`. qutebrowser's `--save` deletes what is in `autoconfig.yml`; the file bru would
+/// have to touch to mean the same thing is `~/.config/bru/config.lua`, which is configer's and
+/// hand-written — DESIGN.md gives bru the defaults and gives that file the user's overrides, and bru
+/// writing it would make it neither. Ignoring the flag would leave a user who typed it believing
+/// their file had been emptied, which is the one outcome worse than refusing.
+pub fn run_clear(save: bool) {
+    let unset = with_live(|settings| settings.clear());
+    let count = unset.iter().filter(|u| u.was_customized).count();
+    for one in &unset {
+        if let Err(error) = reset(one) {
+            eprintln!("bru: {error}");
+        }
+    }
+    if save {
+        crate::message::error(
+            "config-clear: --save has nothing to do. ~/.config/bru/config.lua is hand-written and \
+             bru never writes it; the settings this browser is running on are back to bru's own, \
+             and the file is untouched.",
+        );
+    }
+    say(Ok(match count {
+        0 => "config-clear: nothing was customized".to_string(),
+        1 => "config-clear: 1 setting back to bru's own".to_string(),
+        n => format!("config-clear: {n} settings back to bru's own"),
+    }));
+}
+
+/// `:config-diff` — the Lua that would reproduce this browser's settings, printed.
+///
+/// It prints rather than opening a page, and prints the *config file's* language rather than a
+/// table: what a reader of this command wants is the lines to paste into the file that is theirs.
+/// The binding half is `config.rs`'s, and `exec.rs` prints the two together.
+pub fn diff_lines() -> Vec<String> {
+    with_live(|settings| settings.diff())
+}
+
+/// Put Chromium back where an [`Unset`] left bru.
+///
+/// **Forgetting a content setting is not the same as unsetting it**, and this is the whole reason
+/// this function is not `apply`. Chromium keeps the rule in the profile under `--user-data-dir`,
+/// beside cookies and history, so a bru that merely dropped the value from its own store would
+/// restart with JavaScript still blocked on the host and no record of why.
+/// `ContentSettingValues::DEFAULT` is Chromium's "there is no rule here", which is what bru's own
+/// default means.
+fn reset(unset: &Unset) -> Result<(), String> {
+    let kind = match unset.def.backing {
+        Backing::Content(kind) => kind,
+        // Everything else is read out of bru's own store when it is wanted, so removing the value
+        // is the whole of the work — except that the bar and the engine table are built eagerly and
+        // have to be rebuilt.
+        _ => {
+            let Some(value) = unset.value.clone() else {
+                return Ok(());
+            };
+            return apply(&Applied { def: unset.def, value, pattern: unset.pattern.clone() });
+        }
+    };
+    let Some(context) = request_context_get_global_context() else {
+        return Err("no request context — settings cannot reach Chromium".to_string());
+    };
+    match &unset.pattern {
+        Some(pattern) => {
+            let page = crate::ipc::current_url();
+            for url in pattern.urls(&page) {
+                let url = CefString::from(url.as_str());
+                context.set_content_setting(Some(&url), None, kind.cef(), ContentSettingValues::DEFAULT);
+            }
+        }
+        None => context.set_content_setting(None, None, kind.cef(), ContentSettingValues::DEFAULT),
+    }
+    Ok(())
+}
+
+/// One line, in the bar as well as on stderr.
+///
+/// [`report`] is what `:set` and the two dict commands use and it stays as it is: its answer can be
+/// a fifteen-line dictionary, and a fifteen-line dictionary in a one-line bar is not an answer. The
+/// commands below all answer in one line, and a one-line answer that only reaches stderr is an
+/// answer nobody running a browser sees — `message.rs` exists now, and it echoes to stderr as well.
+fn say(outcome: Result<String, String>) {
+    match outcome {
+        Ok(text) if text.is_empty() => {}
+        Ok(text) => crate::message::info(&text),
+        Err(text) => crate::message::error(&text),
+    }
+}
+// --- end config commands -------------------------------------------------------------------
+
 /// bru has no status-bar message area yet — `statusbar/` has url, scroll, tab index, keystring and
 /// the search count, and nothing that shows a one-off line. Until it does, `-p` goes to stderr,
 /// which is where every other command that has something to say already writes.
@@ -1312,6 +1920,8 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             crate::open::install_engines(engines);
             return Ok(());
         }
+        // Nothing to push, and deliberately nothing to fetch — see `Backing::AdblockLists`.
+        Backing::AdblockLists => return Ok(()),
         Backing::Content(kind) => kind,
     };
     let Value::Bool(allow) = applied.value else {
@@ -1364,7 +1974,11 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let kind = match def(name)?.backing {
         Backing::Content(kind) => kind,
         // None of these is a Chromium content setting, so Chromium has no opinion to read back.
-        Backing::StartPage | Backing::Insert | Backing::Bar | Backing::SearchEngines => {
+        Backing::StartPage
+        | Backing::Insert
+        | Backing::Bar
+        | Backing::SearchEngines
+        | Backing::AdblockLists => {
             return None;
         }
     };
@@ -1564,7 +2178,9 @@ mod tests {
         // `input.insert_mode.*` that `focus.rs` reads, and the two dictionaries —
         // `statusbar.mode.labels` and `url.searchengines`. Raise this with the setting, never to
         // make a failing build pass.
-        assert_eq!(SETTINGS.len(), 11);
+        // Twelve since `content.blocking.adblock.lists`, which is bru's first `Kind::List` and was
+        // `adblock::DEFAULT_LISTS` before it was a setting.
+        assert_eq!(SETTINGS.len(), 12);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
@@ -1573,6 +2189,15 @@ mod tests {
                 shape
                     .check(def.name, key, value)
                     .unwrap_or_else(|e| panic!("{}: bad default pair: {e}", def.name));
+            }
+        }
+        // And every list's own, for the same reason.
+        for def in SETTINGS {
+            let Kind::List(shape) = def.kind else { continue };
+            for value in shape.defaults {
+                shape
+                    .check(def.name, value)
+                    .unwrap_or_else(|e| panic!("{}: bad default entry: {e}", def.name));
             }
         }
     }
@@ -2001,6 +2626,224 @@ mod tests {
         );
         // The two keys that are not a mode name — the ones a `state.mode` lookup would miss.
         assert!(js.contains("search_forward") && js.contains("search_backward"), "{js}");
+    }
+
+    // -- lists, unsetting and the diff -----------------------------------------------------------
+
+    /// **The append decision, asserted**, and it is [`DictShape`]'s merge decision in the other
+    /// container. A replace would pass every other test in this file and show up only as a bru that
+    /// blocks nothing because `config.lua` named one filter list.
+    #[test]
+    fn a_list_override_appends_to_brus_defaults_rather_than_replacing_them() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        // Nothing set: bru's own two, in the order they are written.
+        assert_eq!(
+            settings.list_vec(def(name).unwrap()),
+            crate::adblock::DEFAULT_LISTS.to_vec()
+        );
+
+        settings
+            .set_list(name, &["https://example.com/mine.txt".to_string()])
+            .unwrap();
+        let entries = settings.list_vec(def(name).unwrap());
+        assert_eq!(entries.len(), 3, "the two bru ships are still there");
+        assert_eq!(entries[2], "https://example.com/mine.txt", "and the new one is last");
+
+        // An entry already there is not appended twice: two identical URLs would be fetched twice
+        // into one file name.
+        settings
+            .set_list(name, &[crate::adblock::DEFAULT_LISTS[0].to_string()])
+            .unwrap();
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 3);
+        let error = settings
+            .list_add(name, crate::adblock::DEFAULT_LISTS[0])
+            .unwrap_err();
+        assert!(error.contains("already in"), "{error}");
+
+        // Removing is the only way to lose one of bru's own.
+        settings.list_remove(name, crate::adblock::DEFAULT_LISTS[0]).unwrap();
+        let entries = settings.list_vec(def(name).unwrap());
+        assert_eq!(entries.len(), 2);
+        assert!(!entries.contains(&crate::adblock::DEFAULT_LISTS[0].to_string()));
+        let error = settings.list_remove(name, "https://nowhere/").unwrap_err();
+        assert!(error.contains("is not in"), "{error}");
+    }
+
+    #[test]
+    fn a_list_refuses_what_bru_could_not_fetch_and_is_not_a_scalar() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        let error = settings.list_add(name, "easylist.txt").unwrap_err();
+        assert!(error.contains("http:// or https://"), "{error}");
+        assert!(settings.list_add(name, "   ").is_err());
+        // One bad entry leaves the whole list alone, exactly as one bad pair leaves a dict alone.
+        assert!(settings
+            .set_list(
+                name,
+                &["https://ok/a.txt".to_string(), "nope".to_string()]
+            )
+            .is_err());
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 2);
+
+        // No text spelling, no cycling, and the two list commands refuse a setting that is not one.
+        let error = settings.set(name, "https://x/a.txt").unwrap_err();
+        assert!(error.contains("config-list-add"), "{error}");
+        assert!(settings.cycle(name, &[], None).is_err());
+        let error = settings.list_add("start_page", "https://x/").unwrap_err();
+        assert!(error.contains("can only be used for lists"), "{error}");
+        let error = settings.dict_add(name, "a", "b", false).unwrap_err();
+        assert!(error.contains("can only be used for dicts"), "{error}");
+    }
+
+    #[test]
+    fn printing_a_list_is_a_line_per_entry_and_says_which_are_not_brus() {
+        let mut settings = Settings::default();
+        let name = "content.blocking.adblock.lists";
+        settings.list_add(name, "https://example.com/mine.txt").unwrap();
+        let printed = settings.describe(name, None).unwrap();
+        let mut lines = printed.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "content.blocking.adblock.lists — 3 entries, 1 added and 0 of bru's own removed"
+        );
+        assert_eq!(printed.lines().count(), 4, "a header and one line per entry");
+        assert!(
+            printed.contains("content.blocking.adblock.lists[2] = https://example.com/mine.txt   (added)"),
+            "{printed}"
+        );
+        settings.list_remove(name, crate::adblock::DEFAULT_LISTS[0]).unwrap();
+        assert!(
+            settings
+                .describe(name, None)
+                .unwrap()
+                .starts_with("content.blocking.adblock.lists — 2 entries, 1 added and 1 of bru's own removed"),
+            "{printed}"
+        );
+    }
+
+    /// `:config-unset` and `:config-clear` — the two commands that need bru to *have* a default.
+    #[test]
+    fn unsetting_puts_a_setting_back_to_brus_own() {
+        let mut settings = Settings::default();
+        settings.set("content.images", "false").unwrap();
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(false)));
+
+        let unset = settings.unset("content.images", None).unwrap();
+        assert!(unset.was_customized);
+        // Back to bru's own — which is the whole point, and is a place rather than an absence.
+        assert_eq!(unset.value, Some(Value::Bool(true)));
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(true)));
+        assert_eq!(unset.describe(), "content.images = true (bru's own)");
+
+        // Unsetting what was never set is an answer, not an error.
+        let unset = settings.unset("content.images", None).unwrap();
+        assert!(!unset.was_customized);
+        assert!(unset.describe().contains("was already bru's own"), "{}", unset.describe());
+        assert!(settings.unset("content.nonsense", None).is_err());
+
+        // A per-URL value comes off on its own, leaving the global one standing.
+        let site = Some("*://*.example.com/*");
+        settings.set("content.images", "false").unwrap();
+        settings.set_scoped("content.images", "true", site).unwrap();
+        let unset = settings.unset("content.images", site).unwrap();
+        assert!(unset.was_customized);
+        assert_eq!(unset.value, Some(Value::Bool(false)), "the global value is what is left");
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(false)));
+
+        // A dict and a list go back whole.
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+        settings.list_add("content.blocking.adblock.lists", "https://x/l.txt").unwrap();
+        settings.unset("url.searchengines", None).unwrap();
+        settings.unset("content.blocking.adblock.lists", None).unwrap();
+        assert_eq!(settings.search_engines().iter().count(), 9);
+        assert_eq!(settings.list_vec(def("content.blocking.adblock.lists").unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn clearing_puts_everything_back_at_once() {
+        let mut settings = Settings::default();
+        settings.set("content.images", "false").unwrap();
+        settings.set("start_page", "example.com").unwrap();
+        settings
+            .set_scoped("content.javascript.enabled", "false", Some("*://*.example.com/*"))
+            .unwrap();
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+
+        let cleared = settings.clear();
+        assert_eq!(cleared.len(), 4, "one per stored value, pattern included: {cleared:?}");
+        assert!(cleared.iter().all(|one| one.was_customized));
+        // Deterministic, so two runs report the same order.
+        assert_eq!(
+            cleared.iter().map(|one| one.def.name).collect::<Vec<_>>(),
+            ["content.images", "content.javascript.enabled", "start_page", "url.searchengines"]
+        );
+
+        assert_eq!(settings.get("content.images", None).unwrap(), Some(Value::Bool(true)));
+        // `start_page` is the one whose default is an absence — `app::HOME` stands again.
+        assert_eq!(settings.get("start_page", None).unwrap(), None);
+        assert_eq!(settings.search_engines().iter().count(), 9);
+        assert!(settings.diff().is_empty());
+    }
+
+    /// **`:config-diff` prints Lua, and it is also the whole of what `:config-write-py` refused.**
+    #[test]
+    fn the_diff_is_the_lua_that_would_reproduce_it() {
+        let mut settings = Settings::default();
+        assert!(settings.diff().is_empty(), "a fresh bru differs from itself in nothing");
+
+        settings.set("start_page", "example.com").unwrap();
+        settings.set("content.images", "false").unwrap();
+        settings.dict_add("url.searchengines", "gh", "https://x/?q={}", false).unwrap();
+        settings.list_add("content.blocking.adblock.lists", "https://x/l.txt").unwrap();
+        let diff = settings.diff();
+
+        assert!(diff.contains(&r#"bru.set("start_page", "example.com")"#.to_string()), "{diff:?}");
+        assert!(diff.contains(&r#"bru.set("content.images", "false")"#.to_string()), "{diff:?}");
+        // Only the pair that is not bru's: pasting the whole table back would be pasting bru's own
+        // defaults into a file that is supposed to be a patch.
+        assert!(
+            diff.contains(&r#"bru.set("url.searchengines", { ["gh"] = "https://x/?q={}" })"#.to_string()),
+            "{diff:?}"
+        );
+        assert!(
+            diff.contains(&r#"bru.set("content.blocking.adblock.lists", { "https://x/l.txt" })"#.to_string()),
+            "{diff:?}"
+        );
+
+        // Setting something to the value bru already ships is not a difference.
+        let mut settings = Settings::default();
+        settings.set("content.images", "true").unwrap();
+        assert!(settings.diff().is_empty(), "{:?}", settings.diff());
+
+        // The two things `config.lua` cannot say are said as the commands that did them, marked.
+        let mut settings = Settings::default();
+        settings
+            .set_scoped("content.javascript.enabled", "false", Some("*://*.example.com/*"))
+            .unwrap();
+        settings.dict_remove("url.searchengines", "hoog").unwrap();
+        settings
+            .list_remove("content.blocking.adblock.lists", crate::adblock::DEFAULT_LISTS[1])
+            .unwrap();
+        let diff = settings.diff();
+        assert!(diff.iter().any(|line| line.contains(":set -u *://*.example.com/*")), "{diff:?}");
+        assert!(diff.iter().any(|line| line.contains(":config-dict-remove url.searchengines hoog")), "{diff:?}");
+        assert!(diff.iter().any(|line| line.contains(":config-list-remove")), "{diff:?}");
+        for line in &diff {
+            if line.starts_with("--") {
+                continue;
+            }
+            assert!(line.starts_with("bru."), "a diff line is Lua or a comment: {line}");
+        }
+    }
+
+    /// A value with a quote in it is a Lua string literal and not the end of one.
+    #[test]
+    fn a_diff_line_escapes_what_lua_would_choke_on() {
+        assert_eq!(lua_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        let mut settings = Settings::default();
+        settings.set("start_page", "a\"b").unwrap();
+        assert_eq!(settings.diff(), [r#"bru.set("start_page", "a\"b")"#]);
     }
 
     #[test]

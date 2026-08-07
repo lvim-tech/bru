@@ -551,6 +551,62 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 // --- end src/settings.rs ---------------------------------------------------
 
+// --- config commands ---------------------------------------------------------------------------
+        // The list twins of the two dict commands, against bru's one list setting.
+        Command::ConfigListAdd { option, value, print } => {
+            crate::settings::run_list_add(option, value, *print)
+        }
+        Command::ConfigListRemove { option, value, print } => {
+            crate::settings::run_list_remove(option, value, *print)
+        }
+        // Back to bru's own default — which exists, now that bru ships every setting's.
+        Command::ConfigUnset { option, pattern } => {
+            crate::settings::run_unset(option, pattern.as_deref())
+        }
+        Command::ConfigClear { save } => crate::settings::run_clear(*save),
+        // The settings half and the bindings half, printed together: two commands' worth of state
+        // in one answer, because "what have I changed" is one question.
+        Command::ConfigDiff => {
+            let mut lines = crate::settings::diff_lines();
+            lines.extend(crate::config::binding_diff());
+            if lines.is_empty() {
+                crate::message::info("config-diff: nothing is customized");
+            } else {
+                let count = lines.len();
+                for line in &lines {
+                    eprintln!("bru: {line}");
+                }
+                crate::message::info(&format!(
+                    "config-diff: {count} line(s) on stderr — the Lua that would reproduce this"
+                ));
+            }
+        }
+        // A second Lua state, at runtime. `config::source_over` carries the argument for why that
+        // respects "Lua is never on the key path" rather than breaking it.
+        Command::ConfigSource { filename, clear } => {
+            crate::config::run_source(filename.as_deref(), *clear)
+        }
+        Command::ConfigEdit { no_source } => crate::config::run_edit(*no_source),
+        // **Refused**, with the reason, rather than left to say "not implemented yet" — see
+        // `Command::ConfigWritePy`, which carries it. It acts: it explains, and names the command
+        // that does the half bru can do.
+        Command::ConfigWritePy => crate::message::error(
+            "config-write-py: bru never writes ~/.config/bru/config.lua — that file is \
+             hand-written and belongs to configer, and bru holds only the defaults it is layered \
+             on. `:config-diff` prints the Lua this browser would need, for you to paste there.",
+        ),
+        // `:bind` with no key is the page listing every binding — `qute://bindings` in qutebrowser,
+        // and here the page bru already generates from the table it is running on. It is done in
+        // this file because navigating is this file's job; the other three shapes are `config.rs`'s.
+        Command::Bind { mode, keys, command, default } => match keys {
+            None => crate::open::open(state, browser, Some("bru://chrome/help"), true, false),
+            Some(keys) => {
+                crate::config::run_bind(mode, Some(keys.as_str()), command.as_deref(), *default)
+            }
+        },
+        Command::Unbind { mode, keys } => crate::config::run_unbind(mode, keys),
+// --- end config commands -----------------------------------------------------------------------
+
         // --- the command line ---------------------------------------------------------------
         // Unreachable: `cmdline::run_command` at the top of this function claims both. The arms
         // stay because the match has no `_`, and they document where the two actually go.
@@ -882,6 +938,27 @@ pub fn is_live(command: &Command) -> bool {
         // default table names neither, so the live-binding count is untouched by both.
         Command::ConfigDictAdd { .. } | Command::ConfigDictRemove { .. } => true,
 // --- end src/settings.rs ---------------------------------------------------
+
+// --- config commands ---------------------------------------------------------------------------
+        // All ten act, and none of them is bound by default, so the live-binding count is
+        // untouched by the whole group — checked in `the_config_commands_raise_no_binding`.
+        //
+        // `config-write-py` is live and **refused** at the same time, which no other command in bru
+        // is, and it is deliberate: `exec::refusal` is for a *binding* that will never act, and
+        // nothing binds this. What it does when typed is explain itself, which is doing something.
+        // Claiming it inert would send it to the dispatcher's "not implemented yet", which is the
+        // one answer that is false.
+        Command::ConfigUnset { .. }
+        | Command::ConfigClear { .. }
+        | Command::ConfigDiff
+        | Command::ConfigListAdd { .. }
+        | Command::ConfigListRemove { .. }
+        | Command::ConfigSource { .. }
+        | Command::ConfigEdit { .. }
+        | Command::ConfigWritePy
+        | Command::Bind { .. }
+        | Command::Unbind { .. } => true,
+// --- end config commands -----------------------------------------------------------------------
 
 // --- src/completers.rs ---------------------------------------------------------------------
         Command::CompletionItemFocus { .. } | Command::CompletionItemDel => true,
@@ -2031,6 +2108,50 @@ mod tests {
         assert_eq!(commands::parse("set").unwrap(), Command::SettingsPage);
     }
 // --- end src/settings.rs ---------------------------------------------------
+
+// --- config commands ---------------------------------------------------------------------------
+    /// **The ten commands that reach the configuration raise the live-binding count by nothing**,
+    /// and that is a fact about the default table rather than a shortfall.
+    ///
+    /// Not one of them is bound in `configdata.yml`, in any mode: they are typed. The one default
+    /// binding that so much as mentions `:bind` is `sk`, which is `cmd-set-text -s :bind` — it puts
+    /// the text in the command line and has been live since `cmdline.rs` existed, whether or not
+    /// anything answered when the line was accepted. So 285 stays 285, and this is what says so
+    /// rather than the absence of a change.
+    #[test]
+    fn the_config_commands_raise_no_binding() {
+        let names = [
+            "config-clear",
+            "config-diff",
+            "config-edit",
+            "config-list-add",
+            "config-list-remove",
+            "config-source",
+            "config-unset",
+            "config-write-py",
+            "bind",
+            "unbind",
+        ];
+        for (mode, keys, cmd) in DEFAULT_BINDINGS {
+            for name in names {
+                let first = cmd.split_whitespace().next().unwrap_or("");
+                assert_ne!(
+                    first, name,
+                    "{mode} {keys} is bound to {name}; the live count above has to move with it"
+                );
+            }
+        }
+        // `sk` is the near miss, and it was already live: what it does is type, not bind.
+        let (_, _, sk) = DEFAULT_BINDINGS
+            .iter()
+            .find(|(mode, k, _)| *mode == "normal" && *k == "sk")
+            .expect("sk is a default binding");
+        assert_eq!(*sk, "cmd-set-text -s :bind");
+        assert!(is_live(&commands::parse(sk).unwrap()));
+        // And what it puts in the line is a command that now answers, which it did not before.
+        assert!(is_live(&commands::parse("bind j").unwrap()));
+    }
+// --- end config commands -----------------------------------------------------------------------
 
 // --- src/hints.rs -----------------------------------------------------------------------
     /// The bindings hint groups and targets turned on, and the four still inert, named one by one.

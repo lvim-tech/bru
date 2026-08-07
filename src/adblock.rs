@@ -532,17 +532,30 @@ fn start_update() {
         return;
     }
 
+    // --- config commands (merge: this block belongs to the config-commands workstream) --------
+    // [`DEFAULT_LISTS`] is now the `content.blocking.adblock.lists` setting's defaults rather than
+    // the list itself, so `:config-list-add content.blocking.adblock.lists <url>` and a
+    // `bru.set(…, { … })` in `config.lua` both reach this loop. With nothing set it answers exactly
+    // the two lists this array holds, which is the state of a bru with no `~/.config/bru/`.
+    let lists = crate::settings::list_of("content.blocking.adblock.lists");
+    if lists.is_empty() {
+        eprintln!("bru[adblock]: no filter lists configured — nothing to fetch");
+        return;
+    }
+    // --- end config commands ------------------------------------------------------------------
+
     {
         let Ok(mut guard) = UPDATE.lock() else { return };
         if guard.is_some() {
             eprintln!("bru[adblock]: an update is already running");
             return;
         }
-        *guard = Some(Update { pending: DEFAULT_LISTS.len(), written: 0, requests: Vec::new() });
+        *guard = Some(Update { pending: lists.len(), written: 0, requests: Vec::new() });
     }
 
-    eprintln!("bru[adblock]: fetching {} lists", DEFAULT_LISTS.len());
-    for url in DEFAULT_LISTS {
+    eprintln!("bru[adblock]: fetching {} lists", lists.len());
+    for url in &lists {
+        let url = url.as_str();
         let path = dir.join(list_filename(url));
         let Some(mut request) = request_create() else {
             finish_one(false);

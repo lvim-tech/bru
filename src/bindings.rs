@@ -628,8 +628,13 @@ impl<V> BindingTrie<V> {
     }
 
     /// Unbind a sequence, pruning the branch that is left empty.
-    // `bru.unbind`'s half of the trie. Reached through `Config`, not from the key path.
-    #[allow(dead_code)]
+    ///
+    /// **Its production caller is `config::change_live_binding`** — `:unbind`, and `:bind
+    /// --default` on a key bru ships nothing for. This comment used to name `bru.unbind` and
+    /// `Config`, and that was wrong in a way worth recording: a config-time unbind edits the
+    /// `Bindings` map *before* `into_tries` builds anything, so nothing removed a node from a trie
+    /// until a command could do it while bru was running. The pruning is what keeps `d` answering
+    /// `NoMatch` rather than `PartialMatch` after the last binding under a prefix goes.
     pub fn remove(&mut self, sequence: &[KeyInfo]) -> Option<V> {
         let Some((first, rest)) = sequence.split_first() else {
             return self.value.take();
@@ -721,6 +726,18 @@ impl KeyParser {
     pub fn bindings(&self) -> &BindingTrie<Command> {
         &self.bindings
     }
+
+// --- config commands -----------------------------------------------------------------------
+    /// The mode's trie, mutably — what `:bind` and `:unbind` change while bru runs.
+    ///
+    /// One caller, `config::change_live_binding`, and it is the reason [`BindingTrie::remove`]
+    /// exists: a config-time `bru.unbind` edits the `Bindings` map before any trie is built, so
+    /// until there was a command that took a binding away at *runtime* nothing in production ever
+    /// removed a node.
+    pub fn bindings_mut(&mut self) -> &mut BindingTrie<Command> {
+        &mut self.bindings
+    }
+// --- end config commands ---------------------------------------------------------------------
 
     /// The pending chain, as the status bar shows it.
     pub fn keystring(&self) -> String {
