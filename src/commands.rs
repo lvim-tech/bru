@@ -436,6 +436,26 @@ pub enum Command {
     GreasemonkeyReload { quiet: bool },
 // --- end src/greasemonkey.rs -------------------------------------------------------------------
 
+// --- lua runtime -------------------------------------------------------------------------------
+    /// A command a **plugin** registered with `bru.command(name, fn)`.
+    ///
+    /// The one variant in this file whose name is not written down anywhere in it. It is produced
+    /// only when `plugins::is_registered(name)` answers yes, which is a registry that is empty until
+    /// `~/.local/share/bru/plugins/` has been read — so a name no plugin claims still parses to
+    /// [`Command::Unimplemented`] and still says exactly what it said before plugins existed.
+    ///
+    /// `args` is **the rest of the line as it was typed**, quotes and all, rather than the
+    /// re-joined tokens: a plugin parses its own arguments, and re-joining would take away the one
+    /// thing it needs to do that. This is `maxsplit=0` in qutebrowser's vocabulary.
+    Plugin { name: String, args: String },
+    /// `plugin-list` — what is loaded, what each one registered, and what is wrong with the rest.
+    PluginList,
+    /// `plugin-reload [name]` — re-read one plugin, or all of them.
+    PluginReload { name: Option<String> },
+    /// `plugin-disable <name>` — switch one off for the rest of the session.
+    PluginDisable { name: String },
+// --- end lua runtime ---------------------------------------------------------------------------
+
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
     /// `view-source` — the page's own source, in a tab of its own.
     ViewSource,
@@ -1669,6 +1689,19 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
 // --- end src/greasemonkey.rs -------------------------------------------------------------------
 
+// --- lua runtime -------------------------------------------------------------------------------
+        "plugin-list" => Command::PluginList,
+        "plugin-reload" => Command::PluginReload {
+            name: args.arg(0).map(str::to_string),
+        },
+        "plugin-disable" => {
+            let Some(name) = args.arg(0) else {
+                return Err(bad("needs the name of a plugin"));
+            };
+            Command::PluginDisable { name: name.to_string() }
+        }
+// --- end lua runtime ---------------------------------------------------------------------------
+
 // --- src/devtools.rs, src/message.rs (the polish workstream) -------------------------------------
         // `view-source --edit` hands the source to `$EDITOR`, which is a whole other mechanism;
         // the bare form, which is what `gf` is, opens it in a tab.
@@ -1939,10 +1972,39 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "bookmarks-reload" => Command::MarksReload { which: crate::utilcmds::Marks::Bookmarks },
 // --- end src/utilcmds.rs ---------------------------------------------------
 
+// --- lua runtime -------------------------------------------------------------------------------
+        // **After every one of bru's own arms, and before the fall-through.** A plugin may not take
+        // a name bru ships — `plugins::register_command` refuses one — and this is the other half of
+        // that: bru's own arms are matched first, so even a registration that slipped through could
+        // not shadow a built-in. A name no plugin registered falls to the line below and says what
+        // it has always said.
+        name if crate::plugins::is_registered(name) => Command::Plugin {
+            name: name.to_string(),
+            args: rest_of_line(s, name),
+        },
+// --- end lua runtime ---------------------------------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
 }
+
+// --- lua runtime -------------------------------------------------------------------------------
+/// Everything after the command's own name, **as it was typed**.
+///
+/// `tokens[1..].join(" ")` would be the obvious spelling and it is wrong for the one caller: it has
+/// already taken the quotes off, so `:mycmd "a b" c` and `:mycmd a b c` would reach the plugin as
+/// the same string and the plugin could never tell them apart. A plugin parses its own arguments;
+/// this hands them over intact.
+fn rest_of_line(whole: &str, name: &str) -> String {
+    whole
+        .trim_start()
+        .strip_prefix(name)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+// --- end lua runtime ---------------------------------------------------------------------------
 
 // --- src/utilcmds.rs -------------------------------------------------------
 

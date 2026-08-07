@@ -463,7 +463,11 @@ mod tests {
         // `url.open_base_url`, `hints.scatter` and `downloads.location.prompt` from the constants
         // that became settings, then `scrollbar.style` and `scrollbar.page_overrides`.
         assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 2);
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 11);
+        // --- lua runtime ---------------------------------------------------------------------
+        // **+1 `true`**: `plugins.enabled`, which bru answers itself and ships on. This number
+        // moves with every bru-backed boolean, and 11 is what it was before this branch.
+        // --- end lua runtime -----------------------------------------------------------------
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 12);
     }
 
     // --- unhardcoded -----------------------------------------------------------------------

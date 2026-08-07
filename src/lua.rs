@@ -38,9 +38,10 @@
 //!
 //! # What is *not* here
 //!
-//! **Nothing on the key path.** `j` reaches `scroll::step`, which reads an atomic in 0.3 ns. What
-//! reaches this file is a strip rebuild or a typed command — never a keystroke.
-//! `grep -n mlua src/keys.rs` is empty and is the review-level check of exactly this.
+//! **Nothing on the key path.** `j` reaches `scroll::step`, which reads an atomic in 0.3 ns, and a
+//! plugin registers a **command** — the key still goes through the trie in Rust and the same
+//! dispatcher. One crossing per command, never per keystroke. `grep -n mlua src/keys.rs` is empty
+//! and is the review-level check of exactly this.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -55,13 +56,11 @@ use cef::{currently_on, ThreadId};
 /// a panic inside mlua (`WeakLua::lock` is `.expect("Lua instance is destroyed")`), not an error
 /// bru could report.
 struct Runtime {
-    /// Every function handed over — by `bru.set("x", function() … end)`, and later by
-    /// `bru.command(…)` and `bru.on(…)` — keyed by [`FnRef`]'s id.
+    /// Every function handed over — by `bru.set("x", function() … end)`, by `bru.command(…)` and by
+    /// `bru.on(…)` — keyed by [`FnRef`]'s id.
     functions: HashMap<u64, mlua::Function>,
     /// The next id. Never reused, so a stale [`FnRef`] answers "gone" rather than somebody else's
     /// function.
-    // Read only by `register`, which is unreached until a setting or a plugin hands a function over.
-    #[allow(dead_code)]
     next_id: u64,
     lua: mlua::Lua,
 }
@@ -91,7 +90,8 @@ thread_local! {
 
 /// A handle to a Lua function the rest of bru is holding.
 ///
-/// Opaque on purpose: `settings.rs` must not name `mlua`, and this is the type that lets it not. `Clone`, `Send` and `Sync` because a [`crate::settings::Value`] is all three — the
+/// Opaque on purpose: `settings.rs` and `plugins.rs` must not name `mlua`, and this is the type that
+/// lets them not. `Clone`, `Send` and `Sync` because a [`crate::settings::Value`] is all three — the
 /// store is a `static Mutex` reached from several threads. None of that makes the *function*
 /// reachable from another thread: [`call_string`] looks the id up in this thread's [`RUNTIME`] and
 /// finds nothing on a thread that never loaded a config, which is the renderer case and the
@@ -245,8 +245,6 @@ pub fn mark_baseline() {
 /// The global names right now, or `None` on a thread with no state.
 ///
 /// `plugins.rs` takes one either side of a load and hands the difference to [`add_to_baseline`].
-// Unreached until P3: `plugins.rs` takes a snapshot either side of a plugin load.
-#[allow(dead_code)]
 pub fn global_names_now() -> Option<BTreeSet<String>> {
     with(global_names)
 }
@@ -261,8 +259,6 @@ pub fn global_names_now() -> Option<BTreeSet<String>> {
 /// What this cannot do: a plugin that is reloaded and *stops* setting a global leaves the old name
 /// in the baseline for the rest of the session, so a config file that happens to use that name is
 /// not cleared. Nothing here can tell that case from a plugin that still owns it.
-// Unreached until P3, with `global_names_now` above it.
-#[allow(dead_code)]
 pub fn add_to_baseline(names: BTreeSet<String>) {
     if names.is_empty() {
         return;
@@ -323,8 +319,6 @@ pub fn clear_added_globals() -> usize {
 /// `None` when this thread has no state, which cannot happen from the callers — `config.rs` has just
 /// run a config file in it, and `bru.command` is only reachable from inside one — but is answered
 /// rather than asserted so that a later caller cannot make it a panic.
-// Unreached until P2 gives a setting a function to hold and P3 gives a plugin a handler.
-#[allow(dead_code)]
 pub fn register(function: &mlua::Function) -> Option<FnRef> {
     // `info()` before the borrow, because it locks the Lua and a callback could in principle reach
     // back in here. It cannot today; the ordering costs nothing and removes the question.
@@ -389,8 +383,6 @@ pub fn call_unit(handle: &FnRef, fields: &[(&'static str, Arg)]) -> Result<(), S
 /// `PLUGIN-CONTRACTS.md` spells and because it is what a plugin author will write without being
 /// told: `bru.command("hello", function(args) … end)`. `nil` comes back as the empty string, which
 /// is `plugins.rs`'s "the handler said nothing".
-// Unreached until P3 — a plugin's command handler is its only caller.
-#[allow(dead_code)]
 pub fn call_text(handle: &FnRef, argument: &str) -> Result<String, String> {
     let (_, function) = look_up(handle)?;
     // The `<function …>` prefix that [`call_string`] puts on a throw is left off here, and that is
@@ -464,9 +456,9 @@ fn take_string(handle: &FnRef, answer: mlua::Result<mlua::Value>) -> Result<Stri
 /// falls back to bru's own default rather than to somebody else's function. Nothing else in bru may
 /// forget one, because nothing else can know that no `Value::Fn` still names it.
 ///
-/// It takes the handles to **keep** rather than clearing everything, because not every registered
-/// function will belong to a config file: P3's plugin command handlers are registered the same way
-/// and `:config-source --clear` must not take those.
+/// **A plugin's command handler is a registered function too**, and `--clear` must not take those:
+/// `:config-source --clear` clears the *configuration*, and a plugin is not configuration. So this
+/// takes the handles to keep, which `plugins.rs` fills in.
 pub fn forget_functions_except(keep: &[FnRef]) {
     let keep: BTreeSet<u64> = keep.iter().map(|handle| handle.id).collect();
     RUNTIME.with(|cell| {
@@ -489,6 +481,18 @@ pub fn forget_functions_except(keep: &[FnRef]) {
 /// mean something while a `Config` is being built.
 fn install_bru_table(lua: &mlua::Lua) -> mlua::Result<()> {
     let bru = lua.create_table()?;
+
+    // bru.command(name, fn) — the plugin registry's front door. `plugins.rs` owns what happens with
+    // it; this is only the crossing.
+    bru.set(
+        "command",
+        lua.create_function(|_, (name, handler): (String, mlua::Function)| {
+            let handle = register(&handler).ok_or_else(|| {
+                mlua::Error::RuntimeError("there is no Lua state to register into".to_string())
+            })?;
+            crate::plugins::register_command(&name, handle).map_err(mlua::Error::RuntimeError)
+        })?,
+    )?;
 
     // bru.cmd(line) — **posts a UI task, never runs inline.**
     //
@@ -555,6 +559,13 @@ fn install_bru_table(lua: &mlua::Lua) -> mlua::Result<()> {
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default())
         })?,
+    )?;
+
+    // bru.plugin_dir() — the calling plugin's own directory, during its load and inside its
+    // handlers. Empty anywhere else, because outside a plugin there is no honest answer.
+    bru.set(
+        "plugin_dir",
+        lua.create_function(|_, ()| Ok(crate::plugins::current_plugin_dir()))?,
     )?;
 
     lua.globals().set("bru", bru)?;
@@ -720,7 +731,7 @@ mod tests {
             "function"
         );
         // The long-lived half of the `bru` table.
-        for name in ["cmd", "get", "message", "error", "data_dir"] {
+        for name in ["command", "cmd", "get", "message", "error", "data_dir", "plugin_dir"] {
             assert_eq!(
                 lua.load(format!("return type(bru.{name})")).eval::<String>().unwrap(),
                 "function",

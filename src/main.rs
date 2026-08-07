@@ -32,7 +32,7 @@ mod ipc;
 mod keys;
 mod load;
 // --- lua runtime -------------------------------------------------------------------------------
-// The second file allowed to mention `mlua`. See `src/lua.rs`.
+// The second file allowed to mention `mlua`, and the registry over it. See `src/lua.rs`.
 mod lua;
 // --- end lua runtime ---------------------------------------------------------------------------
 mod macros;
@@ -41,6 +41,9 @@ mod modes;
 mod navigate;
 mod open;
 mod popups;
+// --- lua runtime -------------------------------------------------------------------------------
+mod plugins;
+// --- end lua runtime ---------------------------------------------------------------------------
 mod profile;
 mod prompt;
 mod scroll;

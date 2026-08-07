@@ -639,15 +639,33 @@ impl Config {
     /// `settings::apply_at_startup`, which `app.rs` calls once CEF is up, because this function is
     /// also run by unit tests with no browser process behind them.
     pub fn into_parsers(self) -> KeyParsers {
-        // Built from the settings store rather than carried beside it — see `Config`. It is done
-        // here rather than left to `settings::apply_at_startup` because that only walks what has
-        // been *set*: a config that names no engine at all must still reach `open.rs` with bru's
-        // nine, and a bru with no `~/.config/bru/` is exactly that config.
-        crate::open::install(self.search(), self.settings.start_page());
-        crate::settings::install(self.settings);
+        self.install_stores();
         KeyParsers::new(self.bindings.into_tries())
     }
 
+// --- lua runtime -------------------------------------------------------------------------------
+    /// The two stores, without parsing the bindings — the first half of [`Config::into_parsers`].
+    ///
+    /// Split out because **the plugins have to load between the halves**, and each half needs a
+    /// different side of it:
+    ///
+    /// - a plugin's `bru.get("x")` must read the user's value, so the settings store has to be
+    ///   installed *before* the plugins load;
+    /// - `into_tries` is where a binding's command string is parsed, and `commands::parse` asks
+    ///   `plugins::is_registered`, so the bindings must be parsed *after*.
+    ///
+    /// `app.rs` therefore calls this, then `plugins::load_at_startup`, then `into_parsers`, which
+    /// runs this a second time. Installing twice is idempotent and costs a `SearchEngines` rebuild.
+    ///
+    /// Built from the settings store rather than carried beside it — see `Config`. It is done here
+    /// rather than left to `settings::apply_at_startup` because that only walks what has been
+    /// *set*: a config that names no engine at all must still reach `open.rs` with bru's nine, and
+    /// a bru with no `~/.config/bru/` is exactly that config.
+    pub fn install_stores(&self) {
+        crate::open::install(self.search(), self.settings.start_page());
+        crate::settings::install(self.settings.clone());
+    }
+// --- end lua runtime ---------------------------------------------------------------------------
 }
 
 /// `$XDG_CONFIG_HOME/bru/config.lua`, or `~/.config/bru/config.lua`.
@@ -937,15 +955,13 @@ pub fn source_over(current: Config, path: &Path, clear: bool) -> Result<Config, 
 ///
 /// Two things go, and one deliberately does not:
 ///
-/// - every global that is not in `lua::mark_baseline`'s set, which today is the standard library
-///   and `bru`;
-/// - every registered function. A `Value::Fn` a config set reads as "not reachable" afterwards and
-///   falls back to bru's own default, which is what `--clear` means.
-///
-/// The `&[]` below is the list of handles to **keep**, and it is empty only because nothing but a
-/// config file registers one yet.
+/// - every global that is not in `lua::mark_baseline`'s set — the standard library, `bru`, and
+///   whatever the **plugins** left, because a plugin is not configuration;
+/// - every registered function except the ones a plugin's commands are holding, for the same
+///   reason. A `Value::Fn` a config set reads as "not reachable" afterwards and falls back to bru's
+///   own default, which is what `--clear` means.
 fn clear_back_to_brus_own() -> Config {
-    crate::lua::forget_functions_except(&[]);
+    crate::lua::forget_functions_except(&crate::plugins::handles());
     let gone = crate::lua::clear_added_globals();
     if gone > 0 {
         eprintln!("bru[config]: --clear also took away {gone} Lua global(s) a config file set");
@@ -1794,6 +1810,25 @@ mod tests {
         );
     }
 
+    /// `bru.command` is a plugin's, and a config file that calls it is told so by name rather than
+    /// registering a command nothing would ever reach.
+    #[test]
+    fn a_config_file_cannot_register_a_plugin_command() {
+        let cfg = TempConfig::new(
+            "not-a-plugin",
+            r#"
+                bru.bind("normal", "X", "tab-prev")
+                bru.command("hello", function() return "hi" end)
+                bru.bind("normal", "Y", "tab-prev")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        // The bind before it took effect; the call raised; the one after did not run — the same
+        // shape as every other error in a config file.
+        assert_eq!(config.bindings.command_for(Mode::Normal, "X"), Some("tab-prev"));
+        assert_eq!(config.bindings.command_for(Mode::Normal, "Y"), None);
+        assert!(!crate::plugins::is_registered("hello"));
+    }
 // --- end lua runtime ---------------------------------------------------------------------------
 
     /// `:config-source`'s argument, resolved the way qutebrowser resolves it.

@@ -505,6 +505,20 @@ pub const COMMANDS: &[Doc] = &[
                nothing when it is given.",
         example: "greasemonkey-reload" },
 
+// --- lua runtime -------------------------------------------------------------------------------
+    Doc { names: &["plugin-list"], args: "", flags: &[],
+        what: "What plugins are loaded, what each one registered, and why the rest are not.",
+        example: "plugin-list" },
+    Doc { names: &["plugin-reload"], args: "[name]", flags: &[],
+        what: "Re-read one plugin, or all of them. A reload forgets a plugin's throw count and any \
+               :plugin-disable, because you have just fixed it.",
+        example: "plugin-reload" },
+    Doc { names: &["plugin-disable"], args: "<name>", flags: &[],
+        what: "Switch one plugin off for the rest of the session. Its commands still parse and say \
+               so when they are typed.",
+        example: "plugin-disable x" },
+// --- end lua runtime ---------------------------------------------------------------------------
+
     Doc { names: &["view-source"], args: "", flags: &["-e/--edit", "--pygments"],
         what: "Show the page's own source in a tab. --pygments names a highlighter bru does not \
                ship and the command does nothing when it is given.",
@@ -875,9 +889,69 @@ pub fn page(bindings: &Bindings) -> String {
     }
     out.push_str("</table>\n");
 
+// --- lua runtime -------------------------------------------------------------------------------
+    // **The plugins' commands, under their own heading, so the page does not claim they are bru's.**
+    //
+    // Built from the live registry rather than from a table, because there is no table: a plugin
+    // command's name is written in somebody's `init.lua`. That is also why the rows carry
+    // `data-row="plugin"` and not `data-row="command"` — `the_commands_are_on_the_page` and
+    // `the_summary_counts_the_commands_without_dividing_them` count the latter, and a plugin
+    // arriving would otherwise change a number those tests were written to hold.
+    //
+    // The section is absent when no plugin has registered anything, which is what a bru with no
+    // `~/.local/share/bru/plugins/` looks like and is the normal case.
+    let plugin_commands = crate::plugins::command_names();
+    if !plugin_commands.is_empty() {
+        out.push_str(
+            "<h2>plugin commands</h2>\n<p class=\"note\">These are not bru's. Each one was \
+             registered by a plugin in your own data directory, and <code>:plugin-list</code> says \
+             which.</p>\n<table>\n",
+        );
+        for (name, plugin) in plugin_commands {
+            let keys = by_key
+                .get(&name)
+                .map(|found| {
+                    found
+                        .runs
+                        .iter()
+                        .chain(found.types.iter())
+                        .map(|key| escape(key))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "<tr data-row=\"plugin\" class=\"live\"><td class=\"name\">{}</td>\
+                 <td class=\"cmd\"><span class=\"what\">registered by the plugin {}</span></td>\
+                 <td class=\"bound\">{keys}</td><td class=\"state\"></td></tr>\n",
+                escape(&name),
+                escape(&plugin),
+            ));
+        }
+        out.push_str("</table>\n");
+    }
+// --- end lua runtime ---------------------------------------------------------------------------
+
     out.push_str("</main>\n");
     out
 }
+
+// --- lua runtime -------------------------------------------------------------------------------
+/// Whether `name` is a command bru itself answers to.
+///
+/// [`COMMANDS`] is the list, and four guards at the bottom of this file hold it equal to the set of
+/// names `commands::parse` and `cmdline::is_named` accept — so it is the *whole* set and not a
+/// documentation of part of it, which is what makes it safe to refuse a registration against.
+///
+/// One caller: `plugins::register_command`. A plugin that registered `open` would be registering
+/// something `commands::parse` can never reach, because bru's own arms are matched first; a
+/// registration that silently does nothing is worse than one that says why.
+pub fn is_a_name_bru_ships(name: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|doc| doc.names.iter().any(|shipped| *shipped == name))
+}
+// --- end lua runtime ---------------------------------------------------------------------------
 
 /// The page is built from command strings, which come from `config.lua` — the user's own file, but
 /// still a file, and one typo away from putting a `<` where markup begins.
@@ -1304,7 +1378,15 @@ mod tests {
 
         // A number, so that a scrape which silently starts finding nothing is a failure rather than
         // a vacuous pass. It went from 146 arm heads plus `bind` plus cmdline's nineteen.
-        assert_eq!(source.len(), 166, "the scrape found a different number of commands");
+        //
+        // --- lua runtime ---------------------------------------------------------------------
+        // **+3**: `plugin-list`, `plugin-reload` and `plugin-disable`. A plugin's *own* command is
+        // not among them and never can be — its name is written in somebody's `init.lua` and the
+        // arm that reaches it is a guard (`name if plugins::is_registered(name)`) with no literal
+        // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
+        // `every_command_variant_is_reachable_by_name`.
+        // --- end lua runtime -----------------------------------------------------------------
+        assert_eq!(source.len(), 169, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1477,6 +1559,12 @@ mod tests {
                 Command::AdblockToggle => "AdblockToggle",
                 Command::AdblockInfo => "AdblockInfo",
                 Command::GreasemonkeyReload { .. } => "GreasemonkeyReload",
+// --- lua runtime -------------------------------------------------------------------------------
+                Command::Plugin { .. } => "Plugin",
+                Command::PluginList => "PluginList",
+                Command::PluginReload { .. } => "PluginReload",
+                Command::PluginDisable { .. } => "PluginDisable",
+// --- end lua runtime ---------------------------------------------------------------------------
                 Command::ViewSource => "ViewSource",
                 Command::Print => "Print",
                 Command::DevTools => "DevTools",
@@ -1530,7 +1618,15 @@ mod tests {
                 }
             }
         }
-        for exempt in ["Chain", "Unimplemented"] {
+// --- lua runtime -------------------------------------------------------------------------------
+        // **`Plugin` joins the two variants that no row can reach, and for the same kind of
+        // reason.** `Chain` is `a ;; b` and `Unimplemented` is a name bru has not got; `Plugin` is a
+        // name **a plugin** has, which is not knowable from a table compiled into the binary. There
+        // is nothing this page could write down for it, and the heading it does get is built from
+        // the live registry — see `page`. What it is not exempt from is the arm in `exec::run` and
+        // the arm in `exec::is_live`, both of which are exhaustive.
+        for exempt in ["Chain", "Unimplemented", "Plugin"] {
+// --- end lua runtime ---------------------------------------------------------------------------
             reached.insert(exempt);
         }
 
@@ -1570,6 +1666,9 @@ mod tests {
         "JsEval", "EditUrl", "EditCommand", "QuickmarkAdd", "HistoryClear", "Later", "Repeat",
         "RunWithCount", "Restart", "Version", "Messages", "Process", "ClickElement",
         "ScrollToAnchor", "DownloadRemove", "ClearMessages", "MarksReload", "Unimplemented",
+// --- lua runtime -------------------------------------------------------------------------------
+        "Plugin", "PluginList", "PluginReload", "PluginDisable",
+// --- end lua runtime ---------------------------------------------------------------------------
     ];
 
     /// Every flag a documented spelling names, as the parser would see it: `-u/--pattern/--url`
