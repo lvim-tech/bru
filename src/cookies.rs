@@ -1119,6 +1119,50 @@ mod tests {
         assert!(stash_take().is_empty());
     }
 
+    /// The name, and the shapes it has to take. Tested here rather than in `commands.rs`'s own test
+    /// module so that this workstream's edits to that shared file stay the two fenced blocks.
+    #[test]
+    fn the_command_is_cookies_and_takes_a_domain() {
+        use crate::commands::{parse, Command};
+        assert_eq!(parse("cookies").unwrap(), Command::Cookies { filter: None, bg: false });
+        assert_eq!(
+            parse("cookies github.com").unwrap(),
+            Command::Cookies { filter: Some("github.com".to_string()), bg: false }
+        );
+        assert_eq!(
+            parse("cookies -b github.com").unwrap(),
+            Command::Cookies { filter: Some("github.com".to_string()), bg: true }
+        );
+        // maxsplit0: a filter with a space in it stays one argument rather than losing its tail.
+        assert_eq!(
+            parse("cookies my domain").unwrap(),
+            Command::Cookies { filter: Some("my domain".to_string()), bg: false }
+        );
+        // And the command runs — a name that parses and does nothing is what `is_live` is for.
+        assert!(crate::exec::is_live(&parse("cookies").unwrap()));
+    }
+
+    /// The two enums make a raw integer and offer no way back, so the mapping is written out. A
+    /// cookie restored with the wrong `SameSite` is a cookie a site will not send.
+    #[test]
+    fn the_cookie_enums_survive_a_round_trip_through_an_integer() {
+        for value in [
+            CookieSameSite::UNSPECIFIED,
+            CookieSameSite::NO_RESTRICTION,
+            CookieSameSite::LAX_MODE,
+            CookieSameSite::STRICT_MODE,
+        ] {
+            assert_eq!(same_site_of(value.get_raw() as i32), value);
+        }
+        for value in [CookiePriority::LOW, CookiePriority::MEDIUM, CookiePriority::HIGH] {
+            assert_eq!(priority_of(value.get_raw()), value);
+        }
+        // A value from a future CEF falls back to what Chromium treats a missing attribute as,
+        // rather than to whichever constant happens to be first.
+        assert_eq!(same_site_of(9999), CookieSameSite::UNSPECIFIED);
+        assert_eq!(priority_of(9999), CookiePriority::MEDIUM);
+    }
+
     /// `:cookies github.com` must not put `github.com` in a URL — see [`show`]. The filter travels
     /// beside the navigation, keyed by window, and is taken exactly once.
     #[test]
