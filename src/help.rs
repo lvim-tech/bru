@@ -92,15 +92,18 @@ pub fn page(bindings: &Bindings) -> String {
 "#,
     );
 
-    // **A count, not a fraction.** This said "251 of 264 bindings do something today", and the
-    // user's objection 2026-08-07 was the shape rather than the wording: an "x of y" reads as a
-    // score against somebody else's total even when y is bru's own table. bru's numbers stand on
-    // their own — this many keys act, this many say why they never will — and nothing here is
-    // measured against anything.
+    // **A count, not a fraction, and no machinery.** This said "251 of 264 bindings do something
+    // today. The rest are bound and parsed so that a chain like `gg` still works…" — a sentence
+    // that explained bru's trie to someone who opened the page to find out what a key does. Both
+    // halves were wrong for the reader: the "x of y" reads as a score against somebody else's
+    // total, and *why* a dead key stays in the table is an implementation detail. It is a real
+    // reason and it belongs where it is acted on — dropping those rows would make `t` answer
+    // NoMatch and eat a pending chain — but it belongs in `config.rs`, not here.
+    //
+    // What is left is the two numbers and the promise that each dead key says why.
     out.push_str(&format!(
         "<h1>bru</h1>\n<p class=\"summary\">{live} keys do something. \
-         {refused} more are bound and parsed — so that a chain like <code>gg</code> still \
-         works — and say why they never will when pressed. Each carries its reason.</p>\n"
+         {refused} say why they do not.</p>\n"
     ));
 
     for mode in Mode::ALL {
@@ -260,7 +263,7 @@ mod tests {
 
         // Thirteen rows, and the summary says so rather than only the table.
         assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 13);
-        assert!(html.contains("13 more are bound and parsed"), "the summary undercounts");
+        assert!(html.contains("13 say why they do not"), "the summary undercounts");
         // And it states counts rather than a fraction of anything — the user asked for that
         // 2026-08-07, and a helpful-looking "x of y" is exactly what crept back last time.
         assert!(!html.contains(" of 264"), "the summary is measuring against a total again");
