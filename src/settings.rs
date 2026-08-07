@@ -537,6 +537,19 @@ static SCROLLBAR_WIDTH: IntShape =
 /// 6 is where the completion's rows stop being readable; 40 is past the height the strips reserve
 /// (28px and 24px), so a font above it would be clipped rather than large.
 static FONT_SIZE: IntShape = IntShape { min: 6, max: 40, unit: "pixels", sentinel: "" };
+
+/// `completion.height`, in CSS pixels.
+///
+/// qutebrowser's is `50%` by default and takes a percentage *or* a pixel value (configdata.yml:
+/// `completion.height`). **bru takes pixels only**, and the reason is not laziness: the cap is
+/// applied by `chrome.css` inside the panel's own document, and a percentage there would be a
+/// percentage of the panel — the very thing whose height it decides. The window's height is not a
+/// number that document has.
+///
+/// 60 is three rows and a heading, below which the table says less than the line above it; 1200 is
+/// past any screen here, and a panel taller than the window would leave no page.
+static COMPLETION_HEIGHT: IntShape =
+    IntShape { min: 60, max: 1200, unit: "pixels", sentinel: "" };
 // --- end src/chrome.rs: fonts ------------------------------------------------------------------
 
 // --- setting functions ---------------------------------------------------------------------------
@@ -1688,6 +1701,17 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
         // --- end src/chrome.rs: themes -------------------------------------------------------
+    },
+    Def {
+        // How tall the completion table may get before it scrolls inside itself. It was
+        // `--completion-max-h: 300px` in `chrome.css` and a matching `MAX_H = 300` in Rust, which
+        // is the duplication that made the panel's height two numbers that had to agree; the Rust
+        // half is gone and this is the other one, now that the chrome measures itself.
+        name: "completion.height",
+        kind: Kind::Int(&COMPLETION_HEIGHT),
+        default: Some("300"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
     },
     // --- end src/chrome.rs: fonts ----------------------------------------------------------------
 ];
@@ -3822,7 +3846,7 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             // moves — so the three pushes above cannot carry them and a reload is what applies one.
             // Only for those three: reloading both strips of every window on a `tabs.title.format`
             // change would be paying for something the push already did.
-            if applied.def.name.starts_with("fonts.") || applied.def.name.starts_with("colors.") {
+            if crate::chrome::SERVED_IN_USER_CSS.contains(&applied.def.name) {
                 // --- src/chrome.rs: themes -------------------------------------------------
                 // A theme is a stylesheet too, and it is chosen here rather than where it is
                 // served — `theme.css` is fetched several times per window, and a warning per
@@ -4461,7 +4485,7 @@ mod tests {
         // **Sixty-one**, +3 for the `fonts.*` block: a family, a size and a weight. They are
         // one workstream's and split three ways because CSS keeps them apart — Qt's
         // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
-        assert_eq!(SETTINGS.len(), 62);
+        assert_eq!(SETTINGS.len(), 63);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

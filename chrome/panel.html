@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>bru panel</title>
+        <link rel="stylesheet" href="chrome.css" />
+        <link rel="stylesheet" href="theme.css" />
+        <link rel="stylesheet" href="user.css" />
+    </head>
+    <!-- THE PANEL IS A SEPARATE VIEW FROM THE BAR, AND THAT IS THE WHOLE POINT.
+         src/window.rs
+
+         The completion table and the prompt used to live in bottom.html beside
+         the bar, and the one view holding all three grew when either of them
+         opened. Photographed 2026-08-07, frame by frame at 60fps: on the frame
+         the panel opens, the browser process has already made the view 85px tall
+         while the renderer is still painting into a 24px viewport, so those 24
+         pixels of content — the bar, with the right mode badge in it — land at
+         the TOP of the new area and the rest is background. One frame later
+         everything is where it belongs. The user saw the bar jump upward and
+         come back.
+
+         Nothing about that is fixable by ordering the two, and four attempts at
+         it only moved the seam: the browser process and the renderer learn a new
+         size at different moments, and between those moments one of them is
+         drawing at the wrong size. What is fixable is *which view* resizes. The
+         bar is now alone in a view that is 24px and never anything else, so
+         there is no moment at which its size is in question. This document is
+         the one that grows, and the frame where its size and its content
+         disagree is a frame of empty panel, where there is nothing to jump. -->
+    <body data-view="panel">
+        <!-- src/prompt.rs: the question bru is waiting on, above the completion
+             table, where qutebrowser puts its prompt container. Empty means
+             nothing is being asked, and `#prompt:empty { display: none }` is
+             what takes its height back. -->
+        <div id="prompt"></div>
+        <!-- Empty means closed. #completion:empty is display:none, so this
+             document is zero-height until there is something to show — and a
+             zero-height panel is one `preferred_size` of 0, which is a view the
+             box layout gives no room at all. -->
+        <div id="completion"></div>
+        <script src="completion.js"></script>
+        <script src="prompt.js"></script>
+        <script src="panel.js"></script>
+    </body>
+</html>

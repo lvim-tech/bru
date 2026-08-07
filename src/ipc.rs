@@ -212,6 +212,14 @@ impl BrowserSideHandler for BruQueryHandler {
                         with_window(window, |entry| tabs_json_of(&entry.tabs))
                             .unwrap_or_else(|| "{\"tabs\":[]}".to_string())
                     }
+                    // --- src/window.rs: the panel ---------------------------------------
+                    // Answered with the same state object the bar is given: one JSON is built per
+                    // push and both documents read the keys they draw. See `panel.js`.
+                    "panel" => {
+                        with_window(window, |entry| entry.frames.panel = Some(frame));
+                        bar_json_for(window)
+                    }
+                    // --- end src/window.rs: the panel -----------------------------------
                     "bottom" => {
                         with_window(window, |entry| entry.frames.bottom = Some(frame));
                         // The command line cannot be driven before there is an input to drive, so
@@ -373,6 +381,11 @@ fn fail(callback: &Arc<Mutex<dyn BrowserSideCallback>>, code: i32, message: &str
 struct ChromeFrames {
     top: Option<Frame>,
     bottom: Option<Frame>,
+    // --- src/window.rs: the panel ---------------------------------------------------------------
+    /// The completion table and the prompt, in the one chrome view that changes size. See
+    /// `chrome/panel.html` for the frames that made it a view of its own.
+    panel: Option<Frame>,
+    // --- end src/window.rs: the panel -----------------------------------------------------------
 }
 
 /// Everything one window's chrome is and shows.
@@ -762,11 +775,12 @@ fn push() {
 /// The same for a named window. Every push is aimed at one window: a background window's bar keeps
 /// what it was last shown, which is what its own tab is doing.
 fn push_for(window: u32) {
-    let (top, bottom, tabs) = match chrome().lock() {
+    let (top, bottom, panel, tabs) = match chrome().lock() {
         Ok(chrome) => match chrome.iter().find(|entry| entry.window == window) {
             Some(entry) => (
                 entry.frames.top.clone(),
                 entry.frames.bottom.clone(),
+                entry.frames.panel.clone(),
                 entry.tabs.clone(),
             ),
             None => return,
@@ -784,6 +798,16 @@ fn push_for(window: u32) {
         let bar = bar_json_for(window);
         log(&format!("push to window {window}: {bar}"));
         render(&frame, &bar);
+        // --- src/window.rs: the panel -----------------------------------------------------
+        // **The same string, into the other document.** The completion table and the prompt are
+        // drawn in a view of their own now; `panel.js` reads the two keys it draws and ignores the
+        // rest, and `bottom.js` does the opposite. Built once rather than twice because a second
+        // serialisation would be a second thing to keep in step, and neither document is confused
+        // by a key it has no element for.
+        if let Some(frame) = panel {
+            render(&frame, &bar);
+        }
+        // --- end src/window.rs: the panel -------------------------------------------------
     }
 }
 
@@ -950,13 +974,24 @@ pub fn reload_chrome_everywhere() {
         state.window_ids()
     };
     for window in windows {
-        for frame in [bottom_frame_for(window), top_frame_for(window)]
-            .into_iter()
-            .flatten()
+        for frame in [
+            bottom_frame_for(window),
+            top_frame_for(window),
+            // The panel reads `user.css` too — `--completion-max-h` is `completion.height` — and it
+            // was left out of this list when it was split off, so `:set completion.height` changed
+            // a file the one document that reads it never re-fetched.
+            panel_frame_for(window),
+        ]
+        .into_iter()
+        .flatten()
         {
             if let Some(browser) = frame.browser() {
-                // `reload` takes `&self` in this binding, so nothing here has to be `mut`.
-                browser.reload();
+                // **`reload_ignore_cache`, not `reload`.** The stylesheet this exists to re-fetch is
+                // served by bru itself with no cache headers, so Chromium keeps it — a plain reload
+                // re-ran the document against the bytes it already had, and `:set completion.height
+                // 150` left the panel capped at 300. Nothing here is a network fetch: all three
+                // documents and every asset they name come out of the binary.
+                browser.reload_ignore_cache();
             }
         }
     }
@@ -970,6 +1005,22 @@ fn top_frame_for(window: u32) -> Option<Frame> {
         .iter()
         .find(|entry| entry.window == window)
         .and_then(|entry| entry.frames.top.clone())
+}
+
+// --- src/window.rs: the panel -------------------------------------------------------------------
+/// The panel's frame — the completion table and the prompt.
+fn panel_frame_for(window: u32) -> Option<Frame> {
+    let chrome = chrome().lock().ok()?;
+    chrome
+        .iter()
+        .find(|entry| entry.window == window)
+        .and_then(|entry| entry.frames.panel.clone())
+}
+// --- end src/window.rs: the panel ---------------------------------------------------------------
+
+/// The browser drawing the panel, for the code that has to resize its view.
+pub fn panel_chrome_browser_for(window: u32) -> Option<Browser> {
+    panel_frame_for(window).and_then(|frame| frame.browser())
 }
 
 fn bottom_frame_for(window: u32) -> Option<Frame> {
@@ -1050,7 +1101,14 @@ pub fn ask_cmdline(window: u32, what: &str) {
 /// two different inputs in the one strip, and a call site that read `ask_cmdline` while finishing a
 /// prompt would be a line to misread later.
 pub fn ask_prompt(window: u32, what: &str) {
-    ask_cmdline(window, what);
+    // **The panel's frame, not the bar's.** `#prompt` moved into `panel.html` with the completion
+    // table when the bar was made a view that never resizes, so `ask_cmdline` — which is the bar's
+    // by name and by target — no longer reaches the input this asks about.
+    let Some(frame) = panel_frame_for(window) else {
+        return;
+    };
+    let code = format!("window.bru && window.bru.{what} && window.bru.{what}();");
+    frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
 }
 // --- end src/prompt.rs -----------------------------------------------------
 

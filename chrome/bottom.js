@@ -121,6 +121,15 @@
       return;
     }
     reportedHeight = px;
+    // **Sent straight away, and the two-frame wait that used to be here is gone.**
+    //
+    // Waiting for the paint (`requestAnimationFrame` twice) fixed the opening and broke the
+    // closing: the badge became `normal` while the panel was still standing open for the two
+    // frames the wait cost, which is the same seam seen from the other side. The badge and the
+    // panel are a renderer paint and a browser-process relayout; they cannot be made one event,
+    // so the honest choice is the smallest gap rather than a gap moved somewhere else. Measured
+    // 2026-08-07: 2.2-3.0 ms from this line to the view being resized, which is inside one frame
+    // at 60Hz.
     query({ type: "height", px: px });
   }
 
@@ -398,10 +407,9 @@
       document.body.className = "mode-" + (state.mode || "normal");
 
       renderMessage(state.message);
-      renderCompletion(state.completion);
-      // Last, and after the DOM is written: this is what sizes the view, and it
-      // has to measure what was just drawn rather than what is about to be.
-      reportHeight();
+      // The completion table and the prompt are panel.js's, drawn in a view of
+      // its own. This document is 24px and never resizes, which is the whole
+      // reason they left — see panel.html.
       // --- src/prompt.rs ----------------------------------------------------
       // The open question, or null. prompt.js owns every string in it, because
       // every string in it may have come from a web page.

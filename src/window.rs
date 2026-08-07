@@ -25,6 +25,22 @@ use crate::tabs::{self, SharedState};
 /// The two chrome documents, served by `chrome.rs` over the scheme registered in every process.
 const TOP_URL: &str = "bru://chrome/top.html";
 const BOTTOM_URL: &str = "bru://chrome/bottom.html";
+// --- src/window.rs: the panel ------------------------------------------------------------------
+/// The completion table and the prompt, in the one chrome view that changes size.
+const PANEL_URL: &str = "bru://chrome/panel.html";
+/// The panel is nothing when nothing is open, and `preferred_size` adds the two blocks' heights to
+/// this. Zero rather than a band the box layout has to be told to hide.
+const PANEL_HEIGHT: i32 = 0;
+
+/// The tab strip. Hidden by `tabs.show`, never grows.
+pub const KIND_TABS: i32 = 0;
+/// The status bar. Hidden by `statusbar.show`, and **never grows** — that is the whole reason the
+/// panel is its own view.
+pub const KIND_BAR: i32 = 1;
+/// The completion table and the prompt. Grows; hidden with the bar, because a panel over a hidden
+/// status line would be a block floating on the page with nothing under it.
+pub const KIND_PANEL: i32 = 2;
+// --- end src/window.rs: the panel ---------------------------------------------------------------
 
 /// Chrome strip heights, in logical pixels.
 const TOP_HEIGHT: i32 = 40;
@@ -71,7 +87,21 @@ pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
         .expect("state mutex poisoned")
         .open_window_slot();
 
-    let settings = BrowserSettings::default();
+    // --- src/chrome.rs: the blink on the panel's top edge ---------------------------------------
+    // **A view that has just been made taller hands the renderer pixels it has never painted**, and
+    // CEF fills them with `background_color` until the renderer catches up. At the default that
+    // field's alpha is 0 — fully transparent — so what showed through was **the page behind**. The
+    // completion panel grows upward, so the band was along its top edge, exactly where its category
+    // header is, and on an orange page it flashed orange. Photographed 2026-08-07; the paint
+    // ordering had already been fixed by then and the band stayed, which is what pointed here.
+    //
+    // The page's own browser is created in `tabs.rs` with CEF's defaults and is left alone: its
+    // pre-load colour is a different decision, seen on every navigation rather than on a resize.
+    let mut chrome_settings = BrowserSettings::default();
+    if let Some(colour) = crate::chrome::chrome_background() {
+        chrome_settings.background_color = colour;
+    }
+    // --- end src/chrome.rs: the blink on the panel's top edge -----------------------------------
     let mut client = state.lock().expect("state mutex poisoned").client();
 
     // All three views share one Client, so one set of handlers serves the page and the chrome.
@@ -79,11 +109,11 @@ pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
     // argument is `grows` — see `COMPLETION_HEIGHT`. Only the bottom strip does; the tab strip's
     // height is its own.
     let mut top_delegate =
-        BruChromeViewDelegate::new(state.clone(), window_id, TOP_HEIGHT, false);
+        BruChromeViewDelegate::new(state.clone(), window_id, TOP_HEIGHT, KIND_TABS);
     let top_view = browser_view_create(
         client.as_mut(),
         Some(&CefString::from(TOP_URL)),
-        Some(&settings),
+        Some(&chrome_settings),
         None,
         None,
         Some(&mut top_delegate),
@@ -104,12 +134,37 @@ pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
         FirstTab::None => {}
     }
 
+    // --- src/window.rs: the panel ---------------------------------------------------------------
+    // **`false`, and that is the fix for the bar jumping.** The bottom strip used to carry the
+    // completion table and the prompt and grow with them; the frame a panel opened on had the
+    // browser process holding the view at its new height while the renderer was still painting at
+    // the old one, and the bar landed at the top of the new area for exactly one frame. It is 24px
+    // now and never anything else, so there is no frame in which its size is in question.
     let mut bottom_delegate =
-        BruChromeViewDelegate::new(state.clone(), window_id, BOTTOM_HEIGHT, true);
+        BruChromeViewDelegate::new(state.clone(), window_id, BOTTOM_HEIGHT, KIND_BAR);
+    // The view that does grow. Its own document, its own frame, and nothing in it that has to stay
+    // still: the frame where its size and its content disagree is a frame of empty panel.
+    let mut panel_delegate =
+        BruChromeViewDelegate::new(state.clone(), window_id, PANEL_HEIGHT, KIND_PANEL);
+    let panel_view = browser_view_create(
+        client.as_mut(),
+        Some(&CefString::from(PANEL_URL)),
+        Some(&chrome_settings),
+        None,
+        None,
+        Some(&mut panel_delegate),
+    );
+    // Invisible until something opens it. A `BoxLayout` skips an invisible child, which is what
+    // keeps the pages whole on a window that has never had a completion table in it — the first
+    // `apply_height` above zero is what shows it.
+    if let Some(view) = panel_view.as_ref() {
+        View::from(view).set_visible(0);
+    }
+    // --- end src/window.rs: the panel -------------------------------------------------------------
     let bottom_view = browser_view_create(
         client.as_mut(),
         Some(&CefString::from(BOTTOM_URL)),
-        Some(&settings),
+        Some(&chrome_settings),
         None,
         None,
         Some(&mut bottom_delegate),
@@ -120,6 +175,7 @@ pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
         window_id,
         RefCell::new(top_view),
         RefCell::new(bottom_view),
+        RefCell::new(panel_view),
     );
     window_create_top_level(Some(&mut window_delegate));
 
@@ -569,7 +625,7 @@ fn reorder(handle: &Window, top: &BrowserView, bottom: &BrowserView, want: Layou
 }
 
 /// Whether a strip is currently hidden, for the preferred height its delegate answers with.
-fn strip_hidden(window: u32, grows: bool) -> bool {
+fn strip_hidden(window: u32, kind: i32) -> bool {
     STRIPS
         .lock()
         .ok()
@@ -579,10 +635,12 @@ fn strip_hidden(window: u32, grows: bool) -> bool {
                 .find(|entry| entry.window == window)
                 .and_then(|entry| entry.applied)
                 .map(|applied| {
-                    if grows {
-                        !applied.status_visible
-                    } else {
+                    // The panel goes with the bar: a completion table over a hidden status line
+                    // would be a block floating on the page with nothing under it.
+                    if kind == KIND_TABS {
                         !applied.tabs_visible
+                    } else {
+                        !applied.status_visible
                     }
                 })
         })
@@ -695,6 +753,9 @@ wrap_window_delegate! {
         window_id: u32,
         top_view: RefCell<Option<BrowserView>>,
         bottom_view: RefCell<Option<BrowserView>>,
+        // --- src/window.rs: the panel -------------------------------------------------------
+        panel_view: RefCell<Option<BrowserView>>,
+        // --- end src/window.rs: the panel ---------------------------------------------------
     }
 
     impl ViewDelegate {
@@ -708,7 +769,11 @@ wrap_window_delegate! {
     impl WindowDelegate {
         fn on_window_created(&self, window: Option<&mut Window>) {
             let (top, bottom) = (self.top_view.borrow(), self.bottom_view.borrow());
-            let (Some(window), Some(top), Some(bottom)) = (window, top.as_ref(), bottom.as_ref())
+            // --- src/window.rs: the panel ---------------------------------------------------
+            let panel = self.panel_view.borrow();
+            // --- end src/window.rs: the panel -----------------------------------------------
+            let (Some(window), Some(top), Some(bottom), Some(panel)) =
+                (window, top.as_ref(), bottom.as_ref(), panel.as_ref())
             else {
                 return;
             };
@@ -723,6 +788,26 @@ wrap_window_delegate! {
             };
             let layout = window.set_to_box_layout(Some(&settings));
 
+            // --- src/window.rs: the panel ---------------------------------------------------
+            // **Flex 0 on all three strips, said out loud rather than left to the default.**
+            //
+            // `tabs.rs` gives every page view flex 1, which is what makes the pages absorb the
+            // window. Nothing ever said what the strips' flex was, and while there were two of them
+            // — one fixed at 28px and one that asked for its own height — that never showed. Adding
+            // a third that asks for **0** did: the panel came up occupying the bottom half of the
+            // window with nothing in it, because a leftover being shared out has to land somewhere
+            // and a child that has not said `0` is a child that can take some.
+            //
+            // Set here, on the layout, before any of the three is added: `set_flex_for_view` is the
+            // panel's own record of the child and does not need the child to be placed yet.
+            if let Some(layout) = layout.as_ref() {
+                for view in [top, bottom, panel] {
+                    let mut view = View::from(view);
+                    layout.set_flex_for_view(Some(&mut view), 0);
+                }
+            }
+            // --- end src/window.rs: the panel -----------------------------------------------
+
             // --- tabs and statusbar --------------------------------------------------------
             // The two strips are remembered before either is added: `leading_strip_count`, which
             // `tabs::attach_all_in` is about to ask, is a pure function of the settings and does
@@ -734,11 +819,20 @@ wrap_window_delegate! {
             let places = places();
             let mut leading: Vec<View> = Vec::new();
             let mut trailing: Vec<View> = Vec::new();
+            // --- src/window.rs: the panel ---------------------------------------------------
+            // **The panel goes between the bar and the pages, on whichever side the bar is.** It
+            // opens *towards* the page — that is where the room is — so with the bar at the bottom
+            // it is directly above it, and with `statusbar.position top` directly below. Adjacent
+            // and on the page side either way, which is the one arrangement that reads as one
+            // block growing rather than two strips swapping places.
             if places.status_at_top {
                 leading.push(View::from(bottom));
+                leading.push(View::from(panel));
             } else {
+                trailing.push(View::from(panel));
                 trailing.push(View::from(bottom));
             }
+            // --- end src/window.rs: the panel -----------------------------------------------
             if places.tabs_at_top {
                 leading.push(View::from(top));
             } else {
@@ -938,11 +1032,17 @@ wrap_browser_view_delegate! {
         // wrong window.
         window_id: u32,
         height: i32,
-        // --- src/completers.rs ---------------------------------------------------------------
-        // Whether this strip grows with the completion table. The bottom one does; the tab strip
-        // must not, or an open completion would make the tabs 300px tall.
-        grows: bool,
-        // --- end src/completers.rs -----------------------------------------------------------
+        // --- src/window.rs: the panel ----------------------------------------------------------
+        // **Which of the three strips this is**, as [`KIND_TABS`], [`KIND_BAR`] or [`KIND_PANEL`].
+        //
+        // It was a `grows: bool` — true for the strip that grew with the completion table, false
+        // for the tab strip — and one boolean was enough while there were two strips and the one
+        // that grew was the one with the bar in it. Splitting the panel out broke that in a way the
+        // compiler could not see: `strip_hidden` read the same boolean to decide *which setting*
+        // hides the strip, so a bar that no longer grew started answering to `tabs.show`. Three
+        // strips need a name each.
+        kind: i32,
+        // --- end src/window.rs: the panel ------------------------------------------------------
     }
 
     impl ViewDelegate {
@@ -955,12 +1055,12 @@ wrap_browser_view_delegate! {
             // as window 1's table.
             // Two slots, added: the completion table's and — src/prompt.rs — the prompt block's.
             // Either can be zero and both can be open at once; see `PROMPT_HEIGHTS`.
-            let extra = if self.grows {
+            let extra = if self.kind == KIND_PANEL {
                 completion_height(self.window_id) + prompt_height(self.window_id)
             } else {
                 0
             };
-            if self.grows {
+            if self.kind == KIND_PANEL {
                 debug_bar(self.window_id, self.height + extra);
             }
 // --- tabs and statusbar --------------------------------------------------------------------
@@ -968,7 +1068,7 @@ wrap_browser_view_delegate! {
             // second: a `BoxLayout` skips an invisible child, so either alone should reclaim the
             // band — asking for nothing as well means a CEF that lays an invisible view out anyway
             // still lays it out zero pixels tall.
-            if strip_hidden(self.window_id, self.grows) {
+            if strip_hidden(self.window_id, self.kind) {
                 return Size { width: 1280, height: 0 };
             }
 // --- end tabs and statusbar ----------------------------------------------------------------

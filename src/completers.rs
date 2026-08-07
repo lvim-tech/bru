@@ -1150,14 +1150,28 @@ pub fn apply_height(window: u32, px: i32) {
         // resize a Views tree on every scroll report.
         return;
     }
-    let Some(mut browser) = crate::ipc::bottom_chrome_browser_for(window) else {
+    // **The panel's browser, not the bar's.** `bottom_chrome_browser_for` was right while the bar
+    // and the table were one view; it now points at the strip that never changes size, so this was
+    // invalidating the layout of the one thing that had nothing to relayout.
+    let Some(mut browser) = crate::ipc::panel_chrome_browser_for(window) else {
         return;
     };
     let Some(view) = browser_view_get_for_browser(Some(&mut browser)) else {
         return;
     };
+    // **Visible only when it has something in it.** A `BoxLayout` skips an invisible child
+    // entirely; a *visible* child asking for zero is still a child the leftover can be shared with,
+    // and the panel came up owning the bottom half of the window with nothing drawn in it. Setting
+    // flex to 0 was not enough — this is, and it is the same trick `strip_hidden` already uses for
+    // `tabs.show` and `statusbar.show`.
+    View::from(&view).set_visible(i32::from(wanted > 0));
     // `invalidate_layout` on the strip alone leaves the box layout that *placed* it holding the
     // old height, so the window is asked too — it is the panel that does the laying out.
+    //
+    // Both, and in this order. Invalidating only the parent was tried 2026-08-07 to see whether the
+    // child's own relayout was causing a visible jump: the strip then reported intermediate heights
+    // — 125px where 324 was wanted — because the parent lays out with whatever preferred size the
+    // child last computed, and the child had not been asked to compute a new one.
     View::from(&view).invalidate_layout();
     let handle = crate::state::BruState::instance()
         .and_then(|state| state.lock().ok().and_then(|state| state.window_handle(window)));
@@ -1205,6 +1219,7 @@ pub fn focus(which: FocusWhich, history: bool) {
 
     // `--history` is `<Up>` and `<Down>`, and on a bare `:` or a line already recalled from the
     // history they walk the history instead (`completionwidget.py:305-317`).
+    //
     if history {
         let empty = live().lock().map(|live| live.cats.is_empty()).unwrap_or(true);
         if text == ":" || browsing || empty {

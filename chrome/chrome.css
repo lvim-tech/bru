@@ -42,6 +42,45 @@ body {
     padding: 0;
 }
 
+/* THE BOTTOM STRIP IS ANCHORED TO ITS BOTTOM EDGE, AND THAT IS NOT COSMETIC.
+ *
+ * The document is as tall as its contents, and the view it lives in is resized
+ * to match — but not in the same instant. The completion table enters the DOM
+ * first, and for the frame or two before CEF has grown the view, an 85px
+ * document is being shown in a 24px viewport. Laid out from the top, what those
+ * 24 pixels contain is the completion's first row: the bar vanishes and its
+ * category header stands where the bar was, which is the flash that was chased
+ * through four wrong explanations before the user named it — "the bar itself is
+ * being pushed up".
+ *
+ * Anchored to the bottom, a document taller than its viewport overflows off the
+ * TOP instead. The bar is what the 24 pixels contain, unmoved, and the panel is
+ * revealed above it as the view grows. Nothing is ever drawn in the wrong place;
+ * the only difference between the two frames is how much of the panel is
+ * visible.
+ *
+ * The top strip is a fixed 28px and never resizes, so this costs it nothing. */
+body {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+}
+
+/* The panel ------------------------------------------------------- src/window.rs
+ *
+ * Its own document, holding the two blocks that change size. It has no grid and
+ * no background of its own: each block paints its own, and the gap between them
+ * when only one is open would otherwise be a band of colour with nothing in it.
+ *
+ * No height is pinned here, and none may be. panel.js measures
+ * `document.documentElement.scrollHeight` after every draw and Rust makes the
+ * view that tall, so a height on html or body would be the document telling
+ * itself how tall it is. */
+body[data-view="panel"] {
+    display: block;
+}
+
 /* Scrollbars --------------------------------------------------- src/scrollbar.rs
  *
  * Every scrollbar on a bru:// page, including the one down the side of
@@ -276,14 +315,22 @@ body[data-align="center"] #tabs .title {
 
 body[data-view="bottom"] {
     display: grid;
-    /* Three rows now. The first is the completion table, the second — since
-       src/prompt.rs — is the prompt block, and the third is the bar. Both of
-       the first two are `auto` and are zero-high when their element is empty,
-       so a strip with neither open is still exactly --bar-h tall and the window
-       relayouts on its own. They are separate rows rather than one shared one
-       because they are separate heights on the Rust side too, added together in
-       window.rs; one row would mean whichever drew last decided the height. */
-    grid-template-rows: auto auto var(--bar-h);
+    /* ONE ROW, and that is the point of this view existing on its own.
+       src/window.rs
+
+       There were three: the completion table, the prompt block, and the bar.
+       The view holding all three grew when either of the first two opened, and
+       on the frame it grew the browser process had already made it taller while
+       the renderer was still painting at the old size — so the bar landed at
+       the top of the new area for exactly one frame and appeared to jump.
+       Photographed at 60fps 2026-08-07; four attempts at ordering the two
+       processes only moved the seam, because they learn a new size at different
+       moments and nothing on either side can make that one moment.
+
+       So the two that grow moved to panel.html, in a view of their own, and
+       this one is --bar-h and never anything else. A view whose height cannot
+       change has no frame in which its height is in question. */
+    grid-template-rows: var(--bar-h);
     /* Three columns since the mode indicator: it is `auto` so it takes exactly
        the width of the word in it, the command line's column is what absorbs
        the slack, and the status fields keep the right-hand end. */
@@ -457,7 +504,7 @@ body.mode-command {
  */
 
 #prompt {
-    grid-row: 2;
+    grid-row: 1;
     grid-column: 1 / span 3;
     max-height: var(--completion-max-h);
     overflow-y: auto;
@@ -566,7 +613,7 @@ body.mode-command {
 /* Command line ------------------------------------------------------------- */
 
 #cmdline {
-    grid-row: 3;
+    grid-row: 1;
     grid-column: 2;
     min-width: 0;
     height: var(--bar-h);
@@ -604,7 +651,7 @@ body:not(.mode-command) #cmdline {
  */
 
 #mode {
-    grid-row: 3;
+    grid-row: 1;
     grid-column: 1;
     display: flex;
     align-items: center;
@@ -642,7 +689,7 @@ body:not(.mode-command) #cmdline {
  * never produces — which made the duplicate invisible rather than harmless. */
 
 #message {
-    grid-row: 3;
+    grid-row: 1;
     grid-column: 2;
     display: flex;
     align-items: center;
@@ -677,7 +724,7 @@ body.mode-command #message {
 /* Status group ------------------------------------------------------------- */
 
 #statusline {
-    grid-row: 3;
+    grid-row: 1;
     grid-column: 3;
     display: flex;
     align-items: center;

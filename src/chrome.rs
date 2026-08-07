@@ -44,6 +44,10 @@ const COOKIES_JS: &[u8] = include_bytes!("../chrome/cookies.js");
 /// every colour was missing. A generated file cannot drift from the stylesheet that way, because
 /// the same generator produces the whole vocabulary.
 const DEFAULT_THEME_CSS: &str = include_str!("../chrome/theme.css");
+// --- src/window.rs: the panel ------------------------------------------------------------------
+const PANEL_HTML: &[u8] = include_bytes!("../chrome/panel.html");
+const PANEL_JS: &[u8] = include_bytes!("../chrome/panel.js");
+// --- end src/window.rs: the panel --------------------------------------------------------------
 
 /// Called from `App::on_register_custom_schemes`, which runs in **every** process — browser,
 /// renderer, GPU, zygote. A renderer that never heard of `bru://` treats it as an opaque origin and
@@ -130,6 +134,10 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/cookies" | "/cookies.html" => Some(("text/html", crate::cookies::page().into_bytes())),
         "/cookies.js" => Some(("text/javascript", COOKIES_JS.to_vec())),
 // --- end src/cookies.rs ----------------------------------------------------
+// --- src/window.rs: the panel ----------------------------------------------
+        "/panel.html" => Some(("text/html", PANEL_HTML.to_vec())),
+        "/panel.js" => Some(("text/javascript", PANEL_JS.to_vec())),
+// --- end src/window.rs: the panel ------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
 // --- src/chrome.rs: themes -------------------------------------------------
         // **The vocabulary a theme has to speak, as a file.** 141 declarations, of which
@@ -183,6 +191,21 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
 /// The theme in force, as bytes. `scrollbar.rs` reads it to resolve two colours into a page
 /// that will never load `theme.css` itself.
 // --- src/chrome.rs: fonts --------------------------------------------------
+/// The settings `user.css` is built from, and therefore the ones a change to which needs the chrome
+/// re-fetched rather than re-pushed.
+///
+/// A list rather than a prefix test. It was `name.starts_with("fonts.") || starts_with("colors.")`,
+/// and `completion.height` — added later, read by the panel's own stylesheet — matched neither, so
+/// setting it changed a file nothing re-read. A name here and a `{…}` in [`user_css`] are the same
+/// fact written twice; keeping them next to each other is the whole of the guard.
+pub const SERVED_IN_USER_CSS: &[&str] = &[
+    "fonts.default_family",
+    "fonts.default_size",
+    "fonts.default_weight",
+    "completion.height",
+    "colors.scheme",
+];
+
 /// `bru://chrome/user.css` — the settings that are lengths and names rather than colours.
 ///
 /// Built per request, like `theme_css`, so `:set fonts.default_size 15` and a reload is the whole
@@ -196,13 +219,18 @@ fn user_css() -> String {
     let family = crate::settings::text_or_default("fonts.default_family");
     let size = crate::settings::int_of("fonts.default_size");
     let weight = crate::settings::choice_of("fonts.default_weight");
+    // `completion.height`. Served rather than pushed for the fonts' reason, and read by the panel's
+    // own stylesheet, which is where the cap is applied.
+    let panel = crate::settings::int_of("completion.height");
+    let panel = if (60..=1200).contains(&panel) { panel } else { 300 };
     // A store-less process — a renderer, a unit test — answers 0 for an unset int, and a 0px font
     // is a chrome nobody can read. The compiled-in default is the honest answer there.
     let size = if (6..=40).contains(&size) { size } else { 13 };
     format!(
         "/* GENERATED from bru's own settings. Not themer's file: theme.css carries colours and \
          not one rule, and a font is not a colour. */\n:root {{\n    --chrome-font-family: {family};\n\
-             \x20   --chrome-font-size: {size}px;\n    --chrome-font-weight: {weight};\n}}\n"
+             \x20   --chrome-font-size: {size}px;\n    --chrome-font-weight: {weight};\n\
+             \x20   --completion-max-h: {panel}px;\n}}\n"
     )
 }
 // --- end src/chrome.rs: fonts ----------------------------------------------
@@ -297,6 +325,30 @@ pub fn missing_from_theme(css: &str) -> Vec<String> {
     let shipped = declared_names(DEFAULT_THEME_CSS);
     let theirs = declared_names(css);
     shipped.difference(&theirs).cloned().collect()
+}
+
+/// The theme's own background, as the ARGB integer CEF wants, or `None` if it cannot be read.
+///
+/// **This is the colour a growing view flashes**, and that is the whole reason it exists.
+/// `background_color` is documented as "used for the browser before a document is loaded and when
+/// no document color is specified"; left at the default its alpha is 0, which for a windowed browser
+/// means `CefSettings.background_color` — white. So when the completion panel grows, the strip of
+/// pixels it has just been given is painted white for the frame before the renderer draws into it,
+/// and the panel appears to blink along its top edge. Measured 2026-08-07 after the paint ordering
+/// was already fixed: the renders were correct and in the right order, and the blink stayed, which
+/// is what pointed here.
+///
+/// `--completion-even-bg` and not `--bg`: the top edge of the strip is where the completion is, and
+/// the completion is what the exposed pixels become.
+pub fn chrome_background() -> Option<u32> {
+    let theme = String::from_utf8_lossy(&theme_css()).into_owned();
+    let hex = crate::scrollbar::resolve(&theme, "--completion-even-bg")
+        .or_else(|| crate::scrollbar::resolve(&theme, "--bg"))?;
+    let hex = hex.trim().strip_prefix('#')?;
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    // Opaque, which the header requires: the alpha "must be either fully opaque (0xFF) or fully
+    // transparent (0x00)", and transparent is the default that produces the white.
+    Some(0xFF00_0000 | (value & 0x00FF_FFFF))
 }
 
 /// Say once what a theme is missing. Called where a theme is chosen, not where it is served — the

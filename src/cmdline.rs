@@ -518,6 +518,7 @@ fn cmdlines() -> &'static Mutex<BTreeMap<u32, CmdLine>> {
 /// a worse answer than one list.
 static HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+
 /// The window a call with nothing else to go on means. `u32::MAX` is "no window at all" — the
 /// renderer processes and the moment after the last window closes — and it gets a scratch line
 /// rather than a branch at every call site, because nothing can be typed into a window that is not

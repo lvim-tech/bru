@@ -101,7 +101,7 @@ impl Look {
 ///
 /// The walk is bounded at eight hops, which is a cycle guard and not a depth: `themer` generates
 /// this file and nothing stops a hand-edited one from pointing two properties at each other.
-fn resolve<'a>(theme: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn resolve<'a>(theme: &'a str, name: &str) -> Option<&'a str> {
     let mut name = name.to_string();
     for _ in 0..8 {
         let value = declared(theme, &name)?;
