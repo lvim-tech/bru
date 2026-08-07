@@ -1871,6 +1871,36 @@ mod tests {
         assert_eq!(json.matches(':').count(), 12, "one colon per pair");
     }
 
+    /// **The three lines between the store and the pill, asserted at the source.**
+    ///
+    /// Written because deleting the `modelabels` key from `ipc::bar_json`'s format string left all
+    /// 416 tests green — measured 2026-08-07 — while the bar drew `NORMAL` for a config that said
+    /// `nor`. Every test above this one asks the store, and the store was right; what was severed
+    /// was the wire. `bar_json` itself cannot be called here (it answers `{}` with no window), and
+    /// the page cannot be rendered, so this reads the two files instead. It is a weak test of a
+    /// strong kind: it cannot say the pill is right, only that nobody has cut the wire.
+    #[test]
+    fn the_wire_from_the_store_to_the_pill_is_still_connected() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ipc = std::fs::read_to_string(root.join("src/ipc.rs")).expect("src/ipc.rs is readable");
+        assert!(
+            ipc.contains("mode_labels_json()"),
+            "ipc.rs no longer reads the labels out of the store"
+        );
+        assert!(
+            ipc.contains("\\\"modelabels\\\":{mode_labels}"),
+            "the bar JSON no longer carries the labels"
+        );
+        let js = std::fs::read_to_string(root.join("chrome/bottom.js"))
+            .expect("chrome/bottom.js is readable");
+        assert!(
+            js.contains("state.modelabels"),
+            "bottom.js no longer reads the labels off the pushed state"
+        );
+        // The two keys that are not a mode name — the ones a `state.mode` lookup would miss.
+        assert!(js.contains("search_forward") && js.contains("search_backward"), "{js}");
+    }
+
     #[test]
     fn variables_expand_against_nothing_when_there_is_no_page() {
         // `ipc::current_url` is empty outside a running browser, which is the case in a unit test.
