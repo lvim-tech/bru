@@ -31,6 +31,45 @@ body {
     padding: 0;
 }
 
+/* Scrollbars --------------------------------------------------- src/scrollbar.rs
+ *
+ * Every scrollbar on a bru:// page, including the one down the side of
+ * bru://chrome/help. Chromium's native bar has a stepper arrow at each end and
+ * a grey of its own; naming any ::-webkit-scrollbar rule switches it out of the
+ * native bar and into a CSS-drawn one, which is why the track and the thumb
+ * have to be named here too — a custom scrollbar with no background declared is
+ * drawn transparent, not drawn native.
+ *
+ * The same five rules are what src/scrollbar.rs injects into ordinary pages, so
+ * that the bar beside a web page and the bar beside the help page are one
+ * decision. It cannot share this file: a page never loads chrome.css, so Rust
+ * resolves these two var()s against theme.css and writes the colours out.
+ *
+ * #completion and #prompt declare their own width below and keep it: an id plus
+ * a pseudo-element outranks a bare pseudo-element. */
+::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+
+::-webkit-scrollbar-button {
+    display: none;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--completion-scrollbar-bg);
+    border-radius: 0;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--completion-scrollbar-fg);
+    border-radius: 0;
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--completion-scrollbar-bg);
+}
+
 body {
     /* Monospace throughout, like qutebrowser's default family: the completion
        is a table, and columns that do not line up read as a bug. */

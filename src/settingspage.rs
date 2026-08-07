@@ -458,12 +458,12 @@ mod tests {
         //
         // **This number moves with every bru-backed boolean setting**, and it is not a fact about
         // the insert-mode four it started as. Two `false` — `insert.auto_leave` and
-        // `hints.uppercase` — against nine `true`: the other three insert-mode settings, then
+        // `hints.uppercase` — against eleven `true`: the other three insert-mode settings, then
         // `tabs.background`, `tabs.wrap` and `tabs.tooltips` from the strips, then
         // `url.open_base_url`, `hints.scatter` and `downloads.location.prompt` from the constants
-        // that became settings.
+        // that became settings, then `scrollbar.style` and `scrollbar.page_overrides`.
         assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 2);
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 9);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 11);
     }
 
     // --- unhardcoded -----------------------------------------------------------------------

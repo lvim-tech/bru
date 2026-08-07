@@ -479,6 +479,18 @@ static SCROLL_STEP: IntShape =
     IntShape { min: 1, max: 10_000, unit: "pixels", sentinel: "" };
 // --- end unhardcoded ---------------------------------------------------------------------------
 
+// --- src/scrollbar.rs --------------------------------------------------------------------------
+/// `scrollbar.width`, in CSS pixels.
+///
+/// Chromium's native bar measures 15 here and the completion's is 6, so the useful range sits
+/// around them rather than at either end. **1 is allowed and is not the same as off**: a one-pixel
+/// bar is a hairline the page still reserves space for, which is a look somebody may want, and
+/// `scrollbar.style false` is what "no bar of bru's" means. 64 is past any pointer target and is
+/// there to stop a typo from taking half the viewport.
+static SCROLLBAR_WIDTH: IntShape =
+    IntShape { min: 1, max: 64, unit: "pixels", sentinel: "" };
+// --- end src/scrollbar.rs ----------------------------------------------------------------------
+
 /// A setting's value, already validated against its [`Kind`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value {
@@ -569,6 +581,13 @@ enum Backing {
     /// value lives in an `AtomicI32` beside the wheel code and this pushes it there. Measured — see
     /// `scroll::the_key_path_cost_of_reading_the_step`.
     ScrollStep,
+    // --- src/scrollbar.rs -----------------------------------------------------------------------
+    /// The scrollbar bru draws down the side of a page. Nothing in Chromium holds this — the value
+    /// becomes a `<style>` element the load handler puts into each document — so applying it means
+    /// running that injection again in every open tab, which is what makes `:set` change the page
+    /// under the user rather than the next page they open.
+    Scrollbar,
+    // --- end src/scrollbar.rs -------------------------------------------------------------------
     // --- end unhardcoded -----------------------------------------------------------------------
 // --- content settings --------------------------------------------------------------------------
     /// A Chromium **preference** — the other half of Chromium's settings, beside the
@@ -1307,6 +1326,68 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::GlobalOnly,
         backing: Backing::Read,
     },
+    // --- src/scrollbar.rs -----------------------------------------------------------------------
+    Def {
+        // How wide the bar is, and how tall a horizontal one is. Twelve sits between Chromium's
+        // native 15 and the completion's 6: wide enough to take with the pointer, narrow enough
+        // that a page laid out against the native bar does not reflow when bru's replaces it.
+        name: "scrollbar.width",
+        kind: Kind::Int(&SCROLLBAR_WIDTH),
+        default: Some("12"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // **Unset means the theme**, which is the point rather than a missing default: the colour
+        // then comes from `--completion-scrollbar-fg` in whatever `theme.css` is in force, so
+        // swapping the theme moves the scrollbar with everything else and this setting is for the
+        // one person who wants it not to. Any CSS colour — `#a7c080`, `rebeccapurple`,
+        // `rgb(0 0 0 / 40%)` — because the string is handed to Chromium, which is the only thing
+        // here that knows what a colour is. Same shape as `editor.command`, where unset is the
+        // `$BRU_EDITOR` chain rather than nothing.
+        name: "scrollbar.thumb",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // The track behind the thumb. Unset is `--completion-scrollbar-bg` from the theme, for
+        // `scrollbar.thumb`'s reason. `transparent` is a value, and it is how the bar is made to
+        // float over the page rather than sit in a channel.
+        name: "scrollbar.track",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // **bru's own name — qutebrowser has no scrollbar setting at all.** It cannot: Qt draws
+        // QtWebEngine's scrollbar and a page stylesheet has no say over it. bru's is drawn by
+        // Chromium out of five `::-webkit-scrollbar` rules, which is why there is something to
+        // switch off here. Off leaves Chromium's native bar, arrows and all.
+        name: "scrollbar.style",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // **Which side of the cascade bru takes when a page styles its own scrollbar.** True — the
+        // default — puts bru's stylesheet first in the document and adds no `!important`, so
+        // GitHub's and Discord's own rules come later and win. False makes every declaration
+        // `!important` and bru wins everywhere.
+        //
+        // Neither setting can reach a page that sets `scrollbar-color`: that property and the
+        // `::-webkit-scrollbar` pseudo-elements are mutually exclusive in Chromium, and `!important`
+        // decides between two declarations rather than between two scrollbar mechanisms.
+        name: "scrollbar.page_overrides",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    // --- end src/scrollbar.rs -------------------------------------------------------------------
     Def {
         // `editor.command`, configdata.yml:1569. **bru's default is not qutebrowser's, and the
         // difference is deliberate.** qutebrowser ships `["gvim", "-f", "{file}", "-c", …]`; bru has
@@ -1722,6 +1803,9 @@ pub fn value_of(name: &str) -> Option<String> {
             | Backing::Read
             | Backing::ScrollStep
             // --- end unhardcoded ---------------------------------------------------------------
+            // --- src/scrollbar.rs --------------------------------------------------------------
+            | Backing::Scrollbar
+            // --- end src/scrollbar.rs ----------------------------------------------------------
     ) {
         return None;
     }
@@ -3187,6 +3271,14 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
             }
             return Ok(());
         }
+        // --- src/scrollbar.rs ---------------------------------------------------------------
+        // Re-run the injection in every open tab. The script removes what a previous run left
+        // before it puts anything in, so this is "apply" for both settings and for either value.
+        Backing::Scrollbar => {
+            crate::scrollbar::reinject_everywhere();
+            return Ok(());
+        }
+        // --- end src/scrollbar.rs -----------------------------------------------------------
         // --- end unhardcoded -------------------------------------------------------------------
 // --- content settings --------------------------------------------------------------------------
         Backing::Preference(pref) => return write_preference(pref, &applied.value),
@@ -3412,6 +3504,9 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
         | Backing::Read
         | Backing::ScrollStep
         // --- end unhardcoded -------------------------------------------------------------------
+        // --- src/scrollbar.rs ------------------------------------------------------------------
+        | Backing::Scrollbar
+        // --- end src/scrollbar.rs --------------------------------------------------------------
         => {
             return None;
         }
@@ -3706,7 +3801,7 @@ mod tests {
         //   three Chromium preferences.
         //
         // Raise this with the setting, never to make a failing build pass.
-        assert_eq!(SETTINGS.len(), 52);
+        assert_eq!(SETTINGS.len(), 57);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

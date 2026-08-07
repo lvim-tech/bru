@@ -240,6 +240,16 @@ impl BruState {
             .unwrap_or_default()
     }
 
+    /// [`Self::tab_browser_ids`] for a named window rather than the current one.
+    ///
+    /// `scrollbar::reinject_everywhere` needs every tab of *every* window, and the current-window
+    /// form would have silently done one window's worth of work and reported nothing.
+    pub fn tab_browser_ids_in(&self, window: u32) -> Vec<Option<i32>> {
+        self.slot(window)
+            .map(|slot| slot.tabs.iter().map(|tab| tab.browser_id).collect())
+            .unwrap_or_default()
+    }
+
     pub fn tab_count(&self) -> usize {
         self.current_slot().map(|slot| slot.tabs.len()).unwrap_or(0)
     }

@@ -52,6 +52,16 @@ wrap_load_handler! {
 
             trace(id);
 
+            // --- src/scrollbar.rs -------------------------------------------------------------
+            // The document element exists here and the page's own <head> has not been parsed yet,
+            // which is both halves of what the stylesheet needs — see `scrollbar.rs` for the
+            // measurement that rules out the renderer's `on_context_created`, where greasemonkey
+            // injects and where `document.documentElement` is still null.
+            if let Some(mut frame) = browser.main_frame() {
+                crate::scrollbar::inject(&mut frame);
+            }
+            // --- end src/scrollbar.rs ---------------------------------------------------------
+
             // The position belongs to the document that is going away; the next one reports its own
             // as soon as it is scrolled.
             crate::scroll::forget();

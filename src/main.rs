@@ -40,6 +40,7 @@ mod popups;
 mod profile;
 mod prompt;
 mod scroll;
+mod scrollbar;
 mod spawn;
 mod session;
 mod settings;

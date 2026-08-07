@@ -156,7 +156,9 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
 /// The one asset that is not compiled in. Read per request rather than cached: the file belongs to
 /// themer, which rewrites it whenever the desktop theme changes, and a cache would mean bru had to
 /// be restarted to notice.
-fn theme_css() -> Vec<u8> {
+/// The theme in force, as bytes. `scrollbar.rs` reads it to resolve two colours into a page
+/// that will never load `theme.css` itself.
+pub(crate) fn theme_css() -> Vec<u8> {
     match theme_path().and_then(|path| std::fs::read(path).ok()) {
         Some(bytes) => bytes,
         None => DEFAULT_THEME_CSS.as_bytes().to_vec(),
