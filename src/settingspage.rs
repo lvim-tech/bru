@@ -179,6 +179,11 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
 fn default_of(def: &crate::settings::Def) -> String {
     match def.kind {
         Kind::Dict(shape) => format!("{} entries", shape.defaults.len()),
+        // --- config commands ----------------------------------------------------------------
+        // A list's default is a table too, and for the same reason: naming one of the two filter
+        // lists here would be picking one at random.
+        Kind::List(shape) => format!("{} entries", shape.defaults.len()),
+        // --- end config commands ------------------------------------------------------------
         _ => def.default.unwrap_or("unset").to_string(),
     }
 }
@@ -193,6 +198,29 @@ fn default_of(def: &crate::settings::Def) -> String {
 /// columns of noise. What they share is the *marking* — a reader of either can see which pairs are
 /// bru's and which are not without holding the defaults in their head.
 fn in_force_cell(def: &crate::settings::Def, snapshot: Option<&Snapshot>) -> String {
+    // --- config commands --------------------------------------------------------------------
+    // A list is the same argument in the other container: `2 entries` in this cell would be a row
+    // that names a setting and shows none of it, which is the thing this function exists to avoid.
+    if let Kind::List(shape) = def.kind {
+        let entries = crate::settings::list_of(def.name);
+        if entries.is_empty() {
+            return "empty".to_string();
+        }
+        return entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let note = if shape.defaults.contains(&entry.as_str()) {
+                    ""
+                } else {
+                    " ·  added"
+                };
+                format!("<code>{index}</code> {}{}", escape(entry), note)
+            })
+            .collect::<Vec<_>>()
+            .join("<br>");
+    }
+    // --- end config commands ----------------------------------------------------------------
     let Kind::Dict(shape) = def.kind else {
         return escape(&in_force(def.name, snapshot));
     };
@@ -346,6 +374,25 @@ mod tests {
         // the "someone forgot" the whole list exists to deny.
         assert!(html.contains("Chromium 151 has nothing behind this name"));
     }
+
+// --- config commands -------------------------------------------------------------------------
+    /// The list setting's row shows its entries rather than counting them, which is the same claim
+    /// `a_dictionary_setting_shows_a_line_per_pair` makes for the dictionaries.
+    #[test]
+    fn a_list_setting_shows_a_line_per_entry() {
+        let html = page(Some(&snapshot("https://example.com/")));
+        assert!(html.contains("content.blocking.adblock.lists"), "the row is missing");
+        for entry in crate::adblock::DEFAULT_LISTS {
+            assert!(html.contains(entry), "{entry} is not on the page");
+        }
+        assert!(html.contains("a list"), "the kind column does not say what it is");
+        // The count alone would be a row that names a setting and shows none of it.
+        assert!(
+            !html.contains("<td>2 entries</td>"),
+            "the value column is counting instead of listing"
+        );
+    }
+// --- end config commands -----------------------------------------------------------------------
 
     /// The scope rule that keeps bru's own chrome alive has to be visible, or the page invites a
     /// global `content.javascript.enabled false` that `settings.rs` will refuse.
