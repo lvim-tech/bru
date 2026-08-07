@@ -92,9 +92,22 @@ use cef::*;
 
 use crate::modes::Mode;
 
-/// The renderer→browser message. One name, three booleans: is what has the focus now editable, did
-/// the person do it, and is the frame it happened in one of bru's own pages.
+/// The renderer→browser message. One name, four booleans: is what has the focus now editable, did
+/// the person do it, was it the keyboard, and is the frame it happened in one of bru's own pages.
 const REPORT: &str = "bru.focus.changed";
+
+/// The browser→renderer message: "bru has just clicked; say what has the focus now". See
+/// [`after_click`], and the case it exists for — a click onto a field that was already focused
+/// changes no focus and fires no callback.
+const ASK: &str = "bru.focus.ask";
+
+/// How long after the click to ask. The mouse events and this message travel to the renderer on
+/// different channels, so nothing orders them; the delay is what makes the answer be about the
+/// document *after* the click rather than before it.
+///
+/// **60 ms, and it is measured rather than picked.** At 0 ms the answer came back describing the
+/// focus as it was before the click on 3 of 5 runs. See the module header for the run.
+const AFTER_CLICK_MS: i64 = 60;
 
 // -----------------------------------------------------------------------------------------------
 // The renderer half
@@ -196,6 +209,90 @@ fn evaluate(frame: &Frame, code: &str) -> Option<String> {
 /// become "contains".
 pub fn is_bru_url(url: &str) -> bool {
     url.starts_with("bru://")
+}
+
+/// Renderer side of [`ASK`]. Called from `ipc::renderer_on_process_message_received`; answers true
+/// when the message was ours.
+///
+/// The answer comes from CEF's own `Domnode::is_editable` rather than from a JavaScript guess at
+/// what "editable" means, which is why it goes through `visit_dom` instead of another `eval`: one
+/// definition of editable in this file, not two that can disagree.
+pub fn renderer_on_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != ASK {
+        return false;
+    }
+    let Some(frame) = frame else {
+        return true;
+    };
+    let mut visitor = FocusedNode::new(frame.clone());
+    frame.visit_dom(Some(&mut visitor));
+    true
+}
+
+wrap_domvisitor! {
+    struct FocusedNode {
+        frame: Frame,
+    }
+
+    impl Domvisitor {
+        fn visit(&self, document: Option<&mut Domdocument>) {
+            let editable = document
+                .and_then(|document| document.focused_node())
+                .map(|node| node.is_editable() != 0)
+                .unwrap_or(false);
+            let trusted = is_bru_url(&CefString::from(&self.frame.url()).to_string());
+
+            if std::env::var_os("BRU_DEBUG_FOCUS").is_some() {
+                eprintln!("bru[focus,renderer]: after a click, editable={editable} trusted={trusted}");
+            }
+
+            let Some(mut message) = process_message_create(Some(&CefString::from(REPORT))) else {
+                return;
+            };
+            if let Some(arguments) = message.argument_list() {
+                arguments.set_bool(0, editable as ::std::os::raw::c_int);
+                // bru sent the click itself, on behalf of a key the user pressed, and it was a
+                // *mouse* click — which is exactly the pair `auto_enter` and `auto_leave` want.
+                arguments.set_bool(1, 1);
+                arguments.set_bool(2, 0);
+                arguments.set_bool(3, trusted as ::std::os::raw::c_int);
+            }
+            self.frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+        }
+    }
+}
+
+/// Ask, after bru has clicked somewhere itself. The one caller is `hints::click`.
+///
+/// **This is not a general mouse hook and there is no such thing here.** bru's tabs are Chrome-style
+/// `BrowserView`s, so a click the *person* makes with the mouse goes from the compositor into
+/// Chromium without passing through any handler bru owns. What this covers is the click bru makes
+/// on the user's behalf when a hint is followed, which is how a keyboard-driven browser gets into a
+/// text field at all.
+pub fn after_click(browser: &mut Browser) {
+    let Some(frame) = browser.main_frame() else {
+        return;
+    };
+    let mut task = AskFocused::new(frame);
+    post_delayed_task(ThreadId::UI, Some(&mut task), AFTER_CLICK_MS);
+}
+
+wrap_task! {
+    struct AskFocused {
+        frame: Frame,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(mut message) = process_message_create(Some(&CefString::from(ASK))) else {
+                return;
+            };
+            self.frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------------------------

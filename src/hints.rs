@@ -1408,6 +1408,18 @@ fn click(browser: &mut Browser, x: i32, y: i32) {
     host.send_mouse_move_event(Some(&event), 0);
     host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 0, 1);
     host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 1, 1);
+    // --- src/focus.rs ---------------------------------------------------------------------
+    // A hint followed onto a text field must end in insert mode, and `focus.rs` cannot always
+    // learn that from the focus changing: when the field the hint landed on **already had the
+    // focus**, nothing changes and no callback fires. Measured 2026-08-07 on
+    // `https://start.duckduckgo.com/`, whose own script focuses its search box: `hint inputs`
+    // then `a` clicked at (729, 539), no focus change was reported, and the mode stayed normal.
+    //
+    // So the click says so itself. This is the only place in bru that knows a real click has just
+    // been sent at a point on the page; `focus.rs` asks the renderer what has the focus now and
+    // treats the answer as the user's doing, because it was.
+    crate::focus::after_click(browser);
+    // --- end src/focus.rs -----------------------------------------------------------------
 }
 
 /// `;h` — the move without the press. `mouse_leave = 0` means the pointer is entering, which is
