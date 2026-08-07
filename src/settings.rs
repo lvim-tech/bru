@@ -349,19 +349,49 @@ impl ContentKind {
 enum PrefKind {
     /// `enable_do_not_track` — measured exists=1 settable=1 type=VTYPE_BOOL, 2026-08-07.
     DoNotTrack,
-    /// `enable_a_ping` — the same, and it is `<a ping>` and `navigator.sendBeacon`'s switch.
+    /// `enable_a_ping` — the same, and it is `<a ping>`'s switch.
     HyperlinkAuditing,
-    /// `intl.accept_languages` — the same, type VTYPE_STRING once written.
+    /// **Written to `intl.selected_languages` and read from `intl.accept_languages`**, and this is
+    /// the one place in this file where those two are different names. Both exist and both report
+    /// settable, and writing the one whose name matches the header is the wrong move: Chromium
+    /// *derives* `intl.accept_languages` from `intl.selected_languages` and puts its own answer
+    /// back whenever it recomputes.
+    ///
+    /// Measured 2026-08-07, and it is not subtle — one `:set content.headers.accept_language
+    /// fr-FR,fr` writing `intl.accept_languages`, then five navigations on this machine's own
+    /// server:
+    ///
+    /// ```text
+    /// /n0  Accept-Language: en-US,en;q=0.9      (before the set)
+    /// /n1  Accept-Language: fr-FR,fr;q=0.9      (after it)
+    /// /n2  Accept-Language: en-US,en;q=0.9
+    /// /n3  Accept-Language: en-US,en;q=0.9
+    /// /n4  Accept-Language: en-US,en;q=0.9
+    /// ```
+    ///
+    /// **One navigation, and then Chromium put it back** — which read back as success the whole
+    /// time, because the read was taken while the value was still there. A setting that works for
+    /// the first page load after it is typed is worse than one that does not work at all, and only
+    /// a page's own behaviour catches it.
     AcceptLanguage,
 }
 
 impl PrefKind {
-    /// The dotted name CEF knows it by.
+    /// The dotted name bru writes.
     fn name(self) -> &'static str {
         match self {
             PrefKind::DoNotTrack => "enable_do_not_track",
             PrefKind::HyperlinkAuditing => "enable_a_ping",
+            PrefKind::AcceptLanguage => "intl.selected_languages",
+        }
+    }
+
+    /// The dotted name bru reads back, which is the same one for all but the language list — see
+    /// [`PrefKind::AcceptLanguage`].
+    fn read_name(self) -> &'static str {
+        match self {
             PrefKind::AcceptLanguage => "intl.accept_languages",
+            other => other.name(),
         }
     }
 }
@@ -2402,7 +2432,7 @@ fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
 /// Must run on the UI thread, exactly as trap 15's `get_content_setting` must.
 fn read_preference(pref: PrefKind) -> Option<String> {
     let context = request_context_get_global_context()?;
-    let name = CefString::from(pref.name());
+    let name = CefString::from(pref.read_name());
     let value = context.preference(Some(&name))?;
     Some(match value.get_type() {
         t if t == ValueType::BOOL => (value.bool() != 0).to_string(),
