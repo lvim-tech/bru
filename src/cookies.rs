@@ -33,6 +33,20 @@
 //! which drops the Rust struct inside it. So the completion signal is `Drop`, on [`Job`], and it
 //! fires on the empty jar too. See [`Job::drop`].
 //!
+//! Measured 2026-08-07 with the plausible wrong signal in place of the `Drop`: a jar with one
+//! cookie in it rendered, and deleting that cookie left the page frozen on the pre-delete rows
+//! forever — the re-list found nothing, `visit` was never called, and nothing ever answered. The
+//! debug listing printed no line at all for the same reason. Restored, the same run reads
+//! `visit finished: 0 rows, 0 deleted, visit() ran on []`.
+//!
+//! **Which thread the visitor runs on is measured, not assumed.** `cef_cookie_capi.h:143` says the
+//! visitor's functions "will always be called on the UI thread", and that is one of the claims
+//! CEF-NOTES trap 15 exists because of — `get_content_setting` does not fail on the wrong thread,
+//! it answers `default`. So `visit` asks `currently_on` and `BRU_DEBUG_COOKIES=1` prints the
+//! answer: `visit() ran on [UI]`, every time, whether the walk was started from a query handler or
+//! from a posted task. It is **not** the IO thread, which is where a scheme handler runs and where
+//! anyone reading `chrome.rs` would expect this to be too.
+//!
 //! **3. `delete_cookies(url, name)` is the wrong tool for a row on a page.** It is documented in
 //! terms of *hosts* and *domains* — "if only |url| is specified all host cookies (but not domain
 //! cookies) irrespective of path will be deleted" — so deleting the one row a person is pointing at
@@ -56,6 +70,17 @@
 //! cookies back is the thing that makes "delete every cookie in the browser" a decision a person
 //! can afford to get wrong. What it does not survive is the process — the stash is memory, and
 //! `Undo` says so on the page.
+//!
+//! ## The address is deliberately bare
+//!
+//! `:cookies mybank.example` does **not** navigate to `bru://chrome/cookies?domain=mybank.example`.
+//! Measured 2026-08-07: load that URL by hand and Chromium's own `Default/History` holds
+//! `bru://chrome/cookies?domain=mybank.example` on disk afterwards — beside `bru://chrome/top.html`
+//! and `bru://chrome/bottom.html`, which it records too. bru's own history never holds any of them
+//! (`data::is_excluded` lists `bru://`), so the leak would have been Chromium's alone, and it would
+//! still have been a record of which bank's cookies someone went looking at. The filter travels
+//! beside the navigation instead, keyed by the window — see [`show`]. What reaches either history
+//! is `bru://chrome/cookies`, which says only that the page was opened.
 
 use cef::wrapper::message_router::BrowserSideCallback;
 use cef::*;
