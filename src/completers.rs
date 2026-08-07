@@ -24,13 +24,18 @@
 //! - **Deleting** — `completionwidget.py:465-471` and the `delete_func` each category is built
 //!   with (`models/miscmodels.py:42-56`, `models/urlmodel.py:14-28`).
 //!
-//! ## Two things here are deliberately not qutebrowser's
+//! ## Three things here are deliberately not qutebrowser's
 //!
-//! 1. **`completion.quick` is not implemented.** qutebrowser applies a lone match immediately,
+//! 1. **`/` and `?` complete.** qutebrowser refuses them — `completer.py:213-219` sets no model for
+//!    any prefix but `:`, over a comment reading "FIXME complete searches" and its issue #32 — and
+//!    bru offers what has been searched for before. Asked for by the user on 2026-08-07. The store
+//!    is `src/find.rs`'s and the reasoning for its shape is there; what is here is the branch in
+//!    [`partition`] that used to be the refusal.
+//! 2. **`completion.quick` is not implemented.** qutebrowser applies a lone match immediately,
 //!    with a trailing space, and moves on to the next argument (`completer.py:172-186`). It reads
 //!    as the line typing ahead of you and it depends on a per-command `maxsplit` bru's parser does
 //!    not expose; a selection here always waits to be accepted.
-//! 2. **The caret lands at the end of the line**, not at the end of the completed part. bru's
+//! 3. **The caret lands at the end of the line**, not at the end of the completed part. bru's
 //!    command line has one public setter and it puts the cursor at the end (`cmdline::set_text`).
 //!    It only shows when something follows the completed part, which no default binding produces —
 //!    `cmdline::set_text_at(text, cursor)` is the two lines that would close it.
@@ -533,25 +538,39 @@ const COMMAND_WIDTHS: &[u8] = &[20, 60, 20];
 /// is the binding table itself, so a rebind invalidates it without anything having to remember to:
 /// `Bindings::all()` costs 0.53 ms of that 1.46 and comparing two of them is a memcmp.
 ///
+/// What a keystroke costs with the cache warm, measured the same day and the same way: **0.89 ms**
+/// for the whole list and **2.3 ms** once a pattern is filtering it — the second is larger because
+/// a filter makes `list_matches` fold all three columns of all 166 rows instead of short-circuiting
+/// on the first. The settings model beside it is 0.30 ms. **None of this is on the key path**: the
+/// completion is built when the text of a command line changes, and `j` in normal mode reads an
+/// atomic in 0.3 ns and never comes near here.
+///
 /// Before `BruState` exists — a unit test, or a renderer process — the defaults are the truth, the
 /// same fallback `hints.rs` and `prompt.rs` take.
 fn command_rows() -> Vec<Vec<String>> {
     static CACHE: Mutex<Option<(Vec<(Mode, String, String)>, Vec<Vec<String>>)>> = Mutex::new(None);
+    // `Bindings::defaults` builds the whole 298-row table from its source text every call, which is
+    // most of a millisecond; the live one is already built and is only cloned. Neither is worth
+    // paying twice, so the fallback is built once as well.
+    static DEFAULTS: std::sync::OnceLock<crate::config::Bindings> = std::sync::OnceLock::new();
 
-    let bindings = crate::state::BruState::instance()
-        .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()))
-        .unwrap_or_else(crate::config::Bindings::defaults);
+    let live = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()));
+    let bindings = match &live {
+        Some(bindings) => bindings,
+        None => DEFAULTS.get_or_init(crate::config::Bindings::defaults),
+    };
     let key = bindings.all();
 
     let Ok(mut cache) = CACHE.lock() else {
-        return crate::help::completion_rows(&bindings);
+        return crate::help::completion_rows(bindings);
     };
     if let Some((known, rows)) = cache.as_ref() {
         if *known == key {
             return rows.clone();
         }
     }
-    let rows = crate::help::completion_rows(&bindings);
+    let rows = crate::help::completion_rows(bindings);
     *cache = Some((key, rows.clone()));
     rows
 }
