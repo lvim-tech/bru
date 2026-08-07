@@ -377,7 +377,7 @@ mod tests {
         // Nor are the four insert-mode settings: they are bru's own and always in force. Their
         // rows are the only `true`/`false` cells on the page, which is what this counts.
         assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 3);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 4);
     }
 
     /// **A dict is not one line, and this is what the value column does about it.** One row per

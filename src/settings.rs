@@ -298,7 +298,7 @@ pub static SEARCH_ENGINES: DictShape = DictShape {
 
 /// Every setting bru has, and nothing else.
 ///
-/// The list is short on purpose: bru has ten, because ten is how many it can currently change the
+/// The list is short on purpose: bru has eleven, because eleven is how many it can currently change the
 /// behaviour of. Adding a name here without adding the
 /// behaviour behind it would make `:set` a place where things are typed and forgotten.
 ///
@@ -342,6 +342,16 @@ pub const SETTINGS: &[Def] = &[
         name: "url.searchengines",
         kind: Kind::Dict(&SEARCH_ENGINES),
         default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::SearchEngines,
+    },
+    Def {
+        // What a lone engine name means: `aw` is the Arch wiki's front page with this on, and a
+        // search for the word "aw" with it off. qutebrowser ships it off (configdata.yml:2583);
+        // bru ships it on, asked for by the user 2026-08-07 — and bru owns its own defaults.
+        name: "url.open_base_url",
+        kind: Kind::Bool,
+        default: Some("true"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::SearchEngines,
     },
@@ -1554,7 +1564,7 @@ mod tests {
         // `input.insert_mode.*` that `focus.rs` reads, and the two dictionaries —
         // `statusbar.mode.labels` and `url.searchengines`. Raise this with the setting, never to
         // make a failing build pass.
-        assert_eq!(SETTINGS.len(), 10);
+        assert_eq!(SETTINGS.len(), 11);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

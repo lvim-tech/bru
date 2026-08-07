@@ -196,6 +196,11 @@ impl SearchEngines {
     /// The URL `engine` gives for `term`, or `None` if there is no such engine.
     pub fn search_url(&self, engine: &str, term: &str) -> Option<String> {
         let template = self.get(engine)?;
+        // No term: the engine's front page rather than a search for nothing. `parse_search_term`
+        // only ever hands an empty term over when `url.open_base_url` is on.
+        if term.is_empty() {
+            return Some(base_of(template));
+        }
         // The template was checked when it went in, so this cannot fail; if it somehow does, a
         // search that does nothing is better than a panic in a browser.
         format_template(template, term).ok()
@@ -207,8 +212,13 @@ impl SearchEngines {
 /// `("ddg", "python dict")` when the first word names an engine, `(DEFAULT, whole string)` when it
 /// does not — **DECISIONS item 4**. `None` for a string with nothing in it.
 ///
-/// `url.open_base_url` (configdata.yml :2583, default false) is not implemented: a lone `ddg` is a
-/// search for the word "ddg", not DuckDuckGo's front page. Adding it is one branch here.
+/// `url.open_base_url` decides what a lone engine name means: with it on, `aw` is the Arch wiki's
+/// front page; with it off, it is a search for the word "aw". An empty term is the signal, which is
+/// why this returns one rather than resolving here.
+///
+/// **bru ships it on, where qutebrowser ships it off** (configdata.yml :2583). Asked for by the
+/// user 2026-08-07, and bru owns its own defaults — see the correction at the head of
+/// `DECISIONS.md`. `bru.set("url.open_base_url", false)` puts it back.
 fn parse_search_term<'a>(s: &'a str, engines: &SearchEngines) -> Option<(String, &'a str)> {
     let s = s.trim();
     if s.is_empty() {
@@ -218,8 +228,32 @@ fn parse_search_term<'a>(s: &'a str, engines: &SearchEngines) -> Option<(String,
         Some((first, rest)) if engines.contains(first) => {
             Some((first.to_string(), rest.trim_start()))
         }
+        // A whole string that is nothing but an engine's name.
+        None if crate::settings::is_on("url.open_base_url") && engines.contains(s) => {
+            Some((s.to_string(), ""))
+        }
         _ => Some((DEFAULT_ENGINE.to_string(), s)),
     }
+}
+
+/// The engine's own front page: its template with the path, the query and the fragment taken off.
+///
+/// qutebrowser does exactly this — `urlutils.py:172-176` builds the URL from the template and then
+/// `setPath`/`setFragment`/`setQuery` to nothing — so `https://wiki.archlinux.org/?search={}` opens
+/// `https://wiki.archlinux.org/` and not a search for an empty string, which most engines answer
+/// with an error page.
+fn base_of(template: &str) -> String {
+    let (scheme, rest) = match template.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        // No scheme to keep: take everything up to the first separator and hope, which is what a
+        // template without one deserves.
+        None => ("https", template),
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest);
+    format!("{scheme}://{host}/")
 }
 
 /// Python's `str.format` as far as a search template uses it.
@@ -993,14 +1027,15 @@ mod tests {
                 url: "https://duckduckgo.com/?q=nosuchengine%20rust%20cef".to_string(),
             })
         );
-        // An engine name on its own is a search for that word — url.open_base_url is false, as in
-        // qutebrowser.
+        // An engine name on its own is that engine's front page, because bru ships
+        // `url.open_base_url` on where qutebrowser ships it off. The term is empty and
+        // `search_url` turns that into the base — see `base_of`.
         assert_eq!(
             decide_nofs("ddg"),
             Some(Target::Search {
-                engine: "DEFAULT".to_string(),
-                term: "ddg".to_string(),
-                url: "https://duckduckgo.com/?q=ddg".to_string(),
+                engine: "ddg".to_string(),
+                term: String::new(),
+                url: "https://duckduckgo.com/".to_string(),
             })
         );
     }
