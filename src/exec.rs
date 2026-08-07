@@ -344,7 +344,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 crate::ipc::set_mode(mode.name().to_string());
                 // --- src/caret.rs -----------------------------------------------------------
                 let now = state.lock().expect("state mutex poisoned").mode();
-                crate::caret::on_mode_change(browser, before, now);
+                crate::caret::on_mode_change(state, browser, before, now);
                 // --- end src/caret.rs -------------------------------------------------------
             }
         }
@@ -358,7 +358,9 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 drop(guard);
                 crate::ipc::set_mode(now.name().to_string());
                 // --- src/caret.rs -----------------------------------------------------------
-                crate::caret::on_mode_change(browser, before, now);
+                // `state` as well as `browser`, so caret mode can name the window this browser is
+                // in: its session belongs to one window now, the way the mode already does.
+                crate::caret::on_mode_change(state, browser, before, now);
                 // --- end src/caret.rs -------------------------------------------------------
                 // Leaving insert mode should also give the page's text field up, or the next `j`
                 // is typed into it rather than scrolling.

@@ -18,7 +18,8 @@
 //!   from that session's browser, and only carrying the token that session minted.
 
 use cef::*;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use crate::bindings::{BindingTrie, Key, KeyInfo, Match, NamedKey};
 use crate::modes::Mode;
@@ -147,6 +148,10 @@ impl Target {
 struct Session {
     /// The tab this belongs to. A hint session survives no tab switch — checked on every answer
     /// and on every key.
+    ///
+    /// Still here now that the sessions are keyed by *window*, and it is not redundant: a window has
+    /// many tabs and a session belongs to exactly one of them. The window says which session a key
+    /// is about; this says whether the key reached the tab the labels are drawn on.
     browser_id: i32,
     group: Group,
     target: Target,
@@ -180,9 +185,40 @@ struct Session {
     started: std::time::Instant,
 }
 
-fn session() -> &'static Mutex<Option<Session>> {
-    static SESSION: Mutex<Option<Session>> = Mutex::new(None);
-    &SESSION
+/// Every open hint session, keyed by the window it belongs to.
+///
+/// **One per window, because that is where qutebrowser puts it.** `HintManager` is constructed
+/// inside `modeman.init(win_id)` and registered `objreg.register('hintmanager', …, scope='window')`
+/// (`keyinput/modeman.py:76-79`); every `hint` command is `@cmdutils.register(instance='hintmanager',
+/// scope='window')` (`hints.py:660`). The comment at `hints.py:1025` still says "we have one
+/// HintManager per tab" and has been wrong since that registration moved — read the registration,
+/// not the comment.
+///
+/// bru had one `Mutex<Option<Session>>` for the process. That was invisible while everything else
+/// was process-wide too, and stopped being so when the mode became one window's: pressing `f` in a
+/// second window evicted the first window's session and left the first window sitting in hint mode
+/// with nothing behind it.
+///
+/// Keyed by window and **not** by browser on purpose. A window hints one tab at a time — one
+/// `HintContext` per `HintManager` — so `f` in another tab of the same window replaces the session
+/// rather than adding a second. [`Session::browser_id`] is what tells those two tabs apart.
+fn sessions() -> &'static Mutex<HashMap<u32, Session>> {
+    static SESSIONS: LazyLock<Mutex<HashMap<u32, Session>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &SESSIONS
+}
+
+/// The window a browser is in, or `None` for a browser bru never put in one.
+///
+/// Every entry point into this file has a `Browser` and has to turn it into the key of the map
+/// above. It is a linear walk of the window list (`BruState::window_of_browser`), which is why
+/// [`handle_key`] does not call it until it already knows a session exists somewhere.
+fn window_of(state: &SharedState, browser: &mut Browser) -> Option<u32> {
+    let id = browser.identifier();
+    state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_of_browser(id)
 }
 
 /// `BRU_DEBUG_HINTS=1` traces the labels and the keys that reach hint mode. Off by default: the
@@ -299,29 +335,48 @@ pub fn start(
         eprintln!("bru: rapid hinting makes no sense with target {}", target.describe());
         return;
     }
+    let Some(window) = window_of(state, browser) else {
+        eprintln!("bru: hint: this tab is in no window");
+        return;
+    };
     let Some(frame) = browser.main_frame() else {
         return;
     };
     let token = mint_token();
+    let commands = hint_mode_bindings(state);
+    let live = state.lock().expect("state mutex poisoned").window_ids();
 
-    // Whatever session was open is replaced. Its labels come off this page in `collect`, which
-    // begins with the script's own `clear()`; on any other page they went when it was navigated.
-    *session().lock().expect("hint session mutex poisoned") = Some(Session {
-        browser_id: browser.identifier(),
-        group,
-        target,
-        rapid,
-        first,
-        first_run: true,
-        token: token.clone(),
-        points: Vec::new(),
-        labels: Vec::new(),
-        trie: BindingTrie::new(),
-        commands: hint_mode_bindings(state),
-        command_sequence: Vec::new(),
-        sequence: Vec::new(),
-        started: std::time::Instant::now(),
-    });
+    // Whatever session **this window** had is replaced, and no other window's is touched. Its labels
+    // come off this page in `collect`, which begins with the script's own `clear()`; on any other
+    // page they went when it was navigated.
+    {
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        // A closed window takes its mode with it (`BruState::forget_window`) and nothing tells this
+        // file, so the map is swept here instead of hooking `on_before_close` in `keys.rs` for a few
+        // hundred bytes. Nothing depends on the sweep for correctness — a session whose window is
+        // gone can never be reached by a key, because `window_of_browser` cannot name that window
+        // again — so this is only about not holding a page's coordinates for the life of the process.
+        guard.retain(|window, _| live.contains(window));
+        guard.insert(
+            window,
+            Session {
+                browser_id: browser.identifier(),
+                group,
+                target,
+                rapid,
+                first,
+                first_run: true,
+                token: token.clone(),
+                points: Vec::new(),
+                labels: Vec::new(),
+                trie: BindingTrie::new(),
+                commands,
+                command_sequence: Vec::new(),
+                sequence: Vec::new(),
+                started: std::time::Instant::now(),
+            },
+        );
+    }
 
     // The script is injected on every `f` rather than once per page load: a navigation throws the
     // world away, and there is no cheap way to know from here whether this one still has it.
@@ -363,13 +418,27 @@ fn hint_mode_bindings(state: &SharedState) -> BindingTrie<crate::commands::Comma
     trie
 }
 
-/// `<Escape>` in hint mode, and every path that ends a session.
+/// `<Escape>` in hint mode, and every path that ends a session: the one belonging to the window
+/// `browser` is in.
 pub fn cancel(state: &SharedState, browser: &mut Browser) {
-    let had = session().lock().expect("hint session mutex poisoned").take().is_some();
+    let Some(window) = window_of(state, browser) else {
+        return;
+    };
+    cancel_in(state, window, browser);
+}
+
+/// The same with the window already in hand, which is what [`handle_key`] has by the time it gets
+/// to `<Escape>`.
+fn cancel_in(state: &SharedState, window: u32, browser: &mut Browser) {
+    let had = sessions()
+        .lock()
+        .expect("hint sessions mutex poisoned")
+        .remove(&window)
+        .is_some();
     if had {
         clear_labels(browser);
     }
-    leave_mode(state);
+    leave_mode(state, window);
 }
 
 /// Take the labels off the page. Sent as its own script so that it runs even when the session is
@@ -387,17 +456,21 @@ fn clear_labels(browser: &mut Browser) {
     );
 }
 
-fn leave_mode(state: &SharedState) {
+/// Leave hint mode **in one window**, and tell that window's bar.
+///
+/// Named rather than current throughout, because the whole point of `;R` is that the key ending a
+/// session can arrive at a different window from the one holding it.
+fn leave_mode(state: &SharedState, window: u32) {
     let now = {
         let mut guard = state.lock().expect("state mutex poisoned");
-        if guard.mode() != Mode::Hint {
+        if guard.mode_in(window) != Mode::Hint {
             return;
         }
-        guard.leave_mode();
-        guard.mode()
+        guard.leave_mode_in(window);
+        guard.mode_in(window)
     };
-    crate::ipc::set_mode(now.name().to_string());
-    crate::ipc::set_keystring(String::new());
+    crate::ipc::set_mode_for(window, now.name().to_string());
+    crate::ipc::set_keystring_for(window, String::new());
 }
 
 /// A token no page can guess, so that the only `hints` answer bru believes is the one it asked for.
@@ -423,8 +496,12 @@ fn mint_token() -> String {
 /// and it is the only thing a page may say to bru.
 ///
 /// Returns false for anything that is not an answer to a session bru started, which `ipc.rs` turns
-/// into a failed query. Three things have to line up: a session is open, it belongs to the browser
-/// the query came from, and it carries the token bru minted for it.
+/// into a failed query. Three things have to line up: a session is open **in the window this page is
+/// in**, it belongs to the browser the query came from, and it carries the token bru minted for it.
+///
+/// The window is the new part and it costs nothing in safety: the browser check alone was already
+/// enough to refuse another tab's page. It is what says *which* session the answer is for, now that
+/// two can be open at once.
 pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
     let Some(browser) = browser else {
         return false;
@@ -438,9 +515,20 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
         return false;
     };
 
+    let Some(state) = BruState::instance() else {
+        return false;
+    };
+    let Some(window) = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_of_browser(id)
+    else {
+        return false;
+    };
+
     {
-        let guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_ref() else {
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let Some(open) = guard.get(&window) else {
             return false;
         };
         if open.browser_id != id || open.token != token {
@@ -448,21 +536,18 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
         }
     }
 
-    let Some(state) = BruState::instance() else {
-        return false;
-    };
     let mut browser = browser.clone();
 
     match kind.as_str() {
-        "elems" => on_collected(&state, &mut browser, &data),
-        "href" => on_href(&state, &mut browser, &data),
+        "elems" => on_collected(&state, window, &mut browser, &data),
+        "href" => on_href(&state, window, &mut browser, &data),
         _ => return false,
     }
     true
 }
 
 /// The page has reported its hintable elements. Generate the labels, draw them, enter hint mode.
-fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
+fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &str) {
     let points: Vec<(i32, i32)> = data
         .split('|')
         .filter(|part| !part.is_empty())
@@ -475,15 +560,19 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         .collect();
 
     let (elapsed, group, describe) = {
-        let guard = session().lock().expect("hint session mutex poisoned");
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let open = guard.get(&window);
         (
-            guard.as_ref().map(|s| s.started.elapsed()),
-            guard.as_ref().map(|s| s.group.name()).unwrap_or("?"),
-            guard.as_ref().map(|s| s.target.describe()).unwrap_or("?"),
+            open.map(|s| s.started.elapsed()),
+            open.map(|s| s.group.name()).unwrap_or("?"),
+            open.map(|s| s.target.describe()).unwrap_or("?"),
         )
     };
+    // The window is in the line because two of these can now be interleaved on one terminal, and
+    // "33 elements" twice says nothing about which page answered.
     eprintln!(
-        "bru[hints]: group {group}: {} elements in {:.1} ms ({} bytes of payload) — {describe}",
+        "bru[hints]: window {window} group {group}: {} elements in {:.1} ms \
+         ({} bytes of payload) — {describe}",
         points.len(),
         elapsed.map(|e| e.as_secs_f64() * 1000.0).unwrap_or(0.0),
         data.len(),
@@ -491,7 +580,10 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
 
     if points.is_empty() {
         // qutebrowser: message.error("No elements found."), and no mode change.
-        *session().lock().expect("hint session mutex poisoned") = None;
+        sessions()
+            .lock()
+            .expect("hint sessions mutex poisoned")
+            .remove(&window);
         eprintln!("bru: no hintable elements found");
         return;
     }
@@ -508,8 +600,8 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
     }
 
     let first = {
-        let mut guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_mut() else {
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let Some(open) = guard.get_mut(&window) else {
             return;
         };
         open.points = points;
@@ -519,7 +611,7 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         open.first
     };
 
-    debug(&format!("labels {}", labels.join(" ")));
+    debug(&format!("window {window} labels {}", labels.join(" ")));
 
     let list = labels
         .iter()
@@ -531,28 +623,35 @@ fn on_collected(state: &SharedState, browser: &mut Browser, data: &str) {
         &format!("window.__bru_hints.show([{list}],{});", label_style_json()),
     );
 
+    // Hint mode is entered in the window whose page answered, **by name**. It used to be
+    // `enter_mode`, i.e. the current one, which was the same thing while a session was — and stopped
+    // being so the moment a second window could hint: a page that answers a moment after the user
+    // has clicked into the other window would have put *that* window into hint mode, with no session
+    // behind it and the labels drawn somewhere else.
     let entered = state
         .lock()
         .expect("state mutex poisoned")
-        .enter_mode(Mode::Hint, false);
+        .enter_mode_in(window, Mode::Hint, false);
     if entered {
-        crate::ipc::set_mode(Mode::Hint.name().to_string());
-        crate::ipc::set_keystring(String::new());
+        crate::ipc::set_mode_for(window, Mode::Hint.name().to_string());
+        crate::ipc::set_keystring_for(window, String::new());
     }
 
     // `--first` (`gi`): follow element 0 without waiting for a key. `hints.py:_start_cb` fires
     // `strings[0]`, which is the label of the *first element* — the labels are scattered, so the
     // index is 0 and the label is not necessarily "a".
     if first {
-        follow(state, browser, 0);
+        follow(state, window, browser, 0);
     }
 }
 
 /// The page has reported the URL behind a followed hint — every target except `normal` and `hover`.
-fn on_href(state: &SharedState, browser: &mut Browser, url: &str) {
+fn on_href(state: &SharedState, window: u32, browser: &mut Browser, url: &str) {
     let Some((target, rapid, first_run)) = ({
-        let guard = session().lock().expect("hint session mutex poisoned");
-        guard.as_ref().map(|s| (s.target.clone(), s.rapid, s.first_run))
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        guard
+            .get(&window)
+            .map(|s| (s.target.clone(), s.rapid, s.first_run))
     }) else {
         return;
     };
@@ -561,7 +660,7 @@ fn on_href(state: &SharedState, browser: &mut Browser, url: &str) {
     // array along with the labels — it is the teardown, not a repaint — and `href` would then be
     // looking up an index in an empty array. Measured 2026-08-06: clearing first reported no URL
     // for every link on the page.
-    finish(state, browser, rapid);
+    finish(state, window, browser, rapid);
 
     if url.is_empty() {
         eprintln!("bru: no suitable link found for this element");
@@ -582,7 +681,7 @@ fn on_href(state: &SharedState, browser: &mut Browser, url: &str) {
     // let go. Every URL target goes through here, not just the two that navigate: `fill` focuses
     // the bottom chrome and `download` will start a request, and neither is worth a second
     // deadlock to find out about.
-    eprintln!("bru[hints]: {} -> {url}", target.describe());
+    eprintln!("bru[hints]: window {window}: {} -> {url}", target.describe());
     let mut task = FollowUrl::new(target, url.to_string(), first_run);
     post_task(ThreadId::UI, Some(&mut task));
 }
@@ -846,118 +945,111 @@ fn is_safe_colour(value: &str) -> bool {
 /// consumes everything — a key that reached the page here would be typed into whatever the last
 /// click focused.
 pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> Option<bool> {
-    // The mode of the window the **session** is in, not of the window in front.
-    //
-    // These two used to be the same thing. Two workstreams landed in one round — a `ModeManager`
-    // per window, and `;R` surviving the window it opens — and each is right on its own: asking the
-    // current window is what "the mode" now means, and `;R` deliberately lets a key arrive at a
-    // window that is not the hinting one. Together they cancelled out. Measured on the merge, before
-    // this line: `;R` opened one window and stopped, because the window the follow had just created
-    // was in normal mode and this returned `None` before `Foreign::decide` was ever consulted — the
-    // exact behaviour the `;R` work exists to prevent, reintroduced by a file neither agent shared.
-    let hinting_browser = session()
+    // **The fast path, and the one this file is judged on.** `keys.rs` calls this for every key in
+    // every mode, so what happens when nothing is hinting is what `j` pays for hint mode existing:
+    // one uncontended lock, a `HashMap::is_empty`, and — only if the map is empty — the same indexed
+    // mode read the single session did. `window_of_browser` walks the window list and their tabs, so
+    // it is deliberately below this line and not above it.
+    let hinting_somewhere = !sessions()
         .lock()
-        .expect("hint session mutex poisoned")
-        .as_ref()
-        .map(|open| open.browser_id);
-    let in_hint_mode = {
-        let state = state.lock().expect("state mutex poisoned");
-        match hinting_browser.and_then(|id| state.window_of_browser(id)) {
-            Some(window) => state.mode_in(window) == Mode::Hint,
-            None => state.mode() == Mode::Hint,
+        .expect("hint sessions mutex poisoned")
+        .is_empty();
+    if !hinting_somewhere {
+        // Hint mode with no session **anywhere** is reachable and has to be cleaned up rather than
+        // sat in: `mode-enter` takes any mode name (`commands.rs`, `Mode::from_name`), so
+        // `:mode-enter hint` puts a window into hint mode with nothing behind it. `Mode::Hint`
+        // swallows what it cannot match, so leaving it alone would trap the keyboard until
+        // `<Escape>`. Leave the mode and answer `None`; the key goes on to be the ordinary key it is.
+        let window = {
+            let guard = state.lock().expect("state mutex poisoned");
+            (guard.mode() == Mode::Hint).then(|| guard.current_window_id()).flatten()
+        };
+        if let Some(window) = window {
+            leave_mode(state, window);
         }
-    };
-    if !in_hint_mode {
         return None;
     }
-    debug(&format!("key {info}"));
 
-    // A session belongs to one tab, and `--rapid` is the first thing that can outlive a tab switch.
-    // If the key arrived at a different browser the labels are usually on a page nobody is looking
-    // at, and matching against them would follow a link the user cannot see. End the session and
-    // answer `None`, so `keys.rs` treats this as the ordinary key it now is.
-    //
-    // (The stale labels stay on the other tab until its next `collect`, which begins with `clear`,
-    // or until it navigates. Reaching across to remove them would mean holding that tab's `Browser`
-    // for the length of the session, and a live reference is what stops a tab from closing —
-    // CEF-NOTES, Tabs.)
-    //
-    // **`;R` is the one session that has to survive it, and the reason is the session's own doing.**
-    // `hint --rapid links window` opens a window per follow; a new toplevel takes the compositor's
-    // keyboard focus, so the second label of every rapid window session is delivered to the window
-    // the *first* one made. Ending on that is `;f` with extra steps — measured 2026-08-06, and both
-    // the plain change and a focus-back from the follow task are in the report. So for that one
-    // combination the key is aimed back at the browser the labels are drawn on, which is the same
-    // decision `keys.rs` already makes for a key that lands on a chrome strip (CEF-NOTES trap 11).
-    // `<Escape>` below is aimed there too, so the session is still one key from over.
-    let foreign = {
-        let guard = session().lock().expect("hint session mutex poisoned");
-        match guard.as_ref() {
-            None => Foreign::Same,
-            Some(open) => Foreign::decide(
-                open.browser_id,
-                browser.identifier(),
-                open.rapid,
-                &open.target,
-            ),
-        }
+    // Something is hinting. Now it is worth asking which window this key arrived at — `keys.rs` has
+    // already made that window current, so this is the same window `BruState::mode` would answer
+    // for, asked by browser because that is the fact the decision below is about.
+    let key_browser = browser.identifier();
+    let (key_window, key_window_in_hint_mode, open) = {
+        let guard = state.lock().expect("state mutex poisoned");
+        let Some(key_window) = guard.window_of_browser(key_browser) else {
+            // A browser bru never put in a window. There is nothing to route.
+            return None;
+        };
+        let sessions = sessions().lock().expect("hint sessions mutex poisoned");
+        let open: Vec<Open> = sessions
+            .iter()
+            .map(|(window, session)| Open {
+                window: *window,
+                browser: session.browser_id,
+                in_hint_mode: guard.mode_in(*window) == Mode::Hint,
+                rapid_window: session.rapid && session.target == Target::Window,
+            })
+            .collect();
+        (key_window, guard.mode_in(key_window) == Mode::Hint, open)
     };
+
+    let foreign = Foreign::decide(key_window, key_browser, key_window_in_hint_mode, &open);
+    if foreign != Foreign::Ordinary {
+        debug(&format!("key {info} at window {key_window} -> {foreign:?}"));
+    }
+
     // Declared out here and filled in one arm, so that the `Browser` the `&mut` points at outlives
     // the match. Holding it is also what stops that tab from closing for the length of this call
     // (CEF-NOTES, Tabs) — one keystroke, and never across the session.
     let mut hinting;
-    let browser: &mut Browser = match foreign {
-        Foreign::Same => browser,
-        Foreign::End => {
-            *session().lock().expect("hint session mutex poisoned") = None;
-            leave_mode(state);
+    let (window, browser): (u32, &mut Browser) = match foreign {
+        Foreign::Ordinary => return None,
+        // In hint mode with nothing behind it — see the `:mode-enter hint` note above. Reached here
+        // rather than in the fast path when some *other* window is hinting.
+        Foreign::StaleMode(window) => {
+            leave_mode(state, window);
             return None;
         }
-        Foreign::AimBack(id) => {
+        Foreign::End(window) => {
+            sessions()
+                .lock()
+                .expect("hint sessions mutex poisoned")
+                .remove(&window);
+            leave_mode(state, window);
+            return None;
+        }
+        Foreign::Same(window) => (window, browser),
+        Foreign::AimBack(window, id) => {
             let found = state.lock().expect("state mutex poisoned").browser_with_id(id);
             match found {
                 Some(found) => {
-                    debug(&format!("key aimed back at browser {id} for a rapid window session"));
                     hinting = found;
-                    &mut hinting
+                    (window, &mut hinting)
                 }
                 // The hinting tab has gone since the last follow. Nothing to draw on and nothing to
                 // click; this is the ordinary stale case after all.
                 None => {
-                    *session().lock().expect("hint session mutex poisoned") = None;
-                    leave_mode(state);
+                    sessions()
+                        .lock()
+                        .expect("hint sessions mutex poisoned")
+                        .remove(&window);
+                    leave_mode(state, window);
                     return None;
                 }
             }
         }
     };
 
-// --- per-window mode -----------------------------------------------------------------------
-    // Hint mode with **no** session at all, which is the other half of the same question now that
-    // a mode belongs to one window: there is one `SESSION` for the process, so `f` in a second
-    // window replaces the first window's, and the first window is then left in hint mode with
-    // nothing behind it. The old answer was further down — "nothing can match, and the keys must
-    // not reach the page", i.e. swallow everything until `<Escape>` — and while the mode was
-    // process-wide that state could not last, because the other window's next key left hint mode
-    // for both. It can last now. So it is ended here instead: leave the mode and answer `None`, and
-    // the key goes on to be the ordinary key it is.
-    let sessionless = session()
-        .lock()
-        .expect("hint session mutex poisoned")
-        .is_none();
-    if sessionless {
-        leave_mode(state);
-        return None;
-    }
-// --- end per-window mode -------------------------------------------------------------------
-
     // `<Escape>` is `mode-leave` in the `hint:` table, and it is taken *before* that table rather
     // than through it: `exec`'s `mode-leave` knows how to leave a mode and nothing about a hint
     // session, so running it would leave the labels drawn over the page and the session open behind
     // them. qutebrowser does not need the special case because `HintManager.on_mode_left` is wired
     // to the mode manager's signal; bru has no such signal, and one function is cheaper than one.
+    //
+    // Aimed at the session's window, so `<Escape>` ends a `;R` from whichever window its own follows
+    // have moved the focus to — the session is still one key from over.
     if info.key == Key::Named(NamedKey::Escape) {
-        cancel(state, browser);
+        cancel_in(state, window, browser);
         return Some(true);
     }
 
@@ -967,8 +1059,8 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
     // work from inside hint mode. Hint labels are spelled out of `hints.chars`, so nothing here can
     // shadow a label.
     let binding = {
-        let mut guard = session().lock().expect("hint session mutex poisoned");
-        match guard.as_mut() {
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        match guard.get_mut(&window) {
             None => crate::bindings::MatchType::NoMatch,
             Some(open) => {
                 open.command_sequence.push(info);
@@ -997,23 +1089,27 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
 
     // `HintKeyParser._handle_filter_key`: backspace walks the chain back rather than clearing it.
     if info.key == Key::Named(NamedKey::Backspace) {
-        let mut guard = session().lock().expect("hint session mutex poisoned");
-        if let Some(open) = guard.as_mut() {
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        if let Some(open) = guard.get_mut(&window) {
             open.sequence.pop();
         }
         drop(guard);
         // Backspacing can leave one label showing as easily as typing forwards can, and
         // qutebrowser fires `_handle_auto_follow` from the same `handle_partial_key` either way.
-        if let Some(index) = redraw(browser) {
-            follow(state, browser, index);
+        if let Some(index) = redraw(window, browser) {
+            follow(state, window, browser, index);
         }
         return Some(true);
     }
 
     let outcome = {
-        let mut guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_mut() else {
-            // In hint mode with no session: nothing can match, and the keys must not reach the page.
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let Some(open) = guard.get_mut(&window) else {
+            // Unreachable: `Foreign::decide` saw this session a few statements ago, and the only
+            // paths between here and there that can remove one — `cancel_in` and the command trie's
+            // `exec::run` — both `return` before reaching this. It is a `return` and not an `expect`
+            // because a panic inside `on_pre_key_event` takes the browser with it, and hint mode
+            // swallows a key it cannot match either way.
             return Some(true);
         };
         open.sequence.push(info);
@@ -1030,12 +1126,12 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
     };
 
     match outcome {
-        Outcome::Follow(index) => follow(state, browser, index),
+        Outcome::Follow(index) => follow(state, window, browser, index),
         // `hints.auto_follow` is asked here rather than only on an exact match — see [`auto_follow`]
         // for what the difference is and for the measurement that says it is nothing today.
         Outcome::Pending | Outcome::NoMatch => {
-            if let Some(index) = redraw(browser) {
-                follow(state, browser, index);
+            if let Some(index) = redraw(window, browser) {
+                follow(state, window, browser, index);
             }
         }
     }
@@ -1048,27 +1144,100 @@ enum Outcome {
     NoMatch,
 }
 
-/// Where a key that reached hint mode should be acted on — see the block in [`handle_key`].
+/// One open session, reduced to the four facts [`Foreign::decide`] needs. Built in [`handle_key`]
+/// from the map and the mode manager, so that the rule itself has no CEF in it and can be asserted
+/// in a unit test — `handle_key` posts tasks and cannot be called from one (CEF-NOTES trap 13).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Open {
+    window: u32,
+    browser: i32,
+    /// Whether that window is actually in hint mode. It is not between `f` and the page's answer:
+    /// `start` makes the session and `on_collected` enters the mode, which is what stops `f` on a
+    /// blank page from trapping the keyboard.
+    in_hint_mode: bool,
+    /// `hint --rapid links window`, and nothing else. The one session whose own follows move the
+    /// compositor's focus to a window it does not live in.
+    rapid_window: bool,
+}
+
+/// Where a key that reached [`handle_key`] should be acted on.
+///
+/// **"Foreign" means something different now that a session belongs to a window.** It used to mean
+/// "the key arrived at a browser that is not the session's", with one session for the process to
+/// compare against. A key arriving at window B while window B has its own session is not foreign at
+/// all, and the interesting question moved up a level: which of the open sessions, if any, is this
+/// key about?
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Foreign {
-    /// It arrived at the browser the labels are on.
-    Same,
-    /// It arrived somewhere else, and the session goes.
-    End,
-    /// It arrived somewhere else because the session put it there. Aim it at this browser.
-    AimBack(i32),
+    /// Nothing here is hint mode's. `keys.rs` carries on to the ordinary parser.
+    Ordinary,
+    /// This window is in hint mode with no session behind it. Leave the mode and pass the key on.
+    StaleMode(u32),
+    /// This window's session is on another of its tabs. Drop it and pass the key on.
+    End(u32),
+    /// Act on this window's own session, at the browser the key arrived at.
+    Same(u32),
+    /// Act on **another** window's session, at that window's hinting browser — the key is only here
+    /// because that session's own follow opened the window it landed in.
+    AimBack(u32, i32),
 }
 
 impl Foreign {
-    /// The rule, with no CEF in it, so that it can be asserted in a unit test — `handle_key` posts
-    /// tasks and cannot be called from one (CEF-NOTES trap 13).
-    fn decide(session_browser: i32, key_browser: i32, rapid: bool, target: &Target) -> Foreign {
-        if session_browser == key_browser {
-            Foreign::Same
-        } else if rapid && *target == Target::Window {
-            Foreign::AimBack(session_browser)
-        } else {
-            Foreign::End
+    /// The rule, with no CEF in it.
+    ///
+    /// Four cases, in the order they are asked:
+    ///
+    /// 1. **This window has a session.** If the key reached the tab the labels are on, act
+    ///    ([`Foreign::Same`]). If it reached another tab of the same window, the labels are on a page
+    ///    nobody is looking at and matching against them would follow a link the user cannot see, so
+    ///    the session goes ([`Foreign::End`]) — a `--rapid` session is the only one that can outlive
+    ///    a tab switch to begin with. If the window is not in hint mode yet, the page has not
+    ///    answered `f` and there is nothing to match: the key is ordinary.
+    /// 2. **This window is in hint mode with no session.** `:mode-enter hint` is a live command and
+    ///    that is what it leaves behind. `Mode::Hint` swallows what it cannot match, so the mode has
+    ///    to be left rather than sat in.
+    /// 3. **No session here, and exactly one rapid-window session elsewhere.** That is `;R`, and it
+    ///    is the whole reason this function is not just "does this window have a session".
+    ///    `hint --rapid links window` opens a window per follow; a new toplevel takes the
+    ///    compositor's keyboard focus, so the second label of every rapid window session is delivered
+    ///    to the window the *first* one made. Measured 2026-08-06 without it: `;R` opened one window
+    ///    and stopped. The key is aimed back at the browser the labels are drawn on, which is the same
+    ///    decision `keys.rs` already makes for a key that lands on a chrome strip (trap 11).
+    /// 4. **Two of those at once.** Refused rather than guessed: nothing in the key says which of the
+    ///    two sessions opened the window it landed in, and picking one would send a keystroke into a
+    ///    page at random. It needs both windows to be running `;R` simultaneously, which needs the
+    ///    second `;R` to have been typed while the first was swallowing keys — so it is a state
+    ///    nobody can reach today, and this is what it does if that ever changes.
+    fn decide(
+        key_window: u32,
+        key_browser: i32,
+        key_window_in_hint_mode: bool,
+        open: &[Open],
+    ) -> Foreign {
+        if let Some(here) = open.iter().find(|session| session.window == key_window) {
+            if !here.in_hint_mode {
+                return Foreign::Ordinary;
+            }
+            return if here.browser == key_browser {
+                Foreign::Same(key_window)
+            } else {
+                Foreign::End(key_window)
+            };
+        }
+
+        // A stale mode is cleaned up before a key is lent to another window's session: the window in
+        // front is the one the user is looking at, and leaving them stuck in a mode nothing can match
+        // is worse than costing `;R` one keystroke.
+        if key_window_in_hint_mode {
+            return Foreign::StaleMode(key_window);
+        }
+
+        let mut rapid = open
+            .iter()
+            .filter(|session| session.rapid_window && session.in_hint_mode);
+        match (rapid.next(), rapid.next()) {
+            (Some(only), None) => Foreign::AimBack(only.window, only.browser),
+            _ => Foreign::Ordinary,
         }
     }
 }
@@ -1111,10 +1280,10 @@ fn auto_follow(visible: &[usize], typed: &str) -> Option<usize> {
 ///
 /// The visible set is computed here, in Rust, and sent as a list of indices. The page is told which
 /// labels to show; it is never asked which ones match, and never which one to follow.
-fn redraw(browser: &mut Browser) -> Option<usize> {
+fn redraw(window: u32, browser: &mut Browser) -> Option<usize> {
     let (keystring, visible, matched_len) = {
-        let guard = session().lock().expect("hint session mutex poisoned");
-        let open = guard.as_ref()?;
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let open = guard.get(&window)?;
         let typed = crate::bindings::sequence_to_string(&open.sequence);
         let visible: Vec<usize> = open
             .labels
@@ -1126,7 +1295,10 @@ fn redraw(browser: &mut Browser) -> Option<usize> {
         (typed.clone(), visible, typed.chars().count())
     };
 
-    crate::ipc::set_keystring(keystring.clone());
+    // The hinting window's bar, not the one in front. During `;R` the key that filtered these labels
+    // arrived at a window the session's own follow opened, and the chain belongs on the bar of the
+    // window whose page is showing them.
+    crate::ipc::set_keystring_for(window, keystring.clone());
     show(
         browser,
         &format!(
@@ -1143,10 +1315,10 @@ fn redraw(browser: &mut Browser) -> Option<usize> {
 
 /// A hint matched. The element's position is enough for `normal` and `hover`; every other target
 /// needs its URL, which only the page can give, so those ask and continue in [`on_href`].
-fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
+fn follow(state: &SharedState, window: u32, browser: &mut Browser, index: usize) {
     let (target, rapid, point, token) = {
-        let guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_ref() else {
+        let guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let Some(open) = guard.get(&window) else {
             return;
         };
         let Some(point) = open.points.get(index).copied() else {
@@ -1168,11 +1340,14 @@ fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
     // qutebrowser leaves hint mode *before* running the handler (`hints.py:_fire`), and so does
     // this: the click that follows may navigate, and a mode left afterwards is a mode left on a
     // page that no longer exists.
-    finish(state, browser, rapid);
+    finish(state, window, browser, rapid);
 
     match target {
         Target::Normal => {
-            eprintln!("bru[hints]: clicking hint {index} at ({}, {})", point.0, point.1);
+            eprintln!(
+                "bru[hints]: window {window} clicking hint {index} at ({}, {})",
+                point.0, point.1
+            );
             click(browser, point.0, point.1);
         }
         // `;h`. qutebrowser calls `elem.hover()`, which dispatches a synthetic `mouseover`; bru
@@ -1180,7 +1355,10 @@ fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
         // synthetic event skips everything that checks `isTrusted`, and a menu that opens on hover
         // is exactly the kind of thing that checks.
         Target::Hover => {
-            eprintln!("bru[hints]: hovering hint {index} at ({}, {})", point.0, point.1);
+            eprintln!(
+                "bru[hints]: window {window} hovering hint {index} at ({}, {})",
+                point.0, point.1
+            );
             hover(browser, point.0, point.1);
         }
         _ => unreachable!("every other target needs a URL and returned above"),
@@ -1192,17 +1370,20 @@ fn follow(state: &SharedState, browser: &mut Browser, index: usize) {
 ///
 /// `hints.py:_fire` again — the rapid branch resets the filter and redraws every label with no
 /// highlighted prefix, which is what lets the next label be typed straight away.
-fn finish(state: &SharedState, browser: &mut Browser, rapid: bool) {
+fn finish(state: &SharedState, window: u32, browser: &mut Browser, rapid: bool) {
     if !rapid {
-        *session().lock().expect("hint session mutex poisoned") = None;
+        sessions()
+            .lock()
+            .expect("hint sessions mutex poisoned")
+            .remove(&window);
         clear_labels(browser);
-        leave_mode(state);
+        leave_mode(state, window);
         return;
     }
 
     {
-        let mut guard = session().lock().expect("hint session mutex poisoned");
-        let Some(open) = guard.as_mut() else {
+        let mut guard = sessions().lock().expect("hint sessions mutex poisoned");
+        let Some(open) = guard.get_mut(&window) else {
             return;
         };
         open.sequence.clear();
@@ -1213,7 +1394,7 @@ fn finish(state: &SharedState, browser: &mut Browser, rapid: bool) {
     // not `unique-match`'s; see [`auto_follow`].
     // (Called for its effect, and bound first: `debug_assert!(redraw(..).is_none())` would put the
     // only call to `redraw` inside a macro that is compiled out of a release build.)
-    let auto = redraw(browser);
+    let auto = redraw(window, browser);
     debug_assert!(auto.is_none(), "a rapid reset must not auto-follow");
 }
 
@@ -1284,7 +1465,13 @@ fn percent_decode(src: &str) -> String {
 /// |---|---|
 /// | `hint …` | any `hint` command string, through the real parser and the real dispatcher |
 /// | `esc` | cancel the session |
+/// | `report` | print every window's session and mode without pressing anything |
 /// | anything else | fed to the key parser one character at a time |
+///
+/// **It aims at `state.active_browser()`, which is the window in front, so it cannot start a session
+/// in a second window on its own.** That is what `--cmd='win1:hint links'` is for, and what
+/// `--cmdline-script='key:win1:a'` is for; `report` is here so the two of them have something that
+/// prints both sessions at once.
 ///
 /// There is deliberately **no `f` shorthand**. `f` is a hint label — `hints.chars` is `asdfghjkl` —
 /// and a step that meant "start hinting" would shadow the fourth label on every page; it did, and
@@ -1320,6 +1507,8 @@ wrap_task! {
 
             match self.step.as_str() {
                 "esc" => cancel(&state, &mut browser),
+                // Nothing pressed; the report below is the whole step.
+                "report" => {}
                 // Collection is a round trip through the page, so there is nothing to report for a
                 // `hint` step here; `on_collected` prints the count and the timing when the answer
                 // lands. The groups and the targets are reached the way a keypress reaches them,
@@ -1362,20 +1551,42 @@ wrap_task! {
             // change and there is otherwise nothing to read: `;f` and `;b` differ only in which
             // tab is active, `wf` and `;f` only in whether a window appeared, and `;h` and `f`
             // only in what the page did about it.
-            let (mode, tabs, active, windows) = {
+            let (tabs, active, windows, modes) = {
                 let guard = state.lock().expect("state mutex poisoned");
-                (guard.mode(), guard.tab_count(), guard.active_tab(), guard.window_count())
+                let modes: Vec<String> = guard
+                    .window_ids()
+                    .into_iter()
+                    .map(|window| format!("win{window} {}", guard.mode_in(window)))
+                    .collect();
+                (guard.tab_count(), guard.active_tab(), guard.window_count(), modes)
             };
-            let guard = session().lock().expect("hint session mutex poisoned");
+            // **Every** window's session, not "the" session. Two of them open at once is the whole
+            // claim this workstream makes, and one line naming only the current window's could not
+            // tell that state from the one it replaced.
+            let open = {
+                let guard = sessions().lock().expect("hint sessions mutex poisoned");
+                let mut windows: Vec<u32> = guard.keys().copied().collect();
+                windows.sort_unstable();
+                windows
+                    .into_iter()
+                    .map(|window| {
+                        let session = &guard[&window];
+                        format!(
+                            "win{window}: {} hints on browser {} chain {:?}{}",
+                            session.labels.len(),
+                            session.browser_id,
+                            crate::bindings::sequence_to_string(&session.sequence),
+                            if session.rapid { " rapid" } else { "" },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
             eprintln!(
-                "hint-script: after {:?} -> mode {mode}, {} hints, chain {:?}, \
+                "hint-script: after {:?} -> modes [{}], sessions [{open}], \
                  tabs={tabs} active={active} windows={windows}, url={}",
                 self.step,
-                guard.as_ref().map(|s| s.labels.len()).unwrap_or(0),
-                guard
-                    .as_ref()
-                    .map(|s| crate::bindings::sequence_to_string(&s.sequence))
-                    .unwrap_or_default(),
+                modes.join(", "),
                 crate::ipc::current_url(),
             );
         }
@@ -1679,7 +1890,52 @@ mod tests {
         }
     }
 
-    /// A key that arrives at the wrong browser ends the session — except for the one session whose
+    /// One window's session, in the window it belongs to.
+    fn open(window: u32, browser: i32) -> Open {
+        Open { window, browser, in_hint_mode: true, rapid_window: false }
+    }
+
+    /// A key that arrives at the wrong tab of the hinting window ends the session; a key that
+    /// arrives at a window with a session of its own is answered by *that* session.
+    ///
+    /// This is the whole per-window rule. Before it, one `SESSION` for the process meant `f` in a
+    /// second window evicted the first window's, and the first window then sat in hint mode with
+    /// nothing behind it.
+    #[test]
+    fn each_window_answers_its_own_key_from_its_own_session() {
+        let both = [open(0, 7), open(1, 9)];
+
+        // Two sessions, two windows, and each key lands on its own.
+        assert_eq!(Foreign::decide(0, 7, true, &both), Foreign::Same(0));
+        assert_eq!(Foreign::decide(1, 9, true, &both), Foreign::Same(1));
+
+        // A key at another *tab* of a hinting window ends that window's session and nobody else's.
+        assert_eq!(Foreign::decide(0, 8, true, &both), Foreign::End(0));
+
+        // A window with no session and not in hint mode is not hint mode's business, however many
+        // other windows are hinting.
+        assert_eq!(Foreign::decide(2, 5, false, &both), Foreign::Ordinary);
+
+        // A session whose page has not answered `f` yet: there is no mode and there are no labels,
+        // so the key is the ordinary key it is.
+        let waiting = [Open { in_hint_mode: false, ..open(0, 7) }];
+        assert_eq!(Foreign::decide(0, 7, false, &waiting), Foreign::Ordinary);
+    }
+
+    /// `:mode-enter hint` is a live command and leaves a window in hint mode with no session. Hint
+    /// mode swallows what it cannot match, so that state has to be left rather than sat in.
+    #[test]
+    fn hint_mode_with_no_session_is_left_rather_than_swallowed() {
+        assert_eq!(Foreign::decide(0, 7, true, &[]), Foreign::StaleMode(0));
+        // And with another window hinting, which is the case the fast path in `handle_key` cannot
+        // answer: the stale window is still the one in front, and it is still cleaned up first.
+        assert_eq!(
+            Foreign::decide(1, 9, true, &[Open { rapid_window: true, ..open(0, 7) }]),
+            Foreign::StaleMode(1)
+        );
+    }
+
+    /// A key that arrives at the wrong *window* ends the session — except for the one session whose
     /// own follows are what sent it there.
     ///
     /// Measured before it was written: with this rule absent, `--hint-script='hint --rapid links
@@ -1687,16 +1943,38 @@ mod tests {
     /// takes the compositor's keyboard focus and `;R` opens one per follow.
     #[test]
     fn only_a_rapid_window_session_survives_the_focus_its_own_follow_moved() {
-        // The ordinary case, and the one the check was written for: a tab switch during `;r`.
-        assert_eq!(Foreign::decide(7, 7, true, &Target::TabBg), Foreign::Same);
-        assert_eq!(Foreign::decide(7, 9, true, &Target::TabBg), Foreign::End);
-        assert_eq!(Foreign::decide(7, 9, false, &Target::Normal), Foreign::End);
-        // `wf` is not rapid: one window, one follow, and the session is over before the key that
-        // would land in the new window is pressed.
-        assert_eq!(Foreign::decide(7, 9, false, &Target::Window), Foreign::End);
-        // `;R`, and only `;R`.
-        assert_eq!(Foreign::decide(7, 9, true, &Target::Window), Foreign::AimBack(7));
-        assert_eq!(Foreign::decide(7, 7, true, &Target::Window), Foreign::Same);
+        // `;R` in window 0, and the key delivered to the window its follow just opened.
+        let rapid = [Open { rapid_window: true, ..open(0, 7) }];
+        assert_eq!(Foreign::decide(1, 9, false, &rapid), Foreign::AimBack(0, 7));
+        // Back in its own window it is an ordinary key of its own session.
+        assert_eq!(Foreign::decide(0, 7, true, &rapid), Foreign::Same(0));
+
+        // `;r` (rapid, but into a background tab) opens no window, so a key that arrives elsewhere
+        // is not its doing and it does not get the key back.
+        let tab_bg = [open(0, 7)];
+        assert_eq!(Foreign::decide(1, 9, false, &tab_bg), Foreign::Ordinary);
+        // Nor does `wf`: one window, one follow, and the session is over before the key that would
+        // land in the new window is pressed — `rapid_window` is false for it by construction.
+        assert_eq!(Foreign::decide(1, 9, false, &[open(0, 7)]), Foreign::Ordinary);
+
+        // A rapid-window session whose own window has left hint mode is over; it does not keep
+        // pulling keys back.
+        let done = [Open { rapid_window: true, in_hint_mode: false, ..open(0, 7) }];
+        assert_eq!(Foreign::decide(1, 9, false, &done), Foreign::Ordinary);
+    }
+
+    /// Two rapid-window sessions and a key in a third window: nothing in the key says which of them
+    /// opened it, so it is refused rather than sent into a page at random.
+    #[test]
+    fn two_rapid_window_sessions_claim_no_key_between_them() {
+        let two = [
+            Open { rapid_window: true, ..open(0, 7) },
+            Open { rapid_window: true, ..open(1, 9) },
+        ];
+        assert_eq!(Foreign::decide(2, 5, false, &two), Foreign::Ordinary);
+        // Each is still answered in its own window.
+        assert_eq!(Foreign::decide(0, 7, true, &two), Foreign::Same(0));
+        assert_eq!(Foreign::decide(1, 9, true, &two), Foreign::Same(1));
     }
 
     #[test]
@@ -1772,6 +2050,70 @@ mod tests {
         assert!(!is_safe_colour("</script>"));
         assert!(!is_safe_colour(""));
         assert!(!is_safe_colour(&"#".repeat(65)));
+    }
+
+    /// **What a per-window session costs the key path.**
+    ///
+    /// `keys.rs` calls `handle_key` for every key in every mode, and the first thing it does is ask
+    /// whether anything is hinting. That question used to be `Option::is_none` on one slot and is now
+    /// `HashMap::is_empty` on a map; everything else `handle_key` does — `window_of_browser`, the
+    /// `Vec<Open>`, `Foreign::decide` — is below the early return and is never reached by `j`.
+    ///
+    /// `handle_key` itself cannot be called from a test: it takes a `Browser`, and it posts tasks
+    /// (CEF-NOTES trap 13). So this measures the one line of it that `j` runs, against the one line
+    /// it replaced, in the same test on the same machine — and against a `HashMap` with two sessions
+    /// in it, which is the state the whole workstream exists to allow and is *still* only an
+    /// `is_empty`.
+    #[test]
+    fn the_key_path_cost_of_a_per_window_hint_session() {
+        const ROUNDS: u32 = 1_000_000;
+
+        let empty: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::new());
+        let one: Mutex<Option<u32>> = Mutex::new(None);
+        let two: Mutex<HashMap<u32, u32>> =
+            Mutex::new(HashMap::from([(0u32, 7u32), (1u32, 9u32)]));
+
+        for _ in 0..20_000 {
+            std::hint::black_box(std::hint::black_box(&empty).lock().unwrap().is_empty());
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&empty).lock().unwrap().is_empty());
+        }
+        let per_window = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // What it replaced: one `Mutex<Option<Session>>` for the process.
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&one).lock().unwrap().is_none());
+        }
+        let process_wide = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        // And with two sessions open, which is the case that did not exist before.
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(std::hint::black_box(&two).lock().unwrap().is_empty());
+        }
+        let two_open = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+
+        println!(
+            "hints: `j` asks whether anything is hinting in {per_window:.3} ns against \
+             {process_wide:.3} ns for the one session this replaced, and {two_open:.3} ns with two \
+             windows hinting at once"
+        );
+        // Loose on purpose, like the sibling bounds in `state.rs`: this runs unoptimised under
+        // `cargo test` on a machine with other agents on it, and what it catches is an allocation or
+        // a scan appearing on the key path, not a nanosecond either way.
+        assert!(
+            per_window < process_wide * 3.0 + 20.0,
+            "the key path must stay free: {per_window:.3} ns against {process_wide:.3} ns"
+        );
+        assert!(
+            two_open < process_wide * 3.0 + 20.0,
+            "two open sessions must cost the key path nothing extra: {two_open:.3} ns against \
+             {process_wide:.3} ns"
+        );
     }
 
     #[test]

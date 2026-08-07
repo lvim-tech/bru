@@ -75,6 +75,10 @@ impl SelectionState {
 struct Session {
     /// The tab this belongs to. Checked on every answer — a report from a background tab is not
     /// this session's.
+    ///
+    /// Still here now that the sessions are keyed by *window*: a window has many tabs and a session
+    /// belongs to one of them. The window says which session an answer is for; this says whether the
+    /// answer came from the tab the caret is in.
     browser_id: i32,
     /// Minted here, handed to the injected script, and required back on every answer.
     token: String,
@@ -88,9 +92,32 @@ struct Session {
     viewport: (i32, i32),
 }
 
-fn session() -> &'static Mutex<Option<Session>> {
-    static SESSION: Mutex<Option<Session>> = Mutex::new(None);
-    &SESSION
+/// Every open caret session, keyed by the window it belongs to.
+///
+/// **Per window because the mode is.** qutebrowser's `AbstractCaret` is an attribute of
+/// `AbstractTab` (`browser/browsertab.py:1026`), i.e. one per *tab*, and it can afford that because
+/// the caret has no state of its own worth keeping — `CaretBrowsing` lives in the page and the
+/// selection state is read back from it. bru keeps the state in Rust (the module docstring's first
+/// rule), so it needs a place to put it, and the mode that decides whether `j` is a movement or an
+/// extension is one `ModeManager` per window. A per-tab map would let a window hold two caret
+/// sessions in two different selection states, which no mode can be in.
+///
+/// It was one `Mutex<Option<Session>>` for the process. `v` in a second window replaced the first
+/// window's, and the first window stayed in caret mode with `selection()` answering the other
+/// window's text.
+fn sessions() -> &'static Mutex<HashMap<u32, Session>> {
+    static SESSIONS: LazyLock<Mutex<HashMap<u32, Session>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &SESSIONS
+}
+
+/// The window a browser is in, or `None` for a browser bru never put in one.
+fn window_of(state: &SharedState, browser: &mut Browser) -> Option<u32> {
+    let id = browser.identifier();
+    state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_of_browser(id)
 }
 
 /// One outstanding question to the page that is not a caret state report.
@@ -109,8 +136,17 @@ enum AskWhat {
     Follow { tab: bool },
 }
 
-fn ask() -> &'static Mutex<Option<Ask>> {
-    static ASK: Mutex<Option<Ask>> = Mutex::new(None);
+/// The outstanding question per window.
+///
+/// **Keyed, and it is not only symmetry.** The token check already made a single slot *safe* — an
+/// answer whose token does not match is refused — but it did not make it lossless: `` `a `` in one
+/// window and `<Return>` in another a moment later minted a second token over the first, and the
+/// first window's mark was then never set, with nothing said about it anywhere. One request per
+/// window is the smallest key that cannot lose one, because a window can only be waiting for a mark
+/// or a follow, never both: both are started by a key, and a key ends the register mode it came from
+/// before it asks.
+fn ask() -> &'static Mutex<HashMap<u32, Ask>> {
+    static ASK: LazyLock<Mutex<HashMap<u32, Ask>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     &ASK
 }
 
@@ -119,6 +155,17 @@ fn ask() -> &'static Mutex<Option<Ask>> {
 /// Lower case is per page and holds a scroll position; upper case is global and holds a position
 /// **and** the URL it belongs to, which is what makes `'A` a navigation. Both are keyed by a URL
 /// with its fragment stripped, "as it may interfere with scrolling" (tabbedbrowser.py:1084).
+///
+/// **One table for the process, and that is a deliberate divergence.** Both of qutebrowser's live on
+/// `TabbedBrowser`, which is `objreg.register('tabbed-browser', …, scope='window')`
+/// (`mainwindow/mainwindow.py:230`) — so in qutebrowser marks are per *window*, and `'A` set in one
+/// window is simply not set in another. The local table is keyed by URL and would read the same
+/// either way, since two windows on the same page would each hold their own `a` for it and the last
+/// writer in a window is the one that window reads. The global one would not, and the name is the
+/// argument: `tabbedbrowser.py:1078` says "capital indicates a global mark", and a mark whose whole
+/// point is that it survives a change of page reading differently in two windows is a distinction
+/// nobody typing `'A` means. bru's windows are one browsing session, not two profiles.
+/// Unlike the two maps above, nothing here is keyed by window, so nothing here changed.
 #[derive(Default)]
 struct Marks {
     local: HashMap<(String, char), (i32, i32)>,
@@ -131,9 +178,17 @@ fn marks() -> &'static Mutex<Marks> {
 }
 
 /// A jump to a global mark whose page had to be loaded first, waiting for that page to be tall
-/// enough to hold the position. `(key, x, y, attempts left)`.
-fn pending_jump() -> &'static Mutex<Option<(char, i32, i32, u32)>> {
-    static PENDING: Mutex<Option<(char, i32, i32, u32)>> = Mutex::new(None);
+/// enough to hold the position. `(key, x, y, attempts left)`, per window.
+///
+/// **Keyed, and this one fixes a bug rather than a collision.** `JumpToMark` and `PlaceMark` used
+/// `active_browser()`, which is the window in *front*: a `'A` typed in a background window loaded
+/// the page into whichever window happened to be current, and scrolled that one. They take the
+/// window with them now and ask `active_browser_in`. The collision is real too — the retry runs for
+/// up to 2.4 s, which is long enough for a second `'A` in another window to land inside it and take
+/// the first one's remaining attempts.
+fn pending_jump() -> &'static Mutex<HashMap<u32, (char, i32, i32, u32)>> {
+    static PENDING: LazyLock<Mutex<HashMap<u32, (char, i32, i32, u32)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     &PENDING
 }
 
@@ -158,41 +213,52 @@ fn debug(message: &str) {
 /// page's caret is placed afterwards. It has to be, because `V` is
 /// `mode-enter caret ;; selection-toggle --line` — a chain whose second half would run before the
 /// first had finished if entry waited for the page.
-pub fn on_mode_change(browser: &mut Browser, from: Mode, to: Mode) {
+pub fn on_mode_change(state: &SharedState, browser: &mut Browser, from: Mode, to: Mode) {
     if from == to {
         return;
     }
+    // The window the tab is in, which is the window whose mode just changed: `exec::run` was handed
+    // this browser by `keys.rs`, which had already made its window current.
+    let Some(window) = window_of(state, browser) else {
+        return;
+    };
     if to == Mode::Caret {
-        enter(browser);
+        enter(window, browser);
     } else if from == Mode::Caret {
-        leave(browser);
+        leave(window, browser);
     }
 }
 
-fn enter(browser: &mut Browser) {
+fn enter(window: u32, browser: &mut Browser) {
     let Some(frame) = browser.main_frame() else {
         return;
     };
     let token = mint_token();
-    *session().lock().expect("caret session mutex poisoned") = Some(Session {
-        browser_id: browser.identifier(),
-        token: token.clone(),
-        selection: SelectionState::None,
-        text: String::new(),
-        caret: None,
-        viewport: (0, 0),
-    });
+    sessions().lock().expect("caret sessions mutex poisoned").insert(
+        window,
+        Session {
+            browser_id: browser.identifier(),
+            token: token.clone(),
+            selection: SelectionState::None,
+            text: String::new(),
+            caret: None,
+            viewport: (0, 0),
+        },
+    );
 
     // Injected on every `v` rather than once per page load, for the same reason `src/hints.rs`
     // injects on every `f`: a navigation throws the world away and there is no cheap way to know
     // from here whether this one still has the script.
     let code = format!("{CARET_JS}\nwindow.__bru_caret.enter(\"{token}\");");
     frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
-    debug("entered");
+    debug(&format!("window {window} entered"));
 }
 
-fn leave(browser: &mut Browser) {
-    *session().lock().expect("caret session mutex poisoned") = None;
+fn leave(window: u32, browser: &mut Browser) {
+    sessions()
+        .lock()
+        .expect("caret sessions mutex poisoned")
+        .remove(&window);
     let Some(frame) = browser.main_frame() else {
         return;
     };
@@ -204,8 +270,8 @@ fn leave(browser: &mut Browser) {
         None,
         0,
     );
-    crate::ipc::set_search_match(String::new());
-    debug("left");
+    crate::ipc::set_search_match_for(window, String::new());
+    debug(&format!("window {window} left"));
 }
 
 /// The text the page last reported as selected, and the state that selection is in.
@@ -215,9 +281,18 @@ fn leave(browser: &mut Browser) {
 /// adding a `Command::Yank` variant would collide with the module that owns `wl-copy`. That module
 /// asks here for the text and does the copying; nothing in this file touches a clipboard. That
 /// module is `src/clip.rs`, and it calls this.
+///
+/// **The current window's**, and it takes no argument because its two callers have none to give: `yy`
+/// in `clip.rs` and the `{selection}` variable in `spawn.rs` are both running a command in the window
+/// it was typed in, and `keys.rs` has made that window current before either is reached. A caret
+/// selection in a window that is not in front is not what `y` means.
 pub fn selection() -> Option<(SelectionState, String)> {
-    let guard = session().lock().expect("caret session mutex poisoned");
-    guard.as_ref().map(|s| (s.selection, s.text.clone()))
+    let window = BruState::instance()?
+        .lock()
+        .expect("state mutex poisoned")
+        .current_window_id()?;
+    let guard = sessions().lock().expect("caret sessions mutex poisoned");
+    guard.get(&window).map(|s| (s.selection, s.text.clone()))
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -330,9 +405,8 @@ fn ops_for(mv_kind: CaretMove, state: SelectionState, count: u32) -> Vec<Op> {
 
 /// `move-to-…`. The dispatcher's whole caret-movement arm.
 pub fn move_to(state: &SharedState, browser: &mut Browser, kind: CaretMove, count: Option<u32>) {
-    let _ = state;
     let count = count.unwrap_or(1).clamp(1, 1000);
-    let Some((token, selection)) = current(browser) else {
+    let Some((_, token, selection)) = current(state, browser) else {
         return;
     };
     run_ops(browser, &token, ops_for(kind, selection, count));
@@ -344,8 +418,7 @@ pub fn move_to(state: &SharedState, browser: &mut Browser, kind: CaretMove, coun
 /// always ends in `Line` and selects the caret's line; a bare toggle goes to `Normal` from anything
 /// that is not already `Normal`, and from `Normal` back to `None`.
 pub fn selection_toggle(state: &SharedState, browser: &mut Browser, line: bool) {
-    let _ = state;
-    let Some((token, was)) = current(browser) else {
+    let Some((window, token, was)) = current(state, browser) else {
         return;
     };
     let now = if line {
@@ -355,29 +428,31 @@ pub fn selection_toggle(state: &SharedState, browser: &mut Browser, line: bool) 
     } else {
         SelectionState::None
     };
-    set_state(now);
+    set_state(window, now);
 
     let ops = if line { select_line() } else { Vec::new() };
     // Even with no ops the page is asked to report, so the status line and `selection()` learn that
     // the state changed under an unmoved caret.
     run_ops(browser, &token, ops);
-    debug(&format!("selection {} -> {}", was.name(), now.name()));
+    debug(&format!(
+        "window {window} selection {} -> {}",
+        was.name(),
+        now.name()
+    ));
 }
 
 /// `selection-drop` — `<Ctrl-Space>`.
 pub fn selection_drop(state: &SharedState, browser: &mut Browser) {
-    let _ = state;
-    let Some((token, _)) = current(browser) else {
+    let Some((window, token, _)) = current(state, browser) else {
         return;
     };
-    set_state(SelectionState::None);
+    set_state(window, SelectionState::None);
     run_ops(browser, &token, vec![Op::Drop]);
 }
 
 /// `selection-reverse` — `o`.
 pub fn selection_reverse(state: &SharedState, browser: &mut Browser) {
-    let _ = state;
-    let Some((token, _)) = current(browser) else {
+    let Some((_, token, _)) = current(state, browser) else {
         return;
     };
     run_ops(browser, &token, vec![Op::Reverse]);
@@ -389,16 +464,21 @@ pub fn selection_reverse(state: &SharedState, browser: &mut Browser) {
 /// follows whatever the page has selected — a caret-mode selection, a search match turned into one,
 /// or the focused link. So it does not need a caret session, only a token of its own.
 pub fn selection_follow(state: &SharedState, browser: &mut Browser, tab: bool) {
-    let _ = state;
+    let Some(window) = window_of(state, browser) else {
+        return;
+    };
     let Some(frame) = browser.main_frame() else {
         return;
     };
     let token = mint_token();
-    *ask().lock().expect("caret ask mutex poisoned") = Some(Ask {
-        browser_id: browser.identifier(),
-        token: token.clone(),
-        what: AskWhat::Follow { tab },
-    });
+    ask().lock().expect("caret ask mutex poisoned").insert(
+        window,
+        Ask {
+            browser_id: browser.identifier(),
+            token: token.clone(),
+            what: AskWhat::Follow { tab },
+        },
+    );
     let code = format!(
         "{CARET_JS}\nwindow.__bru_caret.follow(\"{token}\",\"{}\");",
         i32::from(tab)
@@ -406,22 +486,27 @@ pub fn selection_follow(state: &SharedState, browser: &mut Browser, tab: bool) {
     frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
 }
 
-/// The session's token and selection state, or `None` when caret mode is not open on this browser.
-fn current(browser: &mut Browser) -> Option<(String, SelectionState)> {
+/// The window, token and selection state of the session this browser belongs to, or `None` when
+/// caret mode is not open on it.
+///
+/// Both checks are kept: the window says which session, and `browser_id` says whether this is the tab
+/// that session is in — a `j` that reached another tab of the hinting window is not a caret movement.
+fn current(state: &SharedState, browser: &mut Browser) -> Option<(u32, String, SelectionState)> {
     let id = browser.identifier();
-    let guard = session().lock().expect("caret session mutex poisoned");
-    let open = guard.as_ref()?;
+    let window = window_of(state, browser)?;
+    let guard = sessions().lock().expect("caret sessions mutex poisoned");
+    let open = guard.get(&window)?;
     if open.browser_id != id {
         return None;
     }
-    Some((open.token.clone(), open.selection))
+    Some((window, open.token.clone(), open.selection))
 }
 
-fn set_state(selection: SelectionState) {
-    if let Some(open) = session()
+fn set_state(window: u32, selection: SelectionState) {
+    if let Some(open) = sessions()
         .lock()
-        .expect("caret session mutex poisoned")
-        .as_mut()
+        .expect("caret sessions mutex poisoned")
+        .get_mut(&window)
     {
         open.selection = selection;
     }
@@ -454,7 +539,15 @@ fn run_ops(browser: &mut Browser, token: &str, ops: Vec<Op>) {
 /// built with `BaseKeyParser`'s `passthrough=False`, so no key on the way to a mark name reaches the
 /// page.
 pub fn handle_mark_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> Option<bool> {
-    let mode = state.lock().expect("state mutex poisoned").mode();
+    // The mode of the window this key's browser is in, by name rather than as "the current mode".
+    // `keys.rs` has already made that window current so the two agree there, but `macros.rs` also
+    // calls this from a replayed key, and a macro run in a background window must read that window's
+    // mode. `None` is a browser bru never put in a window; there is nothing to route.
+    let (window, mode) = {
+        let guard = state.lock().expect("state mutex poisoned");
+        let window = guard.window_of_browser(browser.identifier())?;
+        (window, guard.mode_in(window))
+    };
     if !mode.names_a_register() {
         return None;
     }
@@ -462,7 +555,7 @@ pub fn handle_mark_key(state: &SharedState, browser: &mut Browser, info: KeyInfo
     // The `register:` bindings are consulted first (`super().handle(e)`), and they hold exactly one
     // entry: `<Escape>: mode-leave`.
     if info.key == Key::Named(NamedKey::Escape) {
-        leave_register_mode(state);
+        leave_register_mode(state, window);
         return Some(true);
     }
 
@@ -473,10 +566,10 @@ pub fn handle_mark_key(state: &SharedState, browser: &mut Browser, info: KeyInfo
         return Some(true);
     };
 
-    leave_register_mode(state);
+    leave_register_mode(state, window);
     match mode {
-        Mode::SetMark => request_mark(browser, AskWhat::SetMark(key)),
-        Mode::JumpMark => request_mark(browser, AskWhat::JumpMark(key)),
+        Mode::SetMark => request_mark(window, browser, AskWhat::SetMark(key)),
+        Mode::JumpMark => request_mark(window, browser, AskWhat::JumpMark(key)),
 // --- src/macros.rs -------------------------------------------------------------------------------
         // The other two modes `RegisterKeyParser` is built with (modeparsers.py:294-297). They are
         // two arms here and not a parser of their own for the reason this function exists at all:
@@ -517,18 +610,18 @@ fn register_char(info: KeyInfo) -> Option<char> {
     }
 }
 
-fn leave_register_mode(state: &SharedState) {
+fn leave_register_mode(state: &SharedState, window: u32) {
     let now = {
         let mut guard = state.lock().expect("state mutex poisoned");
-        guard.leave_mode();
-        guard.mode()
+        guard.leave_mode_in(window);
+        guard.mode_in(window)
     };
-    crate::ipc::set_mode(now.name().to_string());
-    crate::ipc::set_keystring(String::new());
+    crate::ipc::set_mode_for(window, now.name().to_string());
+    crate::ipc::set_keystring_for(window, String::new());
 }
 
 /// Ask the page where it is scrolled to, so a mark can be saved or a jump measured.
-fn request_mark(browser: &mut Browser, what: AskWhat) {
+fn request_mark(window: u32, browser: &mut Browser, what: AskWhat) {
     let Some(frame) = browser.main_frame() else {
         return;
     };
@@ -538,11 +631,14 @@ fn request_mark(browser: &mut Browser, what: AskWhat) {
         AskWhat::Follow { .. } => return,
     };
     let token = mint_token();
-    *ask().lock().expect("caret ask mutex poisoned") = Some(Ask {
-        browser_id: browser.identifier(),
-        token: token.clone(),
-        what,
-    });
+    ask().lock().expect("caret ask mutex poisoned").insert(
+        window,
+        Ask {
+            browser_id: browser.identifier(),
+            token: token.clone(),
+            what,
+        },
+    );
     let code = format!(
         "{CARET_JS}\nwindow.__bru_caret.mark(\"{token}\",\"{verb}\",\"{key}\");"
     );
@@ -616,33 +712,45 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
     let Some(state) = BruState::instance() else {
         return false;
     };
+    // Which window's session or request this answer is for. `None` is a browser bru never put in a
+    // window, which no page bru asked anything of can be.
+    let Some(window) = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_of_browser(id)
+    else {
+        debug(&format!("refused: browser {id} is in no window"));
+        return false;
+    };
     let mut browser = browser.clone();
-    debug(&format!("answer kind={kind} from browser {id} token {token}"));
+    debug(&format!(
+        "answer kind={kind} from browser {id} in window {window} token {token}"
+    ));
 
     match kind.as_str() {
         "state" => {
             {
-                let guard = session().lock().expect("caret session mutex poisoned");
-                let Some(open) = guard.as_ref() else {
-                    debug("refused: no caret session is open");
+                let guard = sessions().lock().expect("caret sessions mutex poisoned");
+                let Some(open) = guard.get(&window) else {
+                    debug(&format!("refused: no caret session is open in window {window}"));
                     return false;
                 };
                 if open.browser_id != id || open.token != token {
                     debug(&format!(
-                        "refused: session is browser {} token {}",
+                        "refused: window {window}'s session is browser {} token {}",
                         open.browser_id, open.token
                     ));
                     return false;
                 }
             }
-            on_state(&state, &mut browser, &data, text);
+            on_state(&state, window, &mut browser, &data, text);
         }
         "mark" | "follow" => {
             let asked = {
                 let mut guard = ask().lock().expect("caret ask mutex poisoned");
-                match guard.as_ref() {
+                match guard.get(&window) {
                     Some(open) if open.browser_id == id && open.token == token => {
-                        guard.take().map(|open| open.what)
+                        guard.remove(&window).map(|open| open.what)
                     }
                     _ => None,
                 }
@@ -652,7 +760,7 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
             };
             match what {
                 AskWhat::SetMark(key) | AskWhat::JumpMark(key) => {
-                    on_mark(&state, &mut browser, what_is_jump(&data), key, &data)
+                    on_mark(&state, window, &mut browser, what_is_jump(&data), key, &data)
                 }
                 AskWhat::Follow { tab } => on_follow(&mut browser, tab, &data, &text),
             }
@@ -667,7 +775,7 @@ fn what_is_jump(data: &str) -> bool {
 }
 
 /// The page has applied an op list and is reporting what it left behind.
-fn on_state(state: &SharedState, browser: &mut Browser, data: &str, text: String) {
+fn on_state(state: &SharedState, window: u32, browser: &mut Browser, data: &str, text: String) {
     // `<box>|<collapsed>|<viewport>`, where box is `x,y,w,h` or empty.
     let mut parts = data.split('|');
     let caret = parse_four(parts.next().unwrap_or(""));
@@ -675,8 +783,8 @@ fn on_state(state: &SharedState, browser: &mut Browser, data: &str, text: String
     let viewport = parse_two(parts.next().unwrap_or("")).unwrap_or((0, 0));
 
     {
-        let mut guard = session().lock().expect("caret session mutex poisoned");
-        let Some(open) = guard.as_mut() else {
+        let mut guard = sessions().lock().expect("caret sessions mutex poisoned");
+        let Some(open) = guard.get_mut(&window) else {
             return;
         };
         open.caret = caret;
@@ -692,18 +800,23 @@ fn on_state(state: &SharedState, browser: &mut Browser, data: &str, text: String
     }
 
     eprintln!(
-        "bru[caret]: caret {} collapsed={} selection {:?}",
+        "bru[caret]: window {window} caret {} collapsed={} selection {:?}",
         caret.map(|(x, y, w, h)| format!("{x},{y} {w}x{h}")).unwrap_or_else(|| "?".into()),
         i32::from(collapsed),
         elide(&text),
     );
     // The selection is what the search-match slot of the bar is free to show while caret mode is
-    // open; it is the only visible confirmation that a movement did anything.
-    crate::ipc::set_search_match(if text.is_empty() {
-        String::new()
-    } else {
-        format!("[{} chars]", text.chars().count())
-    });
+    // open; it is the only visible confirmation that a movement did anything. Aimed at the window
+    // whose page reported it — a report arrives asynchronously and can easily land while another
+    // window is in front.
+    crate::ipc::set_search_match_for(
+        window,
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("[{} chars]", text.chars().count())
+        },
+    );
 
     keep_caret_in_view(state, browser, caret, viewport);
 }
@@ -741,7 +854,14 @@ fn keep_caret_in_view(
 }
 
 /// The page has reported where it is scrolled to, for `` ` `` or `'`.
-fn on_mark(state: &SharedState, browser: &mut Browser, jump: bool, key: char, data: &str) {
+fn on_mark(
+    state: &SharedState,
+    window: u32,
+    browser: &mut Browser,
+    jump: bool,
+    key: char,
+    data: &str,
+) {
     let Some(position) = data.rsplit('|').next().and_then(parse_three) else {
         return;
     };
@@ -768,13 +888,18 @@ fn on_mark(state: &SharedState, browser: &mut Browser, jump: bool, key: char, da
         // tall enough to hold it. **Posted**, because this runs inside the message router's query
         // handler and starting a navigation there deadlocks (CEF-NOTES trap 12).
         Some(target) if target != url => {
-            *pending_jump().lock().expect("pending jump mutex poisoned") =
-                Some((key, target_x, target_y, 6));
-            let mut task = JumpToMark::new(target, target_x, target_y);
+            pending_jump()
+                .lock()
+                .expect("pending jump mutex poisoned")
+                .insert(window, (key, target_x, target_y, 6));
+            let mut task = JumpToMark::new(window, target, target_x, target_y);
             post_task(ThreadId::UI, Some(&mut task));
         }
         _ => {
-            eprintln!("bru[caret]: jumping to mark {key} at {target_x},{target_y} from {x},{y}");
+            eprintln!(
+                "bru[caret]: window {window} jumping to mark {key} at \
+                 {target_x},{target_y} from {x},{y}"
+            );
             crate::scroll::scroll_px(state, browser, target_x - x, target_y - y, None);
         }
     }
@@ -782,6 +907,7 @@ fn on_mark(state: &SharedState, browser: &mut Browser, jump: bool, key: char, da
 
 wrap_task! {
     struct JumpToMark {
+        window: u32,
         url: String,
         x: i32,
         y: i32,
@@ -792,31 +918,50 @@ wrap_task! {
             let Some(state) = BruState::instance() else {
                 return;
             };
-            let browser = state.lock().expect("state mutex poisoned").active_browser();
+            // The window the `'A` was typed in, not the one in front. `active_browser` was here
+            // before, and a jump typed in a background window loaded the mark's page into whichever
+            // window happened to be current — the one place a caret request could act on somebody
+            // else's tab.
+            let browser = state
+                .lock()
+                .expect("state mutex poisoned")
+                .active_browser_in(self.window);
             let Some(mut browser) = browser else {
                 return;
             };
-            eprintln!("bru[caret]: loading {} for a global mark", self.url);
+            eprintln!(
+                "bru[caret]: window {} loading {} for a global mark",
+                self.window, self.url
+            );
             crate::open::open(&state, &mut browser, Some(&self.url), false, false);
-            let mut task = PlaceMark::new();
+            let mut task = PlaceMark::new(self.window);
             post_delayed_task(ThreadId::UI, Some(&mut task), 600);
         }
     }
 }
 
 wrap_task! {
-    struct PlaceMark;
+    struct PlaceMark {
+        window: u32,
+    }
 
     impl Task {
         fn execute(&self) {
-            let Some((key, x, y, left)) = *pending_jump().lock().expect("pending jump mutex poisoned")
-            else {
+            let pending = pending_jump()
+                .lock()
+                .expect("pending jump mutex poisoned")
+                .get(&self.window)
+                .copied();
+            let Some((key, x, y, left)) = pending else {
                 return;
             };
             let Some(state) = BruState::instance() else {
                 return;
             };
-            let browser = state.lock().expect("state mutex poisoned").active_browser();
+            let browser = state
+                .lock()
+                .expect("state mutex poisoned")
+                .active_browser_in(self.window);
             let Some(mut browser) = browser else {
                 return;
             };
@@ -827,21 +972,32 @@ wrap_task! {
             let tall_enough = position.map(|p| p.max_y as i32 >= y).unwrap_or(false);
             if tall_enough {
                 let at = position.map(|p| p.y as i32).unwrap_or(0);
-                eprintln!("bru[caret]: placing global mark {key} at {x},{y} (page is at {at})");
+                eprintln!(
+                    "bru[caret]: window {} placing global mark {key} at {x},{y} (page is at {at})",
+                    self.window
+                );
                 crate::scroll::scroll_px(&state, &mut browser, x, y - at, None);
-                *pending_jump().lock().expect("pending jump mutex poisoned") = None;
+                pending_jump()
+                    .lock()
+                    .expect("pending jump mutex poisoned")
+                    .remove(&self.window);
                 return;
             }
 
             crate::scroll::request_position(&mut browser);
             if left == 0 {
                 eprintln!("bru: mark {key}'s page never grew tall enough to hold {y}");
-                *pending_jump().lock().expect("pending jump mutex poisoned") = None;
+                pending_jump()
+                    .lock()
+                    .expect("pending jump mutex poisoned")
+                    .remove(&self.window);
                 return;
             }
-            *pending_jump().lock().expect("pending jump mutex poisoned") =
-                Some((key, x, y, left - 1));
-            let mut task = PlaceMark::new();
+            pending_jump()
+                .lock()
+                .expect("pending jump mutex poisoned")
+                .insert(self.window, (key, x, y, left - 1));
+            let mut task = PlaceMark::new(self.window);
             post_delayed_task(ThreadId::UI, Some(&mut task), 400);
         }
     }
@@ -1031,13 +1187,39 @@ wrap_task! {
                 }
             }
 
-            let mode = state.lock().expect("state mutex poisoned").mode();
-            let guard = session().lock().expect("caret session mutex poisoned");
+            // Every window's mode and every window's session, for the same reason `--hint-script`
+            // prints all of them: two open at once is the claim, and one line about the current
+            // window could not tell that state from the one session this replaced.
+            let modes = {
+                let guard = state.lock().expect("state mutex poisoned");
+                guard
+                    .window_ids()
+                    .into_iter()
+                    .map(|window| format!("win{window} {}", guard.mode_in(window)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let open = {
+                let guard = sessions().lock().expect("caret sessions mutex poisoned");
+                let mut windows: Vec<u32> = guard.keys().copied().collect();
+                windows.sort_unstable();
+                windows
+                    .into_iter()
+                    .map(|window| {
+                        let session = &guard[&window];
+                        format!(
+                            "win{window}: selection {} on browser {} text {}",
+                            session.selection.name(),
+                            session.browser_id,
+                            elide(&session.text),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
             eprintln!(
-                "caret-script: after {:?} -> mode {mode}, selection {}, text {}",
+                "caret-script: after {:?} -> modes [{modes}], sessions [{open}]",
                 self.step,
-                guard.as_ref().map(|s| s.selection.name()).unwrap_or("-"),
-                guard.as_ref().map(|s| elide(&s.text)).unwrap_or_else(|| "-".into()),
             );
         }
     }

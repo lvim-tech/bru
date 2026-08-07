@@ -519,12 +519,32 @@ pub fn set_keystring(keystring: String) {
     set_bar_field(|bar| &mut bar.keystring, keystring);
 }
 
+/// The same for a named window — for a push that arrives knowing which window it is about rather
+/// than which one is in front.
+///
+/// `hints.rs` and `caret.rs` both need it now that a session belongs to one window: `;R` deliberately
+/// lets a key arrive at a window that is not the hinting one, and a caret report can land while
+/// another window is current. Without it the chain typed into window 0's labels was written into
+/// whichever bar happened to be showing.
+pub fn set_keystring_for(window: u32, keystring: String) {
+    set_bar_field_for(window, |bar| &mut bar.keystring, keystring);
+}
+
 /// One field of the current window's bar, pushed only if it moved. The four callers below are all
 /// on paths that fire many times a second.
 fn set_bar_field(field: impl Fn(&mut BarState) -> &mut String, value: String) {
     let Some(window) = current_window() else {
         return;
     };
+    set_bar_field_for(window, field, value);
+}
+
+/// One field of a named window's bar, pushed only if it moved.
+fn set_bar_field_for(
+    window: u32,
+    field: impl Fn(&mut BarState) -> &mut String,
+    value: String,
+) {
     let changed = with_window(window, |entry| {
         let slot = field(&mut entry.bar);
         if *slot == value {
@@ -551,6 +571,13 @@ pub fn set_scroll(scroll: String) {
 /// search as it scans the page, so this is filtered the same way.
 pub fn set_search_match(search: String) {
     set_bar_field(|bar| &mut bar.search, search);
+}
+
+/// The same for a named window. Caret mode borrows this cell to show the size of the selection, and
+/// a caret session belongs to one window — a report from a background window's page must not write
+/// into the bar of the window in front.
+pub fn set_search_match_for(window: u32, search: String) {
+    set_bar_field_for(window, |bar| &mut bar.search, search);
 }
 
 /// `[dl 45%]` from `downloads.rs`, or empty when nothing is running. Filtered like the two above:
