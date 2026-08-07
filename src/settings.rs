@@ -177,6 +177,16 @@ pub enum ListValue {
     /// An `http://` or `https://` URL bru will fetch. Checked here rather than at fetch time
     /// because a typo that is only noticed by `:adblock-update` is a typo noticed on the network.
     FetchableUrl,
+    // --- tabs and statusbar --------------------------------------------------------------------
+    /// The name of a field the status line can draw — `statusbar.widgets`.
+    ///
+    /// Checked against [`STATUSBAR_WIDGET_NAMES`] rather than against anything the chrome says,
+    /// because the chrome cannot refuse: `bottom.js` walks the list and looks each name up, and an
+    /// entry it has no element for would be a word typed into a setting and then silently skipped.
+    /// The error names qutebrowser's widgets bru has not got and says why, so `history` answers with
+    /// the reason instead of with the list.
+    StatusbarWidget,
+    // --- end tabs and statusbar ----------------------------------------------------------------
 }
 
 impl ListShape {
@@ -202,6 +212,24 @@ impl ListShape {
                     ))
                 }
             }
+            // --- tabs and statusbar ------------------------------------------------------------
+            ListValue::StatusbarWidget => {
+                if STATUSBAR_WIDGET_NAMES.contains(&value) {
+                    return Ok(());
+                }
+                if let Some(why) = REFUSED_WIDGETS
+                    .iter()
+                    .find(|(refused, _)| *refused == value)
+                    .map(|(_, why)| *why)
+                {
+                    return Err(format!("{name}: bru has no {value} widget — {why}"));
+                }
+                Err(format!(
+                    "{name}: {value:?} is not one of {}",
+                    STATUSBAR_WIDGET_NAMES.join(", ")
+                ))
+            }
+            // --- end tabs and statusbar --------------------------------------------------------
         }
     }
 }
@@ -212,6 +240,72 @@ pub static ADBLOCK_LISTS: ListShape = ListShape {
     defaults: &crate::adblock::DEFAULT_LISTS,
     value: ListValue::FetchableUrl,
 };
+
+// --- tabs and statusbar ------------------------------------------------------------------------
+
+/// Every field `#statusline` can draw, by the name `statusbar.widgets` calls it.
+///
+/// Five of the six are qutebrowser's own spelling (`configdata.yml:2191-2211`), so a line copied out
+/// of a `config.py` keeps working: `keypress`, `search_match`, `url`, `scroll`, `tabs`. The sixth is
+/// bru's, because the thing it draws is bru's — qutebrowser gives downloads a second row of their
+/// own rather than a status-bar widget, so there is no name to copy.
+///
+/// **`mode` is deliberately not here.** The mode pill is not inside `#statusline` at all: it is the
+/// bar's first grid column and the status group is the third (`chrome.css`), so it cannot be ordered
+/// against these six and a name for it would be a name that moved nothing.
+pub const STATUSBAR_WIDGET_NAMES: &[&str] =
+    &["keypress", "search_match", "url", "scroll", "tabs", "download"];
+
+/// qutebrowser's other five widgets, and why bru has none of them. Read by [`ListValue`]'s check, so
+/// `:config-list-add statusbar.widgets history` answers with the reason rather than with the list.
+const REFUSED_WIDGETS: &[(&str, &str)] = &[
+    (
+        "history",
+        "it is a pair of arrows saying whether `H` and `L` would go anywhere, and bru's per-tab \
+         history is `navigate.rs`'s, which answers that question only when it is asked. Drawing it \
+         would mean asking on every push.",
+    ),
+    (
+        "progress",
+        "bru draws load state on the tab itself — the stripe down a tab's leading edge, \
+         `#tabs .tab.loading::before` — rather than as a bar in the status line.",
+    ),
+    (
+        "scroll_raw",
+        "`42` where `scroll` draws `[42%]`. It is the same number in a second spelling, and \
+         `scroll.rs` builds the string once; two spellings would be two formats to keep true for a \
+         field that already says what it means.",
+    ),
+    (
+        "clock",
+        "it redraws itself once a second whether anything happened or not, and every push through \
+         `ipc::push_for` runs a script in the chrome renderer. A clock would put that on a timer \
+         for the life of the browser.",
+    ),
+    (
+        "text",
+        "`text:foo` is static text with the string after the colon. The value would be part of the \
+         entry rather than a name, which is the one shape this list's check cannot hold — an entry \
+         is a widget's name and nothing else.",
+    ),
+];
+
+/// `statusbar.widgets` — which fields the status line draws, in the order it draws them.
+///
+/// The defaults are what `bottom.html` already laid out, which was transcribed from this very
+/// setting's default (`configdata.yml:2212`) minus the two widgets bru has not got. So a bru with no
+/// `~/.config/bru/` draws exactly what it drew before the setting existed; that is the test.
+///
+/// **Reordering is remove-then-add**, and that follows from [`ListShape`] rather than from anything
+/// here: an override *appends*, so `:config-list-remove statusbar.widgets url` followed by
+/// `:config-list-add statusbar.widgets url` moves the URL to the end of the row. Replacing the whole
+/// list in one call would be the other design, and it is the one DESIGN.md rules out — a patch that
+/// silently deleted the five entries it did not mention would not be a patch.
+pub static STATUSBAR_WIDGETS: ListShape = ListShape {
+    defaults: STATUSBAR_WIDGET_NAMES,
+    value: ListValue::StatusbarWidget,
+};
+// --- end tabs and statusbar --------------------------------------------------------------------
 
 /// A setting's value, already validated against its [`Kind`].
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -253,6 +347,18 @@ enum Backing {
     /// rebuild [`crate::open::SearchEngines`] from this store and install it, so that the setting
     /// is the *front door* to the table `:open` already reads rather than a second copy of it.
     SearchEngines,
+    // --- tabs and statusbar --------------------------------------------------------------------
+    /// Something the tab strip or the window's own layout is made of.
+    ///
+    /// One arm for twelve settings rather than one arm each, because they all end in the same three
+    /// calls and none of them has a Chromium side: rebuild the strip's payload, push the bar, and
+    /// let `window.rs` decide which strips are visible and in what order. Which of the three a given
+    /// setting actually moves is the difference between a redraw and a relayout, and asking that
+    /// here would mean a table of twelve answers that has to be kept true — where doing all three is
+    /// correct for every one of them and costs a relayout that `window::apply_chrome_layout` already
+    /// skips when nothing moved.
+    Chrome,
+    // --- end tabs and statusbar ----------------------------------------------------------------
     /// A Chromium content setting, global or per-origin. See [`apply`].
     Content(ContentKind),
     /// Read by `focus.rs` when a page moves its focus; nothing to push. Chromium has no opinion
@@ -508,6 +614,153 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::AdblockLists,
     },
 // --- end config commands -----------------------------------------------------------------------
+// --- tabs and statusbar ------------------------------------------------------------------------
+// The two strips bru draws itself, made configurable. None of this reaches CEF's content settings:
+// the tab strip and the status line are HTML pages bru writes, and the window is a `BoxLayout` bru
+// fills, so every one of these moves something bru already owns. That is also why they share one
+// `Backing::Chrome` — see the arm.
+    Def {
+        // qutebrowser's own (`configdata.yml:2217`), and the one setting in this block that does
+        // not touch a strip at all: it decides where a middle-click's tab *goes*. `popups.rs`'s
+        // header named the two arms it swaps a week before this existed, and the swap is exactly
+        // what `webview.py:113-121` does — `WebBrowserTab` becomes a background tab and
+        // `WebBrowserBackgroundTab` a foreground one when this is false.
+        name: "tabs.background",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2343`. The user's own qutebrowser config binds `xt` to
+        // `config-cycle tabs.show always never`, which is the shortest possible argument for this
+        // being the first `tabs.*` setting bru grows.
+        //
+        // **`switching` is built, and its delay is not a setting.** qutebrowser pairs it with
+        // `tabs.show_switching_delay` (an Int, 800 ms); bru has no integer kind yet — a second
+        // workstream is adding one this round — so bru uses qutebrowser's own 800 and refuses the
+        // name rather than shipping a knob spelled as text. See REFUSED.
+        name: "tabs.show",
+        kind: Kind::Choice(&["always", "never", "multiple", "switching"]),
+        default: Some("always"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2333`, and **two of qutebrowser's four values**. Top and bottom are the
+        // order of two children of one vertical `BoxLayout` and are honoured live, through
+        // `Panel::reorder_child_view`.
+        //
+        // `left` and `right` are refused rather than half-built, and the reason is structural: a
+        // vertical strip is not a reordering of this layout but a second layout inside it — an
+        // outer vertical box holding a horizontal box that holds the strip and the pages — and
+        // every index in `tabs::attach` is into the window's own child list. bru would also have to
+        // grow `tabs.width` to say how wide the column is, which is a percentage-or-pixels type it
+        // has no kind for. Refusing the pair is one honest sentence; building half of it would be a
+        // value that sets and draws nothing.
+        name: "tabs.position",
+        kind: Kind::Choice(&["top", "bottom"]),
+        default: Some("top"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2378`, with qutebrowser's own default string. The placeholders bru fills
+        // are listed on `crate::tabs::format_title`, which is where the substitution happens —
+        // `cmdline.rs`'s `{url}`/`{title}` replacement is the pattern it copies rather than a
+        // template engine.
+        name: "tabs.title.format",
+        kind: Kind::Text,
+        default: Some("{audio}{index}: {current_title}"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2419`. A pinned tab is `flex: 0 0 auto` in `chrome.css` — it shrinks to
+        // its contents — so a short format is what makes pinning worth anything.
+        name: "tabs.title.format_pinned",
+        kind: Kind::Text,
+        default: Some("{index}"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2254`. `pinned` is the value that pays for the setting: pinned tabs shrink
+        // to their contents, so an icon and no words is what a row of them is for.
+        name: "tabs.favicons.show",
+        kind: Kind::Choice(&["always", "never", "pinned"]),
+        default: Some("always"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2368`. `text-align` on `#tabs .title`, pushed as a value the page puts on
+        // an attribute — the stylesheet holds the three rules, so nothing here writes CSS.
+        name: "tabs.title.alignment",
+        kind: Kind::Choice(&["left", "right", "center"]),
+        default: Some("left"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2531`. `tabs::next_tab` and `prev_tab` are `(active + 1) % count` today,
+        // which is the `true` half of this setting written as an arithmetic operator; `false` stops
+        // at each end instead.
+        name: "tabs.wrap",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2545`. The strip sets `el.title` to the tab's URL, which is the whole of
+        // what a tooltip is here; `false` leaves the attribute off. qutebrowser's own note says it
+        // "only affects windows opened after it has been set" — bru's takes effect on the next push,
+        // because the strip is redrawn from JSON rather than from a widget tree.
+        name: "tabs.tooltips",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2167`, and the other half of the user's `xx` binding. `in-mode` is
+        // qutebrowser's `StatusBar.maybe_hide` — shown in every mode but normal.
+        //
+        // **`never` keeps the bar for as long as something is being typed into it**, and that is a
+        // measured deviation rather than a preference: bru's command line is an `<input>` inside a
+        // `BrowserView`, and a view that is not visible cannot take focus, so a literal reading of
+        // `never` would make `:` a key that does nothing and leaves no way to type the `:set` that
+        // undoes it. qutebrowser has the same setting and not the same problem, because its command
+        // line is a widget it shows on demand. See `window::strip_hidden`.
+        name: "statusbar.show",
+        kind: Kind::Choice(&["always", "never", "in-mode"]),
+        default: Some("always"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2186`. The same `reorder_child_view` as `tabs.position`, and the same
+        // ordering rule qutebrowser's `MainWindow._add_widgets` has: a status bar asked to go to the
+        // top goes above the tab strip, and one at the bottom goes below it.
+        name: "statusbar.position",
+        kind: Kind::Choice(&["top", "bottom"]),
+        default: Some("bottom"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+    Def {
+        // `configdata.yml:2191`. bru's bar had this list hard-coded — `bottom.html` says in as many
+        // words that its span order was transcribed from this setting's own default — so this is the
+        // second setting in bru that was already a compiled-in constant with no door to it, after
+        // `content.blocking.adblock.lists`. A list's defaults are its shape's; see STATUSBAR_WIDGETS.
+        name: "statusbar.widgets",
+        kind: Kind::List(&STATUSBAR_WIDGETS),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Chrome,
+    },
+// --- end tabs and statusbar --------------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -549,6 +802,78 @@ pub const REFUSED: &[(&str, &str)] = &[
          three-value cycle that is wrong on one press in three is worse than a key that says it \
          does nothing.",
     ),
+    // --- tabs and statusbar --------------------------------------------------------------------
+    // The `tabs.*` and `statusbar.*` names bru does not implement and will not until something
+    // changes. Names that are simply not built yet are **not** here: `:set` answers those with
+    // "unknown setting", which is the truth, and a reason is only worth keeping when it is a reason
+    // rather than a date.
+    (
+        "tabs.last_close",
+        "what happens when the last tab closes is DECISIONS.md item 6, and it is still open — the \
+         user has not chosen between bru's current behaviour (the window closes) and qutebrowser's \
+         default (`ignore`, which keeps the window with a blank tab). Shipping the setting would \
+         settle an open question by picking a default for it, which is the one thing an agent may \
+         not do here.",
+    ),
+    (
+        "tabs.title.elide",
+        "CSS can only elide at the end. `#tabs .title` is `text-overflow: ellipsis`, which is this \
+         setting's `right`; `left` and `center` would mean bru measuring the rendered width of each \
+         title and cutting the string itself, and the strip is handed titles as JSON and never \
+         learns how wide a tab came out. Chromium has no `text-overflow: ellipsis center`.",
+    ),
+    (
+        "tabs.padding",
+        "it is a four-number Padding, and bru has no numeric setting kind — no Kind::Int, and no \
+         dict value that is a pixel count. Spelling four integers as text so that the name could \
+         exist would be the shape this file's second rule refuses.",
+    ),
+    (
+        "statusbar.padding",
+        "the same four-number Padding as tabs.padding, and the same missing numeric kind.",
+    ),
+    (
+        "tabs.indicator.width",
+        "a pixel count, and bru has no Kind::Int. The stripe itself is real — `#tabs .tab::before` \
+         draws it and the theme colours it — so this is a missing kind rather than a missing \
+         feature, and it is one line the day bru has one.",
+    ),
+    (
+        "tabs.favicons.scale",
+        "a float, and bru has no float kind either. `tabs.favicons.show` is the half of this that \
+         needs no number and it is implemented.",
+    ),
+    (
+        "tabs.show_switching_delay",
+        "milliseconds, and bru has no Kind::Int. `tabs.show switching` is built and uses \
+         qutebrowser's own default of 800 ms; a delay spelled as text would be a number parsed \
+         twice and validated nowhere.",
+    ),
+    (
+        "tabs.mousewheel_switching",
+        "bru's tab strip takes no wheel events at all. The one pointer input it accepts is a left \
+         click, forwarded from `chrome/top.js` as a `tab-select` query; a wheel over the strip \
+         scrolls nothing because the strip's document is exactly as tall as the strip.",
+    ),
+    (
+        "tabs.close_mouse_button",
+        "the strip listens for one thing, `click`, and CEF gives a chrome page no middle- or \
+         right-button channel bru has wired. Closing a tab with the mouse is not a behaviour bru \
+         has, so this would be a setting that chooses between three ways of doing nothing.",
+    ),
+    (
+        "tabs.close_mouse_button_on_bar",
+        "it names what the button of tabs.close_mouse_button does on the empty part of the strip, \
+         and that button does not exist here — see tabs.close_mouse_button.",
+    ),
+    (
+        "tabs.tabs_are_windows",
+        "DESIGN.md settles the shape as \"one window, many tabs, switched in place\", and it is not \
+         reopenable. bru does have more than one window — `:open -w`, `gD`, `U` — but a mode where \
+         every tab is a window would make the tab strip, `tabs.position` and `tabs.show` draw \
+         nothing.",
+    ),
+    // --- end tabs and statusbar ----------------------------------------------------------------
 ];
 
 /// **What `:set` prints for a dictionary**, and the answer to "a dict is not one line".
@@ -657,7 +982,12 @@ pub fn value_of(name: &str) -> Option<String> {
     // would be a statement about a copy Chromium does not keep.
     if !matches!(
         def.backing,
-        Backing::Bar | Backing::Insert | Backing::SearchEngines | Backing::AdblockLists
+        // --- tabs and statusbar: `Backing::Chrome` is bru's own too ----------------------------
+        Backing::Bar
+            | Backing::Insert
+            | Backing::SearchEngines
+            | Backing::AdblockLists
+            | Backing::Chrome
     ) {
         return None;
     }
@@ -709,6 +1039,22 @@ pub fn mode_labels_json() -> String {
         .collect();
     format!("{{{}}}", pairs.join(","))
 }
+
+// --- tabs and statusbar ------------------------------------------------------------------------
+/// `statusbar.widgets` as a JSON array, for the one key `ipc::bar_json_for` adds.
+///
+/// Built here rather than there for `mode_labels_json`'s reason, word for word: `ipc.rs` is a file
+/// several workstreams are editing at once, and it gains one line instead of eight. An entry cannot
+/// contain a quote — [`ListValue::StatusbarWidget`] only accepts one of six fixed names — but it
+/// goes through `json_escape` anyway, because the check and the encoder should not have to agree.
+pub fn widgets_json() -> String {
+    let entries: Vec<String> = list_of("statusbar.widgets")
+        .into_iter()
+        .map(|name| format!("\"{}\"", crate::ipc::json_escape(&name)))
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+// --- end tabs and statusbar --------------------------------------------------------------------
 
 /// The reason a command string names a refused setting, for `bru://chrome/help`'s third state.
 ///
@@ -1672,6 +2018,31 @@ pub fn is_on(name: &str) -> bool {
 }
 // --- end src/focus.rs --------------------------------------------------------------------------
 
+// --- tabs and statusbar ------------------------------------------------------------------------
+/// One [`Kind::Choice`] or [`Kind::Text`] setting's value in force globally, falling back to its
+/// compiled-in default.
+///
+/// [`is_on`]'s twin, and it exists for the same reason: a `Backing::Chrome` setting has no Chromium
+/// side to read back from, so this is the whole interface between the store and the two strips. A
+/// name this file does not know answers with the empty string rather than panicking — the callers'
+/// names are all `const` in `tabs.rs` and `window.rs`, and a typo in one should not take the browser
+/// down with it.
+///
+/// **Not on the key path**, and that is worth saying twice for this one: it takes the settings mutex
+/// and `tabs_json_in` calls it four times per push. A push happens when a tab is added, closed,
+/// selected, retitled or re-addressed — never per keystroke, because `keys.rs` reaches
+/// `set_keystring`, which pushes the *bar*.
+pub fn text_of(name: &str) -> String {
+    match with_live(|settings| settings.get(name, None)) {
+        Ok(Some(Value::Text(text))) => text,
+        _ => def(name)
+            .and_then(|def| def.default)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+// --- end tabs and statusbar --------------------------------------------------------------------
+
 // -----------------------------------------------------------------------------------------------
 // The commands
 // -----------------------------------------------------------------------------------------------
@@ -1922,6 +2293,18 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         }
         // Nothing to push, and deliberately nothing to fetch — see `Backing::AdblockLists`.
         Backing::AdblockLists => return Ok(()),
+        // --- tabs and statusbar ----------------------------------------------------------------
+        // All three, for every one of the twelve — see `Backing::Chrome`. Each is cheap and each
+        // already stops early when nothing moved: `push_tabs_everywhere` rebuilds one JSON string
+        // per window, `push_bar_everywhere` one per window, and `apply_chrome_layout` compares the
+        // strips' order and visibility against what it last applied before it touches CEF.
+        Backing::Chrome => {
+            crate::tabs::push_tabs_everywhere();
+            crate::ipc::push_bar_everywhere();
+            crate::window::apply_chrome_layout_everywhere();
+            return Ok(());
+        }
+        // --- end tabs and statusbar ------------------------------------------------------------
         Backing::Content(kind) => kind,
     };
     let Value::Bool(allow) = applied.value else {
@@ -1978,7 +2361,9 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
         | Backing::Insert
         | Backing::Bar
         | Backing::SearchEngines
-        | Backing::AdblockLists => {
+        | Backing::AdblockLists
+        // --- tabs and statusbar ----------------------------------------------------------------
+        | Backing::Chrome => {
             return None;
         }
     };
@@ -2180,7 +2565,13 @@ mod tests {
         // make a failing build pass.
         // Twelve since `content.blocking.adblock.lists`, which is bru's first `Kind::List` and was
         // `adblock::DEFAULT_LISTS` before it was a setting.
-        assert_eq!(SETTINGS.len(), 12);
+        // --- tabs and statusbar ----------------------------------------------------------------
+        // Twenty-four: the twelve above plus the nine `tabs.*` and three `statusbar.*` that make
+        // the two strips bru draws itself configurable. **This number is this branch's alone** —
+        // two other workstreams are adding settings to the same table in the same round, and the
+        // merge adds the three deltas rather than any one of them guessing the others'.
+        assert_eq!(SETTINGS.len(), 24);
+        // --- end tabs and statusbar ------------------------------------------------------------
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
@@ -2201,6 +2592,138 @@ mod tests {
             }
         }
     }
+
+    // --- tabs and statusbar --------------------------------------------------------------------
+    /// The two strips' settings, checked at the store rather than at the strip: what the strip does
+    /// with a value needs CEF and a window, what the store does with one does not, and this is the
+    /// half that can be asserted without either.
+    #[test]
+    fn the_two_strips_settings_hold_only_what_they_can_draw() {
+        let mut settings = Settings::default();
+
+        // `tabs.position` takes two of qutebrowser's four, and the refusal names the two it takes.
+        let error = settings.set("tabs.position", "left").unwrap_err();
+        assert!(error.contains("top, bottom"), "{error}");
+        assert!(settings.set("tabs.position", "bottom").is_ok());
+
+        // `tabs.show`'s four are all built. `switching` is the one with a delay behind it.
+        for value in ["always", "never", "multiple", "switching"] {
+            assert!(settings.set("tabs.show", value).is_ok(), "{value}");
+        }
+        assert!(settings.set("tabs.show", "sometimes").is_err());
+
+        // `statusbar.show`'s three, and `in-mode` spelled with the hyphen qutebrowser uses.
+        for value in ["always", "never", "in-mode"] {
+            assert!(settings.set("statusbar.show", value).is_ok(), "{value}");
+        }
+        assert!(settings.set("statusbar.show", "in_mode").is_err());
+
+        // A format is free text, and an empty one is refused by `Kind::Text` — a tab drawn with no
+        // string at all is a tab that cannot be told from its neighbour.
+        assert!(settings.set("tabs.title.format", "{index}").is_ok());
+        assert!(settings.set("tabs.title.format", "").is_err());
+
+        // None of the twelve takes a URL pattern: they are all about a strip, and there is one
+        // strip per window rather than one per site.
+        for name in ["tabs.show", "statusbar.show", "tabs.background"] {
+            assert!(
+                settings
+                    .set_scoped(name, "never", Some("*://*.example.com/*"))
+                    .is_err(),
+                "{name} accepted a pattern"
+            );
+        }
+
+        // `config-cycle` with no values walks a Choice in order — which is what makes a key bound to
+        // `config-cycle tabs.show always never` work, and the user's own qutebrowser config has
+        // exactly that binding.
+        settings.set("tabs.show", "always").unwrap();
+        let applied = settings
+            .cycle("tabs.show", &["always".into(), "never".into()], None)
+            .unwrap();
+        assert_eq!(applied.value, Value::Text("never".to_string()));
+    }
+
+    /// `statusbar.widgets` is a list of names, and a name it cannot draw is refused with the reason
+    /// rather than accepted and skipped.
+    #[test]
+    fn the_status_line_refuses_a_widget_it_has_not_got() {
+        let mut settings = Settings::default();
+
+        // bru's own six are the defaults, in the order `bottom.html` lays the spans out.
+        assert_eq!(
+            list_of_in(&settings, "statusbar.widgets"),
+            vec!["keypress", "search_match", "url", "scroll", "tabs", "download"]
+        );
+
+        // One qutebrowser has and bru does not, with the reason.
+        let error = settings.list_add("statusbar.widgets", "history").unwrap_err();
+        assert!(error.contains("bru has no history widget"), "{error}");
+        assert!(error.contains("`H` and `L`"), "{error}");
+        let error = settings.list_add("statusbar.widgets", "clock").unwrap_err();
+        assert!(error.contains("once a second"), "{error}");
+
+        // One nobody has: the list, not a reason.
+        let error = settings.list_add("statusbar.widgets", "weather").unwrap_err();
+        assert!(error.contains("keypress, search_match"), "{error}");
+
+        // Reordering is remove-then-add, which is what an appending override buys — see
+        // STATUSBAR_WIDGETS.
+        settings.list_remove("statusbar.widgets", "url").unwrap();
+        settings.list_add("statusbar.widgets", "url").unwrap();
+        assert_eq!(
+            list_of_in(&settings, "statusbar.widgets"),
+            vec!["keypress", "search_match", "scroll", "tabs", "download", "url"]
+        );
+
+        // And a widget can be taken away for good, which is what makes the list a list rather than
+        // an order.
+        settings.list_remove("statusbar.widgets", "download").unwrap();
+        assert!(!list_of_in(&settings, "statusbar.widgets").contains(&"download".to_string()));
+    }
+
+    /// `list_of` reads the live store, which these tests do not install into. This is the same
+    /// question asked of a store in hand.
+    fn list_of_in(settings: &Settings, name: &str) -> Vec<String> {
+        match settings.get(name, None) {
+            Ok(Some(Value::List(entries))) => entries,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every `tabs.*` and `statusbar.*` name bru refuses says why, and none of them is also
+    /// implemented — the same pair of rules the file's first test applies to the whole table, aimed
+    /// at the twelve names this workstream added a reason for.
+    #[test]
+    fn the_refused_strip_settings_name_a_reason_rather_than_a_date() {
+        let mut settings = Settings::default();
+        for name in [
+            "tabs.last_close",
+            "tabs.title.elide",
+            "tabs.padding",
+            "statusbar.padding",
+            "tabs.indicator.width",
+            "tabs.favicons.scale",
+            "tabs.show_switching_delay",
+            "tabs.mousewheel_switching",
+            "tabs.close_mouse_button",
+            "tabs.close_mouse_button_on_bar",
+            "tabs.tabs_are_windows",
+        ] {
+            let error = settings.set_scoped(name, "1", None).unwrap_err();
+            assert!(
+                error.starts_with(&format!("bru does not implement {name}: ")),
+                "{name}: {error}"
+            );
+            // "not yet", "later", "TODO" — a date rather than a reason. The whole point of REFUSED
+            // is that the sentence still means something in a year.
+            let why = error.to_lowercase();
+            for excuse in ["not yet", "todo", "coming", "for now"] {
+                assert!(!why.contains(excuse), "{name} is refused with an excuse: {error}");
+            }
+        }
+    }
+    // --- end tabs and statusbar ----------------------------------------------------------------
 
     #[test]
     fn a_refused_setting_says_why_rather_than_pretending() {

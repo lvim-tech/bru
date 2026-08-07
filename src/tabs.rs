@@ -119,7 +119,7 @@ impl BruState {
     pub fn tabs_json(&self) -> String {
         match self.current_window_id() {
             Some(window) => self.tabs_json_in(window),
-            None => "{\"tabs\":[]}".to_string(),
+            None => empty_tabs_json(),
         }
     }
 
@@ -127,24 +127,57 @@ impl BruState {
     /// how a background window ends up listing the tabs of the one in front of it.
     pub fn tabs_json_in(&self, window: u32) -> String {
         let Some(slot) = self.slot(window) else {
-            return "{\"tabs\":[]}".to_string();
+            return empty_tabs_json();
         };
+        // --- tabs and statusbar ----------------------------------------------------------------
+        // Read once for the whole strip rather than once per tab: `text_of` takes the settings
+        // mutex, and a window with twenty tabs would take it eighty times for four answers that
+        // cannot change in between.
+        let format = crate::settings::text_of("tabs.title.format");
+        let pinned_format = crate::settings::text_of("tabs.title.format_pinned");
+        let count = slot.tabs.len();
+        // --- end tabs and statusbar ------------------------------------------------------------
         let entries: Vec<String> = slot
             .tabs
             .iter()
             .enumerate()
             .map(|(index, tab)| {
+                // --- tabs and statusbar --------------------------------------------------------
+                // `label` is what the strip draws and `title`/`url` are what it draws it *from*;
+                // both are sent because the strip still needs the raw URL for the favicon key and
+                // the tooltip. `top.js` reads `label` and falls back to the old `title || url` when
+                // it is absent, so a strip that has not been reloaded after an upgrade still draws
+                // something.
+                let label = format_title(
+                    if tab.pinned { &pinned_format } else { &format },
+                    tab,
+                    index,
+                    slot.active,
+                    count,
+                );
                 format!(
-                    "{{\"title\":\"{}\",\"url\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
+                    "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
                     crate::ipc::json_escape(&tab.title),
                     crate::ipc::json_escape(&tab.url),
+                    crate::ipc::json_escape(&label),
                     index == slot.active,
                     tab.pinned,
                     tab.muted,
                 )
             })
             .collect();
-        format!("{{\"tabs\":[{}]}}", entries.join(","))
+        // --- tabs and statusbar ----------------------------------------------------------------
+        // The three presentation settings ride with the tabs rather than in the bar's payload: they
+        // are the tab strip's, the strip is pushed on its own, and a strip that had to wait for a
+        // bar push to learn its own alignment would be a strip that is right one push late.
+        format!(
+            "{{\"tabs\":[{}],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
+            entries.join(","),
+            crate::ipc::json_escape(&crate::settings::text_of("tabs.favicons.show")),
+            crate::ipc::json_escape(&crate::settings::text_of("tabs.title.alignment")),
+            crate::settings::is_on("tabs.tooltips"),
+        )
+        // --- end tabs and statusbar ------------------------------------------------------------
     }
 
     /// Whether the tab at `index` keeps its place — what `tab-close` and `tab-only` consult before
@@ -391,6 +424,146 @@ pub fn new_tab(state: &SharedState, url: &str, background: bool) {
     }
 }
 
+// --- tabs and statusbar ------------------------------------------------------------------------
+
+/// A strip with nothing in it, in the shape the strip with something in it has.
+///
+/// One string rather than three literals: the payload gained three keys when the presentation
+/// settings arrived, and a fallback that kept the old two-key shape would leave a window with no
+/// tabs drawing its titles left-aligned no matter what `tabs.title.alignment` says — for exactly as
+/// long as it took the first tab to appear.
+fn empty_tabs_json() -> String {
+    format!(
+        "{{\"tabs\":[],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
+        crate::ipc::json_escape(&crate::settings::text_of("tabs.favicons.show")),
+        crate::ipc::json_escape(&crate::settings::text_of("tabs.title.alignment")),
+        crate::settings::is_on("tabs.tooltips"),
+    )
+}
+
+/// `tabs.title.format` and `tabs.title.format_pinned`, filled in for one tab.
+///
+/// **`cmdline.rs`'s `{url}`/`{title}` replacement is the pattern**, deliberately: a chain of
+/// `str::replace` calls, no parser, no template crate. The braces are not nestable and no
+/// placeholder is a prefix of another once the `{` is counted, so the chain cannot be order-
+/// dependent — `{index}` does not match inside `{aligned_index}`, because the character after that
+/// `{` is an `a`.
+///
+/// **A placeholder bru cannot fill is left standing, not blanked**, and that is the whole of the
+/// answer to "what does `{perc}` do". qutebrowser refuses an unknown field when the config is read;
+/// bru's `Kind::Text` has no per-setting validator to refuse it in, so the choice is between a tab
+/// that reads `{perc}: Example` and one that reads `: Example`. The first says what happened where
+/// the second hides it. The four that stay literal are `{perc}`, `{perc_raw}`, `{scroll_pos}` and
+/// `{backend}`: the first three are the scroll position of a tab that is not showing, and `scroll.rs`
+/// only ever hears from the tab that is — a background tab's percentage is a number bru does not
+/// have, not one it has not got round to.
+///
+/// The rest are qutebrowser's own, `configdata.yml:2378-2404`:
+///
+/// | | |
+/// |---|---|
+/// | `{current_title}` | the page's title, or its URL when it has not sent one |
+/// | `{title_sep}` | `" - "` when there is a title, empty otherwise |
+/// | `{index}` | 1-based, the number the strip counts by |
+/// | `{aligned_index}` | the same, right-padded so a strip of ten does not stagger |
+/// | `{relative_index}` | signed, against the tab that is showing |
+/// | `{id}` | the CEF browser identifier, or `-` before CEF has made one |
+/// | `{audio}` | `[M] ` when muted, empty otherwise |
+/// | `{host}`, `{protocol}`, `{current_url}` | pulled out of the tab's address |
+/// | `{private}` | always empty: every browser bru makes shares the one `RequestContext` |
+fn format_title(format: &str, tab: &Tab, index: usize, active: usize, count: usize) -> String {
+    format_fields(
+        format,
+        &tab.title,
+        &tab.url,
+        tab.muted,
+        tab.browser_id,
+        index,
+        active,
+        count,
+    )
+}
+
+/// [`format_title`] with the tab's fields spelled out instead of a `&Tab`.
+///
+/// Split out for one reason: a `Tab` owns a `BrowserView`, which cannot be made without CEF, and a
+/// unit test that cannot construct its input is a unit test that gets written as a second copy of
+/// the substitution. This is the whole of the behaviour and the tests call exactly it.
+#[allow(clippy::too_many_arguments)]
+fn format_fields(
+    format: &str,
+    tab_title: &str,
+    url: &str,
+    muted: bool,
+    browser_id: Option<i32>,
+    index: usize,
+    active: usize,
+    count: usize,
+) -> String {
+    if !format.contains('{') {
+        return format.to_string();
+    }
+    // bru's own fallback, kept from before the setting existed: a tab that has not been given a
+    // title yet shows its address rather than an empty box.
+    let title = if tab_title.is_empty() { url } else { tab_title };
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("", url),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.split('@').next_back().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+
+    let number = index + 1;
+    let width = count.to_string().len();
+    let relative = index as isize - active as isize;
+
+    format
+        .replace("{current_title}", title)
+        .replace("{title_sep}", if tab_title.is_empty() { "" } else { " - " })
+        .replace("{aligned_index}", &format!("{number:>width$}"))
+        .replace("{relative_index}", &relative.to_string())
+        .replace("{index}", &number.to_string())
+        .replace(
+            "{id}",
+            &browser_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        )
+        .replace("{audio}", if muted { "[M] " } else { "" })
+        .replace("{host}", host)
+        .replace("{protocol}", scheme)
+        .replace("{current_url}", url)
+        .replace("{private}", "")
+}
+
+/// Rebuild and push every window's strip.
+///
+/// The one caller is `settings::apply`, for a `Backing::Chrome` setting. It is here rather than in
+/// `ipc.rs` because the payload is built from `BruState` and `ipc.rs` only ever holds the string —
+/// `push_bar_everywhere` re-renders the strip too, but with the *cached* JSON, which is the one
+/// built under the old format.
+pub fn push_tabs_everywhere() {
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let per_window: Vec<(u32, String)> = {
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        state
+            .window_ids()
+            .into_iter()
+            .map(|window| (window, state.tabs_json_in(window)))
+            .collect()
+    };
+    for (window, json) in per_window {
+        crate::ipc::set_tabs_for(window, json);
+    }
+}
+
+// --- end tabs and statusbar --------------------------------------------------------------------
+
 /// Opens a tab on `url` in a named window.
 ///
 /// This is the entry point the popup workstream wants: a `on_before_popup` that has decided which
@@ -477,7 +650,15 @@ pub fn attach_all_in(state: &SharedState, window_id: u32) {
 /// more than one — the index is into that window's tabs, not into a global list.
 fn attach(window: &Window, layout: Option<&BoxLayout>, view: &BrowserView, index: usize) {
     let mut view = View::from(view);
-    window.add_child_view_at(Some(&mut view), index as i32 + 1);
+    // --- tabs and statusbar --------------------------------------------------------------------
+    // The `+ 1` was "the tab strip is child 0". It is now "however many strips are above the
+    // pages", which is 0, 1 or 2 depending on `tabs.position` and `statusbar.position` — see
+    // `window::leading_strip_count`, which is the one place that ordering is decided.
+    window.add_child_view_at(
+        Some(&mut view),
+        index as i32 + crate::window::leading_strip_count(),
+    );
+    // --- end tabs and statusbar ----------------------------------------------------------------
     if let Some(layout) = layout {
         layout.set_flex_for_view(Some(&mut view), 1);
     }
@@ -538,6 +719,11 @@ pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
     // Which tab the strip draws as selected is per window too, and a switch fires no display
     // callback to push it.
     crate::ipc::set_tabs_for(window_id, tabs);
+    // --- tabs and statusbar --------------------------------------------------------------------
+    // `tabs.show switching` shows the strip for 800 ms after a switch and hides it again. Under
+    // every other value this is one string compare and a return.
+    crate::window::note_tab_switch(window_id);
+    // --- end tabs and statusbar ----------------------------------------------------------------
 }
 
 pub fn next_tab(state: &SharedState) {
@@ -548,7 +734,13 @@ pub fn next_tab(state: &SharedState) {
     if count == 0 {
         return;
     }
-    select(state, (active + 1) % count);
+    // --- tabs and statusbar --------------------------------------------------------------------
+    // `tabs.wrap`. The modulo below *is* the `true` half of the setting, written as an operator —
+    // which is why this is one `if` rather than a new code path: `false` stops on the last tab
+    // instead of coming back round to the first, and `select` on the index that is already active
+    // is a no-op the strip never sees.
+    select(state, step(active, count, 1));
+    // --- end tabs and statusbar ----------------------------------------------------------------
 }
 
 pub fn prev_tab(state: &SharedState) {
@@ -559,8 +751,31 @@ pub fn prev_tab(state: &SharedState) {
     if count == 0 {
         return;
     }
-    select(state, (active + count - 1) % count);
+    // --- tabs and statusbar --------------------------------------------------------------------
+    select(state, step(active, count, -1));
+    // --- end tabs and statusbar ----------------------------------------------------------------
 }
+
+// --- tabs and statusbar ------------------------------------------------------------------------
+/// One step through the strip, wrapping or not as `tabs.wrap` says.
+///
+/// Pure, and separate from the two commands so that it can be tested without a window: everything
+/// else in this file needs CEF, and the arithmetic is the whole of what the setting changes.
+pub(crate) fn step_with(active: usize, count: usize, by: isize, wrap: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let next = active as isize + by;
+    if wrap {
+        return next.rem_euclid(count as isize) as usize;
+    }
+    next.clamp(0, count as isize - 1) as usize
+}
+
+fn step(active: usize, count: usize, by: isize) -> usize {
+    step_with(active, count, by, crate::settings::is_on("tabs.wrap"))
+}
+// --- end tabs and statusbar --------------------------------------------------------------------
 
 /// Closes every tab but the showing one — `co`, qutebrowser's `:tab-only`.
 ///
@@ -822,6 +1037,120 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     // pressing `gD`.
     focus(state, target);
 }
+
+// --- tabs and statusbar ------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `format_fields` with the arguments in the order the tests read them. Not a second
+    /// implementation of anything: it forwards, and the substitution it is checking is the one the
+    /// strip runs.
+    #[allow(clippy::too_many_arguments)]
+    fn formatted(
+        format: &str,
+        title: &str,
+        url: &str,
+        muted: bool,
+        index: usize,
+        active: usize,
+        count: usize,
+    ) -> String {
+        format_fields(format, title, url, muted, None, index, active, count)
+    }
+
+    #[test]
+    fn the_default_format_is_what_the_strip_drew_before_the_setting_existed() {
+        assert_eq!(
+            formatted(
+                "{audio}{index}: {current_title}",
+                "Example",
+                "https://example.com/",
+                false,
+                0,
+                0,
+                1
+            ),
+            "1: Example"
+        );
+        // The mute marker was a hard-coded `"[M] "` in top.js. It is `{audio}` now, and it is still
+        // the same three characters in the same place.
+        assert_eq!(
+            formatted(
+                "{audio}{index}: {current_title}",
+                "Example",
+                "https://example.com/",
+                true,
+                2,
+                0,
+                3
+            ),
+            "[M] 3: Example"
+        );
+        // A tab with no title yet draws its address, which is what `tab.title || tab.url` did.
+        assert_eq!(
+            formatted("{current_title}", "", "https://example.com/x", false, 0, 0, 1),
+            "https://example.com/x"
+        );
+    }
+
+    #[test]
+    fn every_placeholder_bru_can_fill_is_filled() {
+        let out = formatted(
+            "{index}|{aligned_index}|{relative_index}|{host}|{protocol}|{current_url}|{title_sep}|{private}|",
+            "T",
+            "https://user@example.com:8443/path",
+            false,
+            2,
+            0,
+            10,
+        );
+        assert_eq!(
+            out,
+            "3| 3|2|example.com|https|https://user@example.com:8443/path| - ||"
+        );
+        // `{aligned_index}` pads to the width of the count, so a strip of ten does not stagger.
+        assert_eq!(formatted("{aligned_index}", "T", "", false, 0, 0, 10), " 1");
+        assert_eq!(formatted("{aligned_index}", "T", "", false, 0, 0, 9), "1");
+        // Relative to the tab that is showing, signed.
+        assert_eq!(formatted("{relative_index}", "T", "", false, 0, 3, 5), "-3");
+    }
+
+    /// The four bru cannot fill are left standing rather than blanked — see `format_fields`. A tab
+    /// reading `{perc}: Example` says what happened; one reading `: Example` hides it.
+    #[test]
+    fn a_placeholder_bru_cannot_fill_stays_on_the_screen() {
+        for unknown in ["{perc}", "{perc_raw}", "{scroll_pos}", "{backend}", "{nonsense}"] {
+            let out = formatted(&format!("{unknown} {{current_title}}"), "T", "", false, 0, 0, 1);
+            assert_eq!(out, format!("{unknown} T"), "{unknown} was quietly swallowed");
+        }
+    }
+
+    /// `{index}` must not match inside `{aligned_index}` — the chain of `str::replace` calls is only
+    /// safe because no placeholder is a prefix of another once the brace is counted.
+    #[test]
+    fn no_placeholder_eats_another() {
+        assert_eq!(formatted("{aligned_index}", "T", "", false, 4, 0, 5), "5");
+        assert_eq!(formatted("{relative_index}", "T", "", false, 4, 4, 5), "0");
+    }
+
+    /// `tabs.wrap`. The modulo the two commands already used *is* the true half, so the false half
+    /// is the only new behaviour and this is what says so.
+    #[test]
+    fn tabs_wrap_false_stops_at_each_end() {
+        assert_eq!(step_with(2, 3, 1, true), 0);
+        assert_eq!(step_with(0, 3, -1, true), 2);
+        assert_eq!(step_with(2, 3, 1, false), 2);
+        assert_eq!(step_with(0, 3, -1, false), 0);
+        // In the middle the two agree, which is what makes this a setting about the ends only.
+        assert_eq!(step_with(1, 3, 1, true), step_with(1, 3, 1, false));
+        assert_eq!(step_with(1, 3, -1, true), step_with(1, 3, -1, false));
+        // One tab is both ends at once.
+        assert_eq!(step_with(0, 1, 1, false), 0);
+        assert_eq!(step_with(0, 1, 1, true), 0);
+    }
+}
+// --- end tabs and statusbar --------------------------------------------------------------------
 
 /// Bring a window to the front and make it the one commands act on.
 pub fn focus(state: &SharedState, window_id: u32) {

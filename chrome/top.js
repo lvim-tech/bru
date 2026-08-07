@@ -64,12 +64,34 @@
   var icons = {};
   var state = { tabs: [] };
 
+  // --- tabs and statusbar -------------------------------------------------
+  // src/settings.rs `tabs.favicons.show`. `pinned` is the value that pays for
+  // the setting: a pinned tab shrinks to its contents, so an icon and no words
+  // is what a row of them is for.
+  function showFavicon(pushed, tab) {
+    if (pushed.favicons === "never") {
+      return false;
+    }
+    if (pushed.favicons === "pinned") {
+      return !!tab.pinned;
+    }
+    return true;
+  }
+  // --- end tabs and statusbar -----------------------------------------------
+
   function draw() {
     var host = document.getElementById("tabs");
     if (!host) {
       return;
     }
     var tabs = state.tabs || [];
+
+    // --- tabs and statusbar -------------------------------------------------
+    // src/settings.rs `tabs.title.alignment`. An attribute, not a class:
+    // top.js already owns className on the tab elements and data-view on the
+    // body, and chrome.css holds the three rules — nothing here writes CSS.
+    document.body.setAttribute("data-align", state.align || "left");
+    // --- end tabs and statusbar ---------------------------------------------
 
     // textContent, not innerHTML: #tabs:empty is a real selector and a
     // whitespace text node would defeat it.
@@ -87,30 +109,60 @@
         (tab.active ? "active " : "") +
         (tab.pinned ? "pinned " : "") +
         loadClass(tab);
-      el.title = tab.url || "";
+      // --- tabs and statusbar ---------------------------------------------
+      // src/settings.rs `tabs.tooltips`. The attribute is the whole of what a
+      // tooltip is here, so leaving it off is the whole of switching them off.
+      // `!== false` rather than a truth test: a strip pushed by an older Rust
+      // sends no `tooltips` key at all, and undefined must mean "as before".
+      if (state.tooltips !== false) {
+        el.title = tab.url || "";
+      }
+      // --- end tabs and statusbar -----------------------------------------
       // The one place a pointer is worth having in a keyboard-driven browser:
       // the strip is the only chrome a mouse naturally goes for. The index is
       // the strip's own order, which is what BruState calls a tab index.
       el.dataset.index = String(i);
 
-      var favicon = document.createElement("span");
-      favicon.className = "favicon";
-      // A data: URL, because this page is served from bru:// and cannot fetch
-      // an image from a site. Absent until the download finishes, which is
-      // what keeps the box empty rather than broken.
-      var icon = icons[origin(tab.url || "")];
-      if (icon) {
-        favicon.style.backgroundImage = 'url("' + icon + '")';
+      // --- tabs and statusbar ---------------------------------------------
+      // src/settings.rs `tabs.favicons.show`: always, never, or only on
+      // pinned tabs. The span is not created at all when it is not wanted —
+      // it is `flex: 0 0 16px` in chrome.css, so an empty one is still 16px
+      // of nothing, and `never` has to give that width back.
+      if (showFavicon(state, tab)) {
+        var favicon = document.createElement("span");
+        favicon.className = "favicon";
+        // A data: URL, because this page is served from bru:// and cannot fetch
+        // an image from a site. Absent until the download finishes, which is
+        // what keeps the box empty rather than broken.
+        var icon = icons[origin(tab.url || "")];
+        if (icon) {
+          favicon.style.backgroundImage = 'url("' + icon + '")';
+        }
+        el.appendChild(favicon);
       }
-      el.appendChild(favicon);
+      // --- end tabs and statusbar -----------------------------------------
 
       var title = document.createElement("span");
       title.className = "title";
-      // qutebrowser puts the mute marker in the title, not in a colour:
-      // tabs.title.format is "{audio}{index}: {current_title}" and {audio} is
-      // "[M] " when muted (tabwidget.py:40). Same string here, so a muted tab
-      // reads the same in both browsers and needs no stylesheet of its own.
-      title.textContent = (tab.muted ? "[M] " : "") + (tab.title || tab.url || "");
+      // --- tabs and statusbar ---------------------------------------------
+      // src/settings.rs `tabs.title.format` / `tabs.title.format_pinned`. The
+      // string arrives already assembled: `tabs::format_title` fills the
+      // placeholders in Rust, where the index, the browser id and the tab's own
+      // address all are, and this side draws what it is handed.
+      //
+      // The mute marker used to be written here, as `"[M] "` prepended to the
+      // title — qutebrowser's `{audio}` (tabwidget.py:40) hard-coded. It is now
+      // one of the placeholders the format fills, so a user who takes `{audio}`
+      // out of their format gets a strip with no markers, which is what taking
+      // it out means.
+      //
+      // The fallback is the old expression, for a strip whose Rust predates
+      // `label`.
+      title.textContent =
+        tab.label !== undefined
+          ? tab.label
+          : (tab.muted ? "[M] " : "") + (tab.title || tab.url || "");
+      // --- end tabs and statusbar -----------------------------------------
       el.appendChild(title);
 
       host.appendChild(el);

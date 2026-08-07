@@ -502,6 +502,13 @@ pub fn set_mode_for(window: u32, mode: String) {
     }
     with_window(window, |entry| entry.bar.mode = mode);
     push_for(window);
+// --- tabs and statusbar ----------------------------------------------------
+    // `statusbar.show in-mode` shows the bar in every mode but normal, and `never` keeps it for as
+    // long as the command line or a prompt holds the keyboard — both are answers about the mode, so
+    // this is where they are asked. Cheap: it returns before it touches a view unless the answer
+    // moved.
+    crate::window::apply_chrome_layout(window);
+// --- end tabs and statusbar ------------------------------------------------
 }
 
 /// The current window's mode. The convenience half of [`set_mode_for`], the way `set_tabs` is of
@@ -780,6 +787,12 @@ fn bar_json_for(window: u32) -> String {
     let mode_style = crate::settings::value_of("statusbar.mode.style").unwrap_or_default();
     // --- src/settings.rs: `statusbar.mode.labels`, already JSON --------------------------------
     let mode_labels = crate::settings::mode_labels_json();
+// --- tabs and statusbar ----------------------------------------------------
+    // `statusbar.widgets` — which fields the status line draws and in what order, already a JSON
+    // array. Read here rather than kept on `BarState` for `tabindex`'s reason: it is a pure
+    // function of a setting, and a copy is a copy somebody has to remember to update.
+    let widgets = crate::settings::widgets_json();
+// --- end tabs and statusbar ------------------------------------------------
     with_window(window, |entry| {
         let bar = &entry.bar;
         format!(
@@ -787,7 +800,7 @@ fn bar_json_for(window: u32) -> String {
             // which ignores a key it has no element for: `search` is the find handler's match count,
             // `download` a running download's progress, `message` one line with a level and its own
             // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
-            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"modelabels\":{mode_labels},\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"prompt\":{prompt},\"message\":{message}}}",
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"modelabels\":{mode_labels},\"widgets\":{widgets},\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"prompt\":{prompt},\"message\":{message}}}",
             json_escape(&bar.url),
             json_escape(&bar.title),
             json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
@@ -956,6 +969,11 @@ fn start_cmdline_script() {
 pub fn set_tabs_for(window: u32, json: String) {
     with_window(window, |entry| entry.tabs = json);
     push_for(window);
+// --- tabs and statusbar ----------------------------------------------------
+    // `tabs.show multiple` counts tabs, and this is the one funnel every change to a window's tab
+    // list goes through. It returns without touching a view when the answer has not moved.
+    crate::window::apply_chrome_layout(window);
+// --- end tabs and statusbar ------------------------------------------------
 }
 
 /// The current window's strip, for callers that act on it by definition.

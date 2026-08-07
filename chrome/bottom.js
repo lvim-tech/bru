@@ -98,6 +98,65 @@
     }
   }
 
+  // --- tabs and statusbar ---------------------------------------------------
+  // src/settings.rs `statusbar.widgets`: which fields #statusline draws and in
+  // what order. The names are qutebrowser's, from that setting's own
+  // valid_values (configdata.yml:2191-2211), and the ids are bottom.html's —
+  // the two vocabularies differ and this table is the only place they meet.
+  var WIDGET_ELEMENTS = {
+    keypress: "keystring",
+    search_match: "search",
+    url: "url",
+    scroll: "scroll",
+    tabs: "tabindex",
+    download: "download",
+  };
+
+  // What the row was when it was last built. Every push reaches renderWidgets
+  // and almost none of them changes the list; moving six nodes on every
+  // keystring change would be DOM churn on a path that runs constantly.
+  var appliedWidgets = null;
+
+  function renderWidgets(list) {
+    var host = document.getElementById("statusline");
+    if (!host || !list || !list.length) {
+      return;
+    }
+    var key = list.join(",");
+    if (key === appliedWidgets) {
+      return;
+    }
+    appliedWidgets = key;
+
+    var kept = {};
+    for (var i = 0; i < list.length; i++) {
+      var id = WIDGET_ELEMENTS[list[i]];
+      if (!id) {
+        continue;
+      }
+      var el = document.getElementById(id);
+      if (!el) {
+        continue;
+      }
+      kept[id] = true;
+      el.classList.remove("off");
+      // appendChild on a node that is already a child *moves* it, so walking
+      // the list in order leaves the row in that order.
+      host.appendChild(el);
+    }
+    for (var name in WIDGET_ELEMENTS) {
+      var other = document.getElementById(WIDGET_ELEMENTS[name]);
+      if (other && !kept[WIDGET_ELEMENTS[name]]) {
+        // Not emptied: the field still has something true to say and Rust still
+        // pushes it. `.off` is display:none in chrome.css, which is what
+        // `#statusline > span:empty` already does for a field with nothing in
+        // it — one rule for "nothing to say", one for "not asked for".
+        other.classList.add("off");
+      }
+    }
+  }
+  // --- end tabs and statusbar -----------------------------------------------
+
   // {level: "info"|"warning"|"error", text} or null. The class is what picks the
   // colours out of theme.css, and textContent is what makes `#message:empty`
   // true again — the stylesheet, not this file, decides that an empty message
@@ -219,6 +278,13 @@
     // data-title at the end.
     render: function (state) {
       state = state || {};
+
+      // --- tabs and statusbar -----------------------------------------------
+      // Which fields are drawn and in what order, before anything is written
+      // into them: `statusbar.widgets` is a list of names now rather than the
+      // fixed span order bottom.html was written with.
+      renderWidgets(state.widgets);
+      // --- end tabs and statusbar -------------------------------------------
 
       // In qutebrowser's `statusbar.widgets` order, which is the order the
       // elements sit in inside #statusline; see bottom.html.
