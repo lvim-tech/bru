@@ -105,6 +105,13 @@ pub const SOCKET_SWITCH: &str = "--socket=";
 ///
 /// The last one wins, which is Chromium's rule for its own switches and the one a person who
 /// appends to a wrapper script expects.
+///
+/// **A named socket gives up the directory's protection, and only the directory's.** The default
+/// sits in `$XDG_RUNTIME_DIR`, which the kernel gives this user alone at mode 0700; a path in
+/// `/tmp` sits somewhere every account can list. What does not change is the socket itself —
+/// `listen` chmods it 0600, and the module header already says that is the belt and the directory
+/// is the braces. So `--socket=/tmp/x.sock` is fine for a test browser and is not the place to put
+/// the one holding a logged-in session.
 fn socket_from(args: &[String], runtime_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let before = args.iter().position(|arg| arg == "--remote").unwrap_or(args.len());
     let named = args[..before]
