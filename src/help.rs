@@ -17,10 +17,11 @@
 //! # The second half: every command, not only the bound ones
 //!
 //! The key table above answers "what does this key do". It cannot answer "what can I type", and by
-//! 2026-08-07 that had become the larger question: bru understood 165 commands and bound 298 keys
-//! naming 62 of them, so a hundred commands — `screenshot`, `jseval`, `config-diff`, `tab-take` —
-//! existed and were written down nowhere. A command nobody can find is a command nobody uses, and
-//! every workstream that lands makes the gap wider.
+//! 2026-08-07 that had become the larger question. Measured that morning: 160 commands under 166
+//! names, 298 bound keys, and **53 commands no key reaches at all** — `screenshot`, `jseval`,
+//! `config-diff`, `tab-take` and the rest of the thirty-two that landed that day. Every one of them
+//! existed, worked, and was written down nowhere. A command nobody can find is a command nobody
+//! uses, and every workstream that lands makes the gap wider.
 //!
 //! So [`COMMANDS`] is the other half of the page, and the column that joins the two is **which key
 //! calls it**. That join is the whole reason both halves are one document: `:tab-select` reads very
@@ -39,10 +40,11 @@
 //!    written down — the arms of `parse_one`'s `match name.as_str()`, and the `matches!` in
 //!    `cmdline::is_named` — then asserts **set equality** with the names below. A command added to
 //!    the parser and not to this table fails, and so does a name here the parser has never heard
-//!    of. The 191 string literals in that file include argument values (`down`, `links`,
-//!    `pretty-url`), and they are told apart from command names by **brace depth**: an arm head of
-//!    that one `match` sits at depth 0 of its own block, and every nested `match dir { "up" => … }`
-//!    is inside an arm body at depth 1 or more. That is what keeps `up` off this page.
+//!    of. That match holds **463 string literals, 317 of them distinct**, and only 146 are command
+//!    names; the rest are argument values (`down`, `links`, `pretty-url`). They are told apart by
+//!    **brace depth**: an arm head of that one `match` sits at depth 0 of its own block, and every
+//!    nested `match dir { "up" => … }` is inside an arm body at depth 1 or more. Ignoring the depth
+//!    was measured on 2026-08-07 and put 35 argument values on the page as commands.
 //! 2. **The `Command` enum is covered exhaustively.** `every_command_variant_is_reachable_by_name`
 //!    matches over [`crate::commands::Command`] with **no `_` arm**, the same trick
 //!    `exec::run` uses, and asserts every variant is produced by parsing something this table
@@ -162,7 +164,7 @@ pub struct Doc {
 /// Every command bru understands, in the order `src/commands.rs` implements them — which groups
 /// them by the module that owns them, and is the order a reader of the source would find them in.
 ///
-/// The tail of the list is `src/cmdline.rs`'s: eighteen names that never become a
+/// The tail of the list is `src/cmdline.rs`'s: nineteen names that never become a
 /// [`crate::commands::Command`] variant at all and are matched as text by `cmdline::is_named`.
 /// They are commands all the same, they are bound to keys, and leaving them off would make this
 /// page disagree with the table above it about `<Ctrl-A>` in command mode.
@@ -781,7 +783,7 @@ pub fn page(bindings: &Bindings) -> String {
     //
     // What is left is the two numbers and the promise that each dead key says why.
     //
-    // **The commands half adds two more counts and no fraction.** "165 commands, 62 of them bound"
+    // **The commands half adds two more counts and no fraction.** "160 commands, 107 of them bound"
     // is the same "x of y" that was taken out of the first sentence by hand this morning: it reads
     // as a score, and the number it scores against is not one a reader has any use for. Two
     // sentences of one count each say the same thing without inviting the division.
@@ -1079,11 +1081,12 @@ mod tests {
     /// One token of Rust source: a string literal, or a single character, each carrying the bracket
     /// depth it sits at and where it starts.
     ///
-    /// Depth is the whole trick. `src/commands.rs` holds 191 string literals inside `parse_one` and
-    /// only some of them are command names; `"down"`, `"links"` and `"pretty-url"` are argument
+    /// Depth is the whole trick. `parse_one`'s command match holds 463 string literals, 317 of them
+    /// distinct, and only 146 are command names; `"down"`, `"links"` and `"pretty-url"` are argument
     /// values, and every one of them sits inside an arm's body — depth 1 or more — while an arm
     /// *head* of the one match that dispatches on the command name sits at depth 0 of that match's
-    /// own block. Scraping by regex would list `up` as a command.
+    /// own block. Scraping by regex would list `up` as a command; taking the `0` out of the pattern
+    /// below was measured and listed 35 of them.
     enum Tok {
         Lit(String),
         Ch(char),
