@@ -56,6 +56,10 @@ const PAGE: usize = 14;
 /// The models bru has. `src/completion.rs` builds `Url`; the rest are below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Which {
+    /// `:` alone, `:m`, and the second argument of `:bind` — every command bru understands, with
+    /// what it does and the keys that reach it (`miscmodels.py:17-23`, `util.py:16-43`). The rows
+    /// are `src/help.rs`'s, because the join to the key table is already written there.
+    Commands,
     /// `:open` — search engines, quickmarks, bookmarks, history.
     Url,
     /// `:tab-select`, `:tab-focus`. `special` adds qutebrowser's Special category, which is where
@@ -82,34 +86,42 @@ enum Which {
 /// One row of the table that turns a command into a model.
 ///
 /// `argpos` is which positional argument, counting from zero after the command name, this model
-/// completes; `maxsplit0` is qutebrowser's `maxsplit=0` — everything after the flags is one
-/// argument, verbatim, spaces included. `:open` has it, which is the only reason
-/// `:open rust vec` can be two search terms rather than two arguments.
+/// completes; `rest_from` is qutebrowser's `maxsplit` — the argument index at which the rest of the
+/// line stops being split and becomes one argument, verbatim, spaces included. `:open` is
+/// `Some(0)`, which is the only reason `:open rust vec` can be two search terms rather than two
+/// arguments; `:bind` is `Some(1)`, so the key is a word and the command it is bound to is
+/// everything after it (`commands/parser.py:177-205`).
+///
+/// `rest_from` is a property of the *command*, not of one of its arguments, so every row sharing a
+/// name has to agree about it — `every_command_agrees_with_itself_about_maxsplit` says so.
 struct Spec {
     name: &'static str,
     argpos: usize,
     which: Which,
-    maxsplit0: bool,
+    rest_from: Option<usize>,
+    /// `*args`: this row answers `argpos` and every position after it, the way
+    /// `Command.get_pos_arg_info` clamps a position to the last parameter when there is a vararg
+    /// (`commands/command.py:165-170`). `:config-cycle option v1 v2 v3` completes a value at every
+    /// one of the three.
+    vararg: bool,
 }
 
-/// Every command bru completes. Adding a model is a line here and an arm in [`build`].
+/// Every command bru completes. Adding a model is a line here and an arm in [`build_which`].
 ///
-/// What is deliberately absent, and why, is in the report and in this file's tests: `:bind` and
-/// `:set` want a registry of command names and of settings that bru does not have yet, and the
-/// command-name model that `:` alone would open wants the same list.
+/// What is deliberately absent, and why, is in the report and in this file's tests.
 const SPECS: &[Spec] = &[
-    Spec { name: "open", argpos: 0, which: Which::Url, maxsplit0: true },
+    Spec { name: "open", argpos: 0, which: Which::Url, rest_from: Some(0), vararg: false },
 // --- src/utilcmds.rs -------------------------------------------------------
-    // `maxsplit0` on both, because both are registered that way (`commands.py:430`, `:930`) and
-    // because their argument may be a title fragment with a space in it.
-    Spec { name: "tab-select", argpos: 0, which: Which::AllTabs, maxsplit0: true },
-    Spec { name: "tab-take", argpos: 0, which: Which::OtherTabs, maxsplit0: true },
+    // The rest of the line on both, because both are registered that way (`commands.py:430`,
+    // `:930`) and because their argument may be a title fragment with a space in it.
+    Spec { name: "tab-select", argpos: 0, which: Which::AllTabs, rest_from: Some(0), vararg: false },
+    Spec { name: "tab-take", argpos: 0, which: Which::OtherTabs, rest_from: Some(0), vararg: false },
 // --- end src/utilcmds.rs ---------------------------------------------------
-    Spec { name: "tab-focus", argpos: 0, which: Which::Tabs { special: true }, maxsplit0: false },
-    Spec { name: "quickmark-load", argpos: 0, which: Which::Quickmark, maxsplit0: false },
-    Spec { name: "quickmark-del", argpos: 0, which: Which::Quickmark, maxsplit0: false },
-    Spec { name: "bookmark-load", argpos: 0, which: Which::Bookmark, maxsplit0: false },
-    Spec { name: "bookmark-del", argpos: 0, which: Which::Bookmark, maxsplit0: false },
+    Spec { name: "tab-focus", argpos: 0, which: Which::Tabs { special: true }, rest_from: None, vararg: false },
+    Spec { name: "quickmark-load", argpos: 0, which: Which::Quickmark, rest_from: None, vararg: false },
+    Spec { name: "quickmark-del", argpos: 0, which: Which::Quickmark, rest_from: None, vararg: false },
+    Spec { name: "bookmark-load", argpos: 0, which: Which::Bookmark, rest_from: None, vararg: false },
+    Spec { name: "bookmark-del", argpos: 0, which: Which::Bookmark, rest_from: None, vararg: false },
 ];
 
 /// The command line cut into the part being completed and the parts around it.
@@ -127,6 +139,7 @@ struct Partition {
     /// Everything after the completed part. Empty for every default binding.
     after: Vec<String>,
     which: Which,
+    /// Whether the completed part is the rest of the line, verbatim — see [`Spec::rest_from`].
     maxsplit0: bool,
 }
 
@@ -162,8 +175,8 @@ fn quote(s: &str) -> String {
 }
 
 /// Cut `text` around `cursor` and say which model answers, or `None` for a line that completes
-/// nothing: a search, an empty line, a flag, anything after a `--`, an unknown command, or an
-/// argument position no model claims.
+/// nothing: an empty line, a flag, anything after a `--`, an unknown command, or an argument
+/// position no model claims.
 fn partition(text: &str, cursor: usize) -> Option<Partition> {
     let chars: Vec<char> = text.chars().collect();
     let prefix = *chars.first()?;
@@ -192,58 +205,29 @@ fn partition(text: &str, cursor: usize) -> Option<Partition> {
     }
     let text_of = |(a, b): (usize, usize)| body[a..b].iter().collect::<String>();
 
-    // `:` alone, or `:   `. qutebrowser opens the command-name model here; bru has no list of
-    // command names to open it from, so the bar stays closed. Said out loud in the report.
-    let (&first, rest) = tokens.split_first()?;
+    // **Nothing before the cursor is the command-name model** — `_get_new_completion`'s first
+    // branch, `if not before_cursor: return miscmodels.command` (`completer.py:87-90`), with the
+    // comment `'|' or 'set|'` naming both cases. `:` alone and `:   ` are the first; a cursor
+    // still inside the command's own name is the second, and its pattern is that half-typed name.
+    // This is where the file used to say "bru has no list of command names to open it from"; it
+    // has two now, `help.rs::COMMANDS` and the key table it is joined to.
+    let Some((&first, rest)) = tokens.split_first() else {
+        return Some(command_name_partition(prefix, String::new(), Vec::new()));
+    };
     let name = text_of(first);
-    let spec = SPECS.iter().find(|spec| spec.name == name)?;
-
-    // maxsplit=0: the flags belong to the command and everything from the first non-flag token to
-    // the end of the line is one argument. `commands/parser.py:177-205`.
-    if spec.maxsplit0 {
-        let mut before = vec![name];
-        let mut from = body.len();
-        for &token in rest {
-            let part = text_of(token);
-            let flag = part.starts_with('-');
-            if at <= token.1 {
-                // The cursor is on this token, so this token is the part being completed — and a
-                // flag completes nothing (`completer.py:83`).
-                if flag {
-                    return None;
-                }
-                from = token.0;
-                break;
-            }
-            if flag {
-                // An explicit end of flags stops the completion outright.
-                if part == "--" {
-                    return None;
-                }
-                before.push(part);
-                continue;
-            }
-            from = token.0;
-            break;
-        }
-        // The cursor has to be inside the argument, not back in the command's own name.
-        if at < from {
-            return None;
-        }
-        let center: String = body[from..].iter().collect();
-        return Some(Partition {
-            prefix,
-            before,
-            center,
-            after: Vec::new(),
-            which: spec.which,
-            maxsplit0: true,
-        });
+    if at <= first.1 {
+        // Whatever follows is kept, so completing `:ope|n duck` leaves `duck` where it was —
+        // `_partition` returns it as the postfix (`completer.py:154`).
+        let after = rest.iter().map(|&token| text_of(token)).collect();
+        return Some(command_name_partition(prefix, name, after));
     }
 
-    // Everything else: the token under the cursor is the pattern. A cursor sitting in the
-    // whitespace between two tokens completes an empty pattern there, as `_partition` does by
-    // inserting an empty part (`completer.py:143-146`).
+    let named: Vec<&Spec> = SPECS.iter().filter(|spec| spec.name == name).collect();
+    let first_spec = *named.first()?;
+
+    // The token under the cursor is the pattern. A cursor sitting in the whitespace between two
+    // tokens completes an empty pattern there, as `_partition` does by inserting an empty part
+    // (`completer.py:143-146`).
     let mut before: Vec<String> = vec![name];
     let mut center = String::new();
     let mut after: Vec<String> = Vec::new();
@@ -271,10 +255,51 @@ fn partition(text: &str, cursor: usize) -> Option<Partition> {
         return None;
     }
     // `argpos` counts positionals only, the command name included, less one (`completer.py:99`).
-    let positionals = before.iter().filter(|part| !part.starts_with('-')).count();
-    if positionals.saturating_sub(1) != spec.argpos {
-        return None;
+    // A flag's *value* is counted as a positional here, because `_get_new_completion` filters on
+    // nothing but the leading `-` and so miscounts `:set -u <pattern> …` in exactly the same way.
+    let mut argpos = before.iter().filter(|part| !part.starts_with('-')).count().saturating_sub(1);
+    let mut maxsplit0 = false;
+
+    // qutebrowser's `maxsplit`: from argument `rest_from` on, the line stops being split and the
+    // whole remainder is one part. Re-cut rather than special-cased above, so that the walk that
+    // decides *which* argument the cursor is in is written once.
+    if let Some(from_arg) = first_spec.rest_from {
+        if argpos >= from_arg {
+            let mut kept: Vec<String> = vec![before[0].clone()];
+            let mut seen = 0usize;
+            let mut from = body.len();
+            for &token in rest {
+                let part = text_of(token);
+                if part.starts_with('-') {
+                    // An explicit end of flags stops the completion outright.
+                    if part == "--" {
+                        return None;
+                    }
+                    kept.push(part);
+                    continue;
+                }
+                if seen == from_arg {
+                    from = token.0;
+                    break;
+                }
+                seen += 1;
+                kept.push(part);
+            }
+            // The cursor has to be inside the argument, not back in an earlier one.
+            if at < from {
+                return None;
+            }
+            before = kept;
+            center = body[from..].iter().collect();
+            after = Vec::new();
+            argpos = from_arg;
+            maxsplit0 = true;
+        }
     }
+
+    let spec = named
+        .iter()
+        .find(|spec| spec.argpos == argpos || (spec.vararg && argpos >= spec.argpos))?;
 
     Some(Partition {
         prefix,
@@ -282,8 +307,22 @@ fn partition(text: &str, cursor: usize) -> Option<Partition> {
         center,
         after,
         which: spec.which,
-        maxsplit0: false,
+        maxsplit0,
     })
+}
+
+/// `_get_new_completion`'s first branch: the command-name model, with nothing before the cursor.
+fn command_name_partition(prefix: char, center: String, after: Vec<String>) -> Partition {
+    Partition {
+        prefix,
+        before: Vec::new(),
+        center,
+        after,
+        which: Which::Commands,
+        // A command name has no spaces in it, so quoting is a no-op — but it is the honest value:
+        // this part is one token and not the rest of the line.
+        maxsplit0: false,
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -352,8 +391,62 @@ fn window_name(id: u32) -> &'static str {
 /// `miscmodels.py:49,68` — `column_widths=(30, 70, 0)`.
 const MARK_WIDTHS: &[u8] = &[30, 70];
 
-fn build(which: Which, pattern: &str) -> Vec<Category> {
+/// `miscmodels.py:19` — `column_widths=(20, 60, 20)`: the name, what it does, the keys.
+const COMMAND_WIDTHS: &[u8] = &[20, 60, 20];
+
+/// The command rows, and the key table they were joined against.
+///
+/// Cached because the join is not free — measured 2026-08-07, debug build: `reached` over the 298
+/// default bindings costs 1.46 ms, which would be paid on **every keystroke** of a `:` line, and
+/// the answer only changes when `:bind` or `:unbind` changes the table. The key it is cached under
+/// is the binding table itself, so a rebind invalidates it without anything having to remember to:
+/// `Bindings::all()` costs 0.53 ms of that 1.46 and comparing two of them is a memcmp.
+///
+/// Before `BruState` exists — a unit test, or a renderer process — the defaults are the truth, the
+/// same fallback `hints.rs` and `prompt.rs` take.
+fn command_rows() -> Vec<Vec<String>> {
+    static CACHE: Mutex<Option<(Vec<(Mode, String, String)>, Vec<Vec<String>>)>> = Mutex::new(None);
+
+    let bindings = crate::state::BruState::instance()
+        .and_then(|state| state.lock().ok().and_then(|state| state.bindings_snapshot()))
+        .unwrap_or_else(crate::config::Bindings::defaults);
+    let key = bindings.all();
+
+    let Ok(mut cache) = CACHE.lock() else {
+        return crate::help::completion_rows(&bindings);
+    };
+    if let Some((known, rows)) = cache.as_ref() {
+        if *known == key {
+            return rows.clone();
+        }
+    }
+    let rows = crate::help::completion_rows(&bindings);
+    *cache = Some((key, rows.clone()));
+    rows
+}
+
+fn build(part: &Partition) -> Vec<Category> {
+    build_which(part.which, &part.center)
+}
+
+fn build_which(which: Which, pattern: &str) -> Vec<Category> {
     match which {
+        // **Uncapped, unlike every other category here.** `completion::MAX_ITEMS` bounds a source
+        // that has no bound of its own — the history table grows with every page load — and 25 of
+        // those is "the newest 25 that matched", which is the answer. The command list is 166 rows
+        // compiled into the binary, and a `:` that showed 25 of them would answer "what can I
+        // type" with a lie. The payload it produces is measured in
+        // `the_whole_command_list_still_fits_in_one_push`.
+        Which::Commands => completion::list_category_max(
+            "Commands",
+            COMMAND_WIDTHS,
+            command_rows(),
+            pattern,
+            usize::MAX,
+        )
+        .into_iter()
+        .collect(),
+
         Which::Url => completion::categories(pattern),
 
 // --- src/utilcmds.rs -------------------------------------------------------
@@ -476,7 +569,7 @@ impl Live {
         self.cursor = cursor;
         self.part = partition(text, cursor);
         self.cats = match &self.part {
-            Some(part) => build(part.which, &part.center),
+            Some(part) => build(part),
             None => Vec::new(),
         };
         // `set_pattern` clears the selection (`completionwidget.py:394`): what was selected was a
@@ -1071,10 +1164,140 @@ mod tests {
 
     #[test]
     fn a_command_with_no_model_completes_nothing() {
-        assert!(part(":").is_none(), "the command-name model is not built");
+        // A command that has no model for the argument being typed.
         assert!(part(":scroll down").is_none());
         assert!(part("/duck").is_none(), "a search is not a command");
         assert!(part("").is_none());
+    }
+
+    // ---- the command-name model ----
+
+    #[test]
+    fn a_bare_colon_opens_the_command_name_model() {
+        // `completer.py:87-90` — nothing before the cursor is the command model, and its pattern is
+        // empty, so the whole list opens.
+        let bare = part(":").unwrap();
+        assert_eq!(bare.which, Which::Commands);
+        assert_eq!(bare.center, "");
+        assert_eq!(bare.line_with("scroll"), ":scroll");
+        // `:   ` is the same case — `_partition` returns `[], '', []` for a body that is all space.
+        assert_eq!(part(":   ").unwrap().which, Which::Commands);
+        assert_eq!(part(":   ").unwrap().center, "");
+    }
+
+    #[test]
+    fn a_half_typed_command_name_completes_itself() {
+        let typed = part(":m").unwrap();
+        assert_eq!(typed.which, Which::Commands);
+        assert_eq!(typed.center, "m");
+        assert_eq!(typed.line_with("macro-record"), ":macro-record");
+        // A name that is also a whole command still completes the *name* until a space follows it,
+        // which is `'set|'` in `_get_new_completion`'s own comment.
+        let whole = part(":open").unwrap();
+        assert_eq!(whole.which, Which::Commands);
+        assert_eq!(whole.center, "open");
+    }
+
+    #[test]
+    fn the_command_name_model_offers_every_name_with_its_sentence_and_its_keys() {
+        let cats = build_which(Which::Commands, "");
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].name, "Commands");
+        // One row per *name*: six of the 160 commands have a second spelling.
+        let names: usize = crate::help::COMMANDS.iter().map(|doc| doc.names.len()).sum();
+        assert_eq!(cats[0].items.len(), names);
+        assert_eq!(names, 166);
+
+        let row = |name: &str| {
+            cats[0]
+                .items
+                .iter()
+                .find(|item| item.cols[0] == name)
+                .unwrap_or_else(|| panic!("no row for {name}"))
+                .cols
+                .clone()
+        };
+        // Three columns: the name, what it does, the keys that reach it.
+        assert_eq!(
+            row("scroll"),
+            [
+                "scroll".to_string(),
+                "Scroll the page. A count repeats it. This is the wheel event bru was built for."
+                    .to_string(),
+                // Every default binding of `scroll`, in the order `reached` collects them.
+                row("scroll")[2].clone(),
+            ]
+        );
+        assert!(row("scroll")[2].contains('j'), "j is not on the scroll row: {:?}", row("scroll")[2]);
+        // A command no key reaches has an empty key column rather than being left out.
+        assert_eq!(row("screenshot")[2], "");
+        // The keys that only *type* a command are marked, not silently mixed in with the ones that
+        // run it: `ga` runs `open -t`, while `o` is `cmd-set-text -s :open` and only prefills it.
+        let open = row("open")[2].clone();
+        let (runs, types) = open.split_once(" types ").expect("both kinds are on the open row");
+        assert!(runs.split(' ').any(|key| key == "ga"), "{runs:?}");
+        assert!(types.split(' ').any(|key| key == "o"), "{types:?}");
+        assert!(!runs.split(' ').any(|key| key == "o"), "o only types :open: {runs:?}");
+
+        // Both spellings of an aliased command are their own row, and they agree about everything
+        // except the name.
+        assert_eq!(row("later")[1], row("cmd-later")[1]);
+        assert_eq!(row("later")[2], row("cmd-later")[2]);
+
+        // Sorted by name, so the prefix-float in `list_category` is the only reordering.
+        let sorted: Vec<String> = {
+            let mut names: Vec<String> = cats[0].items.iter().map(|i| i.cols[0].clone()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            sorted,
+            cats[0].items.iter().map(|i| i.cols[0].clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_command_name_model_filters_and_floats_the_prefix() {
+        let cats = build_which(Which::Commands, "m");
+        let names: Vec<&str> = cats[0].items.iter().map(|i| i.cols[0].as_str()).collect();
+        // Every name that starts with `m` comes first, in name order...
+        assert_eq!(
+            names.iter().take_while(|n| n.starts_with('m')).count(),
+            names.iter().filter(|n| n.starts_with('m')).count(),
+            "a prefix match is stranded behind a substring one: {names:?}"
+        );
+        assert_eq!(names[0], "macro-record");
+        // ...and the substring matches are still there behind them.
+        assert!(names.contains(&"bookmark-add"), "{names:?}");
+        // A pattern nothing matches closes the bar rather than showing an empty header.
+        assert!(build_which(Which::Commands, "zzzznothing").is_empty());
+    }
+
+    /// The one cap this model does not take, measured rather than assumed — see
+    /// `completion::list_category_max`.
+    #[test]
+    fn the_whole_command_list_still_fits_in_one_push() {
+        let cats = build_which(Which::Commands, "");
+        let size = completion::to_json(&cats, Some((0, 0))).len();
+        // 19,730 bytes on 2026-08-07, against the 32 KB the worst-case `:open` payload is held
+        // under in `completion.rs`. It is one `ExecuteJavaScript` per keystroke of a `:` line, and
+        // that line is typed by a person.
+        assert!(size < 32 * 1024, "the whole command list is {size} bytes");
+        assert!(size > 16 * 1024, "the list got shorter, not the payload: {size} bytes");
+    }
+
+    /// The height `resize_bar` asks for with the whole list open, which is the one number a bar
+    /// with 166 rows in it could get absurdly wrong.
+    #[test]
+    fn the_whole_command_list_does_not_ask_for_an_absurd_bar() {
+        let cats = build_which(Which::Commands, "");
+        let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
+        assert_eq!(rows, 166);
+        // `resize_bar`'s arithmetic, which is `chrome.css:186-191`'s: 20px per row and per header,
+        // capped at --completion-max-h and one pixel for the border. 166 rows want 3,340px and get
+        // 301, because past the cap the table scrolls inside itself.
+        let wanted = (20 * (rows + cats.len() as i32)).min(300) + 1;
+        assert_eq!(wanted, 301);
     }
 
     #[test]
@@ -1101,10 +1324,14 @@ mod tests {
     #[test]
     fn a_bare_open_completes_everything() {
         let spaced = part(":open ").unwrap();
+        assert_eq!(spaced.which, Which::Url);
         assert_eq!(spaced.center, "");
         assert_eq!(spaced.line_with("https://a/"), ":open https://a/");
-        // And with no trailing space at all, which is what `:open` alone is.
-        assert_eq!(part(":open").unwrap().center, "");
+        // **The space is what moves the completion from the name to the argument**, and this used
+        // to say the opposite: `:open` with no space answered the URL model with an empty pattern.
+        // `_partition` puts the cursor inside `open` itself there and `_get_new_completion` opens
+        // the command model, which is only observable once there is one to open.
+        assert_eq!(part(":open").unwrap().which, Which::Commands);
     }
 
     #[test]
@@ -1117,12 +1344,43 @@ mod tests {
 
     #[test]
     fn the_cursor_decides_which_part_is_being_completed() {
-        // Cursor inside `open`, not in its argument: the argument is not the part under it.
-        assert!(partition(":open duck", 3).is_none());
+        // Cursor inside `open`, not in its argument: the part under it is the command's own name,
+        // so the command model answers and `duck` is kept where it is.
+        let inside = partition(":open duck", 3).unwrap();
+        assert_eq!(inside.which, Which::Commands);
+        assert_eq!(inside.center, "open");
+        assert_eq!(inside.after, ["duck"]);
+        assert_eq!(inside.line_with("open"), ":open duck");
         // Cursor at the end of the first argument.
         assert_eq!(partition(":tab-focus 1", 12).unwrap().center, "1");
         // And in the gap after it, which is a second argument nothing claims.
         assert!(partition(":tab-focus 1 ", 13).is_none());
+    }
+
+    /// `rest_from` is the command's `maxsplit` and not one argument's, so two rows for one command
+    /// that disagreed about it would cut the same line two ways depending on where the cursor was.
+    #[test]
+    fn every_command_agrees_with_itself_about_maxsplit() {
+        for spec in SPECS {
+            let same: Vec<Option<usize>> = SPECS
+                .iter()
+                .filter(|other| other.name == spec.name)
+                .map(|other| other.rest_from)
+                .collect();
+            assert!(
+                same.iter().all(|rest_from| *rest_from == spec.rest_from),
+                "{} disagrees with itself about maxsplit: {same:?}",
+                spec.name
+            );
+        }
+        // And no two rows claim the same argument of the same command.
+        for spec in SPECS {
+            let claims = SPECS
+                .iter()
+                .filter(|other| other.name == spec.name && other.argpos == spec.argpos)
+                .count();
+            assert_eq!(claims, 1, "{} claims argument {} twice", spec.name, spec.argpos);
+        }
     }
 
     #[test]
@@ -1299,7 +1557,7 @@ mod tests {
         let part = part(text).unwrap();
         let cats = match part.which {
             Which::Url => crate::completion::categories_from(&part.center, &Fixture),
-            other => build(other, &part.center),
+            other => build_which(other, &part.center),
         };
         (part, cats)
     }
@@ -1346,9 +1604,9 @@ mod tests {
     fn the_special_category_is_only_offered_where_the_command_takes_it() {
         // `:tab-focus last` is real; `:tab-select last` is not.
         assert_eq!(part(":tab-focus l").unwrap().which, Which::Tabs { special: true });
-        let cats = build(Which::Tabs { special: true }, "last");
+        let cats = build_which(Which::Tabs { special: true }, "last");
         assert_eq!(cats.last().map(|cat| cat.name), Some("Special"));
-        let cats = build(Which::Tabs { special: false }, "last");
+        let cats = build_which(Which::Tabs { special: false }, "last");
         assert!(cats.iter().all(|cat| cat.name != "Special"));
     }
 }

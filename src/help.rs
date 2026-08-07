@@ -879,6 +879,101 @@ pub fn page(bindings: &Bindings) -> String {
     out
 }
 
+// -----------------------------------------------------------------------------------------------
+// The same three columns, for the completion
+// -----------------------------------------------------------------------------------------------
+
+/// What `:m` offers: one row per command **name**, as `[name, what it does, the keys that reach it]`.
+///
+/// It lives here rather than in `src/completers.rs` because both of its outer columns are this
+/// file's: [`COMMANDS`] holds the sentence and [`reached`] holds the join to the key table, and
+/// `bru://chrome/help` already prints exactly this join. A second copy of it in the completion is a
+/// second thing to keep true — `help.rs`'s own module docs say what happens to a list maintained
+/// beside the table it describes.
+///
+/// **One row per name, not per command.** Six of the 160 commands answer to two spellings, and the
+/// six aliases get rows of their own — 166 rows for 160 commands. That is not what
+/// `bru://chrome/help` does above, where the aliases are printed *beside* the name in one cell, and
+/// the reason is `<Tab>`: column 0 is inserted into the command line verbatim
+/// (`completer.py:162-192`), so a cell reading `edit-text open-editor` would write a line that does
+/// not parse. A reader of the page wants the two spellings together; a typist of `:open-ed` wants
+/// the one they typed to complete. (qutebrowser has the question and answers it the other way for
+/// its own reason: `util.get_cmd_completions` walks `set(objects.commands.values())`, which
+/// deduplicates by *object*, and skips `obj.deprecated` — its second spellings are deprecated ones
+/// it is trying to retire. bru's six are equal spellings, and `Doc::names` says so.)
+///
+/// **Nothing is left out.** The question worth asking is what to do with a command that does
+/// nothing when it is run, because offering one is worse than not offering it — the user picks it
+/// and nothing happens. Measured 2026-08-07 across all 160 rows: `live=160 notyet=0 refused=0`, so
+/// today the question has no instances. It will: [`State`] has three values and the page draws all
+/// three. So a row that is not live carries its state at the front of its own sentence — "not yet:
+/// …", "refused: …" — rather than being dropped. Dropping it would make the completion disagree
+/// with the help page about which commands exist, and it would take the *reason* with it, which is
+/// the one thing the reader of a dead command needs.
+pub fn completion_rows(bindings: &Bindings) -> Vec<Vec<String>> {
+    let by_key = reached(bindings);
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(COMMANDS.len() + 8);
+    for (doc, state) in COMMANDS.iter().zip(states()) {
+        // Every spelling reaches the same command, so every spelling gets the same two other
+        // columns — including the keys, which are collected across all of the names because a key
+        // bound to `cmd-later` reaches `later` too.
+        let keys = keys_reaching(doc, &by_key);
+        let what = describe(doc, *state);
+        for name in doc.names {
+            rows.push(vec![name.to_string(), what.clone(), keys.clone()]);
+        }
+    }
+    // qutebrowser's `sorted(cmdlist)` (`util.py:43`). The completion's own ordering rule is a stable
+    // partition that floats prefix matches (`listcategory.py:90-100`), which over an already sorted
+    // list is exactly Qt's `sort=True` — so sorting once here is the whole of it.
+    rows.sort_by(|a, b| a[0].cmp(&b[0]));
+    rows
+}
+
+/// The state of every row of [`COMMANDS`], worked out once.
+///
+/// [`State::of`] parses its row's `example` and asks `exec::is_live`; 160 of those cost 0.59 ms on
+/// this machine (measured 2026-08-07, debug build), and the answer cannot change while bru runs —
+/// it is a function of two compiled-in tables and nothing else. The key column *can* change, which
+/// is why [`reached`] is not cached here.
+fn states() -> &'static [State] {
+    static STATES: std::sync::OnceLock<Vec<State>> = std::sync::OnceLock::new();
+    STATES.get_or_init(|| COMMANDS.iter().map(|doc| State::of(doc.example)).collect())
+}
+
+/// The sentence the completion's middle column shows: what the command does, with its state in
+/// front of it when running it would not do that.
+fn describe(doc: &Doc, state: State) -> String {
+    match state {
+        State::Live => doc.what.to_string(),
+        State::NotYet => format!("not yet: {}", doc.what),
+        State::Refused(why) => format!("refused: {why}"),
+    }
+}
+
+/// The completion's right-hand column: the keys that run this command, then the keys that only type
+/// it, in the same order the page prints them and with the same distinction.
+///
+/// The page can mark the second group with a `<span class="typed">`; a completion row is three plain
+/// strings, so the word is spelled out instead.
+fn keys_reaching(doc: &Doc, by_key: &BTreeMap<String, Reached>) -> String {
+    let found = doc.names.iter().fold(Reached::default(), |mut all, name| {
+        if let Some(found) = by_key.get(*name) {
+            all.runs.extend(found.runs.iter().cloned());
+            all.types.extend(found.types.iter().cloned());
+        }
+        all
+    });
+    let mut keys = found.runs.join(" ");
+    if !found.types.is_empty() {
+        if !keys.is_empty() {
+            keys.push(' ');
+        }
+        keys.push_str(&format!("types {}", found.types.join(" ")));
+    }
+    keys
+}
+
 /// The page is built from command strings, which come from `config.lua` — the user's own file, but
 /// still a file, and one typo away from putting a `<` where markup begins.
 fn escape(s: &str) -> String {

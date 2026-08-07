@@ -290,6 +290,24 @@ pub fn list_category(
     rows: Vec<Vec<String>>,
     raw: &str,
 ) -> Option<Category> {
+    list_category_max(name, widths, rows, raw, MAX_ITEMS)
+}
+
+/// [`list_category`] with the cap named rather than assumed.
+///
+/// [`MAX_ITEMS`] bounds a source that has no bound of its own — the history table has a row per
+/// site and grows forever — and for one of those the newest 25 matches *are* the answer. A source
+/// that is a table compiled into the binary is already bounded, and truncating it says something
+/// false about what exists: `:` alone showing 25 of bru's 166 command names would answer "what can
+/// I type" with a quarter of the list and no sign that there was more. So the finite models pass
+/// `usize::MAX` and the payload is measured instead of capped.
+pub fn list_category_max(
+    name: &'static str,
+    widths: &'static [u8],
+    rows: Vec<Vec<String>>,
+    raw: &str,
+    max: usize,
+) -> Option<Category> {
     // urlmodel.py:63,67,71 — a category with no source at all is not added.
     if rows.is_empty() {
         return None;
@@ -311,7 +329,7 @@ pub fn list_category(
 
     let items: Vec<Item> = kept
         .into_iter()
-        .take(MAX_ITEMS)
+        .take(max)
         .map(|cols| Item {
             matches: match_ranges(&cols[0], &terms),
             cols,
