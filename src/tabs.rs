@@ -680,6 +680,19 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
         return;
     };
 
+// --- plugin events ---------------------------------------------------------
+    // `tab-opened`, after the tab is in the window's list and so has an index to name — and before
+    // `select_in` below, so that a foreground tab's `tab-opened` arrives before its `tab-switched`
+    // rather than after. There is no title yet; the page has not been asked for one.
+    crate::events::fire(crate::events::Event::TabOpened, Some(window_id), || {
+        vec![
+            ("index", crate::lua::Arg::Int(index as i64)),
+            ("url", crate::lua::Arg::Text(url.to_string())),
+            ("title", crate::lua::Arg::Text(String::new())),
+        ]
+    });
+// --- end plugin events -----------------------------------------------------
+
     // At startup the first tab is made before there is a window to put it in; `attach_all_in` picks
     // it up once the window exists.
     if let Some(window) = window {
@@ -790,6 +803,18 @@ pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
             state.tabs_json_in(window_id),
         )
     };
+// --- plugin events ---------------------------------------------------------
+    // `tab-switched`, before the bar is told — so that a handler asking bru what is showing gets the
+    // tab it was just told about rather than the one being left. It carries the new tab's own url
+    // and title, which are already in hand from the read above and cost nothing to hand on.
+    crate::events::fire(crate::events::Event::TabSwitched, Some(window_id), || {
+        vec![
+            ("index", crate::lua::Arg::Int(index as i64)),
+            ("url", crate::lua::Arg::Text(url.clone())),
+            ("title", crate::lua::Arg::Text(title.clone())),
+        ]
+    });
+// --- end plugin events -----------------------------------------------------
     crate::ipc::set_url_for(window_id, url);
     crate::ipc::set_title_for(window_id, title);
     // Which tab the strip draws as selected is per window too, and a switch fires no display
@@ -955,7 +980,7 @@ pub fn move_current(state: &SharedState, to: usize) {
 /// on — qutebrowser's `tabs.last_close` default keeps a blank tab instead, and that is
 /// DECISIONS.md item 6, still open.
 pub fn close_current(state: &SharedState, force: bool) {
-    let (closed, remaining, window, active, window_id) = {
+    let (closed, remaining, window, active, window_id, closing) = {
         let mut state = state.lock().expect("state mutex poisoned");
         // A pinned tab is not closed by a bare `d`. qutebrowser prompts here
         // (`tabbedbrowser.py:431`); bru has no yes/no mode, so it says why and does nothing, and
@@ -967,6 +992,21 @@ pub fn close_current(state: &SharedState, force: bool) {
         let Some(window_id) = state.current_window_id() else {
             return;
         };
+// --- plugin events ---------------------------------------------------------
+        // What the tab was, read before it is taken — afterwards there is a `BrowserView` and
+        // nothing to ask about it. Behind the handler count so that a bru with no plugins does not
+        // clone two strings per `d`.
+        let closing = if crate::events::handler_count(crate::events::Event::TabClosed) != 0 {
+            let index = state.active_tab();
+            Some((
+                index,
+                state.tab_url(index).unwrap_or_default(),
+                state.tab_title(index).unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
+// --- end plugin events -----------------------------------------------------
         let closed = state.take_active_tab();
         (
             closed,
@@ -974,6 +1014,7 @@ pub fn close_current(state: &SharedState, force: bool) {
             state.window(),
             state.active_tab(),
             window_id,
+            closing,
         )
     };
     let Some(closed) = closed else {
@@ -991,6 +1032,25 @@ pub fn close_current(state: &SharedState, force: bool) {
         window.remove_child_view(Some(&mut View::from(&closed)));
     }
     drop(closed);
+
+// --- plugin events ---------------------------------------------------------
+    // `tab-closed`, after the browser is actually gone, so a handler that counts tabs counts the
+    // ones that are left. `closing` is `None` when nothing is registered, which is the branch.
+    //
+    // **Only `:tab-close` fires this**, not `:tab-only` and not a window closing: `take_other_tabs`
+    // hands back `BrowserView`s with no index or address left to name, and a window closing takes
+    // its tabs with it without passing here at all. Named rather than left to be discovered — see
+    // this workstream's report.
+    if let Some((index, url, title)) = closing {
+        crate::events::fire(crate::events::Event::TabClosed, Some(window_id), || {
+            vec![
+                ("index", crate::lua::Arg::Int(index as i64)),
+                ("url", crate::lua::Arg::Text(url)),
+                ("title", crate::lua::Arg::Text(title)),
+            ]
+        });
+    }
+// --- end plugin events -----------------------------------------------------
 
     // The last tab of *this* window closes *this* window. The process only ends when the last
     // window's last browser does — `BruState::on_before_close` counts browsers, not tabs.

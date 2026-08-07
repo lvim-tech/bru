@@ -114,6 +114,22 @@ thread_local! {
 }
 
 /// `bru.plugin_dir()` — the directory of the plugin whose code is running, or "" outside one.
+/// The plugin whose `init.lua` is running, for the throw counter to count against.
+///
+/// Anything registered outside a plugin's own load — from `config.lua`, say — is attributed to
+/// `config`, so a handler always has a name and the disable-after-three rule always has something
+/// to disable. Workstream B's `events.rs` needs this and `plugins.rs` is where the stack already
+/// lives, so it is one accessor rather than a second stack.
+pub fn current_plugin_name() -> String {
+    CURRENT.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| "config".to_string())
+    })
+}
+
 pub fn current_plugin_dir() -> String {
     CURRENT.with(|stack| {
         stack

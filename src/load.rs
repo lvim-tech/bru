@@ -52,6 +52,24 @@ wrap_load_handler! {
 
             trace(id);
 
+// --- plugin events ---------------------------------------------------------
+            // `page-loaded`, inside both guards — which is what this file's head asks another
+            // workstream to do rather than declare a second `LoadHandler`. The URL is read from the
+            // frame **inside the closure**, so a bru with nothing registered pays one relaxed
+            // atomic load here and never touches CEF for it.
+            crate::events::fire(crate::events::Event::PageLoaded, window, || {
+                vec![(
+                    "url",
+                    crate::lua::Arg::Text(
+                        browser
+                            .main_frame()
+                            .map(|frame| CefString::from(&frame.url()).to_string())
+                            .unwrap_or_default(),
+                    ),
+                )]
+            });
+// --- end plugin events -----------------------------------------------------
+
             // --- src/scrollbar.rs -------------------------------------------------------------
             // The document element exists here and the page's own <head> has not been parsed yet,
             // which is both halves of what the stylesheet needs — see `scrollbar.rs` for the

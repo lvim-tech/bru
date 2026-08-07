@@ -302,6 +302,14 @@ wrap_browser_process_handler! {
             // above, which is what installs the search engines from config.lua.
             crate::completion::install(Box::new(crate::data::DataSources));
 
+// --- plugin events ---------------------------------------------------------
+            // Workstream B's bootstrap was the same two calls as the `lua runtime` block above —
+            // `lua::init()` and the `--plugin-dir` override — written against a stand-in that did
+            // both in one `boot()`. Merged, there is one bootstrap and it is A's, placed for B's
+            // stated reason as well: before the first window exists, so a plugin watching
+            // `page-loaded` sees the start page load rather than starting one navigation behind.
+// --- end plugin events -----------------------------------------------------
+
             // Four modules that were built in parallel and each left a hole where another one
             // belongs. Each hole was deliberate — a second `wl-copy` or a second download path
             // would have been the wrong kind of duplication — so this is where they are introduced

@@ -20,6 +20,9 @@ mod data;
 mod downloads;
 mod editor;
 mod devtools;
+// --- plugin events ------------------------------------------------------------------------------
+mod events;
+// --- end plugin events --------------------------------------------------------------------------
 mod exec;
 mod favicon;
 mod find;
@@ -31,8 +34,8 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
-// The second file allowed to mention `mlua`: the shared state, the plugin registry over it,
-// and the handles a function-valued setting holds. See `src/lua.rs`.
+// The second file allowed to mention `mlua`: the shared state, the plugin registry over it, the
+// handles a function-valued setting holds, and the `bru.on` that `events.rs` registers through.
 mod lua;
 mod macros;
 mod message;

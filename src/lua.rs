@@ -138,12 +138,33 @@ impl std::fmt::Display for FnRef {
 // for P2's function-valued settings and by the event hooks for P4. The two callers that exist today
 // — a plugin command handler and a config file — take a string and nothing.
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Arg {
     Text(String),
     Int(i64),
     Bool(bool),
+    // --- plugin events ---------------------------------------------------------------------
+    /// No value. A payload field that is genuinely absent — a `download-finished` with no browser
+    /// behind it, a `page-loaded` before a window is known — arrives as Lua `nil` rather than as an
+    /// empty string, so a handler can tell "not known" from "known to be empty".
+    Nil,
+    // --- end plugin events -----------------------------------------------------------------
 }
+
+// --- plugin events -------------------------------------------------------------------------
+impl Arg {
+    /// What `BRU_DEBUG_EVENTS=1` prints. Not `Debug`: this is the value as a plugin would see it,
+    /// which is what a line meant for reading an event payload has to show.
+    pub fn debug(&self) -> String {
+        match self {
+            Arg::Text(text) => text.clone(),
+            Arg::Int(number) => number.to_string(),
+            Arg::Bool(flag) => flag.to_string(),
+            Arg::Nil => "nil".to_string(),
+        }
+    }
+}
+// --- end plugin events ---------------------------------------------------------------------
 // --- end setting functions ---------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------------------------
@@ -426,6 +447,12 @@ fn fields_table(
             Arg::Text(text) => table.set(*name, text.as_str()),
             Arg::Int(number) => table.set(*name, *number),
             Arg::Bool(flag) => table.set(*name, *flag),
+            // --- plugin events -----------------------------------------------------------
+            // Set rather than skipped: a field left out of the table and a field set to `nil` read
+            // the same from Lua, but `pairs()` over the payload shows the shape either way only if
+            // every field is named. `Value::Nil` keeps the key list honest.
+            Arg::Nil => table.set(*name, mlua::Value::Nil),
+            // --- end plugin events -------------------------------------------------------
         };
         stored.map_err(|e| format!("{handle}: could not set {name}: {e}"))?;
     }
@@ -493,6 +520,23 @@ fn install_bru_table(lua: &mlua::Lua) -> mlua::Result<()> {
             crate::plugins::register_command(&name, handle).map_err(mlua::Error::RuntimeError)
         })?,
     )?;
+
+    // --- plugin events ---------------------------------------------------------------------
+    // `bru.on(event, fn)`. The same crossing `bru.command` makes: the function goes into the
+    // registry and only its handle leaves this file. `events.rs` owns which names exist and refuses
+    // an unknown one with the list, so a typo is an error at registration rather than a handler
+    // that is simply never called.
+    bru.set(
+        "on",
+        lua.create_function(|_, (event, handler): (String, mlua::Function)| {
+            let handle = register(&handler).ok_or_else(|| {
+                mlua::Error::RuntimeError("there is no Lua state to register into".to_string())
+            })?;
+            crate::events::register(&event, &crate::plugins::current_plugin_name(), handle)
+                .map_err(mlua::Error::RuntimeError)
+        })?,
+    )?;
+    // --- end plugin events -------------------------------------------------------------------
 
     // bru.cmd(line) — **posts a UI task, never runs inline.**
     //
@@ -574,6 +618,43 @@ fn install_bru_table(lua: &mlua::Lua) -> mlua::Result<()> {
     install_config_stubs(lua)?;
     Ok(())
 }
+
+// --- plugin events -------------------------------------------------------------------------
+/// One real crossing of the Lua boundary, of exactly the shape [`call_unit`] makes: a fresh table
+/// with a URL and a window in it, handed to a Lua function. Answers the nanoseconds per call.
+///
+/// It lives here because this is the file allowed to name `mlua`, and
+/// `events::the_cost_of_an_event_nobody_asked_for` needs a number to compare its branch against. A
+/// stand-in would have been the thing this project calls *a harness that reproduces its own
+/// assumption*; `mlua` runs perfectly well under `cargo test` — it is CEF that does not
+/// (CEF-NOTES trap 13).
+///
+/// Its own state, not [`shared`]: the measurement must not depend on what a config or a plugin has
+/// already put in the process's state, and standing one up here would leave it behind for every
+/// test that ran afterwards.
+#[cfg(test)]
+pub fn nanoseconds_per_crossing(rounds: u32, warmup: u32, url: &str) -> f64 {
+    let lua = unsafe { mlua::Lua::unsafe_new() };
+    let handler: mlua::Function = lua
+        .load("local n = 0 return function(e) n = n + 1 return nil end")
+        .eval()
+        .expect("the handler compiles");
+    let once = || {
+        let table = lua.create_table().expect("a table");
+        table.set("url", url).expect("url");
+        table.set("window", 0i64).expect("window");
+        handler.call::<()>(table).expect("the handler runs");
+    };
+    for _ in 0..warmup {
+        once();
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..rounds {
+        once();
+    }
+    start.elapsed().as_nanos() as f64 / f64::from(rounds)
+}
+// --- end plugin events ---------------------------------------------------------------------
 
 /// The `bru` table, for the files that add to it.
 pub(crate) fn bru_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
@@ -731,7 +812,7 @@ mod tests {
             "function"
         );
         // The long-lived half of the `bru` table.
-        for name in ["command", "cmd", "get", "message", "error", "data_dir", "plugin_dir"] {
+        for name in ["command", "on", "cmd", "get", "message", "error", "data_dir", "plugin_dir"] {
             assert_eq!(
                 lua.load(format!("return type(bru.{name})")).eval::<String>().unwrap(),
                 "function",
