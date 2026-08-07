@@ -264,6 +264,27 @@ pub enum Command {
         pattern: Option<String>,
         print: bool,
     },
+    /// `config-dict-add [-t] [-p] <option> <key> <value> [--replace]` —
+    /// `configcommands.py:311-339`.
+    ///
+    /// **No default binding names it**, in qutebrowser or here, so it raises no live-binding count;
+    /// it is a command that is typed. It exists because bru's dict settings *merge* rather than
+    /// replace (see `settings::DictShape`), which leaves adding one pair as the only shape a
+    /// runtime change can have — there being no spelling of a whole dictionary at `:set`.
+    ConfigDictAdd {
+        option: String,
+        key: String,
+        value: String,
+        replace: bool,
+        print: bool,
+    },
+    /// `config-dict-remove [-t] [-p] <option> <key>` — `configcommands.py:371-395`.
+    ///
+    /// The other half of merging, and the reason it is not optional here: an override that merges
+    /// can add a pair and change a pair but can never make one *stop existing*, so without this
+    /// command an engine bru ships could not be got rid of at all. qutebrowser can shrink a dict by
+    /// replacing it wholesale and so treats this as a convenience; bru cannot, so it is not one.
+    ConfigDictRemove { option: String, key: String, print: bool },
 // --- end src/settings.rs ---------------------------------------------------
 
 // --- src/completers.rs ---------------------------------------------------------------------
@@ -1294,7 +1315,9 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // `-u` takes a value, which `Args` cannot express — it would file `*://{url:host}/*` as a
         // positional and nothing would say which positional it was. Both commands are parsed by
         // hand instead.
-        "set" | "config-cycle" => parse_config_command(name, &tokens[1..], s)?,
+        "set" | "config-cycle" | "config-dict-add" | "config-dict-remove" => {
+            parse_config_command(name, &tokens[1..], s)?
+        }
 // --- end src/settings.rs ---------------------------------------------------
 
 // --- src/completers.rs ---------------------------------------------------------------------
@@ -1486,6 +1509,10 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
     let mut positional: Vec<String> = Vec::new();
     let mut end_of_flags = false;
     let mut wants_pattern = false;
+    // `config-dict-add`'s only flag of its own. qutebrowser gives it no short spelling
+    // (`configcommands.py:311`), so neither does bru — `-r` would collide with nothing today and
+    // with something later.
+    let mut replace = false;
 
     for token in tokens {
         if wants_pattern {
@@ -1507,6 +1534,7 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
                 // `-t` is accepted and deliberately does nothing — see Command::Set.
                 "temp" => {}
                 "pattern" | "url" => wants_pattern = true,
+                "replace" if name == "config-dict-add" => replace = true,
                 other => return Err(bad(&format!("unknown flag --{other}"))),
             }
             continue;
@@ -1553,9 +1581,29 @@ fn parse_config_command(name: &str, tokens: &[String], whole: &str) -> Result<Co
         if name == "set" {
             return Ok(Command::SettingsPage);
         }
+        if name.starts_with("config-dict-") {
+            return Err(bad("needs an option and a key"));
+        }
         return Ok(Command::Unimplemented(whole.trim().to_string()));
     };
 // --- end src/settingspage.rs ---------------------------------------------------------------
+
+    if let Some(what) = name.strip_prefix("config-dict-") {
+        // Unlike `config-cycle`, these are never bound, so an option bru does not have is an error
+        // the typist reads rather than a binding left inert. `settings.rs` names what it knows.
+        let key = positional
+            .get(1)
+            .cloned()
+            .ok_or_else(|| bad("needs an option and a key"))?;
+        if what == "remove" {
+            return Ok(Command::ConfigDictRemove { option, key, print });
+        }
+        let value = positional
+            .get(2)
+            .cloned()
+            .ok_or_else(|| bad("needs an option, a key and a value"))?;
+        return Ok(Command::ConfigDictAdd { option, key, value, replace, print });
+    }
 
     if name == "config-cycle" {
         // An option bru does not implement leaves the binding inert rather than making it a key
@@ -2244,6 +2292,55 @@ mod tests {
         assert!(parse("navigate").is_err());
     }
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
+
+// --- src/settings.rs -------------------------------------------------------
+    #[test]
+    fn the_two_dictionary_commands_parse() {
+        assert_eq!(
+            parse("config-dict-add url.searchengines gh https://github.com/search?q={}").unwrap(),
+            Command::ConfigDictAdd {
+                option: "url.searchengines".to_string(),
+                key: "gh".to_string(),
+                value: "https://github.com/search?q={}".to_string(),
+                replace: false,
+                print: false,
+            }
+        );
+        // `--replace` is qutebrowser's only flag of its own here, and it has no short spelling
+        // there either.
+        assert_eq!(
+            parse("config-dict-add -p statusbar.mode.labels normal NOR --replace").unwrap(),
+            Command::ConfigDictAdd {
+                option: "statusbar.mode.labels".to_string(),
+                key: "normal".to_string(),
+                value: "NOR".to_string(),
+                replace: true,
+                print: true,
+            }
+        );
+        assert_eq!(
+            parse("config-dict-remove url.searchengines hoog").unwrap(),
+            Command::ConfigDictRemove {
+                option: "url.searchengines".to_string(),
+                key: "hoog".to_string(),
+                print: false,
+            }
+        );
+        // `--replace` belongs to add, not to remove.
+        assert!(parse("config-dict-remove url.searchengines hoog --replace").is_err());
+        // A missing key or value is an error the typist reads, not an inert command. A bare
+        // `:set` is the settings page; a bare `:config-dict-add` is nothing at all.
+        assert!(parse("config-dict-add url.searchengines gh").is_err());
+        assert!(parse("config-dict-add url.searchengines").is_err());
+        assert!(parse("config-dict-add").is_err());
+        assert!(parse("config-dict-remove").is_err());
+        // Both are live, so pressing one would act — nothing is bound to either, which is why the
+        // live-binding count is unmoved by them.
+        assert!(crate::exec::is_live(
+            &parse("config-dict-remove url.searchengines hoog").unwrap()
+        ));
+    }
+// --- end src/settings.rs ---------------------------------------------------
 
     #[test]
     fn malformed_arguments_are_errors() {

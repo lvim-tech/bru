@@ -470,15 +470,25 @@ impl Bindings {
     }
 }
 
-/// Everything read at startup: the bindings, the search engines, and the settings `bru.set` names.
+/// Everything read at startup: the bindings and the settings `bru.set` and `bru.search` name.
+///
+/// **There is no `search` field.** There was one until dict-valued settings landed; the engines are
+/// now the `url.searchengines` setting, and `bru.search(name, template)` writes one pair of it. Two
+/// stores would have been two answers to `:open gh rust` the moment `:config-dict-add` changed one
+/// of them.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub bindings: Bindings,
-    /// `bru.search(name, template)`. DESIGN.md: "Search engines are a table in `config.lua`, not a
-    /// copied file." Nothing of qutebrowser's is read at runtime.
-    pub search: SearchEngines,
-    /// `bru.set(key, value)`.
+    /// `bru.set(key, value)` and `bru.search(name, template)`.
     pub settings: Settings,
+}
+
+impl Config {
+    /// The engine table this config would search with — the `url.searchengines` setting, rendered
+    /// as the type `open.rs` uses. bru's nine defaults with the config's overrides merged in.
+    pub fn search(&self) -> SearchEngines {
+        self.settings.search_engines()
+    }
 }
 
 impl Config {
@@ -515,7 +525,6 @@ impl Config {
     fn default_config() -> Config {
         Config {
             bindings: Bindings::defaults(),
-            search: SearchEngines::default(),
             settings: Settings::default(),
         }
     }
@@ -533,7 +542,11 @@ impl Config {
     /// `settings::apply_at_startup`, which `app.rs` calls once CEF is up, because this function is
     /// also run by unit tests with no browser process behind them.
     pub fn into_parsers(self) -> KeyParsers {
-        crate::open::install(self.search, self.settings.start_page());
+        // Built from the settings store rather than carried beside it — see `Config`. It is done
+        // here rather than left to `settings::apply_at_startup` because that only walks what has
+        // been *set*: a config that names no engine at all must still reach `open.rs` with bru's
+        // nine, and a bru with no `~/.config/bru/` is exactly that config.
+        crate::open::install(self.search(), self.settings.start_page());
         crate::settings::install(self.settings);
         KeyParsers::new(self.bindings.into_tries())
     }
@@ -602,6 +615,13 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
 
         // M9. `bru.search("ddg", "https://duckduckgo.com/?q={}")`. DESIGN.md settles that the
         // engines are a table here and never a file copied from qutebrowser.
+        //
+        // It writes one pair of the `url.searchengines` **setting**, which is where the engines
+        // live now — `bru.search("gh", …)` and `bru.set("url.searchengines", { gh = … })` are the
+        // same store reached two ways, and the file's last word about a name wins. `replace: true`
+        // because this spelling has always overwritten and `bru.search("DEFAULT", …)` replacing
+        // DuckDuckGo is a documented thing to do; `--replace` is `:config-dict-add`'s guard against
+        // a typo at a terminal, and there is no terminal here.
         let target = Arc::clone(&shared);
         bru.set(
             "search",
@@ -609,23 +629,45 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
                 target
                     .lock()
                     .expect("the config.lua mutex is never poisoned")
-                    .search
-                    .set(&name, &template)
+                    .settings
+                    .dict_add("url.searchengines", &name, &template, true)
+                    .map(|_| ())
                     .map_err(mlua::Error::RuntimeError)
             })?,
         )?;
 
-        // M9. `bru.set("start_page", "https://start.duckduckgo.com/")`.
+        // M9. `bru.set("start_page", "https://start.duckduckgo.com/")` — and, since dict settings
+        // landed, `bru.set("statusbar.mode.labels", { normal = "NOR" })`.
+        //
+        // **This is the one place a setting's value is more than a scalar, and it is the reason the
+        // config file is Lua.** DESIGN.md: "Lua is the language of that file so a setting can hold
+        // a function, not only a scalar. Any settings design that assumes a value is a string, a
+        // number or a boolean is wrong for this project." A table arrives as a table; nothing is
+        // serialised to a string and parsed back, and there is no JSON anywhere in the path.
+        //
+        // A table **merges** into bru's defaults rather than replacing them — see
+        // `settings::DictShape`, which carries the argument. `mlua::Value` rather than `String` so
+        // that the two shapes are told apart here instead of by looking at the key; a number or a
+        // boolean is still accepted and stringified, because `bru.set("content.images", false)`
+        // reads better in Lua than the quoted spelling and means the same thing.
         let target = Arc::clone(&shared);
         bru.set(
             "set",
-            lua.create_function(move |_, (key, value): (String, String)| {
-                target
+            lua.create_function(move |_, (key, value): (String, mlua::Value)| {
+                let mut config = target
                     .lock()
-                    .expect("the config.lua mutex is never poisoned")
-                    .settings
-                    .set(&key, &value)
-                    .map_err(mlua::Error::RuntimeError)
+                    .expect("the config.lua mutex is never poisoned");
+                match value {
+                    mlua::Value::Table(table) => {
+                        let pairs = lua_table_pairs(&key, &table)?;
+                        config.settings.set_dict(&key, &pairs).map(|_| ())
+                    }
+                    other => {
+                        let text = scalar_to_string(&key, &other)?;
+                        config.settings.set(&key, &text)
+                    }
+                }
+                .map_err(mlua::Error::RuntimeError)
             })?,
         )?;
 
@@ -642,6 +684,40 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
     Arc::try_unwrap(shared)
         .map(|m| m.into_inner().expect("the config mutex is never poisoned"))
         .unwrap_or_else(|arc| arc.lock().expect("the config mutex is never poisoned").clone())
+}
+
+/// A Lua table as the `(key, value)` pairs a dict setting takes.
+///
+/// Sorted, so a table written in one order and a table written in the other reach `settings.rs` the
+/// same way and a printed dictionary does not depend on Lua's hash order. Every key and every value
+/// must be a string (or a number, which Lua writes without quotes readily enough); anything else —
+/// a nested table, a function, `nil` in a value — is an error naming the key, at startup, where the
+/// person who wrote it is looking.
+fn lua_table_pairs(option: &str, table: &mlua::Table) -> mlua::Result<Vec<(String, String)>> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let key = scalar_to_string(option, &key)?;
+        let value = scalar_to_string(&format!("{option}[{key}]"), &value)?;
+        pairs.push((key, value));
+    }
+    pairs.sort();
+    Ok(pairs)
+}
+
+/// A Lua scalar as the string a setting stores. Booleans keep Lua's spelling, which is also the
+/// spelling `settings.rs` parses.
+fn scalar_to_string(what: &str, value: &mlua::Value) -> mlua::Result<String> {
+    match value {
+        mlua::Value::String(text) => Ok(text.to_str()?.to_string()),
+        mlua::Value::Integer(n) => Ok(n.to_string()),
+        mlua::Value::Number(n) => Ok(n.to_string()),
+        mlua::Value::Boolean(b) => Ok(b.to_string()),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "{what}: expected a string, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -797,10 +873,10 @@ mod tests {
             "#,
         );
         let config = Config::load_from(Some(&cfg.path()));
-        assert_eq!(config.search.get("ddg"), Some("https://duckduckgo.com/?q={}"));
-        assert_eq!(config.search.get("gh"), Some("https://github.com/search?q={}"));
+        assert_eq!(config.search().get("ddg"), Some("https://duckduckgo.com/?q={}"));
+        assert_eq!(config.search().get("gh"), Some("https://github.com/search?q={}"));
         // DEFAULT is there whether or not the config mentioned it.
-        assert_eq!(config.search.get("DEFAULT"), Some(crate::open::DEFAULT_ENGINE_URL));
+        assert_eq!(config.search().get("DEFAULT"), Some(crate::open::DEFAULT_ENGINE_URL));
         assert_eq!(
             config.settings.start_page().as_deref(),
             Some("https://start.duckduckgo.com/")
@@ -808,12 +884,133 @@ mod tests {
 
         // ...and the table survives all the way into the decision `:open` makes.
         assert_eq!(
-            crate::open::decide("gh rust cef", &config.search),
+            crate::open::decide("gh rust cef", &config.search()),
             Some(crate::open::Target::Search {
                 engine: "gh".to_string(),
                 term: "rust cef".to_string(),
                 url: "https://github.com/search?q=rust%20cef".to_string(),
             })
+        );
+    }
+
+    /// **A bru with no `config.lua` at all searches with all nine.** DECISIONS.md item 4 as the
+    /// user corrected it, asked of the thing `app.rs` actually builds rather than of a table a test
+    /// filled in.
+    #[test]
+    fn no_config_file_still_ships_nine_search_engines_and_twelve_mode_labels() {
+        let config = Config::load_from(None);
+        let engines = config.search();
+        for (name, template) in crate::open::DEFAULT_ENGINES {
+            assert_eq!(engines.get(name), Some(*template), "{name} is missing");
+        }
+        assert_eq!(engines.iter().count(), 9);
+        // And each one is reachable as a prefix at `:open`, which is the claim that matters.
+        assert_eq!(
+            crate::open::decide("wiki CEF", &engines).map(|t| t.url().to_string()),
+            Some("https://en.wikipedia.org/wiki/CEF".to_string())
+        );
+        assert_eq!(
+            crate::open::decide("ub yeet", &engines).map(|t| t.url().to_string()),
+            Some("https://www.urbandictionary.com/define.php?term=yeet".to_string())
+        );
+        assert_eq!(
+            crate::open::decide("cef rust", &engines).map(|t| t.url().to_string()),
+            Some("https://duckduckgo.com/?q=cef%20rust".to_string())
+        );
+        // Twelve labels, all bru's own.
+        assert_eq!(
+            config.settings.describe("statusbar.mode.labels", None).unwrap().lines().next(),
+            Some("statusbar.mode.labels — 12 entries, 0 changed from bru's own")
+        );
+    }
+
+    /// **The reason `config.lua` is Lua**: a setting whose value is a table, arriving as a table.
+    #[test]
+    fn a_lua_table_is_a_settings_value_and_it_merges() {
+        let cfg = TempConfig::new(
+            "dict",
+            r#"
+                bru.set("statusbar.mode.labels", { normal = "NOR", insert = "INS" })
+                bru.set("url.searchengines", { gh = "https://github.com/search?q={}" })
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        let printed = config.settings.describe("statusbar.mode.labels", None).unwrap();
+        assert!(printed.contains("statusbar.mode.labels[normal] = NOR"), "{printed}");
+        assert!(printed.contains("statusbar.mode.labels[insert] = INS"), "{printed}");
+        // The ten the file did not mention are still bru's.
+        assert!(printed.contains("statusbar.mode.labels[caret] = caret\n"), "{printed}");
+        assert!(printed.starts_with("statusbar.mode.labels — 12 entries, 2 changed"), "{printed}");
+
+        // A tenth engine, and the nine still there.
+        let engines = config.search();
+        assert_eq!(engines.get("gh"), Some("https://github.com/search?q={}"));
+        assert_eq!(engines.get("yt"), Some("https://www.youtube.com/results?search_query={}"));
+        assert_eq!(engines.iter().count(), 10);
+    }
+
+    /// `bru.search` and `bru.set` are two doors to one table, and the file's last word wins.
+    #[test]
+    fn bru_search_and_the_setting_are_the_same_store() {
+        let cfg = TempConfig::new(
+            "two-doors",
+            r#"
+                bru.search("gh", "https://github.com/search?q={}")
+                bru.set("url.searchengines", { sr = "https://sourcegraph.com/search?q={}" })
+                bru.search("gh", "https://github.com/issues?q={}")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        let engines = config.search();
+        // Neither door threw the other's work away, and the second `bru.search` won.
+        assert_eq!(engines.get("gh"), Some("https://github.com/issues?q={}"));
+        assert_eq!(engines.get("sr"), Some("https://sourcegraph.com/search?q={}"));
+        assert_eq!(engines.iter().count(), 11);
+        // ...and one store means `:set url.searchengines` sees what `bru.search` wrote.
+        let printed = config.settings.describe("url.searchengines", None).unwrap();
+        assert!(printed.contains("url.searchengines[gh] = https://github.com/issues?q={}   (added)"));
+    }
+
+    /// A table with something in it that is not a string is an error at startup, naming the key.
+    #[test]
+    fn a_bad_table_is_an_error_the_config_author_can_see() {
+        let cfg = TempConfig::new(
+            "bad-table",
+            r#"
+                bru.search("ok", "https://x/?q={}")
+                bru.set("statusbar.mode.labels", { normal = {} })
+                bru.search("never", "https://y/?q={}")
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        assert_eq!(config.search().get("ok"), Some("https://x/?q={}"));
+        assert_eq!(config.search().get("never"), None);
+        // The label is untouched — the whole table is refused, not the pairs after the bad one.
+        let printed = config.settings.describe("statusbar.mode.labels", None).unwrap();
+        assert!(printed.contains("0 changed"), "{printed}");
+
+        // A key that is not one of the twelve is refused too, with the list.
+        let cfg = TempConfig::new("bad-key", r#"bru.set("statusbar.mode.labels", { nope = "X" })"#);
+        let config = Config::load_from(Some(&cfg.path()));
+        assert!(config
+            .settings
+            .describe("statusbar.mode.labels", None)
+            .unwrap()
+            .contains("0 changed"));
+
+        // A non-table value still works for a scalar setting, and a boolean keeps Lua's spelling.
+        let cfg = TempConfig::new(
+            "scalars",
+            r#"
+                bru.set("start_page", "example.com")
+                bru.set("content.images", false)
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        assert_eq!(config.settings.start_page().as_deref(), Some("example.com"));
+        assert_eq!(
+            config.settings.describe("content.images", None).unwrap(),
+            "content.images = false"
         );
     }
 
@@ -826,7 +1023,7 @@ mod tests {
         let config = Config::load_from(Some(&cfg.path()));
         // DECISIONS item 4: a bare `:open words` goes to DEFAULT, whatever DEFAULT now is.
         assert_eq!(
-            crate::open::decide("python dict", &config.search).map(|t| t.url().to_string()),
+            crate::open::decide("python dict", &config.search()).map(|t| t.url().to_string()),
             Some("https://search.marginalia.nu/search?query=python%20dict".to_string())
         );
     }
@@ -843,9 +1040,9 @@ mod tests {
         );
         let config = Config::load_from(Some(&cfg.path()));
         // The call before the bad one took effect; the bad one raised; the one after did not run.
-        assert_eq!(config.search.get("ok"), Some("https://x/?q={}"));
+        assert_eq!(config.search().get("ok"), Some("https://x/?q={}"));
         assert_eq!(config.settings.start_page(), None);
-        assert_eq!(config.search.get("never"), None);
+        assert_eq!(config.search().get("never"), None);
 
         // A name with a space could never be typed at `:open`, so it is refused rather than kept.
         let mut engines = SearchEngines::default();

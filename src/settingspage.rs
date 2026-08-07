@@ -150,9 +150,12 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
              <td class=\"state\">{}</td></tr>\n",
             escape(def.name),
             escape(kind(def.kind)),
-            escape(def.default.unwrap_or("unset")),
+            escape(&default_of(def)),
             escape(scope(def.scopes)),
-            escape(&in_force(def.name, snapshot)),
+            // Not escaped as one string: a dictionary's cell is a line per pair, and the `<br>`s
+            // between them are the page's own markup. Every *value* inside it went through
+            // `escape` in `in_force_cell`.
+            in_force_cell(def, snapshot),
         ));
     }
     out.push_str("</table>\n");
@@ -168,6 +171,52 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
     }
     out.push_str("</table>\n</main>\n");
     out
+}
+
+/// What the "default" column says. A dictionary's default is not a value but a table, so the column
+/// says how big it is and the value column shows what is in it — printing one of twelve labels
+/// there would be picking one at random.
+fn default_of(def: &crate::settings::Def) -> String {
+    match def.kind {
+        Kind::Dict(shape) => format!("{} entries", shape.defaults.len()),
+        _ => def.default.unwrap_or("unset").to_string(),
+    }
+}
+
+/// **What the value column shows for a dictionary**: one line per pair, `key value`, in the store's
+/// own sorted order, with the pairs the user has moved marked.
+///
+/// A dict is not one line and this is the cell that says so. The same question is answered for
+/// `:set` in `settings::describe_dict`, and the two are deliberately different shapes: the terminal
+/// gets `option[key] = value` because a line there has to carry which option it belongs to, and
+/// this cell is already inside the option's row, so repeating the name nine times would be nine
+/// columns of noise. What they share is the *marking* — a reader of either can see which pairs are
+/// bru's and which are not without holding the defaults in their head.
+fn in_force_cell(def: &crate::settings::Def, snapshot: Option<&Snapshot>) -> String {
+    let Kind::Dict(shape) = def.kind else {
+        return escape(&in_force(def.name, snapshot));
+    };
+    let pairs = crate::settings::dict_of(def.name);
+    if pairs.is_empty() {
+        return "empty".to_string();
+    }
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            let ships = shape
+                .defaults
+                .iter()
+                .find(|(known, _)| known == key)
+                .map(|(_, value)| *value);
+            let note = match ships {
+                Some(default) if default == value => "",
+                Some(_) => " ·  changed",
+                None => " ·  added",
+            };
+            format!("<code>{}</code> {}{}", escape(key), escape(value), note)
+        })
+        .collect::<Vec<_>>()
+        .join("<br>")
 }
 
 /// What the setting is, in one cell.
@@ -198,6 +247,8 @@ fn kind(kind: Kind) -> &'static str {
         // Leaked as a `&'static str` because this returns one and the list is compiled in: one
         // allocation per settings-page render, of a string that would have been a literal anyway.
         Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
+        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key",
+        Kind::Dict(_) => "a dictionary, fixed keys",
     }
 }
 
@@ -322,6 +373,37 @@ mod tests {
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
         // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
+    }
+
+    /// **A dict is not one line, and this is what the value column does about it.** One row per
+    /// setting still, but the cell inside it is a line per pair.
+    #[test]
+    fn a_dictionary_setting_shows_a_line_per_pair() {
+        let html = page(Some(&snapshot("https://example.com/")));
+        // Still one row per setting — the pairs are inside the row, not extra rows.
+        assert_eq!(html.matches("<tr class=").count(), SETTINGS.len() + REFUSED.len());
+        // Nine engines and twelve labels, each as `<code>key</code> value`.
+        for (name, template) in crate::open::DEFAULT_ENGINES {
+            assert!(
+                html.contains(&format!("<code>{name}</code> {}", escape(template))),
+                "{name} is missing from the value column"
+            );
+        }
+        assert!(html.contains("<code>search_forward</code> search"));
+        assert!(html.contains("<code>set_mark</code> set mark"));
+        // The lines are separated by the page's own markup, which is the reason this cell is not
+        // put through `escape` as one string.
+        assert!(html.contains("<code>aw</code> https://wiki.archlinux.org/?search={}<br>"));
+        // ...and the last pair of a dict ends the cell rather than trailing one.
+        assert!(html.contains(
+            "<code>yt</code> https://www.youtube.com/results?search_query={}</td></tr>"
+        ));
+        // The kind column says which of the two dicts will take a key it does not ship.
+        assert!(html.contains("a dictionary, any key"));
+        assert!(html.contains("a dictionary, fixed keys"));
+        // A dictionary's "default" is a count, not one of its values.
+        assert!(html.contains("default 9 entries"));
+        assert!(html.contains("default 12 entries"));
     }
 
     /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this

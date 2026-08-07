@@ -712,6 +712,8 @@ fn bar_json_for(window: u32) -> String {
     // rather than kept on `BarState` for the same reason as `tabindex`: it is a pure function of a
     // setting, and a copy is a copy somebody has to remember to update.
     let mode_style = crate::settings::value_of("statusbar.mode.style").unwrap_or_default();
+    // --- src/settings.rs: `statusbar.mode.labels`, already JSON --------------------------------
+    let mode_labels = crate::settings::mode_labels_json();
     with_window(window, |entry| {
         let bar = &entry.bar;
         format!(
@@ -719,7 +721,7 @@ fn bar_json_for(window: u32) -> String {
             // which ignores a key it has no element for: `search` is the find handler's match count,
             // `download` a running download's progress, `message` one line with a level and its own
             // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
-            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"modelabels\":{mode_labels},\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
             json_escape(&bar.url),
             json_escape(&bar.title),
             json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),

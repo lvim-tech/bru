@@ -24,7 +24,7 @@
 //! `RequestContext::set_content_setting`, and it is also the only thing in this file that has to run
 //! on the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use cef::*;
@@ -40,6 +40,105 @@ pub enum Kind {
     /// `true`/`false` for a [`Kind::Bool`] — so `sm` on a key bound to it steps through the choices
     /// rather than needing them spelled out at the binding.
     Choice(&'static [&'static str]),
+    /// A map from key to text, with bru's own pairs compiled in. See [`DictShape`].
+    Dict(&'static DictShape),
+}
+
+// -----------------------------------------------------------------------------------------------
+// Dictionaries
+// -----------------------------------------------------------------------------------------------
+
+/// The shape of a [`Kind::Dict`] setting: the pairs bru ships, whether a key it does not ship may
+/// be added, and what a value has to be.
+///
+/// ## An override **merges**; it does not replace
+///
+/// This is the decision the type exists to carry, and it is deliberately *not* qutebrowser's.
+/// qutebrowser replaces: `c.url.searchengines = {"gh": …}` in `config.py` leaves you with one
+/// engine, and `:config-dict-add` (`configcommands.py:311-339`) is the separate command for adding
+/// one key without losing the rest — because in qutebrowser `config.py` *is* the configuration and
+/// what it does not say does not exist.
+///
+/// In bru it is the other way round, and DESIGN.md says so in as many words: "bru ships its own
+/// default settings; configer's file only overrides them … `~/.config/bru/config.lua` … holds only
+/// the **user's overrides**, layered on the defaults at startup. It is a patch, not the source." A
+/// patch that silently deleted the nine-tenths of a dictionary it did not mention would not be a
+/// patch. So `bru.set("statusbar.mode.labels", { normal = "NOR" })` renames one mode and leaves the
+/// other eleven labels alone, and `bru.set("url.searchengines", { gh = … })` adds a tenth engine
+/// rather than throwing away nine.
+///
+/// The cost is that merging alone cannot *remove* a pair, which is exactly what
+/// [`crate::commands::Command::ConfigDictRemove`] is for — see the note there. Between them the two
+/// operations reach every table qutebrowser's replace-and-add pair reaches.
+#[derive(PartialEq, Eq, Debug)]
+pub struct DictShape {
+    /// The pairs bru ships. A bru with no `~/.config/bru/` has exactly these.
+    pub defaults: &'static [(&'static str, &'static str)],
+    /// Whether a key that is not in `defaults` may be added.
+    ///
+    /// `false` for `statusbar.mode.labels`: the twelve keys are the twelve labels the bar can
+    /// draw, and a thirteenth would be a value typed and never read — the thing this file's second
+    /// rule exists to refuse. `true` for `url.searchengines`, where a new key is the whole point.
+    pub open_keys: bool,
+    /// What a value has to be.
+    pub value: DictValue,
+}
+
+/// What a dict setting's values are checked against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DictValue {
+    /// Non-empty text drawn somewhere. An empty label would be a pill with nothing in it.
+    Label,
+    /// A search-engine URL template, checked by [`crate::open::check_engine`] — the same function
+    /// `bru.search` goes through, because they are two doors to one table.
+    SearchTemplate,
+}
+
+impl DictShape {
+    /// The pairs bru ships, as the map a [`Value::Dict`] holds.
+    pub fn default_map(&self) -> BTreeMap<String, String> {
+        self.defaults
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// bru's own value for `key`, if it ships one.
+    fn default_for(&self, key: &str) -> Option<&'static str> {
+        self.defaults
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, value)| *value)
+    }
+
+    /// Whether one pair may go into this dict, and why not when it may not.
+    fn check(&self, name: &str, key: &str, value: &str) -> Result<(), String> {
+        if key.trim().is_empty() {
+            return Err(format!("{name}: a key cannot be empty"));
+        }
+        if !self.open_keys && self.default_for(key).is_none() {
+            return Err(format!(
+                "{name}: {key:?} is not one of {}",
+                self.defaults
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        match self.value {
+            DictValue::Label => {
+                if value.trim().is_empty() {
+                    Err(format!("{name}: {key:?} cannot be given an empty label"))
+                } else {
+                    Ok(())
+                }
+            }
+            DictValue::SearchTemplate => {
+                crate::open::check_engine(key, value).map_err(|e| format!("{name}: {e}"))
+            }
+        }
+    }
 }
 
 /// A setting's value, already validated against its [`Kind`].
@@ -47,6 +146,9 @@ pub enum Kind {
 pub enum Value {
     Bool(bool),
     Text(String),
+    /// A whole dictionary, bru's defaults with the user's overrides merged over them. The map is
+    /// complete rather than a diff, so reading one is one lookup and never a merge.
+    Dict(BTreeMap<String, String>),
 }
 
 impl std::fmt::Display for Value {
@@ -55,6 +157,9 @@ impl std::fmt::Display for Value {
             Value::Bool(true) => f.write_str("true"),
             Value::Bool(false) => f.write_str("false"),
             Value::Text(text) => f.write_str(text),
+            // One line, for the places that have room for one. What `:set` and the settings page
+            // print is not this — see `Settings::describe`, which gives a dict a line per pair.
+            Value::Dict(map) => write!(f, "{} entries", map.len()),
         }
     }
 }
@@ -68,6 +173,10 @@ enum Backing {
     /// here when the bar is built, and setting it pushes every window's bar so the change is seen
     /// without a reload.
     Bar,
+    /// `open.rs`'s search engine table. Nothing to apply to Chromium either; what applying does is
+    /// rebuild [`crate::open::SearchEngines`] from this store and install it, so that the setting
+    /// is the *front door* to the table `:open` already reads rather than a second copy of it.
+    SearchEngines,
     /// A Chromium content setting, global or per-origin. See [`apply`].
     Content(ContentKind),
 }
@@ -119,6 +228,65 @@ pub struct Def {
     backing: Backing,
 }
 
+/// The words the mode pill draws, one per label the bar can show.
+///
+/// **Twelve keys for ten modes**, and the three extra are all command mode's. `:`, `/` and `?` are
+/// one mode — `Mode::Command` — and the prefix that says which was moved out of the input and into
+/// the pill on 2026-08-06, because it sat in front of the user's own typing. So the pill draws
+/// `COMMAND`, `SEARCH ▼` or `SEARCH ▲` for the same `state.mode`, chosen from
+/// `state.cmdline.prefix` in `chrome/bottom.js`.
+///
+/// The keys for those three are `command`, `search_forward` and `search_backward`, and the choice
+/// is defensible three ways:
+///
+/// - **This dict is keyed by label, not by mode.** It is the list of words the pill can show; that
+///   there are more of them than there are modes is a fact about the pill. A key that could only be
+///   spelled `command` would leave two of the three labels unreachable, which is the whole reason
+///   the setting was asked for.
+/// - **`forward`/`backward` is the vocabulary the user already has.** `search-next` and
+///   `search-prev` are bound to `n` and `N`, and qutebrowser's own flag is `:search --reverse`. A
+///   key named after the *arrow* (`search_down`) would name the glyph rather than the thing.
+/// - **The underscore matches the mode names that have one.** `set_mark` and `jump_mark` are
+///   spelled that way in `mode-enter set_mark`, so a reader who has typed one has typed the other.
+///
+/// **The arrow is not part of the label**, and that is measured rather than asserted:
+/// `bottom.js`'s `short` branch strips the word to its initials and *keeps* the arrow, which is
+/// what a direction indicator that is not a word looks like in the code that already exists. So
+/// `search_forward = "FIND"` draws `FIND ▼`, and there is no spelling here that removes the
+/// triangle. If that is ever wanted it is a second setting, not a value in this one.
+///
+/// The defaults are the mode names with their underscores spelled as spaces, because the bar is
+/// read rather than typed — `SET MARK`, not `SET_MARK`. The uppercasing is `chrome.css`'s
+/// (`text-transform: uppercase`), so a label written `nor` still draws `NOR`.
+pub static MODE_LABELS: DictShape = DictShape {
+    defaults: &[
+        ("normal", "normal"),
+        ("insert", "insert"),
+        ("caret", "caret"),
+        ("command", "command"),
+        ("search_forward", "search"),
+        ("search_backward", "search"),
+        ("hint", "hint"),
+        ("passthrough", "passthrough"),
+        ("set_mark", "set mark"),
+        ("jump_mark", "jump mark"),
+        ("record_macro", "record macro"),
+        ("run_macro", "run macro"),
+    ],
+    // A key the pill cannot draw is a value typed and forgotten — see DictShape::open_keys.
+    open_keys: false,
+    value: DictValue::Label,
+};
+
+/// The nine engines bru ships, as a setting. The pairs are `open.rs`'s, and so is the check a new
+/// pair goes through: this is a door to that table, not a copy of it.
+pub static SEARCH_ENGINES: DictShape = DictShape {
+    defaults: crate::open::DEFAULT_ENGINES,
+    // A tenth engine is the point of the setting.
+    open_keys: true,
+    value: DictValue::SearchTemplate,
+};
+
 /// Every setting bru has, and nothing else.
 ///
 /// The list is short on purpose. qutebrowser has some 400 options; bru has three, because three is
@@ -142,6 +310,26 @@ pub const SETTINGS: &[Def] = &[
         default: Some("full"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Bar,
+    },
+    Def {
+        // bru's own, like `statusbar.mode.style` beside it. The default is not in `default` — a
+        // dictionary's defaults are its shape's, because there are twelve of them.
+        name: "statusbar.mode.labels",
+        kind: Kind::Dict(&MODE_LABELS),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Bar,
+    },
+    Def {
+        // qutebrowser's name, for qutebrowser's table — DECISIONS.md item 4. The engines were
+        // already reachable through `bru.search`; this is the same store named as a setting, so
+        // that `bru://chrome/settings` can show them and `:config-dict-add` can change them while
+        // bru runs.
+        name: "url.searchengines",
+        kind: Kind::Dict(&SEARCH_ENGINES),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::SearchEngines,
     },
     Def {
         name: "content.javascript.enabled",
@@ -203,6 +391,47 @@ pub const REFUSED: &[(&str, &str)] = &[
     ),
 ];
 
+/// **What `:set` prints for a dictionary**, and the answer to "a dict is not one line".
+///
+/// A header naming the option, how many pairs it holds and how many of them the user has moved,
+/// then one line per pair — `option[key] = value` — sorted, with bru's own value quoted beside any
+/// pair that has been changed and `(added)` against one bru does not ship.
+///
+/// The one-line alternative was rejected on the data rather than on taste: `url.searchengines`'s
+/// nine templates are 314 characters together, which is four wrapped terminal lines with no column
+/// to read down and no way to see which of them is not bru's. Naming the option on every line costs
+/// nine repetitions and buys a line that can be grepped, copied into a `:config-dict-add`, and read
+/// against its neighbour.
+///
+/// It is deliberately *not* the spelling `:set` accepts back — nothing is, for a dict; see
+/// `Def::parse`. A printed form that looked settable and was not would be worse than one that
+/// plainly is not.
+fn describe_dict(def: &'static Def, map: &BTreeMap<String, String>) -> String {
+    let shape = match def.kind {
+        Kind::Dict(shape) => shape,
+        _ => return format!("{} is not a dictionary", def.name),
+    };
+    let moved = map
+        .iter()
+        .filter(|(key, value)| shape.default_for(key) != Some(value.as_str()))
+        .count();
+    let mut out = format!(
+        "{} — {} entries, {} changed from bru's own",
+        def.name,
+        map.len(),
+        moved
+    );
+    for (key, value) in map {
+        out.push_str(&format!("\n  {}[{key}] = {value}", def.name));
+        match shape.default_for(key) {
+            Some(default) if default == value => {}
+            Some(default) => out.push_str(&format!("   (bru ships {default})")),
+            None => out.push_str("   (added)"),
+        }
+    }
+    out
+}
+
 /// The value of a setting bru answers itself, rather than reading back from Chromium.
 ///
 /// `None` for the content settings, whose truth is Chromium's and is read there — see
@@ -211,15 +440,56 @@ pub const REFUSED: &[(&str, &str)] = &[
 /// had compiled in.
 pub fn value_of(name: &str) -> Option<String> {
     let def = def(name)?;
-    if !matches!(def.backing, Backing::Bar) {
+    if !matches!(def.backing, Backing::Bar | Backing::SearchEngines) {
         return None;
     }
     let live = with_live(|settings| settings.get(name, None).ok().flatten());
     Some(match live {
         Some(Value::Text(text)) => text,
         Some(Value::Bool(flag)) => flag.to_string(),
+        // A dictionary has no one-line value. Nothing asks `value_of` for one — `bar_json` reads
+        // `dict_of` and the settings page prints a row per pair — and the count is the honest
+        // answer for anywhere that insists on a scalar.
+        Some(value @ Value::Dict(_)) => value.to_string(),
         None => def.default.unwrap_or_default().to_string(),
     })
+}
+
+/// Every pair of a dict setting, bru's defaults with the user's overrides merged over them.
+///
+/// Empty for a setting that is not a dictionary. This is what `ipc::bar_json` reads for the mode
+/// labels and what `settingspage.rs` prints a row per entry of — one reader, one store.
+pub fn dict_of(name: &str) -> Vec<(String, String)> {
+    let Some(def) = def(name) else { return Vec::new() };
+    let Kind::Dict(shape) = def.kind else {
+        return Vec::new();
+    };
+    match with_live(|settings| settings.get(name, None).ok().flatten()) {
+        Some(Value::Dict(map)) => map.into_iter().collect(),
+        // Before `install`: a renderer process, or a unit test. bru's own defaults are still the
+        // truth, and answering nothing would leave the pill blank in a process that never loads a
+        // config.
+        _ => shape.default_map().into_iter().collect(),
+    }
+}
+
+/// The mode labels as a JSON object, for the one line `ipc::bar_json` adds.
+///
+/// Built here rather than there so that `ipc.rs` — a file four other workstreams are also editing —
+/// gains two lines instead of eight. `json_escape` is `ipc.rs`'s, because a label is user text and
+/// a quote in one would otherwise end the JSON string early.
+pub fn mode_labels_json() -> String {
+    let pairs: Vec<String> = dict_of("statusbar.mode.labels")
+        .into_iter()
+        .map(|(key, label)| {
+            format!(
+                "\"{}\":\"{}\"",
+                crate::ipc::json_escape(&key),
+                crate::ipc::json_escape(&label)
+            )
+        })
+        .collect();
+    format!("{{{}}}", pairs.join(","))
 }
 
 /// The reason a command string names a refused setting, for `bru://chrome/help`'s third state.
@@ -292,13 +562,45 @@ impl Def {
                     ))
                 }
             }
+            // **A whole dictionary has no spelling on the command line, on purpose.** There is
+            // nothing for `:set url.searchengines <one token>` to mean: an override *merges* (see
+            // DictShape), so a text form would be a way of writing a merge one token wide, which is
+            // what `:config-dict-add` already is and says more clearly. Refusing it here is what
+            // makes `:set url.searchengines '{"gh": …}'` an error naming the command that works,
+            // rather than a JSON parser bru would have to carry and a quoting rule the command line
+            // does not have.
+            Kind::Dict(_) => Err(format!(
+                "{0} is a dictionary — set one pair at a time with \
+                 `:config-dict-add {0} <key> <value> --replace`, remove one with \
+                 `:config-dict-remove {0} <key>`, or write a Lua table in config.lua. A whole \
+                 dictionary has no spelling here because an override merges into bru's defaults \
+                 rather than replacing them.",
+                self.name
+            )),
         }
     }
 
     /// The value when nothing has set it.
     fn default_value(&self) -> Option<Value> {
+        // A dictionary's defaults are its shape's, and there is always a full set of them: a bru
+        // with no `~/.config/bru/` searches with nine engines and draws twelve labels.
+        if let Kind::Dict(shape) = self.kind {
+            return Some(Value::Dict(shape.default_map()));
+        }
         let default = self.default?;
         self.parse(default).ok()
+    }
+
+    /// The [`DictShape`] behind a dict setting, and the error a command that only works on one gets
+    /// when it is pointed at something else. qutebrowser's wording, `configcommands.py:326-328`.
+    fn dict_shape(&self, command: &str) -> Result<&'static DictShape, String> {
+        match self.kind {
+            Kind::Dict(shape) => Ok(shape),
+            _ => Err(format!(
+                ":{command} can only be used for dicts, and {} is not one",
+                self.name
+            )),
+        }
     }
 }
 
@@ -501,6 +803,10 @@ impl Applied {
     /// When that is wider than the one that was typed the line says so, rather than echoing the
     /// pattern back and letting it look like it was honoured as written. See [`Pattern`].
     pub fn describe(&self) -> String {
+        // A dict is not one line — see `describe_dict`, which is what both print paths use.
+        if let Value::Dict(map) = &self.value {
+            return describe_dict(self.def, map);
+        }
         let mut out = format!("{} = {}", self.def.name, self.value);
         if let Some(pattern) = &self.pattern {
             out.push_str(&format!(" for {}", pattern.describe()));
@@ -536,6 +842,112 @@ impl Settings {
         Ok(Applied { def, value: parsed, pattern })
     }
 
+    /// `bru.set(key, { … })` — a Lua table, **merged** into whatever the dict already holds.
+    ///
+    /// Merged rather than substituted for the reason [`DictShape`] carries at length: `config.lua`
+    /// is a patch over bru's defaults, not the source of them, so a table naming one mode renames
+    /// one mode. Within the table itself the last pair for a key wins, which is Lua's own answer
+    /// for a table literal that names a key twice.
+    ///
+    /// Every pair is checked before any is stored, so a table with a typo in its fifth line changes
+    /// nothing rather than four-twelfths of something. That is stricter than the surrounding file —
+    /// `bru.bind` applies each call as it comes — and it is right here because the twelve pairs
+    /// arrive as **one** call, so "what ran before the error" would be a fraction of one statement.
+    pub fn set_dict(&mut self, key: &str, pairs: &[(String, String)]) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let shape = def.dict_shape("config-dict-add")?;
+        for (k, v) in pairs {
+            shape.check(def.name, k, v)?;
+        }
+        let mut map = self.dict_map(def);
+        for (k, v) in pairs {
+            map.insert(k.clone(), v.clone());
+        }
+        let value = Value::Dict(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-dict-add <option> <key> <value> [--replace]` — one pair.
+    ///
+    /// **`--replace` is qutebrowser's, verbatim** (`configcommands.py:333-336`): a key that is
+    /// already there is refused unless it is passed, so that a mistyped key cannot quietly overwrite
+    /// something. bru ships a default for every key it knows, so in practice `--replace` is needed
+    /// for every *change* and not needed for an *addition* — which is a sharper distinction than
+    /// qutebrowser's own, where the default table is one entry long, and it is the one this command
+    /// name promises.
+    pub fn dict_add(
+        &mut self,
+        key: &str,
+        entry: &str,
+        value: &str,
+        replace: bool,
+    ) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let shape = def.dict_shape("config-dict-add")?;
+        shape.check(def.name, entry, value)?;
+        let mut map = self.dict_map(def);
+        if map.contains_key(entry) && !replace {
+            return Err(format!(
+                "{entry} already exists in {} — use --replace to overwrite",
+                def.name
+            ));
+        }
+        map.insert(entry.to_string(), value.to_string());
+        let value = Value::Dict(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-dict-remove <option> <key>`.
+    ///
+    /// The other half of merging: an override can add and change, so this is the only way to make a
+    /// pair bru ships stop existing. Removing a key of a closed dict — one of the twelve labels —
+    /// is refused rather than obeyed, because the pill would then have nothing to draw.
+    pub fn dict_remove(&mut self, key: &str, entry: &str) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let shape = def.dict_shape("config-dict-remove")?;
+        let mut map = self.dict_map(def);
+        if !map.contains_key(entry) {
+            return Err(format!("{entry} is not in {}", def.name));
+        }
+        if !shape.open_keys {
+            return Err(format!(
+                "{}: {entry:?} cannot be removed — every one of its keys is something the bar \
+                 draws, and a missing one would be a blank badge. Give it a different value \
+                 instead.",
+                def.name
+            ));
+        }
+        map.remove(entry);
+        let value = Value::Dict(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// The dict as it stands: whatever has been stored, or bru's defaults when nothing has.
+    fn dict_map(&self, def: &'static Def) -> BTreeMap<String, String> {
+        match self.values.get(&(None, def.name)) {
+            Some(Value::Dict(map)) => map.clone(),
+            _ => match def.kind {
+                Kind::Dict(shape) => shape.default_map(),
+                _ => BTreeMap::new(),
+            },
+        }
+    }
+
+    /// `url.searchengines`, as the table `open.rs` searches with.
+    ///
+    /// The one conversion between the setting and the thing it is the front door to. It is called
+    /// at startup by `Config::into_parsers` and again by [`apply`] every time the setting changes,
+    /// so there is never a moment when the two disagree.
+    pub fn search_engines(&self) -> crate::open::SearchEngines {
+        let Some(def) = def("url.searchengines") else {
+            return crate::open::SearchEngines::default();
+        };
+        crate::open::SearchEngines::from_pairs(self.dict_map(def))
+    }
+
     /// `config-cycle <option> [values…]` — the next value in the list, or the first when the current
     /// one is not in it (`configcommands.py:220-225`). An empty list on a boolean is `true false`.
     pub fn cycle(
@@ -545,6 +957,14 @@ impl Settings {
         pattern: Option<&str>,
     ) -> Result<Applied, String> {
         let def = def(key).ok_or_else(|| unknown(key))?;
+        // Cycling a dictionary would mean cycling between whole tables, which nothing can spell —
+        // said here rather than left to `parse`, whose message is about `:set`.
+        if matches!(def.kind, Kind::Dict(_)) {
+            return Err(format!(
+                "{} is a dictionary; config-cycle walks the values of a single option",
+                def.name
+            ));
+        }
         let owned: Vec<String>;
         let values = if values.is_empty() && def.kind == Kind::Bool {
             owned = vec!["true".to_string(), "false".to_string()];
@@ -598,6 +1018,9 @@ impl Settings {
         let def = def(key).ok_or_else(|| unknown(key))?;
         let scope = self.scope(def, pattern)?;
         let value = self.get(key, pattern)?;
+        if let Some(Value::Dict(map)) = &value {
+            return Ok(describe_dict(def, map));
+        }
         let value = value.map_or_else(|| "<unset>".to_string(), |value| value.to_string());
         Ok(match scope {
             Some(pattern) => format!("{} = {value} for {}", def.name, pattern.describe()),
@@ -710,6 +1133,36 @@ pub fn run_set(option: Option<&str>, value: Option<&str>, pattern: Option<&str>,
     report(outcome);
 }
 
+/// `:config-dict-add [-p] <option> <key> <value> [--replace]` — the arm `exec::run` calls.
+///
+/// It prints the pair it changed rather than the whole dictionary: the answer to "what did that
+/// do" is one line, and `:set <option>` is there for the other question.
+pub fn run_dict_add(option: &str, key: &str, value: &str, replace: bool, print: bool) {
+    let outcome = with_live(|settings| settings.dict_add(option, key, value, replace))
+        .and_then(|applied| {
+            apply(&applied)?;
+            Ok(if print {
+                format!("{option}[{key}] = {value}")
+            } else {
+                String::new()
+            })
+        });
+    report(outcome);
+}
+
+/// `:config-dict-remove [-p] <option> <key>`.
+pub fn run_dict_remove(option: &str, key: &str, print: bool) {
+    let outcome = with_live(|settings| settings.dict_remove(option, key)).and_then(|applied| {
+        apply(&applied)?;
+        Ok(if print {
+            format!("{option}[{key}] removed")
+        } else {
+            String::new()
+        })
+    });
+    report(outcome);
+}
+
 /// `:config-cycle [-p] [-u <pattern>] <option> [values…]`.
 pub fn run_cycle(option: &str, values: &[String], pattern: Option<&str>, print: bool) {
     let pattern = pattern.map(expand);
@@ -724,11 +1177,17 @@ pub fn run_cycle(option: &str, values: &[String], pattern: Option<&str>, print: 
 /// bru has no status-bar message area yet — `statusbar/` has url, scroll, tab index, keystring and
 /// the search count, and nothing that shows a one-off line. Until it does, `-p` goes to stderr,
 /// which is where every other command that has something to say already writes.
+///
+/// Every line gets the prefix, not only the first: a dictionary prints one line per pair, and a
+/// twelve-line answer whose continuation lines look like some other program's output is a twelve-
+/// line answer nobody can grep for.
 fn report(outcome: Result<String, String>) {
-    match outcome {
-        Ok(text) if text.is_empty() => {}
-        Ok(text) => eprintln!("bru: {text}"),
-        Err(error) => eprintln!("bru: {error}"),
+    let text = match outcome {
+        Ok(text) if text.is_empty() => return,
+        Ok(text) | Err(text) => text,
+    };
+    for line in text.lines() {
+        eprintln!("bru: {line}");
     }
 }
 
@@ -749,6 +1208,14 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         // The bar reads it when it is built; setting it only has to make that happen again.
         Backing::Bar => {
             crate::ipc::push_bar_everywhere();
+            return Ok(());
+        }
+        // The front door doing its one job: rebuild `open.rs`'s table from this store and install
+        // it. Nothing else in bru holds engines, so a `:config-dict-add url.searchengines …` is
+        // live at the next `:open` without a restart.
+        Backing::SearchEngines => {
+            let engines = with_live(|settings| settings.search_engines());
+            crate::open::install_engines(engines);
             return Ok(());
         }
         Backing::Content(kind) => kind,
@@ -802,8 +1269,8 @@ pub fn apply_at_startup() {
 pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let kind = match def(name)?.backing {
         Backing::Content(kind) => kind,
-        // Neither is a Chromium content setting, so Chromium has no opinion to read back.
-        Backing::StartPage | Backing::Bar => return None,
+        // None of the three is a Chromium content setting, so Chromium has no opinion to read back.
+        Backing::StartPage | Backing::Bar | Backing::SearchEngines => return None,
     };
     let context = request_context_get_global_context()?;
     let url = CefString::from(url);
@@ -994,10 +1461,20 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: bad default: {e}", def.name));
             }
         }
-        // Four since `statusbar.mode.style`, which is bru's own rather than a name copied from
-        // qutebrowser — it has no mode indicator to configure. Raise this with the setting, never
-        // to make a failing build pass.
-        assert_eq!(SETTINGS.len(), 4);
+        // Six since the two dictionaries — `statusbar.mode.labels`, bru's own, and
+        // `url.searchengines`, which is qutebrowser's name for the table `bru.search` was already
+        // filling. Raise this with the setting, never to make a failing build pass.
+        assert_eq!(SETTINGS.len(), 6);
+        // Every dictionary's own defaults have to pass its own check, for the same reason: a
+        // shipped pair that the setting would refuse is a default nobody could type back.
+        for def in SETTINGS {
+            let Kind::Dict(shape) = def.kind else { continue };
+            for (key, value) in shape.defaults {
+                shape
+                    .check(def.name, key, value)
+                    .unwrap_or_else(|e| panic!("{}: bad default pair: {e}", def.name));
+            }
+        }
     }
 
     #[test]
@@ -1206,6 +1683,192 @@ mod tests {
             settings.describe("start_page", None).unwrap(),
             "start_page = <unset>"
         );
+    }
+
+    // -- dictionaries ---------------------------------------------------------------------------
+
+    /// **The merge decision, asserted.** This is the one that would break silently: a replace would
+    /// pass every other test in this file and only show up as nine missing engines on the user's
+    /// screen.
+    #[test]
+    fn an_override_merges_into_brus_defaults_rather_than_replacing_them() {
+        let mut settings = Settings::default();
+        // Nothing set at all: bru's own, in full.
+        assert_eq!(settings.search_engines().get("yt"), Some("https://www.youtube.com/results?search_query={}"));
+        assert_eq!(settings.dict_map(def("url.searchengines").unwrap()).len(), 9);
+
+        // One engine named — the other nine survive and the tenth is there.
+        settings
+            .set_dict(
+                "url.searchengines",
+                &[("gh".to_string(), "https://github.com/search?q={}".to_string())],
+            )
+            .unwrap();
+        let engines = settings.search_engines();
+        assert_eq!(engines.get("gh"), Some("https://github.com/search?q={}"));
+        assert_eq!(engines.get("aw"), Some("https://wiki.archlinux.org/?search={}"));
+        assert_eq!(engines.iter().count(), 10);
+
+        // One label named — the other eleven survive.
+        settings
+            .set_dict(
+                "statusbar.mode.labels",
+                &[("normal".to_string(), "NOR".to_string())],
+            )
+            .unwrap();
+        let labels = settings.dict_map(def("statusbar.mode.labels").unwrap());
+        assert_eq!(labels.get("normal").map(String::as_str), Some("NOR"));
+        assert_eq!(labels.get("insert").map(String::as_str), Some("insert"));
+        assert_eq!(labels.len(), 12);
+    }
+
+    /// The keys the pill can draw, including command mode's three — the reason the dict is keyed by
+    /// label rather than by mode.
+    #[test]
+    fn command_modes_three_labels_are_three_keys() {
+        let mut settings = Settings::default();
+        let labels = settings.dict_map(def("statusbar.mode.labels").unwrap());
+        assert_eq!(labels.get("command").map(String::as_str), Some("command"));
+        assert_eq!(labels.get("search_forward").map(String::as_str), Some("search"));
+        assert_eq!(labels.get("search_backward").map(String::as_str), Some("search"));
+        // All three move independently: renaming the forward search leaves `:` and `?` alone.
+        settings
+            .set_dict("statusbar.mode.labels", &[("search_forward".to_string(), "find".to_string())])
+            .unwrap();
+        let labels = settings.dict_map(def("statusbar.mode.labels").unwrap());
+        assert_eq!(labels.get("search_forward").map(String::as_str), Some("find"));
+        assert_eq!(labels.get("search_backward").map(String::as_str), Some("search"));
+        assert_eq!(labels.get("command").map(String::as_str), Some("command"));
+        // Every mode `modes.rs` has is a key here, or a mode would draw its own name while its
+        // neighbours drew the user's word.
+        for mode in crate::modes::Mode::ALL {
+            assert!(labels.contains_key(mode.name()), "{} has no label", mode.name());
+        }
+    }
+
+    #[test]
+    fn a_dict_refuses_what_it_could_not_draw_or_search_with() {
+        let mut settings = Settings::default();
+        // A closed dict takes only its own keys, and says which they are.
+        let error = settings
+            .set_dict("statusbar.mode.labels", &[("nonsense".to_string(), "X".to_string())])
+            .unwrap_err();
+        assert!(error.contains("is not one of"), "{error}");
+        assert!(error.contains("passthrough"), "{error}");
+        // An empty label would be a pill with nothing in it.
+        assert!(settings
+            .set_dict("statusbar.mode.labels", &[("normal".to_string(), "  ".to_string())])
+            .is_err());
+        // An engine goes through `open.rs`'s own check — the same one `bru.search` uses.
+        let error = settings
+            .set_dict("url.searchengines", &[("gh".to_string(), "https://github.com/".to_string())])
+            .unwrap_err();
+        assert!(error.contains("the term would be dropped"), "{error}");
+        assert!(settings
+            .set_dict("url.searchengines", &[("two words".to_string(), "https://x/?q={}".to_string())])
+            .is_err());
+        // And one bad pair leaves the whole table alone, rather than storing the pairs before it.
+        assert!(settings
+            .set_dict(
+                "url.searchengines",
+                &[
+                    ("ok".to_string(), "https://x/?q={}".to_string()),
+                    ("bad".to_string(), "https://x/".to_string()),
+                ]
+            )
+            .is_err());
+        assert_eq!(settings.search_engines().get("ok"), None);
+
+        // A dictionary has no text spelling, and the error names the command that does work.
+        let error = settings.set("url.searchengines", "{\"gh\": \"x\"}").unwrap_err();
+        assert!(error.contains("config-dict-add"), "{error}");
+        // Nor can it be cycled.
+        assert!(settings.cycle("statusbar.mode.labels", &[], None).is_err());
+        // A scalar setting is not a dict, and the two dict commands say so rather than doing
+        // something surprising — qutebrowser's wording, configcommands.py:326-328.
+        let error = settings.dict_add("start_page", "a", "b", false).unwrap_err();
+        assert!(error.contains("can only be used for dicts"), "{error}");
+    }
+
+    /// `config-dict-add` and `config-dict-remove`, including the `--replace` guard bru takes
+    /// verbatim from qutebrowser.
+    #[test]
+    fn adding_and_removing_one_pair() {
+        let mut settings = Settings::default();
+        // A key bru does not ship needs no flag.
+        settings
+            .dict_add("url.searchengines", "gh", "https://github.com/search?q={}", false)
+            .unwrap();
+        // A key that is there does, and the error says which flag.
+        let error = settings
+            .dict_add("url.searchengines", "gh", "https://github.com/search?q={}", false)
+            .unwrap_err();
+        assert!(error.contains("--replace"), "{error}");
+        settings
+            .dict_add("url.searchengines", "gh", "https://github.com/issues?q={}", true)
+            .unwrap();
+        assert_eq!(
+            settings.search_engines().get("gh"),
+            Some("https://github.com/issues?q={}")
+        );
+
+        // Removing is the only way to lose a pair, since an override merges.
+        settings.dict_remove("url.searchengines", "hoog").unwrap();
+        assert_eq!(settings.search_engines().get("hoog"), None);
+        assert_eq!(settings.search_engines().iter().count(), 9);
+        assert!(settings.dict_remove("url.searchengines", "hoog").is_err());
+
+        // A label cannot be removed: every key of that dict is something the bar draws.
+        let error = settings.dict_remove("statusbar.mode.labels", "normal").unwrap_err();
+        assert!(error.contains("blank badge"), "{error}");
+    }
+
+    /// **What `:set` prints for a dictionary.** A dict is not one line, and this is the shape.
+    #[test]
+    fn printing_a_dictionary_is_a_line_per_pair_and_says_which_are_not_brus() {
+        let mut settings = Settings::default();
+        settings
+            .set_dict("statusbar.mode.labels", &[("normal".to_string(), "NOR".to_string())])
+            .unwrap();
+        let printed = settings.describe("statusbar.mode.labels", None).unwrap();
+        let mut lines = printed.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "statusbar.mode.labels — 12 entries, 1 changed from bru's own"
+        );
+        assert_eq!(printed.lines().count(), 13, "a header and one line per pair");
+        // The pair that moved carries what bru ships, so the reader can put it back.
+        assert!(
+            printed.contains("statusbar.mode.labels[normal] = NOR   (bru ships normal)"),
+            "{printed}"
+        );
+        // The ones that did not are plain.
+        assert!(printed.contains("statusbar.mode.labels[insert] = insert\n"), "{printed}");
+
+        // An engine bru does not ship is marked as added rather than as changed.
+        settings
+            .dict_add("url.searchengines", "gh", "https://github.com/search?q={}", false)
+            .unwrap();
+        let printed = settings.describe("url.searchengines", None).unwrap();
+        assert!(printed.starts_with("url.searchengines — 10 entries, 1 changed from bru's own"));
+        assert!(
+            printed.contains("url.searchengines[gh] = https://github.com/search?q={}   (added)"),
+            "{printed}"
+        );
+        assert!(printed.contains("url.searchengines[DEFAULT] = https://duckduckgo.com/?q={}\n"));
+    }
+
+    /// The JSON the bar is handed — one key per label, escaped, whatever the label holds.
+    #[test]
+    fn the_labels_reach_the_bar_as_json() {
+        // `mode_labels_json` reads the *live* store, which no unit test installs, so this is the
+        // defaults path: a process with no config still draws twelve labels.
+        let json = mode_labels_json();
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\"normal\":\"normal\""), "{json}");
+        assert!(json.contains("\"search_forward\":\"search\""), "{json}");
+        assert!(json.contains("\"set_mark\":\"set mark\""), "{json}");
+        assert_eq!(json.matches(':').count(), 12, "one colon per pair");
     }
 
     #[test]
