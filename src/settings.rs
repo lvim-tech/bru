@@ -2795,6 +2795,107 @@ mod tests {
         }
     }
 
+// --- content settings ----------------------------------------------------------------------------
+    /// Every value a content setting can be given maps to one of Chromium's, and `content.mute`
+    /// maps to the *opposite* one.
+    ///
+    /// The polarity is the assertion worth having: it is one `matches!` away from being wrong in a
+    /// way that reads correctly everywhere else — `:set content.mute true` would print
+    /// `content.mute = true`, the store would agree with itself, and the tab would make a noise.
+    /// Measured against the browser on 2026-08-07 as well: with the inversion deliberately
+    /// disabled, `:set -u *://127.0.0.1/* content.mute true` read back `allow`, and with it back,
+    /// `block`.
+    #[test]
+    fn a_content_setting_maps_bru_words_to_chromium_words_and_mute_is_backwards() {
+        use ContentSettingValues as V;
+        let m = |kind, value| content_value(kind, &value);
+
+        assert_eq!(m(ContentKind::Images, Value::Bool(true)), Some(V::ALLOW));
+        assert_eq!(m(ContentKind::Images, Value::Bool(false)), Some(V::BLOCK));
+        // Silence is what `true` asks for, so Chromium is told to block the sound.
+        assert_eq!(m(ContentKind::Sound, Value::Bool(true)), Some(V::BLOCK));
+        assert_eq!(m(ContentKind::Sound, Value::Bool(false)), Some(V::ALLOW));
+        assert!(ContentKind::Sound.inverted());
+        for kind in [ContentKind::Images, ContentKind::Geolocation, ContentKind::Popups] {
+            assert!(!kind.inverted(), "{kind:?} must not be inverted");
+        }
+
+        // The three-valued ones arrive as text, and `ask` is a value in its own right.
+        let text = |s: &str| Value::Text(s.to_string());
+        assert_eq!(m(ContentKind::Geolocation, text("true")), Some(V::ALLOW));
+        assert_eq!(m(ContentKind::Geolocation, text("false")), Some(V::BLOCK));
+        assert_eq!(m(ContentKind::Geolocation, text("ask")), Some(V::ASK));
+        // The clipboard says the same three things in its own words.
+        assert_eq!(m(ContentKind::Clipboard, text("access")), Some(V::ALLOW));
+        assert_eq!(m(ContentKind::Clipboard, text("none")), Some(V::BLOCK));
+        assert_eq!(m(ContentKind::Clipboard, text("ask")), Some(V::ASK));
+
+        // Nothing else is a content setting's value, and `apply` says so rather than guessing.
+        assert_eq!(m(ContentKind::Images, text("maybe")), None);
+        assert_eq!(m(ContentKind::Images, Value::List(Vec::new())), None);
+    }
+
+    /// The three-valued settings cycle through their three values with no arguments, which is what
+    /// makes a key bound to a bare `config-cycle` on one of them useful.
+    #[test]
+    fn a_three_valued_content_setting_cycles_without_being_given_the_values() {
+        let mut settings = Settings::default();
+        let site = Some("*://*.example.com/*");
+        // bru ships `ask`, so the first step is the one after it — which wraps to the front.
+        let seen: Vec<String> = (0..4)
+            .map(|_| {
+                settings
+                    .cycle("content.geolocation", &[], site)
+                    .expect("geolocation cycles")
+                    .value
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(seen, ["true", "false", "ask", "true"]);
+
+        // And a value outside the list is refused rather than stored, so `ask` cannot be spelled
+        // `prompt` by accident.
+        assert!(settings.set_scoped("content.geolocation", "prompt", site).is_err());
+        // The clipboard's fourth value has no separate rule in Chromium and is not accepted; the
+        // error names the three that differ. See the Def.
+        let error = settings
+            .set_scoped("content.javascript.clipboard", "access-paste", site)
+            .unwrap_err();
+        assert!(error.contains("none, access, ask"), "{error}");
+    }
+
+    /// A preference-backed setting is global, and says so instead of storing a pattern nothing
+    /// reads. Chromium's preferences have no URL dimension at all — see `Backing::Preference`.
+    #[test]
+    fn a_preference_backed_setting_takes_no_url_pattern() {
+        let mut settings = Settings::default();
+        for name in [
+            "content.headers.do_not_track",
+            "content.hyperlink_auditing",
+            "content.headers.accept_language",
+        ] {
+            let error = settings
+                .set_scoped(name, "true", Some("*://*.example.com/*"))
+                .expect_err("a preference cannot be scoped");
+            assert!(error.contains("cannot be set per URL"), "{name}: {error}");
+        }
+        // Globally they are ordinary settings, and bru's defaults are its own rather than
+        // Chromium's — measured, and `apply_at_startup` is what puts them in force.
+        assert_eq!(
+            settings.get("content.headers.do_not_track", None).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            settings.get("content.hyperlink_auditing", None).unwrap(),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            settings.get("content.headers.accept_language", None).unwrap(),
+            Some(Value::Text("en-US,en".to_string()))
+        );
+    }
+// --- end content settings ------------------------------------------------------------------------
+
     #[test]
     fn a_refused_setting_says_why_rather_than_pretending() {
         let mut settings = Settings::default();
