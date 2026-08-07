@@ -58,8 +58,7 @@
 //!
 //! ## Deleting everything is reversible, and that is deliberate
 //!
-//! bru has no prompt mode and DESIGN.md gives it no dialogs, so a confirmation cannot be a modal.
-//! Two things stand in for one:
+//! Two things do the work of a confirmation:
 //!
 //! - the bulk button **arms first** — the first activation turns it into "press again to delete
 //!   N", the second does it, and it disarms itself after five seconds;
@@ -70,6 +69,27 @@
 //! cookies back is the thing that makes "delete every cookie in the browser" a decision a person
 //! can afford to get wrong. What it does not survive is the process — the stash is memory, and
 //! `Undo` says so on the page.
+//!
+//! ### Why the arming stays now that `src/prompt.rs` exists
+//!
+//! This paragraph used to open "bru has no prompt mode and DESIGN.md gives it no dialogs, so a
+//! confirmation cannot be a modal", and the arming was written as a stand-in for one. There is a
+//! prompt mode now. **The arming stays, and it is a decision rather than an omission:**
+//!
+//! - **The prompt is for somebody else asking bru.** Everything `prompt.rs` draws arrives from
+//!   outside — a page's `confirm()`, a permission, a server wanting a password, a certificate that
+//!   does not check out. The thing they have in common is that the user did not start them and has
+//!   no context on screen. A bulk delete on this page is the opposite: the user pressed the
+//!   button, the count is in the button, and the rows are above it.
+//! - **The question would move away from the thing it is about.** The prompt is drawn in the
+//!   bottom strip; the cookies are a full page of rows above it. Asking "delete 412 cookies?" in a
+//!   one-line bar under a table of the 412 is a worse question than asking it in the button.
+//! - **Undo is what makes this safe, and it is unaffected either way.** A modal would add a second
+//!   chance to say no to something that already has an unlimited number of chances to be undone.
+//!
+//! What would change the answer: a destructive action here that *cannot* be undone. There is none
+//! today — every delete stashes — and if one is ever added it should ask through `prompt.rs`
+//! rather than grow a second arming.
 //!
 //! ## The address is deliberately bare
 //!

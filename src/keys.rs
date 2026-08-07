@@ -260,11 +260,21 @@ wrap_keyboard_handler! {
                 // current mode": window 1's bottom strip must take the letters when window 1 is the
                 // one with the command line open, whatever window 0 is doing.
                 let in_command_mode = window.is_some_and(|window| {
-                    self.state
+                    let mode = self
+                        .state
                         .lock()
                         .expect("state mutex poisoned")
-                        .mode_in(window)
-                        == crate::modes::Mode::Command
+                        .mode_in(window);
+                    // --- src/prompt.rs ----------------------------------------------------------
+                    // A text prompt's `<input>` is the same kind of real input as `#cmdline`, in
+                    // the same strip, so the exception covers it too — and only when the open
+                    // question has a line to type into. `yesno` never does, and `alert` never
+                    // does: there `y` is a binding or it is nothing, and a letter that reached a
+                    // hidden input would be typed where nobody can see it.
+                    mode.types_into_the_bar()
+                        && (mode != crate::modes::Mode::Prompt
+                            || crate::prompt::takes_typing(window))
+                    // --- end src/prompt.rs ------------------------------------------------------
                 });
                 let forward = in_command_mode
                     && crate::ipc::is_bottom_chrome_browser(browser_id)
@@ -322,6 +332,24 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(crate::load::BruLoadHandler::new(self.state.clone()))
         }
+
+        // --- src/prompt.rs ------------------------------------------------------------------
+        // The three handlers a question can arrive through. Without them CEF draws its own
+        // dialogs — a second window with a second keyboard grammar, which DESIGN.md's "nothing of
+        // Brave's chrome" rules out — or, for the permission handler, silently answers for the
+        // user. All three are answered from the bar, possibly much later; see src/prompt.rs.
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(crate::prompt::BruJsdialogHandler::new())
+        }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(crate::prompt::BruPermissionHandler::new())
+        }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(crate::prompt::BruDialogHandler::new())
+        }
+        // --- end src/prompt.rs --------------------------------------------------------------
 
         // bru has a request handler only because the message router demands two of its callbacks.
         // The message router demands two of its callbacks, and the ad blocker asks for a third.
@@ -450,6 +478,39 @@ wrap_request_handler! {
         ) {
             crate::ipc::on_render_process_terminated(browser);
         }
+
+        // --- src/prompt.rs -------------------------------------------------------------------
+        // The two questions that come from the network rather than from a page. Both default to
+        // `Default::default()`, which is 0: for auth that cancels the request without asking, and
+        // for a certificate error it leaves Chromium's own interstitial in place. bru asks in the
+        // bar instead; src/prompt.rs owns both, including what a cancelled question means.
+        fn auth_credentials(
+            &self,
+            browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            is_proxy: ::std::os::raw::c_int,
+            host: Option<&CefString>,
+            port: ::std::os::raw::c_int,
+            realm: Option<&CefString>,
+            _scheme: Option<&CefString>,
+            callback: Option<&mut AuthCallback>,
+        ) -> ::std::os::raw::c_int {
+            crate::prompt::on_auth_credentials(
+                browser, origin_url, is_proxy, host, port, realm, callback,
+            )
+        }
+
+        fn on_certificate_error(
+            &self,
+            browser: Option<&mut Browser>,
+            cert_error: Errorcode,
+            request_url: Option<&CefString>,
+            _ssl_info: Option<&mut Sslinfo>,
+            callback: Option<&mut Callback>,
+        ) -> ::std::os::raw::c_int {
+            crate::prompt::on_certificate_error(browser, cert_error, request_url, callback)
+        }
+        // --- end src/prompt.rs ----------------------------------------------------------------
 
         // --- adblock -------------------------------------------------------------------------
         // Once per resource request, on the browser process IO thread, before the request is

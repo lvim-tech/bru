@@ -116,6 +116,12 @@ pub struct Entry {
     /// Only while it is running. Dropped the moment it is not, so nothing here holds a callback
     /// belonging to a download Chromium has finished with.
     cancel: Option<DownloadItemCallback>,
+// --- src/prompt.rs ---------------------------------------------------------
+    /// Set by `prompt-open-download`: `Some(None)` is "open it with the desktop's default when it
+    /// lands", `Some(Some(cmdline))` names the program. Cleared the moment it fires, so a
+    /// `download-retry` of the same row does not open it a second time.
+    open_when_complete: Option<Option<String>>,
+// --- end src/prompt.rs -----------------------------------------------------
 }
 
 impl Entry {
@@ -182,18 +188,27 @@ wrap_download_handler! {
             1
         }
 
-        /// Choose the path. Answering the callback here rather than later is deliberate: CEF allows
-        /// either, and bru has no prompt mode to answer from, so there is nothing to wait for.
+        /// Choose the path — by **asking**, since src/prompt.rs.
+        ///
+        /// The callback is answered later, from prompt mode, which the header explicitly allows:
+        /// "return true (1) and execute |callback| either in this function or at a later time".
+        /// This is qutebrowser's own default — `downloads.location.prompt` ships as *true* — and
+        /// the note under [`download_dir`] said so while there was no mode to ask in.
+        ///
+        /// **Nothing about where files go has changed**: [`target_path`] still computes the answer
+        /// and it is what the line edit opens with, so `<Return>` writes exactly the file the
+        /// previous version wrote without asking. What is new is that the path can be edited first,
+        /// that `<Escape>` cancels the download, and that `<Ctrl-X>` opens it instead of keeping it.
         fn on_before_download(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             download_item: Option<&mut DownloadItem>,
             suggested_name: Option<&CefString>,
             callback: Option<&mut BeforeDownloadCallback>,
         ) -> ::std::os::raw::c_int {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
-            let Some(callback) = callback else {
+            let Some(callback) = callback.map(|callback| callback.clone()) else {
                 return 0;
             };
             let suggested = suggested_name.map(CefString::to_string).unwrap_or_default();
@@ -205,30 +220,75 @@ wrap_download_handler! {
             let path = target_path(&suggested, &url);
             debug(&format!("on_before_download #{id} {url:?} -> {}", path.display()));
 
-            // `show_dialog = 0`: bru has no "Save As", and Chromium's own would be a piece of
-            // browser chrome DESIGN.md does not have.
-            callback.cont(
-                Some(&CefString::from(path.to_string_lossy().as_ref())),
-                0,
-            );
-
             let mut list = downloads().lock().expect("downloads mutex poisoned");
             match list.iter_mut().find(|entry| entry.id == id) {
                 // `on_download_updated` may run first — the header says it "may be called multiple
                 // times before and after on_before_download()" — and then the row already exists
                 // with no path in it.
-                Some(entry) => entry.path = path,
+                Some(entry) => entry.path = path.clone(),
                 None => list.push(Entry {
                     id,
-                    url,
-                    path,
+                    url: url.clone(),
+                    path: path.clone(),
                     received: 0,
                     total: -1,
                     state: State::InProgress,
                     cancel: None,
+                    open_when_complete: None,
                 }),
             }
             drop(list);
+
+// --- src/prompt.rs ---------------------------------------------------------
+            let window = browser
+                .as_deref()
+                .map(Browser::identifier)
+                .and_then(|id| {
+                    crate::state::BruState::instance()
+                        .and_then(|state| state.lock().ok().and_then(|s| s.window_of_browser(id)))
+                });
+            let Some(window) = window else {
+                // No window to ask in — `gd` before the first tab exists, or a browser bru did not
+                // place. Fall back to the path it would have chosen anyway rather than cancelling
+                // a download the user asked for.
+                callback.cont(Some(&CefString::from(path.to_string_lossy().as_ref())), 0);
+                return 1;
+            };
+            let offered = path.clone();
+            let question = crate::prompt::Question::new(
+                crate::prompt::Kind::Download,
+                "Save file to",
+                move |answer| match answer {
+                    crate::prompt::Answer::Text(chosen) => {
+                        callback.cont(Some(&CefString::from(chosen.as_str())), 0);
+                    }
+                    // `<Ctrl-X>` / `<Ctrl-P>`: somewhere temporary, and opened when it lands.
+                    crate::prompt::Answer::OpenDownload { cmdline } => {
+                        match temp_download_path(&offered) {
+                            Ok(temp) => {
+                                open_this_one_when_it_lands(id, cmdline);
+                                callback.cont(
+                                    Some(&CefString::from(temp.to_string_lossy().as_ref())),
+                                    0,
+                                );
+                            }
+                            Err(e) => {
+                                crate::message::error(&format!("download: {e}"));
+                                callback.cont(None, 0);
+                            }
+                        }
+                    }
+                    // `<Escape>`, the tab going away, the window closing. An empty path is how CEF
+                    // is told the download was refused — measured 2026-08-07: no file appeared in
+                    // the download directory and the row reported `cancelled`.
+                    _ => callback.cont(None, 0),
+                },
+            )
+            .about(browser.as_deref(), &url)
+            .saying(&format!("Save {} to", short_name(&url)))
+            .defaulting_to(path.to_string_lossy().as_ref());
+            crate::prompt::ask(window, question);
+// --- end src/prompt.rs -----------------------------------------------------
 
             // 1 — "return true (1) and execute |callback| ... to continue or cancel the download".
             //
@@ -239,6 +299,8 @@ wrap_download_handler! {
             // `~/Downloads/Unconfirmed 171025.crdownload`, then `~/Downloads/report.pdf` — with the
             // path chosen above thrown away and `XDG_DOWNLOAD_DIR` never consulted. So 0 here does
             // not mean "nothing happens"; it means the file lands somewhere bru did not choose.
+            //
+            // It is also what makes answering later legal, which is the whole of the prompt above.
             1
         }
 
@@ -286,6 +348,7 @@ wrap_download_handler! {
                             total: -1,
                             state,
                             cancel: None,
+                            open_when_complete: None,
                         });
                         list.last_mut().expect("just pushed")
                     }
@@ -315,6 +378,23 @@ wrap_download_handler! {
                 report_line()
             ));
 
+// --- src/prompt.rs ---------------------------------------------------------
+            // A download answered with `prompt-open-download` is opened the moment it lands. Here
+            // rather than in the prompt because this is the only callback that says "complete",
+            // and taken rather than read so it can only ever fire once.
+            if state == State::Complete {
+                let opening = {
+                    let mut list = downloads().lock().expect("downloads mutex poisoned");
+                    list.iter_mut()
+                        .find(|entry| entry.id == id)
+                        .and_then(|entry| entry.open_when_complete.take().map(|cmdline| (entry.path.clone(), cmdline)))
+                };
+                if let Some((path, cmdline)) = opening {
+                    open_path(&path, cmdline.as_deref());
+                }
+            }
+// --- end src/prompt.rs -----------------------------------------------------
+
             // Filtered inside `ipc`, which pushes only when the string changes: this arrives several
             // times a second and the percentage does not.
             crate::ipc::set_download(summary());
@@ -329,11 +409,13 @@ wrap_download_handler! {
 
 /// The directory downloads are written to.
 ///
-/// **This is not qutebrowser's behaviour and cannot be yet.** qutebrowser has
-/// `downloads.location.prompt`, which defaults to *true*, and asks — through prompt mode, which bru
-/// does not have — falling back to `downloads.location.directory`, which is a setting bru has
-/// nowhere to keep. So bru takes the answer the desktop already holds, in the order every other
-/// XDG-aware program takes it:
+/// **bru asks, since src/prompt.rs** — `downloads.location.prompt` is qutebrowser's default and now
+/// bru's behaviour too. What this function answers is what the question *opens with*, so
+/// `<Return>` still writes the file where the version that never asked wrote it.
+///
+/// qutebrowser's fallback for a declined prompt is `downloads.location.directory`, which is a
+/// setting bru still has nowhere to keep. So the directory below stays the desktop's answer, in the
+/// order every other XDG-aware program takes it:
 ///
 /// 1. `$XDG_DOWNLOAD_DIR`, if it is set and absolute.
 /// 2. `XDG_DOWNLOAD_DIR=` in `$XDG_CONFIG_HOME/user-dirs.dirs`, which is what `xdg-user-dirs-update`
@@ -346,8 +428,8 @@ wrap_download_handler! {
 ///
 /// **What changes once the settings workstream lands:** `downloads.location.directory` becomes the
 /// first thing consulted, with this as its default rather than as the whole answer, and
-/// `downloads.location.prompt` becomes answerable once there is a prompt mode. Neither changes the
-/// shape of anything below — `target_path` takes a directory.
+/// `downloads.location.prompt` becomes a setting that can turn the question *off* again. Neither
+/// changes the shape of anything below — `target_path` takes a directory.
 pub fn download_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR")
         .map(PathBuf::from)
@@ -726,6 +808,14 @@ pub fn open_file(count: Option<u32>, cmdline: Option<&str>, dir: bool) {
         }
     };
 
+    open_path(&path, cmdline);
+}
+
+/// Open one file with `cmdline`, or with the desktop's default when there is none.
+///
+/// Split out of [`open_file`] so `prompt-open-download` can reach it without going through a
+/// download *index*: by the time a download lands, the row it is on may not be the last one.
+fn open_path(path: &Path, cmdline: Option<&str>) {
     // `{}` is qutebrowser's placeholder; with none, the path is appended.
     let mut words: Vec<String> = match cmdline {
         Some(cmdline) if !cmdline.trim().is_empty() => {
@@ -745,6 +835,47 @@ pub fn open_file(count: Option<u32>, cmdline: Option<&str>, dir: bool) {
     debug(&format!("download-open {words:?}"));
     spawn(&words);
 }
+
+// --- src/prompt.rs ---------------------------------------------------------
+/// Remember that this download is to be opened when it lands — `prompt-open-download`'s half of
+/// the answer. The other half is the temporary path the file goes to.
+fn open_this_one_when_it_lands(id: u32, cmdline: Option<String>) {
+    let mut list = downloads().lock().expect("downloads mutex poisoned");
+    if let Some(entry) = list.iter_mut().find(|entry| entry.id == id) {
+        entry.open_when_complete = Some(cmdline);
+    }
+}
+
+/// Where a download the user does not want to keep goes.
+///
+/// `$XDG_RUNTIME_DIR/bru-downloads/` when there is one — it is tmpfs, per-user and 0700, and the
+/// session cleans it up — and `/tmp` otherwise. The *name* is kept from the path the user was
+/// offered, because that is what the program opening it reads the extension from.
+fn temp_download_path(offered: &Path) -> Result<PathBuf, String> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("bru-downloads");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let name = offered
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    Ok(dir.join(unique_name(&dir, &name)))
+}
+
+/// The filename part of a URL, for the one line the prompt says about what is being saved. Long
+/// enough to recognise, short enough not to push the question's own words off the row.
+fn short_name(url: &str) -> String {
+    let name = url_basename(url);
+    if name.is_empty() {
+        url.to_string()
+    } else {
+        name
+    }
+}
+// --- end src/prompt.rs -----------------------------------------------------
 
 /// Run a program and reap it, so a session that opens ten downloads does not leave ten zombies.
 fn spawn(words: &[String]) {
@@ -989,6 +1120,9 @@ pub fn start_mhtml(browser: &mut Browser) {
         id: entry,
         url,
         path: path.clone(),
+        // `download --mhtml` chooses its own path and never reaches `on_before_download`, so there
+        // is no question to answer with `prompt-open-download` and nothing to open on completion.
+        open_when_complete: None,
         received: 0,
         // Unknown until the snapshot arrives, which is what `-1` means everywhere else here. It is
         // why the bar shows a byte count for this and a percentage for a real download: nobody can
@@ -1258,6 +1392,7 @@ mod tests {
             total: 100,
             state: State::InProgress,
             cancel: None,
+            open_when_complete: None,
         };
         assert_eq!(entry.percent(), Some(45));
         assert_eq!(entry.name(), "x.bin");

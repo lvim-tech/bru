@@ -1,10 +1,15 @@
 //! Keyboard modes and the transitions between them.
 //!
 //! A behavioural port of qutebrowser 3.7.0's `keyinput/modeman.py`. Stage 1's four modes, stage 2's
-//! `hint` and stage 3's `caret`, `set_mark`, `jump_mark`, `record_macro` and `run_macro` are here —
-//! `prompt` and `yesno` are still to come — but the transition rules are the real ones, so adding a
-//! mode is a variant and a row in each `match` rather than a rewrite. `hint` was exactly that, and
-//! so were the four below it.
+//! `hint`, stage 3's `caret`, `set_mark`, `jump_mark`, `record_macro` and `run_macro`, and now
+//! `prompt` and `yesno` — every mode `usertypes.KeyMode` has — are here, and the transition rules
+//! are the real ones, so adding a mode is a variant and a row in each `match` rather than a rewrite.
+//! `hint` was exactly that, and so were the six below it.
+//!
+//! **The two prompt modes are the first that are entered by something that is not a keypress**, and
+//! they are why `prev_mode` below stopped being a placeholder: a question that arrives while a page
+//! is being typed into has to hand insert mode back when it is answered, or a `confirm()` from a
+//! script drops the user out of the field they were in and the next letter scrolls.
 //!
 //! Nothing in this file touches CEF or Lua. It is a state machine over an enum.
 
@@ -42,11 +47,17 @@ pub enum Mode {
     /// The next keystroke names the register a macro is replayed from. Entered by `@` with no
     /// argument. `src/macros.rs` owns everything it does.
     RunMacro,
+    /// A question with a text answer is waiting in the bar — a page's `prompt()`, a login, a
+    /// download's filename. Never entered by a key: something asked. `src/prompt.rs` owns it.
+    Prompt,
+    /// A question with a yes/no answer is waiting — a page's `confirm()`, "leave site?", a
+    /// permission, a certificate. `src/prompt.rs` owns it.
+    YesNo,
 }
 
 impl Mode {
     /// Every mode bru implements, in a stable order. Used to build one key parser per mode.
-    pub const ALL: [Mode; 10] = [
+    pub const ALL: [Mode; 12] = [
         Mode::Normal,
         Mode::Insert,
         Mode::Command,
@@ -57,6 +68,8 @@ impl Mode {
         Mode::JumpMark,
         Mode::RecordMacro,
         Mode::RunMacro,
+        Mode::Prompt,
+        Mode::YesNo,
     ];
 
     /// The name used in `configdata.yml` and in `config.lua`.
@@ -76,16 +89,23 @@ impl Mode {
             Mode::JumpMark => "jump_mark",
             Mode::RecordMacro => "record_macro",
             Mode::RunMacro => "run_macro",
+            Mode::Prompt => "prompt",
+            Mode::YesNo => "yesno",
         }
     }
 
     /// Parse a mode name as written in `config.lua` or in a `mode-enter` command.
     ///
-    /// Returns `None` for names qutebrowser knows but bru does not implement yet (`prompt`,
-    /// `yesno`, `register`) as well as for nonsense, so the caller warns once at startup either
-    /// way. `register` stays `None` on purpose even now that all four modes built on
+    /// Returns `None` for `register` and for nonsense, so the caller warns once at startup either
+    /// way. `register` stays `None` on purpose even though all four modes built on
     /// `RegisterKeyParser` exist: it is the name of the *bindings section* those modes read
     /// (configdata.yml:3991), not a mode `mode-enter` can be given.
+    ///
+    /// `prompt` and `yesno` **do** parse — `bindings.default.prompt` and `.yesno` are real sections
+    /// of `configdata.yml` and a `config.lua` has to be able to rebind inside them. What refuses
+    /// them is `mode-enter`, which is a different question and is answered in `commands.rs`:
+    /// `modeman.mode_enter` (modeman.py:401-405) raises for hint, command, yesno, prompt and
+    /// register alike, because those five are entered by something happening and never by asking.
     pub fn from_name(name: &str) -> Option<Mode> {
         match name {
             "normal" => Some(Mode::Normal),
@@ -98,8 +118,38 @@ impl Mode {
             "jump_mark" => Some(Mode::JumpMark),
             "record_macro" => Some(Mode::RecordMacro),
             "run_macro" => Some(Mode::RunMacro),
+            "prompt" => Some(Mode::Prompt),
+            "yesno" => Some(Mode::YesNo),
             _ => None,
         }
+    }
+
+    /// Whether a question is waiting in this mode. `modeman.PROMPT_MODES` (modeman.py:25).
+    ///
+    /// Three rules hang off it, and all three are in [`ModeManager`]: one prompt mode never
+    /// *overrides* the other (a `confirm()` arriving while a `prompt()` is open is queued, not
+    /// swapped in under the user's fingers), entering one remembers an input mode to give back, and
+    /// leaving one gives it back.
+    pub fn is_prompt(self) -> bool {
+        matches!(self, Mode::Prompt | Mode::YesNo)
+    }
+
+    /// Whether keys in this mode belong to the page. `modeman.INPUT_MODES` (modeman.py:24).
+    ///
+    /// The only thing that reads it is the prompt restore: these are the two modes worth handing
+    /// back, because they are the two a user is *in the middle of* rather than passing through.
+    pub fn is_input(self) -> bool {
+        matches!(self, Mode::Insert | Mode::Passthrough)
+    }
+
+    /// Whether `mode-enter <name>` may put the window into this mode.
+    ///
+    /// `modeman.mode_enter` (modeman.py:401-405) refuses hint, command, yesno, prompt and register:
+    /// each is entered by something happening — a question, a `:`, an `f` — and a bare `mode-enter
+    /// yesno` would leave the bar in a mode with nothing behind it and no way out but `<Escape>`.
+    /// `register` is not a `Mode` here at all, so the list below is four names and not five.
+    pub fn can_be_entered_by_command(self) -> bool {
+        !matches!(self, Mode::Hint | Mode::Command | Mode::Prompt | Mode::YesNo)
     }
 
     /// Whether a single keystroke in this mode names a register rather than starting a binding.
@@ -115,6 +165,16 @@ impl Mode {
         )
     }
 
+    /// Whether a key this mode does not bind is typed into a text field bru is drawing.
+    ///
+    /// Only `command` and `prompt` — the two modes with a real `<input>` in the bottom strip — and
+    /// `prompt` only when the open question has a line to type into, which `src/prompt.rs` answers
+    /// separately. `yesno` has no input at all: `y`, `n`, `Y` and `N` are bindings, and every other
+    /// letter is thrown away rather than typed anywhere.
+    pub fn types_into_the_bar(self) -> bool {
+        matches!(self, Mode::Command | Mode::Prompt)
+    }
+
     /// Whether unbound keys reach the page.
     ///
     /// `modeman.init` constructs the insert, command, passthrough **and caret** parsers with
@@ -124,6 +184,13 @@ impl Mode {
     /// `passthrough=False` — modeman.py:90 — because a stray letter while labels are up would be
     /// typed into whatever the last click focused. `RegisterKeyParser` takes the same default, and
     /// for the same reason: while `` ` `` is waiting for a mark name, no key belongs to the page.
+    ///
+    /// **The two prompt modes disagree with each other, and that is qutebrowser's own arrangement.**
+    /// `prompt`'s parser is built with `passthrough=True` (modeman.py:127-135) and `yesno`'s is not
+    /// (modeman.py:137-143): a `prompt()` has a line edit, so a letter it does not bind is a letter
+    /// being typed, while in `yesno` there is nothing to type into and a stray key must go nowhere.
+    /// For `prompt` this only decides what happens to a key bru does not claim — `keys.rs` aims the
+    /// forwarding at the bar's own input, not at the page, because the page is not what has focus.
     pub fn passthrough(self) -> bool {
         match self {
             Mode::Normal
@@ -131,8 +198,9 @@ impl Mode {
             | Mode::SetMark
             | Mode::JumpMark
             | Mode::RecordMacro
-            | Mode::RunMacro => false,
-            Mode::Insert | Mode::Command | Mode::Passthrough | Mode::Caret => true,
+            | Mode::RunMacro
+            | Mode::YesNo => false,
+            Mode::Insert | Mode::Command | Mode::Passthrough | Mode::Caret | Mode::Prompt => true,
         }
     }
 
@@ -159,7 +227,12 @@ impl Mode {
             | Mode::SetMark
             | Mode::JumpMark
             | Mode::RecordMacro
-            | Mode::RunMacro => false,
+            | Mode::RunMacro
+            // Both prompt parsers are built with `supports_count=False` (modeman.py:127-143), and
+            // in `prompt` mode that is the difference between typing `3` into a filename and
+            // waiting for a command to give it to.
+            | Mode::Prompt
+            | Mode::YesNo => false,
         }
     }
 
@@ -234,8 +307,16 @@ impl Transition {
 #[derive(Debug)]
 pub struct ModeManager {
     mode: Mode,
-    /// The mode to restore after a prompt. Always `Normal` while bru has no prompt modes; kept so
-    /// that adding them is a change to `enter`/`leave` and not to the struct.
+    /// The mode to restore after a prompt — `modeman.ModeManager._prev_mode`.
+    ///
+    /// It was a placeholder for as long as there were no prompt modes. Now it is the whole of
+    /// "answering a question puts you back where you were": a `confirm()` raised while a page's
+    /// text field had focus leaves insert mode behind, and without this the answer would drop the
+    /// window into normal mode with the caret still blinking in the field.
+    ///
+    /// Only [`Mode::is_input`] modes are remembered. Everything else restores to `Normal`, which is
+    /// what qutebrowser does and what stops a question raised during a hint session from putting
+    /// the labels' mode back with the labels long gone.
     prev_mode: Mode,
 }
 
@@ -263,12 +344,18 @@ impl ModeManager {
     ///   `input.insert_mode.auto_enter` avoids yanking you out of passthrough when a page focuses
     ///   a field.
     /// - Entering from a non-normal mode overrides it: the old mode is left first.
+    /// - **One prompt mode never overrides the other.** `modeman.enter`'s condition is
+    ///   `self.mode == mode or (self.mode in PROMPT_MODES and mode in PROMPT_MODES)`
+    ///   (modeman.py:365-366), so a `confirm()` arriving while a `prompt()` is open is ignored here
+    ///   and queued by `src/prompt.rs` instead. Without it the second question would take the
+    ///   first's place under the user's fingers, and the keystroke aimed at the first would answer
+    ///   the second.
     pub fn enter(&mut self, mode: Mode, only_if_normal: bool) -> Transition {
         if mode == Mode::Normal {
             return self.leave(self.mode, true).unwrap_or(Transition::IGNORED);
         }
 
-        if self.mode == mode {
+        if self.mode == mode || (self.mode.is_prompt() && mode.is_prompt()) {
             return Transition::IGNORED;
         }
 
@@ -280,9 +367,14 @@ impl ModeManager {
             left = Some(self.mode);
         }
 
-        // With no prompt modes there is nothing to restore, so this is always Normal. The branch
-        // in modeman.py exists for `mode in PROMPT_MODES and self.mode in INPUT_MODES`.
-        self.prev_mode = Mode::Normal;
+        // `if mode in PROMPT_MODES and self.mode in INPUT_MODES` (modeman.py:379-382), and the
+        // `else` really is unconditional: every other transition forgets whatever was remembered,
+        // so a question answered long after an unrelated mode change cannot restore it.
+        self.prev_mode = if mode.is_prompt() && self.mode.is_input() {
+            self.mode
+        } else {
+            Mode::Normal
+        };
         self.mode = mode;
         Transition { left, entered: Some(mode), clear_keychain: left.is_some() }
     }
@@ -310,9 +402,20 @@ impl ModeManager {
         }
 
         self.mode = Mode::Normal;
+
+        // `if mode in PROMPT_MODES: self.enter(self._prev_mode, ...)` — modeman.py:436-438. The
+        // restore is spelled as a real `enter`, not as an assignment, so that entering `Normal`
+        // stays the no-op it is everywhere else and so that `prev_mode` is cleared by the same
+        // rule that sets it. What the caller is told is the mode it is now in, which for a prompt
+        // raised over a text field is `insert` and not `normal`.
+        if mode.is_prompt() {
+            let restore = self.prev_mode;
+            self.enter(restore, false);
+        }
+
         Ok(Transition {
             left: Some(mode),
-            entered: Some(Mode::Normal),
+            entered: Some(self.mode),
             clear_keychain: true,
         })
     }
@@ -347,9 +450,18 @@ mod tests {
         assert_eq!(Mode::from_name("run_macro"), Some(Mode::RunMacro));
         assert_eq!(Mode::from_name("set-mark"), None);
         assert_eq!(Mode::from_name("record-macro"), None);
-        // Modes qutebrowser has and bru does not, yet.
-        assert_eq!(Mode::from_name("prompt"), None);
-        assert_eq!(Mode::from_name("yesno"), None);
+        // The two prompt modes parse, because `bindings.default.prompt` and `.yesno` are real
+        // sections a `config.lua` must be able to rebind inside. What they may not be is the
+        // argument of `mode-enter` — a different question, asked below.
+        assert_eq!(Mode::from_name("prompt"), Some(Mode::Prompt));
+        assert_eq!(Mode::from_name("yesno"), Some(Mode::YesNo));
+        assert!(!Mode::Prompt.can_be_entered_by_command());
+        assert!(!Mode::YesNo.can_be_entered_by_command());
+        assert!(!Mode::Hint.can_be_entered_by_command());
+        assert!(!Mode::Command.can_be_entered_by_command());
+        for mode in [Mode::Insert, Mode::Passthrough, Mode::Caret, Mode::SetMark, Mode::JumpMark] {
+            assert!(mode.can_be_entered_by_command(), "{mode} is a mode-enter argument");
+        }
         // Not a mode at all: `register` names the bindings section the four register modes read.
         assert_eq!(Mode::from_name("register"), None);
         assert_eq!(Mode::from_name("nonsense"), None);
@@ -377,6 +489,108 @@ mod tests {
         for mode in [Mode::Normal, Mode::Insert, Mode::Command, Mode::Passthrough, Mode::Hint, Mode::Caret] {
             assert!(!mode.names_a_register(), "{mode} is not a register mode");
         }
+    }
+
+    /// The two prompt parsers disagree about passthrough, and it is not an oversight in either
+    /// this file or qutebrowser's: `prompt` is built with `passthrough=True` (modeman.py:127-135)
+    /// because it has a line edit, `yesno` is not (modeman.py:137-143) because it has nothing to
+    /// type into. Neither counts.
+    #[test]
+    fn a_prompt_forwards_what_it_does_not_bind_and_a_yesno_eats_it() {
+        assert!(Mode::Prompt.passthrough());
+        assert!(!Mode::Prompt.swallows_unmatched(false));
+        assert!(Mode::Prompt.types_into_the_bar());
+
+        assert!(!Mode::YesNo.passthrough());
+        assert!(Mode::YesNo.swallows_unmatched(false));
+        assert!(
+            !Mode::YesNo.types_into_the_bar(),
+            "a yes/no question has no input, so a stray letter must go nowhere at all"
+        );
+
+        for mode in [Mode::Prompt, Mode::YesNo] {
+            assert!(!mode.supports_count(), "{mode} must not read counts");
+            assert!(!mode.names_a_register());
+            assert!(mode.is_prompt());
+            assert!(!mode.is_input());
+        }
+        // Command mode is the other half of the typing exception, and the only other half.
+        assert!(Mode::Command.types_into_the_bar());
+        for mode in [Mode::Normal, Mode::Insert, Mode::Passthrough, Mode::Hint, Mode::Caret] {
+            assert!(!mode.types_into_the_bar(), "{mode} has no input in the bar");
+            assert!(!mode.is_prompt(), "{mode} is not a prompt mode");
+        }
+        assert!(Mode::Insert.is_input() && Mode::Passthrough.is_input());
+    }
+
+    /// A second question does not take the first one's place. `modeman.enter` ignores the request
+    /// when both modes are prompt modes (modeman.py:365-366), and `prompt.rs` queues instead.
+    ///
+    /// Without this the keystroke aimed at the first question answers the second, which is the
+    /// worst thing a modal dialog can do: the user reads "delete everything?" and presses the `y`
+    /// they had already decided on for "allow notifications?".
+    #[test]
+    fn one_prompt_mode_never_overrides_the_other() {
+        let mut m = ModeManager::new();
+        assert!(m.enter(Mode::YesNo, false).changed());
+        assert_eq!(m.enter(Mode::Prompt, false), Transition::IGNORED);
+        assert_eq!(m.mode(), Mode::YesNo);
+        // ...and the same the other way round.
+        let mut m = ModeManager::new();
+        m.enter(Mode::Prompt, false);
+        assert_eq!(m.enter(Mode::YesNo, false), Transition::IGNORED);
+        assert_eq!(m.mode(), Mode::Prompt);
+    }
+
+    /// Answering a question puts the window back where the question found it, but only when that
+    /// was insert or passthrough — `modeman`'s `INPUT_MODES`.
+    #[test]
+    fn a_prompt_hands_an_input_mode_back_and_anything_else_back_to_normal() {
+        // The case this exists for: a page's `confirm()` while a field is being typed into.
+        let mut m = ModeManager::new();
+        m.enter(Mode::Insert, false);
+        let t = m.enter(Mode::YesNo, false);
+        assert_eq!(t.left, Some(Mode::Insert));
+        assert_eq!(t.entered, Some(Mode::YesNo));
+        let t = m.leave(Mode::YesNo, false).unwrap();
+        assert_eq!(t.left, Some(Mode::YesNo));
+        assert_eq!(
+            t.entered,
+            Some(Mode::Insert),
+            "the caret is still in the page's field, so the mode has to be insert again"
+        );
+        assert_eq!(m.mode(), Mode::Insert);
+
+        // Passthrough is the other input mode, and is restored the same way.
+        let mut m = ModeManager::new();
+        m.enter(Mode::Passthrough, false);
+        m.enter(Mode::Prompt, false);
+        assert_eq!(m.leave(Mode::Prompt, false).unwrap().entered, Some(Mode::Passthrough));
+
+        // Anything else restores to normal: a question raised during a hint session must not put
+        // hint mode back with the labels gone.
+        for from in [Mode::Normal, Mode::Hint, Mode::Caret, Mode::Command] {
+            let mut m = ModeManager::new();
+            if from != Mode::Normal {
+                m.enter(from, false);
+            }
+            m.enter(Mode::Prompt, false);
+            assert_eq!(m.mode(), Mode::Prompt);
+            let t = m.leave(Mode::Prompt, false).unwrap();
+            assert_eq!(t.entered, Some(Mode::Normal), "a prompt over {from} restores normal");
+            assert_eq!(m.mode(), Mode::Normal);
+        }
+
+        // And the memory is not kept for a second question: entering insert, prompting, answering,
+        // then prompting again from normal must not resurrect insert.
+        let mut m = ModeManager::new();
+        m.enter(Mode::Insert, false);
+        m.enter(Mode::Prompt, false);
+        m.leave(Mode::Prompt, false).unwrap();
+        m.leave(Mode::Insert, false).unwrap();
+        m.enter(Mode::YesNo, false);
+        assert_eq!(m.leave(Mode::YesNo, false).unwrap().entered, Some(Mode::Normal));
+        assert_eq!(m.mode(), Mode::Normal);
     }
 
     #[test]

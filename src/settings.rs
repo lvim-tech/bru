@@ -275,6 +275,12 @@ pub static MODE_LABELS: DictShape = DictShape {
         ("jump_mark", "jump mark"),
         ("record_macro", "record macro"),
         ("run_macro", "run macro"),
+        // The two prompt modes, added when `prompt.rs` added the modes. The merge is what found
+        // them missing: `command_modes_three_labels_are_three_keys` walks `Mode::ALL`, so a mode
+        // that arrives without a label here fails the build rather than quietly drawing its own
+        // name beside neighbours drawing the user's word.
+        ("prompt", "prompt"),
+        ("yesno", "yesno"),
     ],
     // A key the pill cannot draw is a value typed and forgotten — see DictShape::open_keys.
     open_keys: false,
@@ -1803,7 +1809,9 @@ mod tests {
         let labels = settings.dict_map(def("statusbar.mode.labels").unwrap());
         assert_eq!(labels.get("normal").map(String::as_str), Some("NOR"));
         assert_eq!(labels.get("insert").map(String::as_str), Some("insert"));
-        assert_eq!(labels.len(), 12);
+        // Fourteen since `prompt.rs` brought `prompt` and `yesno`. The number moves with
+        // `MODE_LABELS`, and it moving is the point: an override must not shrink the dict.
+        assert_eq!(labels.len(), 14);
     }
 
     /// The keys the pill can draw, including command mode's three — the reason the dict is keyed by
@@ -1918,9 +1926,9 @@ mod tests {
         let mut lines = printed.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "statusbar.mode.labels — 12 entries, 1 changed from bru's own"
+            "statusbar.mode.labels — 14 entries, 1 changed from bru's own"
         );
-        assert_eq!(printed.lines().count(), 13, "a header and one line per pair");
+        assert_eq!(printed.lines().count(), 15, "a header and one line per pair");
         // The pair that moved carries what bru ships, so the reader can put it back.
         assert!(
             printed.contains("statusbar.mode.labels[normal] = NOR   (bru ships normal)"),
@@ -1952,7 +1960,7 @@ mod tests {
         assert!(json.contains("\"normal\":\"normal\""), "{json}");
         assert!(json.contains("\"search_forward\":\"search\""), "{json}");
         assert!(json.contains("\"set_mark\":\"set mark\""), "{json}");
-        assert_eq!(json.matches(':').count(), 12, "one colon per pair");
+        assert_eq!(json.matches(':').count(), 14, "one colon per pair");
     }
 
     /// **The three lines between the store and the pill, asserted at the source.**

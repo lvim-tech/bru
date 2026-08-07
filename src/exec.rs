@@ -690,6 +690,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::GreasemonkeyReload { quiet } => crate::greasemonkey::reload(*quiet),
 // --- end src/greasemonkey.rs -------------------------------------------------------------------
 
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // The five `prompt-*` commands, all of which act on the question open in the window the
+        // key was pressed in. They take no browser: a prompt belongs to a window, and the browser
+        // that raised it may be a background tab.
+        Command::PromptAccept { .. }
+        | Command::PromptItemFocus { .. }
+        | Command::PromptOpenDownload { .. }
+        | Command::PromptYank { .. }
+        | Command::PromptFileselectExternal => {
+            crate::prompt::run_command(command);
+        }
+// --- end src/prompt.rs ---------------------------------------------------------------------
+
         // A command qutebrowser has and bru's parser does not know. It kept its place in the trie
         // so `;` still reports a partial match; running it does nothing.
         Command::Unimplemented(_) => {}
@@ -853,6 +866,20 @@ pub fn is_live(command: &Command) -> bool {
         | Command::MoveTo(_) => true,
         // --- end src/caret.rs ---------------------------------------------------------------
 
+// --- src/prompt.rs -------------------------------------------------------------------------
+        // All five act, and each of the three that can meet the wrong kind of question does what
+        // qutebrowser does with it rather than nothing: `prompt-accept` says why a value is
+        // refused, `prompt-item-focus` is `UnsupportedOperationError`, caught and passed
+        // (`prompt.py:433-435`), and `prompt-fileselect-external` refuses by name. The other
+        // fifteen prompt bindings are `rl-*` rows that reach `cmdline.rs` by name, and
+        // `Command::Unimplemented` at the bottom of this match is what asks about those.
+        Command::PromptAccept { .. }
+        | Command::PromptItemFocus { .. }
+        | Command::PromptOpenDownload { .. }
+        | Command::PromptYank { .. }
+        | Command::PromptFileselectExternal => true,
+// --- end src/prompt.rs ---------------------------------------------------------------------
+
         // Bound, reachable, and deliberately a no-op — see the arm in `run`.
         Command::HintFollow => false,
 
@@ -910,7 +937,7 @@ pub fn is_live(command: &Command) -> bool {
 /// Why a bound command will **never** act, or `None` if it might.
 ///
 /// [`is_live`] answers "does pressing this do something today". This answers "and is that ever
-/// going to change", and it exists because the answer is no for thirteen of the 264 default
+/// going to change", and it exists because the answer is no for thirteen of the 298 default
 /// bindings. A row that says "not yet" about a key nothing can implement is a lie of a different
 /// kind from a row that says it about a key waiting for a milestone: it invites the same
 /// investigation every few months, and the second one costs as much as the first.
@@ -1445,7 +1472,9 @@ mod tests {
         // `hint:` bindings (configdata.yml:3884) had a mode to belong to; 262 once caret mode
         // brought the 29 of `caret:` (3961) and the two mark modes each brought the one line of
         // `register:` (3991); 264 once macros brought the other two modes that read it.
-        assert_eq!(DEFAULT_BINDINGS.len(), 264);
+        // 298 with src/prompt.rs, which brought `bindings.default.prompt`'s 26 rows and
+        // `.yesno`'s 8 — the last two sections of `configdata.yml` bru had no mode for.
+        assert_eq!(DEFAULT_BINDINGS.len(), 298);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1481,14 +1510,23 @@ mod tests {
         // is worth and the last one it was owed: `Target::Window` opened a foreground tab, which
         // is `tab-fg`'s own reason for refusing `--rapid`, and it opens a window now.
         //
+        // **285 with prompt mode, and the denominator moved with it: 251/264 to 285/298.** All
+        // thirty-four new rows are live, and they are live for two different reasons worth keeping
+        // apart. Nineteen name one of the five `prompt-*` commands, which `src/prompt.rs`
+        // implements and `is_live` claims outright. The other fifteen are `rl-*` rows: they parse
+        // to `Unimplemented`, reach `cmdline.rs` by name, and are answered by `prompt::run_readline`
+        // before the command line sees them — so they are counted by the same `cmdline::claims`
+        // call that has counted command mode's seventeen since the ruler was fixed. Both halves
+        // were checked by pressing them, not by reading this match.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 251, "the live-binding count moved");
+        assert_eq!(live, 285, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
     /// **Every default binding now either acts or is refused. Nothing is merely waiting.**
     ///
-    /// 251 and 13, and the thirteen are named rather than counted: six `content.plugins`, six
+    /// 285 and 13, and the thirteen are named rather than counted: six `content.plugins`, six
     /// `content.cookies.accept`, and `<Return>` in hint mode. Each of the three groups was
     /// measured against CEF 151 rather than assumed — the reasons are in `settings::REFUSED` and
     /// `hints::WHY_HINT_FOLLOW_IS_REFUSED`, and the arms above carry the numbers.
@@ -1510,7 +1548,7 @@ mod tests {
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        assert_eq!(live, 251);
+        assert_eq!(live, 285);
         assert_eq!(
             refused,
             [

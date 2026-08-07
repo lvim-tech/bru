@@ -408,7 +408,7 @@ mod tests {
         assert!(html.contains("a dictionary, fixed keys"));
         // A dictionary's "default" is a count, not one of its values.
         assert!(html.contains("default 9 entries"));
-        assert!(html.contains("default 12 entries"));
+        assert!(html.contains("default 14 entries"));
     }
 
     /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this
