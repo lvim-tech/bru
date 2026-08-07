@@ -214,6 +214,11 @@
       // src/find.rs: `Match [3/17]`, or empty for no search. Empty is what
       // `#statusline > span:empty { display: none }` reads, so a bar with no
       // search running is the same width it was before this field existed.
+      // The mode, at the front of the bar. `set_mark` and `jump_mark` are the
+      // only names with an underscore in them; they are shown with a space
+      // because the bar is read, not typed, and `:mode-enter set_mark` is where
+      // the underscore belongs.
+      put("mode", (state.mode || "").replace(/_/g, " "));
       put("search", state.search);
       put("url", state.url);
       put("scroll", state.scroll);

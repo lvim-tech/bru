@@ -37,6 +37,19 @@
              nothing could ever address and the stylesheet could only ever hide.
              -->
         <div id="message"></div>
+        <!-- Which mode the keyboard is in, at the front of the bar and always
+             visible, including in normal mode. Asked for 2026-08-07.
+
+             qutebrowser only ever writes "-- INSERT MODE --" into its message
+             area, and only for the modes whose parser is passthrough
+             (statusbar/bar.py:381-396); everything else it says with colour
+             alone. bru says it with both: the bar still recolours, and this
+             names the mode in words, because a colour tells you something
+             changed and a word tells you what.
+
+             First in the source and first in the grid, so nothing that grows —
+             a long URL, an open command line — can push it out of sight. -->
+        <div id="mode"></div>
         <!-- qutebrowser's widget order, from `statusbar.widgets`' default in
              configdata.yml:2212 — keypress, search_match, url, scroll, history,
              tabs, progress. bru has no history arrows and no load progress bar,

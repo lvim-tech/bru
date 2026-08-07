@@ -203,7 +203,10 @@ body[data-view="top"] {
 body[data-view="bottom"] {
     display: grid;
     grid-template-rows: auto var(--bar-h);
-    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    /* Three columns since the mode indicator: it is `auto` so it takes exactly
+       the width of the word in it, the command line's column is what absorbs
+       the slack, and the status fields keep the right-hand end. */
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, auto);
     background: var(--statusbar-normal-bg);
     color: var(--statusbar-normal-fg);
 }
@@ -252,7 +255,7 @@ body.mode-command {
 
 #completion {
     grid-row: 1;
-    grid-column: 1 / span 2;
+    grid-column: 1 / span 3;
     max-height: var(--completion-max-h);
     overflow-y: auto;
     background: var(--completion-even-bg);
@@ -344,7 +347,7 @@ body.mode-command {
 
 #cmdline {
     grid-row: 2;
-    grid-column: 1;
+    grid-column: 2;
     min-width: 0;
     height: var(--bar-h);
     padding: 0 var(--pad-x);
@@ -368,6 +371,37 @@ body:not(.mode-command) #cmdline {
     background: var(--completion-item-selected-bg);
 }
 
+
+/* The mode indicator (src/modes.rs, pushed as state.mode) ------------------
+ *
+ * First in the bar and always drawn, normal included. It takes no colour of
+ * its own: the bar is already recoloured by mode below, so the word inherits
+ * whatever that mode's pair is and reads in every one of them without a rule
+ * per mode. Uppercase because the modes are spelled lowercase everywhere else
+ * in bru — `:mode-enter caret`, `body.mode-caret` — and a word that is styled
+ * differently from the way it is typed is a word you do not confuse with a
+ * command.
+ */
+
+#mode {
+    grid-row: 2;
+    grid-column: 1;
+    display: flex;
+    align-items: center;
+    height: var(--bar-h);
+    padding: 0 var(--pad-x);
+    white-space: nowrap;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+}
+
+/* Empty before the first push, and `:empty` rather than a width of zero so the
+   command line starts at the left edge until there is a mode to name. */
+#mode:empty {
+    display: none;
+}
+
 /* Messages (src/message.rs, and src/clip.rs through it) --------------------
  *
  * qutebrowser's message area, with one line in it: "Yanked URL to clipboard: …".
@@ -389,7 +423,7 @@ body:not(.mode-command) #cmdline {
 
 #message {
     grid-row: 2;
-    grid-column: 1;
+    grid-column: 2;
     display: flex;
     align-items: center;
     min-width: 0;
@@ -424,7 +458,7 @@ body.mode-command #message {
 
 #statusline {
     grid-row: 2;
-    grid-column: 2;
+    grid-column: 3;
     display: flex;
     align-items: center;
     justify-content: flex-end;
@@ -534,37 +568,42 @@ body.mode-command #message {
 
 /* Mode colouring ----------------------------------------------------------
  *
- * qutebrowser recolours the whole statusbar by mode; the same three keys are
- * in the theme, so the same thing happens here.
+ * **The bar keeps one colour; the indicator is what changes.** qutebrowser
+ * repaints the whole statusbar by mode and bru did the same until the user
+ * said otherwise 2026-08-07: a bar that turns green under the page is a large
+ * moving thing at the bottom of the eye, and it says only "something is
+ * different" — the word in the box says which. So the mode's own pair from the
+ * theme is spent on the box, where it is a badge, and the bar itself never
+ * moves.
+ *
+ * Normal mode uses the same pair as the bar, so its badge reads as plain text
+ * rather than as a block. That is deliberate: normal is the mode you are in
+ * when nothing is happening, and it should look like nothing is happening.
  */
 
-body.mode-insert {
+#mode {
+    color: var(--statusbar-normal-fg);
+    background: var(--statusbar-normal-bg);
+}
+
+body.mode-insert #mode {
     color: var(--statusbar-insert-fg);
     background: var(--statusbar-insert-bg);
 }
 
-body.mode-insert #url,
-body.mode-insert #scroll,
-body.mode-insert #tabindex,
-body.mode-insert #keystring {
-    color: var(--statusbar-insert-fg);
-}
-
-body.mode-passthrough {
+body.mode-passthrough #mode {
     color: var(--statusbar-passthrough-fg);
     background: var(--statusbar-passthrough-bg);
 }
 
-body.mode-passthrough #url,
-body.mode-passthrough #scroll,
-body.mode-passthrough #tabindex,
-body.mode-passthrough #keystring {
-    color: var(--statusbar-passthrough-fg);
-}
-
-body.mode-caret {
+body.mode-caret #mode {
     color: var(--statusbar-caret-fg);
     background: var(--statusbar-caret-bg);
+}
+
+body.mode-command #mode {
+    color: var(--statusbar-command-fg);
+    background: var(--statusbar-command-bg);
 }
 
 /* ------------------------------------------------------------------------- */
