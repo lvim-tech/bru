@@ -70,6 +70,9 @@ enum Backing {
     Bar,
     /// A Chromium content setting, global or per-origin. See [`apply`].
     Content(ContentKind),
+    /// Read by `focus.rs` when a page moves its focus; nothing to push. Chromium has no opinion
+    /// about which of bru's modes a focused field means — that question only exists inside bru.
+    Insert,
 }
 
 /// The content settings bru drives. Kept as bru's own enum rather than `ContentSettingTypes` so
@@ -121,7 +124,7 @@ pub struct Def {
 
 /// Every setting bru has, and nothing else.
 ///
-/// The list is short on purpose. qutebrowser has some 400 options; bru has three, because three is
+/// The list is short on purpose. qutebrowser has some 400 options; bru has seven, because seven is
 /// how many it can currently change the behaviour of. Adding a name here without adding the
 /// behaviour behind it would make `:set` a place where things are typed and forgotten.
 pub const SETTINGS: &[Def] = &[
@@ -160,6 +163,47 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::Both,
         backing: Backing::Content(ContentKind::Images),
     },
+    // --- src/focus.rs -------------------------------------------------------------------------
+    // qutebrowser's four, by their own names and with their own defaults (`configdata.yml:1905`,
+    // `:1911`, `:1916`, `:1926`). They are here rather than hard-coded in `focus.rs` because bru ships its own
+    // defaults and `config.lua` layers overrides on them — a user who wants the old behaviour back
+    // writes `bru.set("input.insert_mode.auto_load", "true")` and gets it, with no branch to keep.
+    Def {
+        name: "input.insert_mode.auto_load",
+        kind: Kind::Bool,
+        // **false**, and this is the fix. A page that focuses its own search box must not be
+        // holding the next key the user presses — `:` on the start page opens the command line.
+        default: Some("false"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Insert,
+    },
+    Def {
+        name: "input.insert_mode.auto_enter",
+        kind: Kind::Bool,
+        // **true**: clicking into a field, or following a hint onto one, still types into it.
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Insert,
+    },
+    Def {
+        name: "input.insert_mode.auto_leave",
+        kind: Kind::Bool,
+        // **true**: clicking something that is not editable ends insert mode.
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Insert,
+    },
+    Def {
+        name: "input.insert_mode.leave_on_load",
+        kind: Kind::Bool,
+        // **true** (`configdata.yml:1926`): a new page load ends insert mode. qutebrowser allows a
+        // URL pattern here and says in the same breath that patterns are unreliable on it, because
+        // it may match either end of the navigation. bru takes the honest half: global only.
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Insert,
+    },
+    // --- end src/focus.rs ---------------------------------------------------------------------
 ];
 
 /// The settings qutebrowser's default bindings name that bru refuses, and why.
@@ -211,7 +255,10 @@ pub const REFUSED: &[(&str, &str)] = &[
 /// had compiled in.
 pub fn value_of(name: &str) -> Option<String> {
     let def = def(name)?;
-    if !matches!(def.backing, Backing::Bar) {
+    // `Backing::Insert` is here for the same reason `Backing::Bar` is: `focus.rs`'s four settings
+    // move bru's own mode and are never written to Chromium, so "not read yet" would be a
+    // statement about a copy Chromium does not keep.
+    if !matches!(def.backing, Backing::Bar | Backing::Insert) {
         return None;
     }
     let live = with_live(|settings| settings.get(name, None).ok().flatten());
@@ -681,6 +728,25 @@ fn with_live<R>(f: impl FnOnce(&mut Settings) -> R) -> R {
     f(guard.get_or_insert_with(Settings::default))
 }
 
+// --- src/focus.rs ------------------------------------------------------------------------------
+/// One boolean setting's value in force globally, falling back to its compiled-in default.
+///
+/// The reader for settings whose backing is bru itself rather than Chromium — there is nothing to
+/// push, so there is nothing to read back from Chromium either, and this is the whole interface.
+/// A name this file does not know answers `false`; that cannot happen from `focus.rs`, whose three
+/// names are `const`, and answering rather than panicking is what keeps a typo in a caller from
+/// taking the browser down.
+///
+/// **Not on the key path.** It takes the settings mutex, and its callers are focus changes, which
+/// happen when a person clicks or a page loads — never per keystroke.
+pub fn is_on(name: &str) -> bool {
+    matches!(
+        with_live(|settings| settings.get(name, None)),
+        Ok(Some(Value::Bool(true)))
+    )
+}
+// --- end src/focus.rs --------------------------------------------------------------------------
+
 // -----------------------------------------------------------------------------------------------
 // The commands
 // -----------------------------------------------------------------------------------------------
@@ -746,6 +812,9 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
     let kind = match applied.def.backing {
         // Nothing to push: `open.rs` reads it when it needs it.
         Backing::StartPage => return Ok(()),
+        // Nothing to push either: `focus.rs` reads it when a focus changes. Chromium is not told,
+        // because Chromium has no idea bru has modes.
+        Backing::Insert => return Ok(()),
         // The bar reads it when it is built; setting it only has to make that happen again.
         Backing::Bar => {
             crate::ipc::push_bar_everywhere();
@@ -802,8 +871,8 @@ pub fn apply_at_startup() {
 pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let kind = match def(name)?.backing {
         Backing::Content(kind) => kind,
-        // Neither is a Chromium content setting, so Chromium has no opinion to read back.
-        Backing::StartPage | Backing::Bar => return None,
+        // None of these is a Chromium content setting, so Chromium has no opinion to read back.
+        Backing::StartPage | Backing::Insert | Backing::Bar => return None,
     };
     let context = request_context_get_global_context()?;
     let url = CefString::from(url);
@@ -994,10 +1063,56 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: bad default: {e}", def.name));
             }
         }
-        // Four since `statusbar.mode.style`, which is bru's own rather than a name copied from
-        // qutebrowser — it has no mode indicator to configure. Raise this with the setting, never
-        // to make a failing build pass.
-        assert_eq!(SETTINGS.len(), 4);
+        // Eight: three content/start-page settings, `statusbar.mode.style`, which is bru's own
+        // rather than a name copied from qutebrowser, and the four `input.insert_mode.*` that
+        // `focus.rs` reads. Raise this with the setting, never to make a failing build pass.
+        assert_eq!(SETTINGS.len(), 8);
+    }
+
+    /// The four insert-mode settings, read the way `focus.rs` reads them: through the live store,
+    /// so that a default that never reaches [`is_on`] is a failing test rather than a browser that
+    /// silently behaves the other way round.
+    #[test]
+    fn the_insert_mode_defaults_survive_the_live_store() {
+        install(Settings::default());
+        assert!(!is_on("input.insert_mode.auto_load"));
+        assert!(is_on("input.insert_mode.auto_enter"));
+        assert!(is_on("input.insert_mode.auto_leave"));
+        assert!(is_on("input.insert_mode.leave_on_load"));
+
+        // And an override reaches it — this is what `config.lua` does.
+        let mut settings = Settings::default();
+        settings
+            .set("input.insert_mode.auto_load", "true")
+            .expect("auto_load is a boolean bru knows");
+        install(settings);
+        assert!(is_on("input.insert_mode.auto_load"));
+
+        // A name nothing implements is false rather than a panic.
+        assert!(!is_on("input.insert_mode.nonsense"));
+
+        install(Settings::default());
+    }
+
+    /// They are bru's own, not Chromium's: `:set -u` must refuse them, and `apply` must not try to
+    /// write a content setting for them.
+    #[test]
+    fn the_insert_mode_settings_are_brus_own_and_global() {
+        let mut settings = Settings::default();
+        let error = settings
+            .set_scoped("input.insert_mode.auto_load", "true", Some("example.com"))
+            .expect_err("bru's modes are not per site");
+        assert!(error.contains("cannot be set per URL"), "{error}");
+        assert!(chromium_value_is_not_chromiums("input.insert_mode.auto_enter"));
+    }
+
+    /// Split out so the test above says what it means without a `#[cfg]` dance: `chromium_value`
+    /// needs a request context, and the assertion is only about the arm that returns before it.
+    fn chromium_value_is_not_chromiums(name: &str) -> bool {
+        matches!(
+            def(name).map(|def| def.backing),
+            Some(Backing::Insert) | Some(Backing::StartPage)
+        )
     }
 
     #[test]

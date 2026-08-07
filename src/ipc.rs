@@ -62,6 +62,14 @@ pub fn on_process_message_received(
     if crate::navigate::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/focus.rs -------------------------------------------------------------------------
+    // A page moved its focus, and the renderer says whether what has it now is editable. Same
+    // shape and the same reason as the three above: it is not a query a page could have started,
+    // so it never reaches the router's `bru://`-only check.
+    if crate::focus::on_report(browser.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/focus.rs ---------------------------------------------------------------------
     browser_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),
@@ -950,6 +958,13 @@ pub fn renderer_on_process_message_received(
     if crate::navigate::renderer_on_query(frame.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/focus.rs -------------------------------------------------------------------------
+    // "bru has just clicked — what has the focus now?" Only the browser process can address this
+    // renderer, so a page cannot ask it, and it never reaches the router's `bru://`-only check.
+    if crate::focus::renderer_on_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/focus.rs ---------------------------------------------------------------------
     renderer_router().on_process_message_received(
         browser.cloned(),
         frame.cloned(),

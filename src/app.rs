@@ -184,6 +184,20 @@ wrap_render_process_handler! {
             crate::ipc::renderer_on_context_released(browser, frame, context);
         }
 
+        // --- src/focus.rs -----------------------------------------------------------------------
+        // The renderer is the only process that can be told a page moved its focus, and `Domnode`
+        // exists nowhere else. Everything this decides is decided in the browser process; this hook
+        // reads the one bit that is only readable here and sends it on. See `focus.rs`.
+        fn on_focused_node_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            node: Option<&mut Domnode>,
+        ) {
+            crate::focus::renderer_on_focus_changed(frame, node);
+        }
+        // --- end src/focus.rs -------------------------------------------------------------------
+
         fn on_process_message_received(
             &self,
             browser: Option<&mut Browser>,

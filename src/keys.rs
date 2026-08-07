@@ -175,24 +175,24 @@ wrap_keyboard_handler! {
                 browser
             };
 
-            // A focused text field means insert mode, which is qutebrowser's
-            // `input.insert_mode.auto_enter` and defaults to true. `only_if_normal` is what keeps a
-            // page's focus event from stealing passthrough out from under the user.
-            // Insert mode is entered in the window the key arrived at, and nowhere else: a page in
-            // a background window focusing a field must not put the window being typed in into
-            // insert mode. `window` is `Some` for every browser bru placed in a window.
-            if event.focus_on_editable_field != 0 {
-                if let Some(window) = window {
-                    let entered = self
-                        .state
-                        .lock()
-                        .expect("state mutex poisoned")
-                        .enter_mode_in(window, crate::modes::Mode::Insert, true);
-                    if entered {
-                        crate::ipc::set_mode_for(window, "insert".to_string());
-                    }
-                }
-            }
+            // --- src/focus.rs -------------------------------------------------------------------
+            // **Nothing about focus is decided here any more, and that is the fix.** This used to
+            // read `event.focus_on_editable_field` and enter insert mode from it. That flag rides on
+            // a key event, so bru learned a field was focused one keypress *late*: the bar said
+            // NORMAL while a caret blinked in a search box, and the key that told it — `:` on
+            // `https://start.duckduckgo.com/`, which focuses its own box — entered insert mode and
+            // was then looked up in insert mode, where `:` is not bound, so the colon went into the
+            // page and the command line never opened. Reported by the user 2026-08-07.
+            //
+            // The same flag also could not tell a field the *page* focused from one the *user*
+            // clicked into, and qutebrowser treats those oppositely (`auto_load` false,
+            // `auto_enter` true). One flag cannot answer two questions.
+            //
+            // Focus is now decided when the focus changes, in `focus.rs`, from
+            // `on_focused_node_changed` in the render process. Two things follow that are worth
+            // saying out loud: the mode indicator is never a keypress behind, and **this is one
+            // less branch and one less mutex acquisition on the path a held `j` takes**.
+            // --- end src/focus.rs -----------------------------------------------------------------
 
             // Translate the CEF event into qutebrowser's own key spelling. `None` is a bare
             // modifier press, which is never a binding on its own.

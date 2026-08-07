@@ -42,11 +42,10 @@ wrap_load_handler! {
                 return;
             };
             let id = browser.identifier();
-            let is_active = self
-                .state
-                .lock()
-                .expect("state mutex poisoned")
-                .is_active_browser(id);
+            let (is_active, window) = {
+                let state = self.state.lock().expect("state mutex poisoned");
+                (state.is_active_browser(id), state.window_of_browser(id))
+            };
             if !is_active {
                 return;
             }
@@ -59,6 +58,14 @@ wrap_load_handler! {
             // The search goes with it — both bru's memory of what `n` repeats and Chromium's own
             // find session, which measurably does *not* end on its own. See `find::forget_for`.
             crate::find::forget_for(browser);
+            // --- src/focus.rs -----------------------------------------------------------------
+            // And so does insert mode: qutebrowser's `input.insert_mode.leave_on_load`, which is
+            // true by default. The field that was being typed into belongs to the document this
+            // navigation is replacing, so the mode that named it has to go with the document.
+            if let Some(window) = window {
+                crate::focus::on_load_started(window);
+            }
+            // --- end src/focus.rs -------------------------------------------------------------
         }
     }
 }

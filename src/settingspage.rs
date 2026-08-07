@@ -180,7 +180,8 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     }
     // The same for every setting bru answers itself. "not read yet" is a statement about
     // *Chromium's* copy, and printing it against a setting Chromium has never heard of says the
-    // browser does not know its own value — which it does. `settings::value_of` is where it lives.
+    // browser does not know its own value — which it does. `settings::value_of` is where it lives,
+    // and `focus.rs`'s four `input.insert_mode.*` are answered through it too.
     if let Some(value) = crate::settings::value_of(name) {
         return value;
     }
@@ -322,6 +323,10 @@ mod tests {
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
         // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
+        // Nor are the four insert-mode settings: they are bru's own and always in force. Their
+        // rows are the only `true`/`false` cells on the page, which is what this counts.
+        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 1);
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 3);
     }
 
     /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this
