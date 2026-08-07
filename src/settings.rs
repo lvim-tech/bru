@@ -3364,6 +3364,203 @@ mod tests {
         assert_eq!(settings.diff(), [r#"bru.set("start_page", "a\"b")"#]);
     }
 
+    // --- unhardcoded ---------------------------------------------------------------------------
+    // -- the whole-number kind --------------------------------------------------------------------
+
+    /// **A default this file changed is a behaviour it broke**, so this asserts every one of the
+    /// fourteen against the constant it was lifted out of, by name.
+    ///
+    /// It is the most important test in this block and the least clever: the whole risk of turning
+    /// a `const` into a setting is that the number moves on the way past, and nothing else here
+    /// would notice. `crate::scroll::STEP` and the rest are still compiled in as the fallbacks
+    /// their store-less processes use, so both sides of each of these is a real value and not a
+    /// restatement of one literal.
+    #[test]
+    fn every_lifted_default_is_the_value_the_constant_had() {
+        let settings = Settings::default();
+        let number = |name: &str| match settings.get(name, None).unwrap() {
+            Some(Value::Int(number)) => number,
+            other => panic!("{name} is {other:?}, not a number"),
+        };
+        let text = |name: &str| match settings.get(name, None).unwrap() {
+            Some(Value::Text(text)) => text,
+            other => panic!("{name} is {other:?}, not text"),
+        };
+        let flag = |name: &str| settings.get(name, None).unwrap() == Some(Value::Bool(true));
+
+        // hints.rs
+        assert_eq!(text("hints.chars"), crate::hints::CHARS);
+        assert_eq!(number("hints.min_chars"), 1);
+        assert_eq!(text("hints.auto_follow"), "unique-match");
+        assert!(!flag("hints.uppercase"));
+        assert!(flag("hints.scatter"), "hint_strings was _hint_scattered and only that");
+        // editor.rs and downloads.rs: unset, which is what leaves the environment and the XDG
+        // answer standing. An absence is the default here, exactly as it is for `start_page`.
+        assert_eq!(settings.get("editor.command", None).unwrap(), None);
+        assert_eq!(settings.get("downloads.location.directory", None).unwrap(), None);
+        assert!(flag("downloads.location.prompt"), "src/prompt.rs asks, and asked unconditionally");
+        assert_eq!(number("downloads.remove_finished"), -1, "a finished row stayed until cd");
+        // message.rs
+        assert_eq!(number("messages.timeout"), 3000);
+        assert_eq!(number("messages.limit"), 100);
+        // exec.rs
+        assert_eq!(number("zoom.default"), 100);
+        let levels: Vec<u32> = ZOOM_LEVELS
+            .defaults
+            .iter()
+            .filter_map(|entry| percent_of(entry))
+            .collect();
+        assert_eq!(
+            levels,
+            [25, 33, 50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500]
+        );
+        // scroll.rs — the one the project exists for.
+        assert_eq!(number("scroll.step_px"), i64::from(crate::scroll::STEP));
+        assert_eq!(number("scroll.step_px"), 120);
+        // And nothing in the block has been given a Chromium side it does not have. Safe to call
+        // with no CEF behind it (trap 13) exactly because of that: `chromium_value` answers `None`
+        // for these two backings before it reaches for a request context.
+        for def in SETTINGS {
+            if matches!(def.backing, Backing::Read | Backing::ScrollStep) {
+                assert!(
+                    chromium_value(def.name, "https://example.com/").is_none(),
+                    "{} claims a Chromium value",
+                    def.name
+                );
+                assert!(value_of(def.name).is_some(), "{} answers nothing", def.name);
+            }
+        }
+    }
+
+    /// `Kind::Int`: what it accepts, what it refuses, and what the refusal says.
+    #[test]
+    fn a_number_is_typed_and_bounded_and_says_what_the_bounds_were() {
+        let mut settings = Settings::default();
+        assert!(settings.set("messages.timeout", "500").is_ok());
+        assert_eq!(settings.get("messages.timeout", None).unwrap(), Some(Value::Int(500)));
+
+        // Not a number at all.
+        let error = settings.set("messages.timeout", "soon").unwrap_err();
+        assert!(error.contains("is not a whole number of milliseconds"), "{error}");
+        // A number outside the range, with the range and the sentinel in the message.
+        let error = settings.set("messages.timeout", "-1").unwrap_err();
+        assert!(error.contains("outside 0..86400000 milliseconds"), "{error}");
+        assert!(error.contains("(0 is never clear)"), "{error}");
+        // The sentinel is the *end* of the range where there is one, so -1 is legal there.
+        assert!(settings.set("downloads.remove_finished", "-1").is_ok());
+        assert!(settings.set("downloads.remove_finished", "-2").is_err());
+        // `hints.min_chars` has a ceiling qutebrowser has not, because the number is an exponent.
+        assert!(settings.set("hints.min_chars", "5").is_ok());
+        let error = settings.set("hints.min_chars", "20").unwrap_err();
+        assert!(error.contains("outside 1..5 characters"), "{error}");
+        assert!(settings.set("hints.min_chars", "0").is_err());
+        // A percent takes qutebrowser's own spelling as well as bru's, because `:zoom 150%` does.
+        assert!(settings.set("zoom.default", "150%").is_ok());
+        assert_eq!(settings.get("zoom.default", None).unwrap(), Some(Value::Int(150)));
+        assert!(settings.set("zoom.default", "150").is_ok());
+        // ...and only where the unit is percent: a timeout with a % in it is a typo.
+        assert!(settings.set("messages.timeout", "500%").is_err());
+
+        // What it prints is the number and nothing else, which is the spelling `:set` takes back.
+        assert_eq!(
+            settings.describe("scroll.step_px", None).unwrap(),
+            "scroll.step_px = 120"
+        );
+        settings.set("scroll.step_px", "200").unwrap();
+        assert_eq!(
+            settings.set_scoped("scroll.step_px", "240", None).unwrap().describe(),
+            "scroll.step_px = 240"
+        );
+        // And it is global-only, like every setting in this block: Chromium scopes content
+        // settings, and none of these is one.
+        assert!(settings
+            .set_scoped("scroll.step_px", "240", Some("*://*.example.com/*"))
+            .is_err());
+    }
+
+    /// **What `config-cycle` with no values does for a number**: it refuses, and names the values
+    /// to type. A `Bool` has two and a `Choice` has its list; a number has neither.
+    #[test]
+    fn config_cycle_needs_the_values_for_a_number_and_says_so() {
+        let mut settings = Settings::default();
+        let error = settings.cycle("messages.timeout", &[], None).unwrap_err();
+        assert!(error.contains("there is no next one to step to"), "{error}");
+        assert!(error.contains(":config-cycle messages.timeout 0 86400000"), "{error}");
+
+        // Spelled out, it walks them and wraps like any other kind.
+        let values = vec!["1000".to_string(), "3000".to_string()];
+        assert_eq!(
+            settings.cycle("messages.timeout", &values, None).unwrap().value,
+            Value::Int(1000),
+            "3000 is the default and is in the list at 1, so the next is 0"
+        );
+        assert_eq!(
+            settings.cycle("messages.timeout", &values, None).unwrap().value,
+            Value::Int(3000)
+        );
+        // A value the setting could not hold is refused before anything is stored.
+        assert!(settings
+            .cycle("hints.min_chars", &["1".to_string(), "99".to_string()], None)
+            .is_err());
+        assert_eq!(settings.get("hints.min_chars", None).unwrap(), Some(Value::Int(1)));
+
+        // The four values of `hints.auto_follow` cycle with no values, because a Choice can.
+        assert_eq!(
+            settings.cycle("hints.auto_follow", &[], None).unwrap().value,
+            Value::Text("full-match".to_string()),
+            "unique-match is at 1 in the list, so the next is at 2"
+        );
+    }
+
+    /// `Kind::Chars`: the three things a one-character or repeating `hints.chars` would do.
+    #[test]
+    fn hint_chars_refuses_what_would_divide_by_zero_or_label_twice() {
+        let mut settings = Settings::default();
+        assert!(settings.set("hints.chars", "aoeuidnths").is_ok());
+        assert_eq!(
+            settings.get("hints.chars", None).unwrap(),
+            Some(Value::Text("aoeuidnths".to_string()))
+        );
+
+        // One character: `hint_strings` divides the label space by `len - 1`.
+        let error = settings.set("hints.chars", "a").unwrap_err();
+        assert!(error.contains("at least two"), "{error}");
+        // A character twice: two elements with one label.
+        let error = settings.set("hints.chars", "asdfa").unwrap_err();
+        assert!(error.contains("uses a character twice"), "{error}");
+        // A space: not typeable as part of a label.
+        assert!(settings.set("hints.chars", "as df").is_err());
+        assert!(settings.set("hints.chars", "").is_err());
+        // Non-ASCII is fine — it is a character set, not an alphabet.
+        assert!(settings.set("hints.chars", "фыва").is_ok());
+    }
+
+    /// `zoom.levels` is a list whose entries are percentages, in either spelling, and whose order
+    /// does not matter because its reader sorts.
+    #[test]
+    fn zoom_levels_takes_both_spellings_and_refuses_what_is_not_a_level() {
+        let mut settings = Settings::default();
+        let name = "zoom.levels";
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 16);
+
+        assert!(settings.list_add(name, "133%").is_ok());
+        assert!(settings.list_add(name, "133").is_ok(), "bru's own spelling is taken too");
+        let error = settings.list_add(name, "big").unwrap_err();
+        assert!(error.contains("not a zoom level"), "{error}");
+        assert!(settings.list_add(name, "0%").is_err());
+        assert!(settings.list_add(name, "20000%").is_err());
+        // Removing one of bru's own is the only way to lose it, as for every bru list.
+        settings.list_remove(name, "25%").unwrap();
+        assert_eq!(settings.list_vec(def(name).unwrap()).len(), 17);
+
+        // Both spellings read back as the same number, which is what stops `133` and `133%` from
+        // becoming two levels once `exec::zoom_levels` has deduplicated them.
+        assert_eq!(percent_of("133%"), Some(133));
+        assert_eq!(percent_of(" 133 "), Some(133));
+        assert_eq!(percent_of("x"), None);
+    }
+    // --- end unhardcoded -------------------------------------------------------------------------
+
     #[test]
     fn variables_expand_against_nothing_when_there_is_no_page() {
         // `ipc::current_url` is empty outside a running browser, which is the case in a unit test.
