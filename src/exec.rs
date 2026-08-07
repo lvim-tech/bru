@@ -1360,6 +1360,23 @@ fn set_zoom_percent(browser: &mut Browser, percent: u32) {
         return;
     };
     let percent = percent.max(1);
+    // --- unhardcoded -------------------------------------------------------------------------
+    // `BRU_DEBUG_ZOOM=1`, in the shape of `BRU_DEBUG_KEYS` and its siblings. Nothing in bru
+    // reports the zoom level: `:zoom` is silent, the status bar has no field for it and a session
+    // does not record it, so `zoom.levels` and `zoom.default` had no way to be *measured* rather
+    // than asserted. Off by default — it is one line per `+`.
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_ZOOM").is_some()) {
+            eprintln!(
+                "bru[zoom]: {percent}% (levels {:?}, default {}%)",
+                zoom_levels(),
+                zoom_default()
+            );
+        }
+    }
+    // --- end unhardcoded -----------------------------------------------------------------------
     host.set_zoom_level((percent as f64 / 100.0).ln() / 1.2f64.ln());
 }
 

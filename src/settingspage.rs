@@ -458,6 +458,58 @@ mod tests {
         // --- end unhardcoded ---------------------------------------------------------------
     }
 
+    // --- unhardcoded -----------------------------------------------------------------------
+    /// **What `bru://chrome/settings` shows for a number**, which is the third of the four places a
+    /// [`Kind`] is read.
+    ///
+    /// The range and the unit are in the "what it takes" cell, because "a whole number" against
+    /// `messages.timeout` says nothing about whether 3000 is a long time and against
+    /// `scroll.step_px` says nothing about what 100000 would do. The value cell is bru's own answer
+    /// rather than "not read yet": none of these has a Chromium side, and a browser that printed
+    /// "not read yet" against a number it has compiled in would be saying it does not know its own
+    /// value.
+    #[test]
+    fn a_number_shows_its_range_and_its_unit_and_never_says_not_read_yet() {
+        let html = page(None);
+        assert!(html.contains("a whole number, 0 to 86400000 milliseconds (0 is never clear)"));
+        assert!(html.contains("a whole number, -1 to 86400000 milliseconds (-1 is never remove)"));
+        assert!(html.contains("a whole number, 1 to 10000 pixels"), "scroll.step_px");
+        assert!(html.contains("a whole number, 1 to 5 characters"), "hints.min_chars");
+        assert!(html.contains("at least two different characters, no spaces"), "hints.chars");
+        // The four values of `hints.auto_follow`, in the same cell a Choice has always used.
+        assert!(html.contains("always or unique-match or full-match or never"));
+
+        // Every row of the block answers with a value, at its own default, with nothing read from
+        // Chromium at all — which is what `page(None)` is.
+        for (name, value) in [
+            ("scroll.step_px", "120"),
+            ("messages.timeout", "3000"),
+            ("messages.limit", "100"),
+            ("zoom.default", "100"),
+            ("hints.chars", "asdfghjkl"),
+            ("hints.auto_follow", "unique-match"),
+            ("downloads.remove_finished", "-1"),
+        ] {
+            let at = html
+                .find(&format!("<td class=\"keys\">{name}</td>"))
+                .unwrap_or_else(|| panic!("no row for {name}"));
+            let row = &html[at..];
+            let row = &row[..row.find("</tr>").expect("the row ends")];
+            assert!(
+                row.contains(&format!("<td class=\"state\">{value}</td>")),
+                "{name} shows {row}"
+            );
+            assert!(!row.contains("not read yet"), "{name} claims Chromium has not been asked");
+        }
+        // `zoom.levels` is a list and its cell is a line per entry, the same shape the filter lists
+        // have — sixteen of them, indexed.
+        assert!(html.contains("<code>0</code> 25%"), "zoom.levels is not enumerated");
+        assert!(html.contains("<code>15</code> 500%"));
+        // The two that ship unset say so rather than showing a path they do not have.
+        assert!(html.contains("default unset"));
+    }
+    // --- end unhardcoded -------------------------------------------------------------------
+
     /// **A dict is not one line, and this is what the value column does about it.** One row per
     /// setting still, but the cell inside it is a line per pair.
     #[test]

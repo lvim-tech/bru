@@ -163,6 +163,7 @@ pub fn show(level: Level, text: &str) {
     // `messages.timeout 0` is "never clear", so no timer is started at all. Posting one with a
     // delay of 0 would clear the message on the next turn of the loop, which is the opposite.
     let timeout = timeout_ms();
+    debug(&format!("show #{sequence} timeout={timeout}ms"));
     if timeout > 0 {
         let mut task = ClearMessage::new(sequence);
         post_delayed_task(ThreadId::UI, Some(&mut task), timeout);
@@ -219,6 +220,21 @@ pub fn json() -> String {
 const LOG_LIMIT: usize = 100;
 
 // --- unhardcoded -------------------------------------------------------------------------------
+/// `BRU_DEBUG_MESSAGES=1` traces a message being shown and the timer taking it away, in the shape
+/// of `BRU_DEBUG_KEYS` and its siblings.
+///
+/// It exists because `messages.timeout` had no other way to be *measured*: what the setting moves
+/// is when a line disappears from the bar, which is a pixel on a screen six brus are sharing. This
+/// says when the timer was started, how long it was given, and when it fired. Off by default — it
+/// is two lines per message said.
+fn debug(text: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("BRU_DEBUG_MESSAGES").is_some()) {
+        eprintln!("bru[messages]: {text}");
+    }
+}
+
 /// `messages.limit`, or [`LOG_LIMIT`] before the settings store exists.
 fn log_limit() -> usize {
     match crate::settings::int_of("messages.limit") {
@@ -471,13 +487,20 @@ wrap_task! {
         fn execute(&self) {
             // Only if nothing has been said since. Without this, three messages a second apart
             // would each take the next one's turn away.
-            if SEQUENCE.load(Ordering::Relaxed) != self.sequence {
+            let now = SEQUENCE.load(Ordering::Relaxed);
+            if now != self.sequence {
+                // Traced *before* the early return, not after. Placed after it, this line made a
+                // message with the default 3 s timeout look as though its timer never ran at all —
+                // measured 2026-08-07, and the timer had run every time: something else had said
+                // or cleared something first, and the guard above had done its job silently.
+                debug(&format!("timer fired for #{}, superseded by #{now}", self.sequence));
                 return;
             }
             let had = match shown().lock() {
         Ok(mut shown) => shown.take().is_some(),
         Err(_) => false,
     };
+            debug(&format!("timer fired for #{}, cleared={had}", self.sequence));
             if had {
                 crate::ipc::push_bar();
             }

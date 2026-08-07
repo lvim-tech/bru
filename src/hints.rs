@@ -711,8 +711,6 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
         (open.first, open.auto_follow)
     };
 
-    debug(&format!("window {window} labels {}", labels.join(" ")));
-
     // --- unhardcoded ---------------------------------------------------------------------------
     // `hints.uppercase`, configdata.yml:1878 — **the drawn label only**, which is qutebrowser's own
     // behaviour and not a simplification of it: `HintLabel._update_text` (hints.py:113-119) upper-
@@ -720,14 +718,25 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
     // raw strings. So `A` is drawn and `a` is typed, the trie is untouched, and nothing about the
     // key path changes. Uppercasing the trie instead would need Shift on every hint.
     let uppercase = crate::settings::is_on("hints.uppercase");
-    let list = labels
+    let drawn: Vec<String> = labels
         .iter()
-        .map(|label| {
-            let shown = if uppercase { label.to_uppercase() } else { label.clone() };
-            format!("\"{shown}\"")
-        })
+        .map(|label| if uppercase { label.to_uppercase() } else { label.clone() })
+        .collect();
+    let list = drawn
+        .iter()
+        .map(|label| format!("\"{label}\""))
         .collect::<Vec<_>>()
         .join(",");
+
+    // Both lists, because they are two different things the moment `hints.uppercase` is on and the
+    // whole risk of that setting is drawing one and matching the other. `BRU_DEBUG_HINTS=1` is the
+    // only place the drawn one can be read — it is a string in a `execute_java_script` call and
+    // never crosses back.
+    debug(&format!(
+        "window {window} labels {} drawn {}",
+        labels.join(" "),
+        drawn.join(" ")
+    ));
     // --- end unhardcoded -----------------------------------------------------------------------
     show(
         browser,
