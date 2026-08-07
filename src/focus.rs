@@ -18,19 +18,20 @@
 //!
 //! ## What qutebrowser does, which is the model
 //!
-//! Three settings, read here by their qutebrowser names (`configdata.yml:1905-1917`):
+//! Four settings, read here by their qutebrowser names and shipped with qutebrowser's defaults:
 //!
 //! | | | |
 //! |---|---|---|
-//! | `input.insert_mode.auto_load` | **false** | a field the *page* focused after loading does not enter insert |
-//! | `input.insert_mode.auto_enter` | **true** | a field the *user* clicked into does |
-//! | `input.insert_mode.auto_leave` | **true** | focusing something that is not editable leaves insert |
+//! | `input.insert_mode.auto_load` | **false** | a field the *page* focused does not enter insert (`configdata.yml:1905`) |
+//! | `input.insert_mode.auto_enter` | **true** | a field the *user* clicked into does (`:1911`) |
+//! | `input.insert_mode.auto_leave` | **true** | clicking something that is not editable leaves insert (`:1916`) |
+//! | `input.insert_mode.leave_on_load` | **true** | a new page load leaves insert (`:1926`) |
 //!
 //! qutebrowser splits them by *mechanism*: `auto_load` is decided in `browsertab.py:886` when a load
-//! finishes, and `auto_enter` in `eventfilter.py:206` on a **mouse press**, by hit-testing the
-//! element under the cursor. bru cannot copy the second half — its pages are Chrome-style
-//! `BrowserView`s, so a real click goes from the compositor into Chromium without passing through
-//! any handler bru owns. There is no `MouseHandler` to hook.
+//! finishes, and `auto_enter` in `eventfilter.py:196-215` on a **mouse press**, by hit-testing the
+//! element under the cursor. bru cannot copy the second half as written — its pages are Chrome-style
+//! `BrowserView`s, so a click the *person* makes goes from the compositor into Chromium without
+//! passing through any handler bru owns. There is no `MouseHandler` to hook.
 //!
 //! ## So the two are told apart by *user activation*, and the obvious alternative was measured wrong
 //!
@@ -70,6 +71,23 @@
 //! half bru could not otherwise have at all — and the case it loses needs a page that steals focus
 //! seconds after the fact, which is the case `input.insert_mode.auto_enter false` is for.
 //!
+//! ## A focus change is not enough on its own, and the missing case is the start page's
+//!
+//! `on_focused_node_changed` fires when the focused node *changes*. Click a field that already has
+//! the focus and nothing changes, so nothing fires. That is not a corner: it is the page in the bug
+//! report. Measured 2026-08-07 on `https://start.duckduckgo.com/` — its script focuses its search
+//! box, bru correctly stays in normal, and `hint inputs` then `a` clicked the box at (729, 539) with
+//! **no focus change reported and the mode still normal**. The user would have hinted their own
+//! search box and then found that typing scrolled.
+//!
+//! So the click says so itself: `hints::click` calls [`after_click`], which asks the renderer what
+//! has the focus now and answers with `gesture` true, because it was. Same page, same script, after
+//! that line: `after a click, editable=true` → `-> Enter` → `mode=insert`.
+//!
+//! **This covers the click bru makes, not the click the person makes.** A real mouse click into a
+//! field that already had the focus still does nothing, and cannot be made to: see the paragraph
+//! above about there being no mouse hook. For a browser driven by hints that is the small half.
+//!
 //! ## bru's own chrome pages are an exception, deliberately
 //!
 //! `bru://chrome/cookies` has `autofocus` on its filter box so that opening the page and typing a
@@ -84,7 +102,12 @@
 //! `is_editable` (6032) can only be asked there. The verdict has to reach the browser process, so
 //! this is the fourth module with the shape `scroll.rs`, `editor.rs` and `navigate.rs` already have:
 //! a `ProcessMessage` claimed in `ipc.rs` before the message router sees it, so it never goes near
-//! the router's `bru://`-only check.
+//! the router's `bru://`-only check. Two names, one each way: [`REPORT`] and [`ASK`].
+//!
+//! The one thing this file asks in JavaScript is [`PROBE`], because Blink exposes user activation
+//! nowhere else. **Editable is never asked in JavaScript** — both paths go through CEF's own
+//! `Domnode::is_editable`, the focus one from the node the callback hands over and the click one
+//! through `Frame::visit_dom`. One definition of editable, not two that can disagree.
 //!
 //! **Nothing in the renderer half may touch `BruState`.** It exists in that process and is empty.
 
@@ -101,12 +124,20 @@ const REPORT: &str = "bru.focus.changed";
 /// changes no focus and fires no callback.
 const ASK: &str = "bru.focus.ask";
 
-/// How long after the click to ask. The mouse events and this message travel to the renderer on
-/// different channels, so nothing orders them; the delay is what makes the answer be about the
-/// document *after* the click rather than before it.
+/// How long after the click to ask.
 ///
-/// **60 ms, and it is measured rather than picked.** At 0 ms the answer came back describing the
-/// focus as it was before the click on 3 of 5 runs. See the module header for the run.
+/// **Say what was measured and what was not.** Measured 2026-08-07, hinting a field the page had
+/// already focused, five runs each: at **0 ms** the answer described the document after the click
+/// 5/5 times, and at **60 ms** 5/5 as well. So this delay is not currently buying anything on this
+/// machine, and the honest reason it is here is a hazard rather than a symptom: the mouse events and
+/// this message reach the renderer on different channels and *nothing orders them*, so a busy
+/// renderer could answer about the document before the click. 60 ms after following a hint is not
+/// perceptible, which makes it a cheap way to not depend on that.
+///
+/// (One of the five 0 ms runs ended in normal mode all the same, and it was not this: the ask
+/// answered `editable=true` and insert was entered, then a *real* focus change arrived saying the
+/// field had been blurred. The hint's click point had missed the input. That is `hints.rs`'s aim,
+/// not this delay.)
 const AFTER_CLICK_MS: i64 = 60;
 
 // -----------------------------------------------------------------------------------------------
