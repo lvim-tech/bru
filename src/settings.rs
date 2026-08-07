@@ -806,6 +806,84 @@ pub const REFUSED: &[(&str, &str)] = &[
          three-value cycle that is wrong on one press in three is worse than a key that says it \
          does nothing.",
     ),
+// --- content settings ----------------------------------------------------------------------------
+    // **These strings are read by a person on `bru://chrome/settings`, so they name nothing but
+    // bru and CEF.** `help.rs::the_page_measures_bru_against_nothing` enforces that for the page it
+    // owns; the rule is the user's and it is the same rule here, whether or not a key is bound to
+    // one of these names today. Where a setting came from belongs in the comments above and in the
+    // commit message, not in the answer someone gets when they type it.
+    (
+        "content.desktop_capture",
+        "the rule exists and reading it kills the browser. CEF 151 has \
+         CEF_CONTENT_SETTING_TYPE_DISPLAY_CAPTURE and cef-rs exposes it, but \
+         RequestContext::get_content_setting on it does not fail and does not answer wrongly — the \
+         browser process takes SIGTRAP and exits 133 with nothing on stderr. Measured 2026-08-07 \
+         under gdb: HostContentSettingsMap::GetContentSetting immediate-crashes \
+         (base/immediate_crash.h:180), reached from CefRequestContextImpl::GetContentSetting \
+         (request_context_impl.cc:600). Every other type bru drives was swept the same way, one \
+         browser process each, and this is the only one that does it. It costs more than one \
+         setting: this page reads every setting it lists, so a row here would take the browser \
+         down whenever the page was opened.",
+    ),
+    (
+        "content.media.audio_video_capture",
+        "Chromium keeps the microphone and the camera in two separate rules and has no third for \
+         the pair — MEDIASTREAM_MIC and MEDIASTREAM_CAMERA are the whole of it in \
+         cef_content_setting_types_t. This name could only be implemented by writing both, and it \
+         would then silently overwrite content.media.audio_capture and content.media.video_capture \
+         beside it, and be overwritten by them in turn. Both halves are implemented; set them in \
+         one line and nothing is lost.",
+    ),
+    (
+        "content.local_storage",
+        "Chromium has no localStorage rule of its own. Measured 2026-08-07: no LOCAL_STORAGE in \
+         cef_content_setting_types_t, and webkit.webprefs.local_storage_enabled answers exists=0 \
+         settable=0, while cef_browser_settings_t::local_storage is read once when a browser is \
+         created and so cannot change a tab that is already open. What is left is COOKIES, which \
+         is the site's whole data store — a setting named local_storage that also threw away the \
+         site's cookies would be a switch wired to two things and labelled with one of them.",
+    ),
+    (
+        "content.canvas_reading",
+        "nothing in CEF 151 has it. There is no entry in cef_content_setting_types_t, no field in \
+         cef_browser_settings_t, and no preference: measured 2026-08-07 with \
+         --settings-probe='prefs:canvas', which matched none. Refusing canvas readback in Chromium \
+         is a decision taken when Blink is built, not one a running browser can take.",
+    ),
+    (
+        "content.webgl",
+        "the only spelling CEF 151 offers is cef_browser_settings_t::webgl, which is read once when \
+         a browser is created. It is not a content setting — there is no WEBGL in \
+         cef_content_setting_types_t — and not a preference either: webkit.webprefs.webgl1_enabled \
+         and webkit.webprefs.webgl2_enabled both answer exists=0 settable=0, measured 2026-08-07. \
+         So it could not be given a URL pattern, which is how every per-site key in bru is written, \
+         and could not change a tab that is already open. A setting that needed a new tab to take \
+         effect and could not be scoped would be two surprises rather than one option.",
+    ),
+    (
+        "content.default_encoding",
+        "cef_browser_settings_t::default_encoding, with content.webgl's objection: read once when \
+         a browser is created, with no content setting and no preference behind it — \
+         webkit.webprefs.default_encoding answers exists=0 settable=0, measured 2026-08-07. \
+         Chromium determines a page's encoding from its bytes and its headers, so the field is a \
+         fallback for documents that declare nothing, and bru cannot scope it or change it live.",
+    ),
+    (
+        "content.xss_auditing",
+        "the XSS Auditor was taken out of Chromium at M78 and CEF 151 is M151. There is no content \
+         setting, no preference, and not even the command-line switch it used to answer to: \
+         measured 2026-08-07, `strings libcef.so` contains no xss-auditor at all. There is nothing \
+         behind the name to switch on or off.",
+    ),
+    (
+        "content.pdfjs",
+        "it asks for a different PDF viewer, which is a feature rather than a setting. Chromium's \
+         viewer is built in, and the one preference CEF exposes beside it is \
+         plugins.always_open_pdf_externally (exists=1 settable=1, measured 2026-08-07), which \
+         means \"hand the file to another program\" — the opposite question. Honouring this name \
+         would mean bru shipping and serving a JavaScript PDF viewer of its own.",
+    ),
+// --- end content settings ------------------------------------------------------------------------
 ];
 
 /// **What `:set` prints for a dictionary**, and the answer to "a dict is not one line".

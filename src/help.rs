@@ -303,7 +303,20 @@ mod tests {
     #[test]
     fn a_refusal_reason_cannot_escape_its_cell() {
         let html = page(&bindings());
-        for (_, why) in crate::settings::REFUSED {
+        let bound = bindings().all();
+        for (name, why) in crate::settings::REFUSED {
+// --- content settings ----------------------------------------------------------------------------
+            // **Only the refusals a key can reach.** A reason arrives on this page through
+            // `exec::refusal` on a *bound* command, so a refused setting nobody has a binding for
+            // has no row here and its reason belongs to `bru://chrome/settings`. Two of the ten
+            // refusals are bound today. Looping over all of them without this asserted that every
+            // refusal is bound to a key, which is a claim about the default binding table and not
+            // about escaping — and it started failing the moment a refusal was written down for a
+            // setting the table never names.
+            if !bound.iter().any(|(_, _, cmd)| cmd.contains(*name)) {
+                continue;
+            }
+// --- end content settings ------------------------------------------------------------------------
             assert!(html.contains(&escape(why)), "the escaped reason is not on the page");
             // The plugins reason contains ASCII quotes, so this is not a vacuous check: the raw
             // string must *not* be there.
