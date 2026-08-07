@@ -769,8 +769,21 @@ pub fn command_accept(rapid: bool) {
 /// The window is the one whose strip sent it, resolved in `ipc.rs` from the answering browser
 /// rather than from the focus: these answers travel chrome → renderer → browser and can arrive
 /// after the focus has moved.
+/// The input holds the line **without** its prefix — see [`json_for`] — so the prefix goes back on
+/// here, taken from what the model already holds. Nothing else in this file learns that the input
+/// and the line are different strings.
 pub fn on_text_changed(window: u32, text: &str, cursor: Option<usize>) {
-    with_in(window, |cmd| cmd.sync(text, cursor));
+    with_in(window, |cmd| {
+        match cmd.prefix() {
+            Some(first) => {
+                let mut whole = String::with_capacity(text.len() + first.len_utf8());
+                whole.push(first);
+                whole.push_str(text);
+                cmd.sync(&whole, cursor.map(|at| at + first.len_utf16()));
+            }
+            None => cmd.sync(text, cursor),
+        }
+    });
 }
 
 /// The same for the current window — the two debug scripts that stand in for typing, which are
@@ -1309,13 +1322,30 @@ pub fn text_in(window: u32) -> String {
 ///
 /// `rev` is what stops a push triggered by something else from rewriting a half-typed line: the
 /// chrome applies `text` only when the revision is one it has not seen.
+/// **The prefix is pushed apart from the text, and the input never holds it.** `:`, `/` and `?` are
+/// the first character of the line in Rust — `run_text` strips them, `prefix` reads them — but on
+/// screen they were a character sitting where the user's own typing begins. The mode indicator at
+/// the front of the bar says what they said; asked for 2026-08-07.
+///
+/// `/` and `?` are not redundant the way `:` is: all three are one mode, so the pill has to carry
+/// the difference, which is what `prefix` is for here. `bottom.js` turns it into the pill's word.
+///
+/// The cursor moves back with the character, and `on_text_changed` puts the prefix back on the way
+/// in — so the model still holds `:open x` and nothing downstream of it changes.
 pub fn json_for(window: u32) -> String {
     let focus = mode_in(window) == Mode::Command;
     with_in(window, |cmd| {
+        let text = cmd.text();
+        let prefix = cmd.prefix();
+        let shown = match prefix {
+            Some(first) => text[first.len_utf8()..].to_string(),
+            None => text,
+        };
         format!(
-            "{{\"text\":\"{}\",\"cursor\":{},\"rev\":{},\"focus\":{}}}",
-            crate::ipc::json_escape(&cmd.text()),
-            cmd.cursor_utf16(),
+            "{{\"prefix\":\"{}\",\"text\":\"{}\",\"cursor\":{},\"rev\":{},\"focus\":{}}}",
+            prefix.map(String::from).unwrap_or_default(),
+            crate::ipc::json_escape(&shown),
+            cmd.cursor_utf16().saturating_sub(prefix.map_or(0, |c| c.len_utf16())),
             cmd.rev(),
             focus,
         )

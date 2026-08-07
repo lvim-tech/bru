@@ -218,16 +218,40 @@
       // only names with an underscore in them; they are shown with a space
       // because the bar is read, not typed, and `:mode-enter set_mark` is where
       // the underscore belongs.
-      // `statusbar.mode.style`: `full` is the whole word, `short` its first letter — NORMAL
-      // against N. The underscore in `set_mark` and `jump_mark` becomes a space, because the bar
-      // is read rather than typed and `:mode-enter set_mark` is where the underscore belongs.
+      // The mode, at the front of the bar.
+      //
+      // Command mode is three different things — `:` a command, `/` a search
+      // forwards, `?` a search backwards — and the prefix that used to say
+      // which now lives here instead of in the input, where it sat in front of
+      // the user's own typing. The arrow is the direction; the word is the job.
+      //
+      // `statusbar.mode.style`: `full` is the whole word, `short` its initials —
+      // NORMAL against N, SEARCH ▼ against S▼. The arrow survives the short
+      // form, because it is the half that is not guessable from the letter.
+      //
+      // Filled triangles rather than ↑ ↓: at the bar's 13px an arrow's stem is
+      // one pixel wide and the glyph reads as a smudge, which the user saw
+      // immediately. A triangle is solid at any size.
       var modeName = (state.mode || "").replace(/_/g, " ");
-      if (state.modestyle === "short" && modeName) {
-        // The first letter of each word, so `set mark` is `SM` and not `S` — two register modes
-        // that both begin with a letter nothing else uses would otherwise be the same badge.
-        modeName = modeName.split(" ").map(function (word) { return word.charAt(0); }).join("");
+      var arrow = "";
+      if (state.mode === "command") {
+        var prefix = (state.cmdline && state.cmdline.prefix) || ":";
+        if (prefix === "/") {
+          modeName = "search";
+          arrow = " \u25bc";
+        } else if (prefix === "?") {
+          modeName = "search";
+          arrow = " \u25b2";
+        }
       }
-      put("mode", modeName);
+      if (state.modestyle === "short" && modeName) {
+        // The first letter of each word, so `set mark` is `SM` and not `S` —
+        // two register modes that both begin with the same letter would
+        // otherwise be the same badge.
+        modeName = modeName.split(" ").map(function (word) { return word.charAt(0); }).join("");
+        arrow = arrow.replace(" ", "");
+      }
+      put("mode", modeName + arrow);
       put("search", state.search);
       put("url", state.url);
       put("scroll", state.scroll);
