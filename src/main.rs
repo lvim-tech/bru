@@ -15,6 +15,7 @@ mod commands;
 mod completers;
 mod completion;
 mod config;
+mod cookies;
 mod data;
 mod downloads;
 mod editor;

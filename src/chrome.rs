@@ -28,6 +28,9 @@ const CHROME_CSS: &[u8] = include_bytes!("../chrome/chrome.css");
 const TOP_JS: &[u8] = include_bytes!("../chrome/top.js");
 const BOTTOM_JS: &[u8] = include_bytes!("../chrome/bottom.js");
 const COMPLETION_JS: &[u8] = include_bytes!("../chrome/completion.js");
+// --- src/cookies.rs --------------------------------------------------------
+const COOKIES_JS: &[u8] = include_bytes!("../chrome/cookies.js");
+// --- end src/cookies.rs ----------------------------------------------------
 
 /// The theme bru ships with, used until themer has written one to `~/.config/bru/theme.css`.
 ///
@@ -114,6 +117,13 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
             Some(("text/html", crate::settingspage::current_page().into_bytes()))
         }
 // --- end src/settingspage.rs -----------------------------------------------
+// --- src/cookies.rs --------------------------------------------------------
+        // The one generated page here that carries **no data at all**. Cookies come from an
+        // asynchronous visitor and this function runs on the IO thread and must answer now, so what
+        // is served is a shell that asks for its rows over `cefQuery`. See src/cookies.rs.
+        "/cookies" | "/cookies.html" => Some(("text/html", crate::cookies::page().into_bytes())),
+        "/cookies.js" => Some(("text/javascript", COOKIES_JS.to_vec())),
+// --- end src/cookies.rs ----------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
         _ => None,
     }

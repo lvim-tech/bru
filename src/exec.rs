@@ -520,6 +520,12 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::History { bg } => crate::history::show(state, browser, *bg),
 // --- end src/history.rs ----------------------------------------------------
 
+// --- src/cookies.rs --------------------------------------------------------
+        Command::Cookies { filter, bg } => {
+            crate::cookies::show(state, browser, filter.as_deref(), *bg)
+        }
+// --- end src/cookies.rs ----------------------------------------------------
+
 // --- src/settings.rs -------------------------------------------------------
         // `:set` and the 24 `config-cycle` bindings. The `-u` pattern still holds `{url:host}` at
         // this point — `commands::parse` ran at startup, when there was no page to ask — so it is
@@ -802,6 +808,13 @@ pub fn is_live(command: &Command) -> bool {
         | Command::BookmarkList { .. }
         | Command::History { .. } => true,
 // --- end src/history.rs ----------------------------------------------------
+
+// --- src/cookies.rs --------------------------------------------------------
+        // No default binding names it — qutebrowser has no cookie command, and DESIGN.md keeps the
+        // key table 1:1 with qutebrowser's — so this raises no binding count. It is live all the
+        // same: `:cookies` opens the page and the page deletes.
+        Command::Cookies { .. } => true,
+// --- end src/cookies.rs ----------------------------------------------------
 
 // --- src/clip.rs -----------------------------------------------------------
         // All five spellings reach `wl-copy`. `open -- {clipboard}` was already counted live

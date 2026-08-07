@@ -264,6 +264,18 @@ impl BrowserSideHandler for BruQueryHandler {
                 succeed(&callback, "");
             }
 
+            // --- src/cookies.rs -----------------------------------------------------------------
+            // `bru://chrome/cookies` reading the cookie jar and deleting from it. It is below the
+            // `bru://` check on purpose and is the first thing that check has ever had to refuse
+            // for real: everything else here drives bru's own chrome, and this one empties the
+            // browser's cookies. The handler answers the callback later — the cookie visitor is
+            // asynchronous — which is what the message router's contract allows and why it takes
+            // the callback rather than a response.
+            Some("cookies") => {
+                crate::cookies::on_page_query(browser.as_ref(), request, &callback);
+            }
+            // --- end src/cookies.rs -------------------------------------------------------------
+
             // A round trip with no side effect, for proving the router is wired end to end.
             Some("echo") => {
                 succeed(&callback, &json_field(request, "text").unwrap_or_default());

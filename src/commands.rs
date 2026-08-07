@@ -174,6 +174,21 @@ pub enum Command {
     History { bg: bool },
 // --- end src/history.rs ----------------------------------------------------
 
+// --- src/cookies.rs --------------------------------------------------------
+    /// `cookies [-b] [domain]` — open `bru://chrome/cookies`, with the filter box already holding
+    /// `domain` when one is given.
+    ///
+    /// **qutebrowser has no cookie command**, so unlike everything else in this enum there is
+    /// nothing to be 1:1 with and the name is a choice that will be permanent. It is the plural
+    /// noun naming what the page lists, which is what every other page bru and qutebrowser have is
+    /// called — `qute://history` / `:history`, `qute://bookmarks`, `qute://settings`,
+    /// `bru://chrome/help`. `:cookies` opens `bru://chrome/cookies`, and there is no second name to
+    /// remember for deleting because deleting is something you do *on* the page.
+    ///
+    /// A new tab, like `:history` and `:bookmark-list`.
+    Cookies { filter: Option<String>, bg: bool },
+// --- end src/cookies.rs ----------------------------------------------------
+
 // --- src/clip.rs -----------------------------------------------------------
     /// `yank [what] [-s]` — `yy`, `yY`, `yt`, `yT`, `yd`, `yD`, `yp`, `yP`, `ym`, `yM`.
     ///
@@ -1190,6 +1205,19 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         },
         "history" => Command::History { bg: args.any(&["b", "bg"]) },
 // --- end src/history.rs ----------------------------------------------------
+
+// --- src/cookies.rs --------------------------------------------------------
+        // `maxsplit0`, so `:cookies my domain` is one filter rather than two arguments — a domain
+        // cannot hold a space, but a mistyped one can, and losing half of it silently would be
+        // worse than filtering to nothing.
+        "cookies" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            Command::Cookies {
+                filter: args.arg(0).filter(|f| !f.is_empty()).map(str::to_string),
+                bg: args.any(&["b", "bg"]),
+            }
+        }
+// --- end src/cookies.rs ----------------------------------------------------
 
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.

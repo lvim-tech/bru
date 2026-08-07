@@ -518,6 +518,25 @@ wrap_browser_process_handler! {
                 crate::greasemonkey::schedule_probe(&probe, &delays);
             }
             // --- end src/greasemonkey.rs --------------------------------------------------------
+
+            // --- src/cookies.rs -----------------------------------------------------------------
+            // Debug hook, off unless asked for. See cookies::schedule_script — it puts cookies in
+            // the jar, reads them back through the same visitor the page uses, and prints what
+            // `cookies::matches` keeps of them, which is the number `chrome/cookies.js`'s own
+            // filter has to agree with.
+            let script =
+                CefString::from(&command_line.switch_value(Some(&CefString::from("cookies-script"))))
+                    .to_string();
+            if !script.is_empty() {
+                let step_ms = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("cookies-step-ms"))),
+                )
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(800);
+                crate::cookies::schedule_script(&script, step_ms);
+            }
+            // --- end src/cookies.rs -------------------------------------------------------------
         }
 
         fn default_client(&self) -> Option<Client> {

@@ -691,3 +691,170 @@ body[data-view="help"] {
     color: var(--comment);
     opacity: 1;
 }
+
+/* ------------------------------------------------- bru://chrome/cookies
+ *
+ * A tab, not a strip, so it scrolls and its text can be selected — the same
+ * two overrides body[data-view="help"] makes, for the same reason.
+ *
+ * Markup chrome/cookies.js produces inside #rows:
+ *
+ *   <h2>github.com<span class="count">4</span></h2>
+ *   <div class="group">
+ *     <div class="row picked"><a class="x">×</a><span class="name">…</span
+ *       ><span class="value">…</span><span class="path">…</span
+ *       ><span class="flags">…</span><span class="expiry">…</span></div>
+ *   </div>
+ *
+ * Not one colour is written here — see the top of this file. The colour test
+ * in src/chrome.rs reads this block too, which is why the page links this
+ * stylesheet instead of carrying a <style> of its own.
+ */
+
+body[data-view="cookies"] {
+    height: auto;
+    overflow: auto;
+    user-select: text;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+#cookies {
+    max-width: 76rem;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+}
+
+#cookies h1 {
+    margin: 0 0 0.25rem;
+    font-size: 1.6rem;
+    color: var(--completion-category-fg);
+}
+
+#cookies .summary {
+    margin: 0 0 0.75rem;
+    color: var(--comment);
+}
+
+#cookies kbd {
+    padding: 0 0.3em;
+    border: 1px solid var(--completion-border);
+    border-radius: 2px;
+    color: var(--completion-match-fg);
+}
+
+/* The controls sit together on one row so that Tab from the filter box lands
+   on the two buttons in the order they are read in. */
+#controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin: 0 0 0.75rem;
+}
+
+#filter {
+    flex: 1;
+    min-width: 0;
+    padding: 0.3rem 0.5rem;
+    font: inherit;
+    background: var(--statusbar-command-bg);
+    color: var(--statusbar-command-fg);
+    border: 1px solid var(--completion-border);
+    border-radius: 2px;
+}
+
+#filter:focus {
+    outline: none;
+    border-color: var(--completion-item-selected-border-top);
+}
+
+#controls button {
+    padding: 0.3rem 0.7rem;
+    font: inherit;
+    background: var(--completion-even-bg);
+    color: var(--fg);
+    border: 1px solid var(--completion-border);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+#controls button:disabled { opacity: 0.4; cursor: default; }
+
+#controls button:focus { outline: 1px solid var(--completion-item-selected-border-top); }
+
+/* Armed, i.e. one more press deletes everything on the screen. It borrows the
+   error colours the theme already carries for the message line, because that
+   is the vocabulary this desktop already reads as "this one bites". */
+#controls button.armed {
+    background: var(--messages-error-bg);
+    color: var(--messages-error-fg);
+    border-color: var(--messages-error-border);
+}
+
+#cookies h2 {
+    display: flex;
+    justify-content: space-between;
+    margin: 1.5rem 0 0.25rem;
+    font-size: 1rem;
+    color: var(--completion-category-fg);
+    border-bottom: 1px solid var(--completion-category-border-bottom);
+    padding-bottom: 0.25rem;
+}
+
+#cookies h2 .count { color: var(--comment); }
+
+#cookies .row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.15rem 0.5rem;
+}
+
+#cookies .group .row:nth-child(odd)  { background: var(--completion-odd-bg); }
+#cookies .group .row:nth-child(even) { background: var(--completion-even-bg); }
+
+/* The row Down/Up is on. It is the completion table's selected-item vocabulary
+   rather than a new one, so a selection means the same thing everywhere in
+   bru. */
+#cookies .group .row.picked {
+    background: var(--completion-item-selected-bg);
+    color: var(--completion-item-selected-fg);
+    border-top: 1px solid var(--completion-item-selected-border-top);
+    border-bottom: 1px solid var(--completion-item-selected-border-bottom);
+    padding: calc(0.15rem - 1px) 0.5rem;
+}
+
+#cookies .x {
+    width: 1.5ch;
+    flex: none;
+    text-align: center;
+    text-decoration: none;
+    color: var(--completion-category-fg);
+}
+
+#cookies .x:hover { text-decoration: underline; }
+
+#cookies .name {
+    width: 24ch;
+    flex: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--completion-match-fg);
+}
+
+/* The value is the widest and the least interesting: it takes what is left and
+   is clipped rather than wrapped, because a wrapped value would make every row
+   a different height and the list unscannable. */
+#cookies .value {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--comment);
+}
+
+#cookies .path   { width: 12ch; flex: none; overflow: hidden; white-space: nowrap; }
+#cookies .flags  { width: 17ch; flex: none; white-space: nowrap; color: var(--completion-category-fg); }
+#cookies .expiry { width: 11ch; flex: none; text-align: right; white-space: nowrap; color: var(--comment); }
