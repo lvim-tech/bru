@@ -157,6 +157,28 @@ impl BrowserSideHandler for BruQueryHandler {
         log(&format!("query from {url}: {request}"));
 
         match json_field(request, "type").as_deref() {
+            // --- the panel's height ---------------------------------------------------------
+            // What `bottom.js` measured after it drew, which is now the only thing that sizes the
+            // strip. See that file for the flicker this replaced: Rust computing the height from a
+            // row count relaid the view out before the render had crossed to the renderer, so the
+            // panel grew while the words in it were still the previous frame's.
+            Some("height") => {
+                // `json_number_field`, not `json_field`: `px` is a number in the JSON because
+                // `offsetHeight` is one, and the string reader answers `None` for an unquoted
+                // value — which arrived here as a silent 0 and left the panel at 24px.
+                let px = json_number_field(request, "px").unwrap_or(0) as i32;
+                let Some(window) = frame.and_then(|frame| frame.browser()).and_then(|browser| {
+                    let mut browser = browser;
+                    window_of(Some(&mut browser))
+                }) else {
+                    fail(&callback, -9, "a height from a strip that belongs to no window");
+                    return true;
+                };
+                crate::completers::apply_height(window, px);
+                succeed(&callback, "");
+                return true;
+            }
+            // --- end the panel's height -------------------------------------------------------
             Some("ready") => {
                 let view = json_field(request, "view").unwrap_or_default();
                 let Some(frame) = frame else {
@@ -1193,9 +1215,10 @@ fn json_field(src: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Read one *number* field. `cursor` is the only one, and it is a number rather than a string
-/// because `selectionStart` is one — quoting it in the chrome to fit `json_field` would be the tail
-/// wagging the dog.
+/// Read one *number* field. Two use it — `cursor`, because `selectionStart` is a number, and `px`,
+/// because `offsetHeight` is. Quoting either in the chrome to fit [`json_field`] would be the tail
+/// wagging the dog, and reading one *with* `json_field` is a silent zero: it answers `None` for an
+/// unquoted value, which is how the completion panel spent an afternoon 24 pixels tall.
 fn json_number_field(src: &str, key: &str) -> Option<usize> {
     let needle = format!("\"{key}\"");
     let at = src.find(&needle)?;

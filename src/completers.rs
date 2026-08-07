@@ -1094,7 +1094,10 @@ pub fn json_for(window: u32) -> String {
         if let Ok(mut live) = live().lock() {
             *live = Live::default();
         }
-        resize_bar(window, &[]);
+        // No `resize_bar` here any more: `bottom.js` measures `#completion` after it has drawn the
+        // `null` and reports 0 itself. Collapsing the view from here would take the height down
+        // before the table had gone from the screen — the same paint-order fault as growing it did,
+        // in the other direction.
         return "null".to_string();
     }
     let (text, cursor, _) = crate::cmdline::state_for_completion_in(window);
@@ -1106,9 +1109,6 @@ pub fn json_for(window: u32) -> String {
         let json = completion::to_json(&guard.cats, guard.selected);
         (json, std::mem::take(&mut guard.cats))
     };
-    // Outside the lock: the relayout this asks for renders the strip, which pushes, which comes
-    // back here.
-    resize_bar(window, &cats);
     if let Ok(mut guard) = live().lock() {
         guard.cats = cats;
     }
@@ -1125,17 +1125,25 @@ pub fn json_for(window: u32) -> String {
 // The window is named at every step now: the height is stored under it, the strip whose layout is
 // invalidated is that window's, and so is the `Window` handle the relayout is asked of. All three
 // used to mean "whichever window is current", which is not the window a push is for.
-fn resize_bar(window: u32, cats: &[Category]) {
-    const ROW_H: i32 = 20;
-    const MAX_H: i32 = 300;
-
-    let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
-    let wanted = if rows == 0 {
-        0
-    } else {
-        (ROW_H * (rows + cats.len() as i32)).min(MAX_H) + 1
-    };
-
+/// Size one window's bottom strip to the height its chrome has just measured.
+///
+/// **The chrome decides, not this file, and that is the fix for a visible flicker.** This used to
+/// compute the height from a row count and a 20px constant mirroring `chrome.css`'s `--row-h`, and
+/// it did so while the state was being built — so the browser process relaid the view out
+/// immediately while the render was still crossing to the renderer, and the panel grew a frame or
+/// two before the words inside it changed. The mode pill read `normal` at the taller size and then
+/// flipped. Measured 2026-08-07: the *call* order was already push-then-resize; it is the *paint*
+/// order that is the other way round, because an in-process Views relayout beats a cross-process JS
+/// call.
+///
+/// Now `bottom.js` measures `#completion` after it has written the DOM and sends the number here, so
+/// the size and the words travel together. It also leaves the arithmetic in one place — the
+/// document's own layout — rather than in two that have to agree.
+pub fn apply_height(window: u32, px: i32) {
+    // The chrome is a `bru://` page bru serves, but a number crossing a process boundary is still
+    // a number from somewhere else: a negative height would ask CEF for an impossible layout and
+    // an unbounded one would take the page's view to nothing.
+    let wanted = px.clamp(0, 2000);
     let was = crate::window::set_completion_height(window, wanted);
     if was == wanted {
         // Every push reaches here and most leave the height alone; a relayout each time would

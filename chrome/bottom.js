@@ -90,6 +90,40 @@
   // shapes is one silently drawing the wrong thing. This file no longer knows
   // what a category looks like.
   //
+  // --- the panel's height, measured after it is drawn -----------------------
+  //
+  // **The flicker this fixes.** Rust used to work the height out itself, from a
+  // row count and a 20px constant mirroring this stylesheet's --row-h, and it
+  // did it while building the state it was about to push. So the browser
+  // process relaid the view out immediately while the render was still crossing
+  // to the renderer — the panel grew a frame or two before the words in it
+  // changed, and the mode pill read `normal` at the taller size before flipping
+  // to `command` or `search`. Measured 2026-08-07: two pushes carrying
+  // mode=command, then `bru[bar]: window 0 asks for 325 px`. The *call* order
+  // was already push-then-resize; it is the *paint* order that is the other way
+  // round, because an in-process Views relayout beats a cross-process JS call.
+  //
+  // So the height now travels the same way and at the same speed as the words:
+  // measured here, after the DOM is written, and Rust applies what it is told.
+  // That also leaves the arithmetic in one place — this document's own layout —
+  // rather than in two that have to agree.
+  //
+  // Only on a change: a push happens for a scroll report and for a title, and a
+  // query per push would be a round trip per keystroke for an answer that
+  // almost never moves.
+  var reportedHeight = null;
+
+  function reportHeight() {
+    var panel = document.getElementById("completion");
+    // offsetHeight is 0 when it is display:none, which is what "closed" is.
+    var px = panel ? panel.offsetHeight : 0;
+    if (px === reportedHeight) {
+      return;
+    }
+    reportedHeight = px;
+    query({ type: "height", px: px });
+  }
+
   // Guarded because bottom.html gains its <script src="completion.js"> at merge:
   // until then the bar still renders, with no completion.
   function renderCompletion(categories) {
@@ -365,6 +399,9 @@
 
       renderMessage(state.message);
       renderCompletion(state.completion);
+      // Last, and after the DOM is written: this is what sizes the view, and it
+      // has to measure what was just drawn rather than what is about to be.
+      reportHeight();
       // --- src/prompt.rs ----------------------------------------------------
       // The open question, or null. prompt.js owns every string in it, because
       // every string in it may have come from a web page.
