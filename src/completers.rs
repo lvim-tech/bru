@@ -81,6 +81,42 @@ enum Which {
     Quickmark,
     /// `:bookmark-load` and friends — a URL is what the command takes.
     Bookmark,
+    /// The option argument of `:set` and the six `config-*` commands that take one
+    /// (`configmodel.py:13-47`). [`Only`] is which of qutebrowser's four option models this is.
+    Setting(Only),
+    /// `:set <option> <value>` and `:config-cycle <option> <values…>` — `configmodel.py:66-94`.
+    /// Which values are offered depends on the option named in the argument before this one.
+    SettingValue,
+    /// `:config-dict-add <option> <key>` and `:config-dict-remove <option> <key>`.
+    ///
+    /// **bru's own, with no qutebrowser counterpart**: `configcommands.py:310,370` declare a
+    /// completion for the *option* of both and none for the key. The key is finite and knowable —
+    /// `statusbar.mode.labels` has exactly the twelve labels the pill can draw and refuses a
+    /// thirteenth — and a `:config-dict-remove url.searchengines <Tab>` that cannot name the nine
+    /// engines is a completion that stops one word short of the word you needed.
+    DictKey,
+    /// `:config-list-add <option> <value>` and `:config-list-remove <option> <value>`, for the
+    /// same reason as [`Which::DictKey`]: the entries a list holds are a list.
+    ListEntry,
+}
+
+/// Which settings an option model offers — `configmodel.py`'s four, less the customized one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Only {
+    /// `configmodel.option` — all of them. `:set`, `:config-cycle`, and `:config-unset`.
+    ///
+    /// `:config-unset` is qutebrowser's `customized_option`, which lists only the options that
+    /// have been changed (`configcommands.py:235`), and bru offers all of them instead. The store
+    /// knows which have moved — `Settings::diff` is built out of exactly that — but it answers in
+    /// `config.lua` syntax rather than in names, and `Settings::entries` is private to
+    /// `settings.rs`, which is another workstream's file. The cost of the wider list is that
+    /// unsetting something already at its default does nothing, which is what `:config-unset`
+    /// means anyway.
+    Any,
+    /// `configmodel.dict_option` — the two dictionaries, for the two `config-dict-*` commands.
+    Dicts,
+    /// `configmodel.list_option` — the list settings, for the two `config-list-*` commands.
+    Lists,
 }
 
 /// One row of the table that turns a command into a model.
@@ -122,6 +158,25 @@ const SPECS: &[Spec] = &[
     Spec { name: "quickmark-del", argpos: 0, which: Which::Quickmark, rest_from: None, vararg: false },
     Spec { name: "bookmark-load", argpos: 0, which: Which::Bookmark, rest_from: None, vararg: false },
     Spec { name: "bookmark-del", argpos: 0, which: Which::Bookmark, rest_from: None, vararg: false },
+
+    // --- the settings, `configmodel.py` ---------------------------------------------------------
+    // `:set` takes an option and a value, and neither is the rest of the line: qutebrowser
+    // registers it with no `maxsplit` (`configcommands.py:69`), so a value with a space in it is
+    // quoted rather than swallowed. `:config-cycle` is `*values`, which is `vararg`.
+    Spec { name: "set", argpos: 0, which: Which::Setting(Only::Any), rest_from: None, vararg: false },
+    Spec { name: "set", argpos: 1, which: Which::SettingValue, rest_from: None, vararg: false },
+    Spec { name: "config-cycle", argpos: 0, which: Which::Setting(Only::Any), rest_from: None, vararg: false },
+    Spec { name: "config-cycle", argpos: 1, which: Which::SettingValue, rest_from: None, vararg: true },
+    Spec { name: "config-unset", argpos: 0, which: Which::Setting(Only::Any), rest_from: None, vararg: false },
+    Spec { name: "config-dict-add", argpos: 0, which: Which::Setting(Only::Dicts), rest_from: None, vararg: false },
+    Spec { name: "config-dict-add", argpos: 1, which: Which::DictKey, rest_from: None, vararg: false },
+    Spec { name: "config-dict-remove", argpos: 0, which: Which::Setting(Only::Dicts), rest_from: None, vararg: false },
+    Spec { name: "config-dict-remove", argpos: 1, which: Which::DictKey, rest_from: None, vararg: false },
+    Spec { name: "config-list-add", argpos: 0, which: Which::Setting(Only::Lists), rest_from: None, vararg: false },
+    Spec { name: "config-list-add", argpos: 1, which: Which::ListEntry, rest_from: None, vararg: false },
+    Spec { name: "config-list-remove", argpos: 0, which: Which::Setting(Only::Lists), rest_from: None, vararg: false },
+    Spec { name: "config-list-remove", argpos: 1, which: Which::ListEntry, rest_from: None, vararg: false },
+    // --- end the settings -----------------------------------------------------------------------
 ];
 
 /// The command line cut into the part being completed and the parts around it.
@@ -160,6 +215,35 @@ impl Partition {
             out.push_str(&self.after.join(" "));
         }
         out
+    }
+
+    /// The first positional argument, which for every command in [`SPECS`] that has a second one is
+    /// the option being set. `configmodel.value(optname, …)` is handed it the same way — from the
+    /// parts before the cursor (`completer.py:236-241`).
+    ///
+    /// It skips flags by their leading `-` and therefore mistakes the *value* of `-u` for a
+    /// positional, exactly as `_get_new_completion` does — see the note on `argpos` in
+    /// [`partition`]. `:set -u https://example.com/ content.images ` completes the values of
+    /// nothing, rather than of `content.images`.
+    fn option(&self) -> Option<&str> {
+        self.before
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .find(|part| !part.starts_with('-'))
+    }
+
+    /// The arguments already typed after the option, which `configmodel.value` takes as `*values`
+    /// and leaves out of what it offers (`configmodel.py:88,92`). One value per `:set`; a list of
+    /// them per `:config-cycle`.
+    fn values_before(&self) -> Vec<&str> {
+        self.before
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .filter(|part| !part.starts_with('-'))
+            .skip(1)
+            .collect()
     }
 }
 
@@ -425,12 +509,236 @@ fn command_rows() -> Vec<Vec<String>> {
     rows
 }
 
+// -----------------------------------------------------------------------------------------------
+// The settings, `configmodel.py`
+// -----------------------------------------------------------------------------------------------
+
+/// `configmodel.py:60` — `column_widths=(20, 70, 10)`: the name, what it takes, what it is.
+const OPTION_WIDTHS: &[u8] = &[20, 70, 10];
+
+/// `configmodel.py:73` — `column_widths=(30, 70, 0)`.
+const VALUE_WIDTHS: &[u8] = &[30, 70];
+
+/// What a setting takes, in one line.
+///
+/// **This is the same question `settingspage::kind` answers, and it is written twice on purpose.**
+/// That module says why in its own words about `escape`: "duplicated rather than shared because
+/// `help.rs` belongs to another workstream and a twelve-line pure function is a cheaper thing to
+/// repeat than a cross-module dependency is to merge" — and `settings.rs` had three workstreams'
+/// uncommitted edits in it on the day this was written, from two other workstreams at once, and one
+/// of them was adding a [`Kind`].
+///
+/// **Which is why the last arm here is `_` and the settings page's is not.** The exhaustive match —
+/// the one a new kind cannot get past without somebody deciding what it takes — belongs in the
+/// module that owns the page settings are read on, and it is there. Here a new kind falls through
+/// to `text`, which is not a guess: `:set` takes its value as a string whatever the kind parses it
+/// into, so "text" is true of every kind bru could add and merely less than the whole truth about
+/// some of them. A short answer in a completion cell costs a reader one word; a build that cannot
+/// be run until two workstreams have merged costs an afternoon.
+fn takes(kind: crate::settings::Kind) -> String {
+    use crate::settings::Kind;
+    match kind {
+        Kind::Bool => "true or false".to_string(),
+        Kind::Choice(choices) => choices.join(" or "),
+        Kind::Dict(shape) if shape.open_keys => "a dictionary, any key".to_string(),
+        Kind::Dict(_) => "a dictionary, fixed keys".to_string(),
+        Kind::List(_) => "a list".to_string(),
+        Kind::Int(shape) => format!("a whole number, {} to {} {}", shape.min, shape.max, shape.unit),
+        Kind::Chars => "at least two different characters, no spaces".to_string(),
+        // `Kind::Text`, and anything added after this was written.
+        _ => "text".to_string(),
+    }
+}
+
+/// What a setting is set to, as the option model's third column.
+///
+/// bru's own store, not Chromium's, and that is qutebrowser's choice too:
+/// `info.config.get_str(opt.name)` is the config's value and not what the engine is enforcing
+/// (`configmodel.py:61`). It is also the only one available here — `chromium_value` has to be
+/// called on the UI thread and needs a URL to be asked about, and the completion has neither to
+/// hand. `Settings::get` is the same reader `:set <option>?` prints through.
+///
+/// A [`crate::settings::Scopes::UrlOnly`] setting has no global value at all and `get` says so
+/// with an error; what is in force at a URL with no rule written for it is bru's own default, so
+/// that is what the column shows.
+fn in_force(store: &crate::settings::Settings, def: &crate::settings::Def) -> String {
+    match store.get(def.name, None) {
+        Ok(Some(value)) => value.to_string(),
+        _ => def.default.unwrap_or("unset").to_string(),
+    }
+}
+
+/// The first sentence of a refusal, which is as much of one as a completion row can hold.
+///
+/// The whole reason is prose — `content.plugins`'s is 90 words — and it is printed in full on
+/// `bru://chrome/settings` and by `:set` itself when the name is typed. What a row here has to do
+/// is stop the reader typing the rest of the name, and the first sentence does that.
+fn first_sentence(why: &str) -> String {
+    match why.split_once(". ") {
+        Some((first, _)) => format!("{first}."),
+        None => why.to_string(),
+    }
+}
+
+/// `:set <option> <value>` — what the value may be.
+///
+/// `configmodel.value` (`configmodel.py:66-94`), which is two categories and not one: what the
+/// option is set to now and what bru ships it as, then the values the *kind* allows. Both drop a
+/// value that is already on the command line.
+///
+/// **A number offers no completions and this says so rather than inventing a range.** `Kind::Int`
+/// carries a minimum and a maximum and could spell out every value between them; `messages.timeout`
+/// is 0 to 86,400,000. What it gets instead is the Current/Default category, which is the two
+/// numbers anyone actually wants to type — the one it is on and the one to put it back to.
+/// `Kind::Text` and `Kind::Chars` are the same. `qutebrowser`'s `typ.complete()` answers `None` for
+/// all three.
+///
+/// **A dict or a list offers nothing at all, not even the current value.** `:set` takes one value
+/// and those two are a table; the current "value" of `url.searchengines` is the string `9 entries`,
+/// which is a count and not something to put in a command line. The commands that *do* change one
+/// pair at a time are `:config-dict-add` and friends, and their arguments are completed above.
+fn setting_values(option: Option<&str>, already: &[&str], pattern: &str) -> Vec<Category> {
+    use crate::settings::Kind;
+
+    let Some(def) = option.and_then(crate::settings::def) else {
+        return Vec::new();
+    };
+    if matches!(def.kind, Kind::Dict(_) | Kind::List(_)) {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(2);
+
+    let store = crate::settings::snapshot();
+    let current = in_force(&store, def);
+    let default = def.default.unwrap_or_default().to_string();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(2);
+    if !already.contains(&current.as_str()) && !current.is_empty() {
+        rows.push(vec![current.clone(), "Current value".to_string()]);
+    }
+    if !already.contains(&default.as_str()) && !default.is_empty() && default != current {
+        rows.push(vec![default, "Default value".to_string()]);
+    }
+    if let Some(cat) = completion::list_category("Current/Default", VALUE_WIDTHS, rows, pattern) {
+        out.push(cat);
+    }
+
+    let values: &[&str] = match def.kind {
+        // `configtypes.Bool.complete()` — the two canonical spellings, though the parser also takes
+        // yes/no/on/off/1/0.
+        Kind::Bool => &["true", "false"],
+        Kind::Choice(choices) => choices,
+        // Every other kind, including any added after this was written: a value it can be told is
+        // not one of a set anybody can list. `Kind::Int`'s range is 2^64 wide and `Kind::Text`'s is
+        // every string, and `typ.complete()` answers `None` for both. What is left is the
+        // Current/Default category above, which is the two values a person actually types.
+        _ => &[],
+    };
+    let rows: Vec<Vec<String>> = values
+        .iter()
+        .filter(|value| !already.contains(*value))
+        .map(|value| vec![value.to_string(), String::new()])
+        .collect();
+    if let Some(cat) = completion::list_category_max(
+        "Completions",
+        VALUE_WIDTHS,
+        rows,
+        pattern,
+        usize::MAX,
+    ) {
+        out.push(cat);
+    }
+    out
+}
+
 fn build(part: &Partition) -> Vec<Category> {
-    build_which(part.which, &part.center)
+    match part.which {
+        Which::SettingValue => setting_values(part.option(), &part.values_before(), &part.center),
+        Which::DictKey => {
+            let rows = part
+                .option()
+                .map(crate::settings::dict_of)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, value)| vec![key, value])
+                .collect();
+            completion::list_category_max("Keys", VALUE_WIDTHS, rows, &part.center, usize::MAX)
+                .into_iter()
+                .collect()
+        }
+        Which::ListEntry => {
+            let rows = part
+                .option()
+                .map(crate::settings::list_of)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| vec![entry])
+                .collect();
+            completion::list_category_max("Entries", &[100], rows, &part.center, usize::MAX)
+                .into_iter()
+                .collect()
+        }
+        which => build_which(which, &part.center),
+    }
 }
 
 fn build_which(which: Which, pattern: &str) -> Vec<Category> {
     match which {
+        // **Two categories, because a refused setting is not a setting.** The names in
+        // `settings::REFUSED` are ones bru will not implement and has a measured reason for; `:set`
+        // answers one with that reason instead of a value. Leaving them out of the completion would
+        // make `:set content.pl<Tab>` answer with silence, which reads as "bru forgot" — and the
+        // reason is the one thing the reader of a name that does nothing needs. Leaving them in the
+        // *same* category would be worse: it would offer them as things to set.
+        //
+        // This is the same rule the command model follows one screen up, applied to the other
+        // table: what bru knows a name for is offered, and a name that does nothing says so where
+        // it is offered.
+        Which::Setting(only) => {
+            let store = crate::settings::snapshot();
+            let rows: Vec<Vec<String>> = crate::settings::SETTINGS
+                .iter()
+                .filter(|def| match only {
+                    Only::Any => true,
+                    Only::Dicts => matches!(def.kind, crate::settings::Kind::Dict(_)),
+                    Only::Lists => matches!(def.kind, crate::settings::Kind::List(_)),
+                })
+                .map(|def| {
+                    vec![def.name.to_string(), takes(def.kind), in_force(&store, def)]
+                })
+                .collect();
+            let mut out = Vec::with_capacity(2);
+            if let Some(cat) =
+                completion::list_category_max("Settings", OPTION_WIDTHS, rows, pattern, usize::MAX)
+            {
+                out.push(cat);
+            }
+            // Only where every setting is on offer: `:config-dict-add` takes a dictionary, and none
+            // of the refused names is one, so listing them under it would be listing them as
+            // dictionaries.
+            if only == Only::Any {
+                let rows: Vec<Vec<String>> = crate::settings::REFUSED
+                    .iter()
+                    .map(|(name, why)| {
+                        vec![name.to_string(), first_sentence(why), "refused".to_string()]
+                    })
+                    .collect();
+                if let Some(cat) = completion::list_category_max(
+                    "Refused",
+                    OPTION_WIDTHS,
+                    rows,
+                    pattern,
+                    usize::MAX,
+                ) {
+                    out.push(cat);
+                }
+            }
+            out
+        }
+
+        // Answered by `build`, which has the option named in the argument before this one.
+        Which::SettingValue | Which::DictKey | Which::ListEntry => Vec::new(),
+
         // **Uncapped, unlike every other category here.** `completion::MAX_ITEMS` bounds a source
         // that has no bound of its own — the history table grows with every page load — and 25 of
         // those is "the newest 25 that matched", which is the answer. The command list is 166 rows
@@ -1367,6 +1675,163 @@ mod tests {
         assert_eq!(partition(":tab-focus 1", 12).unwrap().center, "1");
         // And in the gap after it, which is a second argument nothing claims.
         assert!(partition(":tab-focus 1 ", 13).is_none());
+    }
+
+    // ---- the settings ----
+
+    #[test]
+    fn set_completes_its_option_and_then_that_options_values() {
+        // Two models on one command, chosen by which argument the cursor is in.
+        assert_eq!(part(":set ").unwrap().which, Which::Setting(Only::Any));
+        let value = part(":set scrollbar.width ").unwrap();
+        assert_eq!(value.which, Which::SettingValue);
+        assert_eq!(value.option(), Some("scrollbar.width"));
+        // The option is still the option after a flag, and `-p` stays on the line.
+        let flagged = part(":set -p statusbar.mode.style ").unwrap();
+        assert_eq!(flagged.which, Which::SettingValue);
+        assert_eq!(flagged.option(), Some("statusbar.mode.style"));
+        assert_eq!(flagged.line_with("short"), ":set -p statusbar.mode.style short");
+    }
+
+    #[test]
+    fn the_option_model_lists_every_setting_with_what_it_takes_and_what_it_is() {
+        let cats = build_which(Which::Setting(Only::Any), "");
+        assert_eq!(
+            cats.iter().map(|cat| cat.name).collect::<Vec<_>>(),
+            ["Settings", "Refused"]
+        );
+        assert_eq!(cats[0].items.len(), crate::settings::SETTINGS.len());
+        assert_eq!(cats[1].items.len(), crate::settings::REFUSED.len());
+
+        let row = |name: &str| {
+            cats[0]
+                .items
+                .iter()
+                .find(|item| item.cols[0] == name)
+                .unwrap_or_else(|| panic!("no row for {name}"))
+                .cols
+                .clone()
+        };
+        // A choice prints its choices; a boolean says so; a number carries its range and unit.
+        assert_eq!(row("statusbar.mode.style")[1], "full or short");
+        assert_eq!(row("statusbar.mode.style")[2], "full");
+        assert_eq!(row("url.open_base_url")[1], "true or false");
+        assert_eq!(row("url.open_base_url")[2], "true");
+        assert_eq!(row("messages.timeout")[1], "a whole number, 0 to 86400000 milliseconds");
+        assert_eq!(row("messages.timeout")[2], "3000");
+        // A dictionary's value column is a count, because a dict is not one line — the row that
+        // shows the pairs is `bru://chrome/settings`'s.
+        assert_eq!(row("url.searchengines")[1], "a dictionary, any key");
+        assert_eq!(row("url.searchengines")[2], "9 entries");
+        // A setting that can only be written per URL still shows what is in force where no rule has
+        // been written, which is bru's own default.
+        assert_eq!(row("content.javascript.enabled")[2], "true");
+
+        // A refused name is offered with its reason and never as something to set.
+        let refused = &cats[1].items.iter().find(|i| i.cols[0] == "content.plugins").unwrap().cols;
+        assert_eq!(refused[1], "Chromium 151 has nothing behind this name.");
+        assert_eq!(refused[2], "refused");
+    }
+
+    #[test]
+    fn the_dict_and_list_commands_are_offered_only_the_options_they_work_on() {
+        let dicts = build_which(Which::Setting(Only::Dicts), "");
+        let names: Vec<&str> = dicts[0].items.iter().map(|i| i.cols[0].as_str()).collect();
+        assert_eq!(names, ["statusbar.mode.labels", "url.searchengines"]);
+        // No Refused category here: none of the refused names is a dictionary, so offering them
+        // under `:config-dict-add` would be offering them as dictionaries.
+        assert_eq!(dicts.len(), 1);
+
+        let lists = build_which(Which::Setting(Only::Lists), "");
+        assert!(
+            lists[0].items.iter().all(|item| matches!(
+                crate::settings::def(&item.cols[0]).map(|def| def.kind),
+                Some(crate::settings::Kind::List(_))
+            )),
+            "a non-list is offered to :config-list-add"
+        );
+        assert!(lists[0].items.iter().any(|item| item.cols[0] == "zoom.levels"));
+    }
+
+    #[test]
+    fn what_a_value_may_be_depends_on_the_option_named_before_it() {
+        let names = |cats: &[Category]| -> Vec<(String, Vec<String>)> {
+            cats.iter()
+                .map(|cat| {
+                    (
+                        cat.name.to_string(),
+                        cat.items.iter().map(|i| i.cols[0].clone()).collect(),
+                    )
+                })
+                .collect()
+        };
+
+        // A boolean offers the two spellings, and the current and default value above them.
+        assert_eq!(
+            names(&setting_values(Some("url.open_base_url"), &[], "")),
+            [
+                ("Current/Default".to_string(), vec!["true".to_string()]),
+                ("Completions".to_string(), vec!["true".to_string(), "false".to_string()]),
+            ]
+        );
+        // A choice offers its list, in the order `config-cycle` walks it.
+        assert_eq!(
+            names(&setting_values(Some("content.notifications.enabled"), &[], ""))[1].1,
+            ["true", "false", "ask"]
+        );
+        // A number offers no completions at all — only what it is and what to put it back to.
+        assert_eq!(
+            names(&setting_values(Some("messages.timeout"), &[], "")),
+            [("Current/Default".to_string(), vec!["3000".to_string()])]
+        );
+        // Free text is the same.
+        assert_eq!(names(&setting_values(Some("hints.chars"), &[], "")).len(), 1);
+        // A dict and a list are not a single value, so there is nothing to offer.
+        assert!(setting_values(Some("url.searchengines"), &[], "").is_empty());
+        assert!(setting_values(Some("zoom.levels"), &[], "").is_empty());
+        // An option bru has never heard of, which is what a typo is.
+        assert!(setting_values(Some("no.such.setting"), &[], "").is_empty());
+        assert!(setting_values(None, &[], "").is_empty());
+    }
+
+    #[test]
+    fn a_value_already_on_the_line_is_not_offered_again() {
+        // `configmodel.py:88,92` — a three-valued option with two of them already typed has one
+        // left to offer, and neither of the two it has.
+        let cats = setting_values(Some("content.notifications.enabled"), &["true", "false"], "");
+        let offered: Vec<String> = cats
+            .iter()
+            .flat_map(|cat| cat.items.iter().map(|i| i.cols[0].clone()))
+            .collect();
+        // Twice, and that is `configmodel.value`'s own shape rather than an oversight: the two
+        // categories answer different questions — "what is it now" and "what may it be" — and only
+        // the second is filtered by what is already typed (`configmodel.py:92`). The first is
+        // filtered too, and `ask` survives it because `ask` is not one of the two typed values.
+        assert_eq!(offered, ["ask", "ask"]);
+        // And that is what the command line produces, not only what the helper does.
+        let typed = part(":config-cycle content.notifications.enabled true false ").unwrap();
+        assert_eq!(typed.which, Which::SettingValue);
+        assert_eq!(typed.option(), Some("content.notifications.enabled"));
+        assert_eq!(typed.values_before(), ["true", "false"]);
+        // `*values` means every position after the first answers the same model.
+        assert_eq!(
+            part(":config-cycle content.notifications.enabled true ").unwrap().which,
+            Which::SettingValue
+        );
+    }
+
+    #[test]
+    fn a_dicts_keys_and_a_lists_entries_are_offered_to_the_commands_that_take_them() {
+        let keys = build(&part(":config-dict-remove url.searchengines ").unwrap());
+        let names: Vec<&str> = keys[0].items.iter().map(|i| i.cols[0].as_str()).collect();
+        assert!(names.contains(&"aw"), "{names:?}");
+        assert_eq!(names.len(), crate::open::DEFAULT_ENGINES.len());
+        // The template is beside the key, which is what tells two engines apart.
+        assert!(keys[0].items[0].cols[1].contains("{}"));
+
+        let entries = build(&part(":config-list-remove zoom.levels ").unwrap());
+        let names: Vec<&str> = entries[0].items.iter().map(|i| i.cols[0].as_str()).collect();
+        assert!(names.contains(&"100%"), "{names:?}");
     }
 
     /// `rest_from` is the command's `maxsplit` and not one argument's, so two rows for one command
