@@ -207,8 +207,11 @@ body[data-view="bottom"] {
        the width of the word in it, the command line's column is what absorbs
        the slack, and the status fields keep the right-hand end. */
     grid-template-columns: auto minmax(0, 1fr) minmax(0, auto);
-    background: var(--statusbar-normal-bg);
-    color: var(--statusbar-normal-fg);
+    /* The bar's own pair, not normal mode's. Those were the same variable until
+       the pills were aligned with the statusline, which made
+       `--statusbar-normal-bg` green — and the whole strip went green with it. */
+    background: var(--statusbar-bg);
+    color: var(--statusbar-fg);
 }
 
 /* In command mode the row belongs to the command line, and the status group

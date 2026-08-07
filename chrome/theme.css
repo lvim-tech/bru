@@ -109,6 +109,14 @@
     --prompts-selected-bg: var(--bg-light);
 
     /* c.colors.statusbar.* */
+    /* The bar itself. Its own pair, because the mode pairs below are the
+       *pill's* and normal's is no longer the bar's: aligning the pills with the
+       statusline made `--statusbar-normal-bg` green, and anything still drawing
+       the bar with it turned the whole strip green. A variable that two things
+       read is a variable one of them will one day repaint by accident. */
+    --statusbar-bg: var(--bg);
+    --statusbar-fg: var(--ui-fg);
+
     /* **The same pills as this user's neovim statusline.** `lvim-hud`'s
        `chrome/init.lua:98-103` paints the mode as a coloured pill — normal
        green, insert red, visual orange, command purple, replace cyan, terminal

@@ -195,6 +195,9 @@ fn kind(kind: Kind) -> &'static str {
     match kind {
         Kind::Bool => "true or false",
         Kind::Text => "text",
+        // Leaked as a `&'static str` because this returns one and the list is compiled in: one
+        // allocation per settings-page render, of a string that would have been a literal anyway.
+        Kind::Choice(choices) => Box::leak(choices.join(" or ").into_boxed_str()),
     }
 }
 
