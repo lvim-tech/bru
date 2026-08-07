@@ -220,12 +220,17 @@ mod tests {
         // The state is still reachable, and still rendered — a `config.lua` may name a command
         // qutebrowser has and bru has not built. Without this the branch would be untested the
         // moment the defaults stopped using it.
+        //
+        // It was `click-element id foo` until `src/utilcmds.rs` implemented that command. The
+        // stand-in is a `debug-*` command on purpose: qutebrowser's debug commands are the one
+        // group bru has decided not to port at all, so this example cannot go live under someone
+        // else's milestone the way the last one did.
         let mut b = bindings();
-        b.bind("normal", "ZW", "click-element id foo").expect("a valid binding");
+        b.bind("normal", "ZW", "debug-dump-page /tmp/x").expect("a valid binding");
         let html = page(&b);
-        assert_eq!(State::of("click-element id foo"), State::NotYet);
+        assert_eq!(State::of("debug-dump-page /tmp/x"), State::NotYet);
         assert!(html.contains(
-            r#"<tr class="todo"><td class="keys">ZW</td><td class="cmd">click-element id foo</td><td class="state">not yet</td></tr>"#
+            r#"<tr class="todo"><td class="keys">ZW</td><td class="cmd">debug-dump-page /tmp/x</td><td class="state">not yet</td></tr>"#
         ));
     }
 

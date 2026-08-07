@@ -47,6 +47,18 @@ impl Level {
             Level::Error => "error",
         }
     }
+
+// --- src/utilcmds.rs -------------------------------------------------------
+    /// How severe, as a number, so `:messages warning` can mean "this and worse". The order is
+    /// `log.LOG_LEVELS`', which is Python's `logging`'s, which is everyone's.
+    pub fn severity(self) -> u8 {
+        match self {
+            Level::Info => 0,
+            Level::Warning => 1,
+            Level::Error => 2,
+        }
+    }
+// --- end src/utilcmds.rs ---------------------------------------------------
 }
 
 struct Shown {
@@ -104,6 +116,11 @@ pub fn show(level: Level, text: &str) {
     if let Ok(mut shown) = shown().lock() {
         *shown = Some(Shown { level, text: to_one_line(text) });
     }
+// --- src/utilcmds.rs -------------------------------------------------------
+    // And into the log `:messages` shows. The bar keeps one line for three seconds; this is the
+    // only place the other ones survive.
+    remember(level, text);
+// --- end src/utilcmds.rs ---------------------------------------------------
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     crate::ipc::push_bar();
 
@@ -139,6 +156,60 @@ pub fn json() -> String {
         None => "null".to_string(),
     }
 }
+
+// --- src/utilcmds.rs -------------------------------------------------------
+// The log behind `:messages`.
+//
+// The head of this file says a log page is "deliberately *not* here", and that was right when the
+// alternative was a second chrome document and a ring buffer bought for a bar that says "yanked".
+// `:messages` is qutebrowser's own command and the page is generated at request time from the same
+// `bru://` scheme the help page uses, so what it costs is this buffer: a bounded `Vec` written once
+// per message, off the key path, and never read unless the command is typed.
+
+/// How many messages are kept. qutebrowser's `messages.limit` — 100 by default
+/// (configdata.yml:2044), the same number and for the same reason: the page is read by a person.
+const LOG_LIMIT: usize = 100;
+
+/// One message that was said, with the second it was said in.
+pub struct Logged {
+    pub level: Level,
+    pub text: String,
+    /// Seconds since the epoch. **Not a formatted time**, because bru has no date crate and nothing
+    /// in the build knows this machine's timezone off the UI thread — the page turns it into a local
+    /// clock time in one line of script. See `utilcmds::messages_page`.
+    pub at: i64,
+}
+
+fn log() -> &'static Mutex<Vec<Logged>> {
+    static LOG: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
+    &LOG
+}
+
+fn remember(level: Level, text: &str) {
+    let Ok(mut log) = log().lock() else {
+        return;
+    };
+    if log.len() >= LOG_LIMIT {
+        log.remove(0);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0);
+    log.push(Logged { level, text: to_one_line(text), at });
+}
+
+/// Everything said at `minimum` or above, oldest first — what `:messages [level]` shows.
+pub fn logged(minimum: Level) -> Vec<Logged> {
+    let Ok(log) = log().lock() else {
+        return Vec::new();
+    };
+    log.iter()
+        .filter(|entry| entry.level.severity() >= minimum.severity())
+        .map(|entry| Logged { level: entry.level, text: entry.text.clone(), at: entry.at })
+        .collect()
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
 
 /// One line, however many the caller had. A message is one row of a 24px bar; a newline in it would
 /// either be swallowed by the layout or push the bar's height around, and the second is worse.

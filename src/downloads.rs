@@ -784,6 +784,39 @@ pub fn clear() {
     crate::ipc::set_download(summary());
 }
 
+// --- src/utilcmds.rs -------------------------------------------------------
+/// `:download-remove [--all]` — the last, or the [count]th, off the list (`downloads.py:1240-1262`).
+///
+/// The overlap with `:download-clear` is qutebrowser's and is worth keeping: `--all` is *the same
+/// call*, and the singular form is the one thing `clear` cannot do — take one finished download off
+/// the list and leave the rest. Neither touches the file; that is `:download-delete`.
+///
+/// A download that is still running is refused by name rather than cancelled, because "remove" and
+/// "cancel" are two different commands and the list is the only record that it is running at all.
+pub fn remove(count: Option<u32>, all: bool) {
+    if all {
+        clear();
+        return;
+    }
+    let mut list = downloads().lock().expect("downloads mutex poisoned");
+    let Some(at) = index_for(count, list.len()) else {
+        crate::message::error("there is no download to remove");
+        return;
+    };
+    if !list[at].state.done() {
+        let which = count.unwrap_or(list.len() as u32);
+        drop(list);
+        crate::message::error(&format!("Download {which} is not done!"));
+        return;
+    }
+    let name = list[at].name();
+    list.remove(at);
+    drop(list);
+    debug(&format!("download-remove {name} -> {}", report_line()));
+    crate::ipc::set_download(summary());
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
+
 /// `:download-open [cmdline] [-d]`.
 ///
 /// With no command it is the system default, `xdg-open`. qutebrowser's setting for this is

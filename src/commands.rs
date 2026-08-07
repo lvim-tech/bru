@@ -376,10 +376,104 @@ pub enum Command {
     SettingsPage,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
+// --- src/utilcmds.rs -------------------------------------------------------
+    /// `tab-select [[win-id/]index]` — what `gt` prefills. The argument is left as a string because
+    /// it has two shapes that cannot be told apart here: `1/2` is an address and `rust` is a
+    /// pattern, and which tabs exist is not a parse-time question.
+    TabSelect { index: Option<String> },
+    /// `tab-take [win-id/]index [--keep]` — the other end of `gD`.
+    TabTake { index: String, keep: bool },
+    /// `window-only` — close every window except this one.
+    WindowOnly,
+    /// `screenshot [--rect WxH+X+Y] [--force] <filename>`.
+    Screenshot { filename: String, rect: Option<String>, force: bool },
+    /// `jseval [--file] [--url] [--quiet] <js>`.
+    ///
+    /// `--file` and `--url` are read at *run* time, not here: a `config.lua` binding a `:jseval
+    /// --file x.js` should not fail to load because the file is missing today.
+    JsEval { code: String, file: bool, url: bool, quiet: bool },
+    /// `edit-url [-t|-b|-w] [url]` — a URL through `$EDITOR`, opened if it changed.
+    EditUrl { url: Option<String>, tab: bool, bg: bool, window: bool },
+    /// `edit-command [--run]`, `cmd-edit` since 2.0 — the command line through `$EDITOR`.
+    EditCommand { run: bool },
+    /// `quickmark-add <url> <name>` — the only quickmark command that names both.
+    QuickmarkAdd { url: String, name: String },
+    /// `history-clear [--force]` — bru's visit log and the completion built from it.
+    HistoryClear { force: bool },
+    /// `later <duration> <command>`, `cmd-later` since 2.0.
+    Later { ms: i64, command: Box<Command> },
+    /// `repeat <times> <command>`, `cmd-repeat` since 2.0. A count multiplies `times`.
+    Repeat { times: u32, command: Box<Command> },
+    /// `run-with-count <count> <command>`, `cmd-run-with-count` since 2.0.
+    RunWithCount { count: u32, command: Box<Command> },
+    /// `restart` — save the tabs, start bru again, and go.
+    Restart,
+    /// `version` — `bru://chrome/version`, in a tab of its own.
+    Version,
+    /// `messages [-t|-b|-w] [--plain] [level]` — everything the bar has said.
+    Messages { level: String, plain: bool, tab: bool, bg: bool, window: bool },
+    /// `process [pid] [show|terminate|kill]` — what `:spawn` started.
+    Process { pid: Option<u32>, action: ProcessAction },
+    /// `click-element <filter> [value] [--target …] [--force-event] [--select-first]`.
+    ClickElement {
+        filter: ElementFilter,
+        value: Option<String>,
+        target: ClickTarget,
+        force_event: bool,
+        select_first: bool,
+    },
+    /// `scroll-to-anchor <name>` — a navigation to a fragment, not a wheel event. See the arm.
+    ScrollToAnchor { name: String },
+    /// `download-remove [--all]` — the finished download the count names, off the list.
+    DownloadRemove { all: bool },
+    /// `clear-messages` — take whatever the bar is saying away now.
+    ClearMessages,
+    /// `bookmarks-reload` / `quickmarks-reload` — re-read the file from disk.
+    MarksReload { which: crate::utilcmds::Marks },
+// --- end src/utilcmds.rs ---------------------------------------------------
+
     /// A command qutebrowser has and bru does not implement yet, kept verbatim so the binding
     /// still occupies its place in the trie.
     Unimplemented(String),
 }
+
+// --- src/utilcmds.rs -------------------------------------------------------
+/// How `click-element` chooses its element (`misccommands.py:231`, `choices=`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementFilter {
+    /// `id`: `document.getElementById`.
+    Id,
+    /// `css`: a selector, which may match several — see `--select-first`.
+    Css,
+    /// `position`: `x,y`, in page coordinates.
+    Position,
+    /// `focused`: whatever the page has focused, and the one filter whose value is optional.
+    Focused,
+}
+
+/// What `click-element --target` does with the element it found (`usertypes.ClickTarget`).
+///
+/// A parallel of the five `hints::Target` spellings that mean the same things, and deliberately not
+/// [`HintTarget`] itself: that enum carries `yank`, `download` and `fill`, which a click has no
+/// meaning for, and a variant a command can never build is a variant its dispatcher still has to
+/// answer for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClickTarget {
+    Normal,
+    TabBg,
+    TabFg,
+    Window,
+    Hover,
+}
+
+/// `process`'s second argument (`guiprocess.py:31`, `choices=['show', 'terminate', 'kill']`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcessAction {
+    Show,
+    Terminate,
+    Kill,
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
 
 /// The argument of `scroll`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -628,6 +722,13 @@ impl fmt::Display for ParseError {
 /// Handles `;;` chaining, quoted arguments (`rl-rubout " "`), `--` as end-of-flags, and the short
 /// and long flags the implemented commands take.
 pub fn parse(s: &str) -> Result<Command, ParseError> {
+// --- src/utilcmds.rs -------------------------------------------------------
+    // `no_cmd_split=True`: the five commands whose argument is itself a command line or a piece of
+    // JavaScript keep their own `;;`. See [`no_cmd_split`].
+    if no_cmd_split(s) {
+        return parse_one(s.trim());
+    }
+// --- end src/utilcmds.rs ---------------------------------------------------
     let parts = split_chain(s);
     if parts.len() > 1 {
         let mut out = Vec::with_capacity(parts.len());
@@ -1511,10 +1612,405 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "cmd-repeat-last" | "repeat-command" => Command::CmdRepeatLast,
 // --- end src/settingspage.rs ---------------------------------------------------------------
 
+// --- src/utilcmds.rs -------------------------------------------------------
+        // maxsplit=0 (`commands.py:930`): `1/2` and `part of a title` are both one argument, and
+        // which of the two it is cannot be decided without asking what tabs are open.
+        "tab-select" => Command::TabSelect {
+            index: Args::maxsplit0(&tokens[1..]).arg(0).filter(|i| !i.is_empty()).map(str::to_string),
+        },
+        "tab-take" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            let Some(index) = args.arg(0).filter(|i| !i.is_empty()) else {
+                return Err(bad("needs the tab to take"));
+            };
+            Command::TabTake { index: index.to_string(), keep: args.any(&["k", "keep"]) }
+        }
+        "window-only" => Command::WindowOnly,
+
+        "screenshot" => {
+            let args = Flagged::new(&tokens[1..], &["rect"])?;
+            let Some(filename) = args.arg(0) else {
+                return Err(bad("needs a filename"));
+            };
+            Command::Screenshot {
+                filename: filename.to_string(),
+                rect: args.value("rect").map(str::to_string),
+                force: args.any(&["f", "force"]),
+            }
+        }
+
+        // maxsplit=0 **and** `no_cmd_split=True` (`commands.py:1714`): a `;;` inside JavaScript is
+        // JavaScript. See `no_cmd_split` below, which is what keeps `parse` from cutting it up.
+        "jseval" => {
+            let args = Flagged::maxsplit0(&tokens[1..], &["world"])?;
+            // qutebrowser's own check (`commands.py:1748`).
+            if args.any(&["f", "file"]) && args.any(&["u", "url"]) {
+                return Err(bad("--file and --url are mutually exclusive"));
+            }
+            // `--world` picks one of QtWebEngine's four script worlds. CEF gives the browser
+            // process one way into a page — `V8Context::eval` in the frame's own context, which is
+            // the page's world — so every other value names something bru cannot do. Refused by
+            // name rather than accepted and ignored: a snippet that must not touch the page's own
+            // globals would otherwise run in them and say nothing.
+            if let Some(world) = args.value("world").filter(|world| *world != "main") {
+                return Err(bad(&format!(
+                    "there is one script world here, the page's own; --world {world} cannot be honoured"
+                )));
+            }
+            let code = tail_after_flags(s, &["world"]).trim().to_string();
+            if code.is_empty() {
+                return Err(bad("needs something to evaluate"));
+            }
+            Command::JsEval {
+                code,
+                file: args.any(&["f", "file"]),
+                url: args.any(&["u", "url"]),
+                quiet: args.any(&["q", "quiet"]),
+            }
+        }
+
+        "edit-url" => Command::EditUrl {
+            url: args.arg(0).filter(|u| !u.is_empty()).map(str::to_string),
+            tab: args.any(&["t", "tab"]),
+            bg: args.any(&["b", "bg"]),
+            window: args.any(&["w", "window"]),
+        },
+        // `cmd-edit` is the name since 2.0; `edit-command` is what `deprecated_name=` keeps alive
+        // (`statusbar/command.py:201`), and both are in this user's fingers.
+        "edit-command" | "cmd-edit" => Command::EditCommand { run: args.has("run") },
+
+        "quickmark-add" => {
+            let (Some(url), Some(name)) = (args.arg(0), args.arg(1)) else {
+                return Err(bad("needs a URL and a name"));
+            };
+            // The file is `name url` per line, so a name with a space in it could not be read back.
+            if args.positional.len() > 2 {
+                return Err(bad("a quickmark name cannot contain a space"));
+            }
+            Command::QuickmarkAdd { url: url.to_string(), name: name.to_string() }
+        }
+        "history-clear" => Command::HistoryClear { force: args.any(&["f", "force"]) },
+
+        // maxsplit=1: the duration or the count, and then the whole rest of the line as one
+        // command, `;;` included — `no_cmd_split=True` (`utilcmds.py:28,60,82`).
+        "later" | "cmd-later" | "repeat" | "cmd-repeat" | "run-with-count" | "cmd-run-with-count" => {
+            let (first, rest) = split_off_first_word(s);
+            if rest.is_empty() {
+                return Err(bad("needs a command to run"));
+            }
+            // `parse` and not `parse_one`: the carried command keeps its own `;;`, so it may be a
+            // whole chain — that is the entire meaning of `no_cmd_split`.
+            let command = Box::new(parse(&rest)?);
+            match name.trim_start_matches("cmd-") {
+                "later" => Command::Later { ms: parse_duration(&first).map_err(|e| bad(&e))?, command },
+                "repeat" => Command::Repeat {
+                    times: first.parse().map_err(|_| bad(&format!("{first:?} is not a number of times")))?,
+                    command,
+                },
+                _ => Command::RunWithCount {
+                    count: first.parse().map_err(|_| bad(&format!("{first:?} is not a count")))?,
+                    command,
+                },
+            }
+        }
+
+        "restart" => Command::Restart,
+        "version" => {
+            // `--paste` uploads the report to a pastebin. bru reaches the network of its own accord
+            // in one place, `:adblock-update`, and that is a decision rather than a flag.
+            if args.any(&["p", "paste"]) {
+                return Err(bad("bru uploads nothing; the page is at bru://chrome/version"));
+            }
+            Command::Version
+        }
+        "messages" => {
+            let args = Flagged::new(&tokens[1..], &["f", "logfilter"])?;
+            // A comma-separated list of *logging categories* — `log.LogFilter`. bru's messages have
+            // a level and no category, so there is nothing for a filter to name.
+            if args.value("f").is_some() || args.value("logfilter").is_some() {
+                return Err(bad("bru's messages carry no logging category to filter on"));
+            }
+            let level = args.arg(0).unwrap_or("info").to_string();
+            if crate::utilcmds::threshold(&level).is_none() {
+                return Err(bad(&format!("Invalid log level {level}!")));
+            }
+            Command::Messages {
+                level,
+                plain: args.has("plain"),
+                tab: args.any(&["t", "tab"]),
+                bg: args.any(&["b", "bg"]),
+                window: args.any(&["w", "window"]),
+            }
+        }
+        "process" => Command::Process {
+            pid: match args.arg(0) {
+                None => None,
+                Some(pid) => Some(pid.parse().map_err(|_| bad(&format!("{pid:?} is not a pid")))?),
+            },
+            action: match args.arg(1).unwrap_or("show") {
+                "show" => ProcessAction::Show,
+                "terminate" => ProcessAction::Terminate,
+                "kill" => ProcessAction::Kill,
+                other => return Err(bad(&format!("invalid action {other:?}"))),
+            },
+        },
+
+        "click-element" => {
+            let args = Flagged::new(&tokens[1..], &["target"])?;
+            let Some(filter) = args.arg(0) else {
+                return Err(bad("needs one of id, css, position, focused"));
+            };
+            let filter = match filter {
+                "id" => ElementFilter::Id,
+                "css" => ElementFilter::Css,
+                "position" => ElementFilter::Position,
+                "focused" => ElementFilter::Focused,
+                other => return Err(bad(&format!("invalid filter {other:?}"))),
+            };
+            let value = args.arg(1).map(str::to_string);
+            // `misccommands.py:283-285`, and its words.
+            if value.is_none() && filter != ElementFilter::Focused {
+                return Err(bad("Argument 'value' is only optional with filter 'focused'!"));
+            }
+            Command::ClickElement {
+                filter,
+                value,
+                target: match args.value("target").unwrap_or("normal") {
+                    "normal" => ClickTarget::Normal,
+                    "tab" | "tab-bg" => ClickTarget::TabBg,
+                    "tab-fg" => ClickTarget::TabFg,
+                    "window" => ClickTarget::Window,
+                    "hover" => ClickTarget::Hover,
+                    other => return Err(bad(&format!("invalid target {other:?}"))),
+                },
+                force_event: args.has("force-event"),
+                select_first: args.has("select-first"),
+            }
+        }
+
+        "scroll-to-anchor" => {
+            let Some(anchor) = args.arg(0).filter(|a| !a.is_empty()) else {
+                return Err(bad("needs an anchor"));
+            };
+            Command::ScrollToAnchor { name: anchor.to_string() }
+        }
+
+        "download-remove" => Command::DownloadRemove { all: args.any(&["a", "all"]) },
+        "clear-messages" => Command::ClearMessages,
+        "quickmarks-reload" => Command::MarksReload { which: crate::utilcmds::Marks::Quickmarks },
+        "bookmarks-reload" => Command::MarksReload { which: crate::utilcmds::Marks::Bookmarks },
+// --- end src/utilcmds.rs ---------------------------------------------------
+
         _ => Command::Unimplemented(s.trim().to_string()),
     };
     Ok(cmd)
 }
+
+// --- src/utilcmds.rs -------------------------------------------------------
+
+/// The four commands registered `no_cmd_split=True` whose argument is itself a command line, and the
+/// one whose argument is JavaScript.
+///
+/// [`parse`] cuts on `;;` before anything else, which is right for every other command and wrong for
+/// these: `:later 1s tab-close ;; tab-close` closes two tabs in a second, not one now and one in a
+/// second, and a `;;` inside a `:jseval` is JavaScript. qutebrowser says the same thing with a flag
+/// on the registration (`utilcmds.py:28,60,82`, `commands.py:1714`).
+fn no_cmd_split(s: &str) -> bool {
+    let name = s.trim_start().split(char::is_whitespace).next().unwrap_or("");
+    matches!(
+        name,
+        "later" | "cmd-later" | "repeat" | "cmd-repeat" | "run-with-count" | "cmd-run-with-count"
+            | "jseval"
+    )
+}
+
+/// `<name> <first> <rest…>` → the first word after the command name, and everything after it
+/// **verbatim**. qutebrowser's `maxsplit=1`.
+///
+/// Verbatim because the rest is a command line of its own: `Args::maxsplit0` works from tokens whose
+/// quotes have already been thrown away, and rejoining them with spaces turns
+/// `:later 1s message-info "a b"` into two arguments. `spawn_tail` above exists for the same reason.
+fn split_off_first_word(s: &str) -> (String, String) {
+    let mut rest = s.trim_start();
+    // The command name.
+    rest = match rest.find(char::is_whitespace) {
+        Some(at) => rest[at..].trim_start(),
+        None => "",
+    };
+    match rest.find(char::is_whitespace) {
+        Some(at) => (rest[..at].to_string(), rest[at..].trim().to_string()),
+        None => (rest.to_string(), String::new()),
+    }
+}
+
+/// `XhYmZs`, or a plain number of milliseconds — `utils.parse_duration` (`utils.py:753-777`).
+fn parse_duration(text: &str) -> Result<i64, String> {
+    let invalid =
+        || format!("Invalid duration: {text} - expected XhYmZs or a number of milliseconds");
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
+        return text.parse().map_err(|_| invalid());
+    }
+
+    let mut total = 0f64;
+    let mut number = String::new();
+    let mut seen = 0u8;
+    for c in text.chars() {
+        match c {
+            '0'..='9' | '.' => number.push(c),
+            'h' | 'm' | 's' => {
+                let value: f64 = number.parse().map_err(|_| invalid())?;
+                number.clear();
+                // In order, each unit at most once: the regex is `(…h)?\s*(…m)?\s*(…s)?`, so `1s1h`
+                // is not a duration.
+                let rank = match c {
+                    'h' => 1,
+                    'm' => 2,
+                    _ => 3,
+                };
+                if rank <= seen {
+                    return Err(invalid());
+                }
+                seen = rank;
+                total += value * match c {
+                    'h' => 3600.0,
+                    'm' => 60.0,
+                    _ => 1.0,
+                };
+            }
+            c if c.is_whitespace() => {}
+            _ => return Err(invalid()),
+        }
+    }
+    if !number.is_empty() || seen == 0 {
+        return Err(invalid());
+    }
+    Ok((total * 1000.0) as i64)
+}
+
+/// [`Args`] with the flags that take a value of their own.
+///
+/// `Args` files `--rect 100x200+0+0` as a flag and a positional and nothing says which positional it
+/// was — the same problem `parse_config_command` solves by hand for `-u`. This is that, generalised
+/// to the four commands here that need it (`--rect`, `--target`, `--world`, `-f`).
+struct Flagged {
+    args: Args,
+    values: Vec<(String, String)>,
+}
+
+impl Flagged {
+    fn new(tokens: &[String], valued: &[&str]) -> Result<Flagged, ParseError> {
+        let mut kept: Vec<String> = Vec::new();
+        let mut values: Vec<(String, String)> = Vec::new();
+        let mut wants: Option<String> = None;
+        let mut end_of_flags = false;
+
+        for token in tokens {
+            if let Some(name) = wants.take() {
+                values.push((name, token.clone()));
+                continue;
+            }
+            if end_of_flags || !is_flag(token) {
+                if token == "--" {
+                    end_of_flags = true;
+                }
+                kept.push(token.clone());
+                continue;
+            }
+            let name = token.trim_start_matches('-');
+            if valued.contains(&name) {
+                wants = Some(name.to_string());
+                continue;
+            }
+            kept.push(token.clone());
+        }
+        if let Some(name) = wants {
+            return Err(ParseError(format!("--{name} needs a value")));
+        }
+        Ok(Flagged { args: Args::new(&kept), values })
+    }
+
+    /// [`Flagged::new`] with `maxsplit=0`'s rule: flag parsing stops at the first non-flag token,
+    /// so a `--file` *after* the argument belongs to the argument. `jseval` is registered that way
+    /// and it matters — `:jseval x --file y` evaluates `x --file y` and does not read a file.
+    fn maxsplit0(tokens: &[String], valued: &[&str]) -> Result<Flagged, ParseError> {
+        let mut flags: Vec<String> = Vec::new();
+        let mut skip = false;
+        for token in tokens {
+            if skip {
+                flags.push(token.clone());
+                skip = false;
+                continue;
+            }
+            if token == "--" || !is_flag(token) {
+                break;
+            }
+            skip = valued.contains(&token.trim_start_matches('-'));
+            flags.push(token.clone());
+        }
+        Flagged::new(&flags, valued)
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(flag, _)| flag == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn arg(&self, i: usize) -> Option<&str> {
+        self.args.arg(i)
+    }
+
+    fn has(&self, flag: &str) -> bool {
+        self.args.has(flag)
+    }
+
+    fn any(&self, names: &[&str]) -> bool {
+        self.args.any(names)
+    }
+}
+
+/// `jseval`'s argument: everything from the first non-flag token on, **verbatim from the original
+/// string**, because it is JavaScript and its quotes and its spacing are part of it.
+///
+/// `spawn_tail`'s shape, with one difference: a flag in `valued` eats the word after it, so
+/// `--world main` is two words of flag and not one word of flag and one of code.
+///
+/// Searching the string for the first token would have been shorter and is wrong — measured by the
+/// test below before this existed: `jseval --quiet a …` found the `a` inside `jsev**a**l` and the
+/// code came back as `al --quiet a …`.
+fn tail_after_flags(s: &str, valued: &[&str]) -> String {
+    let mut rest = s.trim_start();
+    // The command name.
+    rest = match rest.find(char::is_whitespace) {
+        Some(at) => &rest[at..],
+        None => "",
+    };
+
+    loop {
+        rest = rest.trim_start();
+        let word = match rest.find(char::is_whitespace) {
+            Some(at) => &rest[..at],
+            None => rest,
+        };
+        if word == "--" {
+            return rest[word.len()..].trim_start().to_string();
+        }
+        if word.is_empty() || !is_flag(word) {
+            return rest.to_string();
+        }
+        let takes_a_value = valued.contains(&word.trim_start_matches('-'));
+        rest = &rest[word.len()..];
+        if takes_a_value {
+            rest = rest.trim_start();
+            rest = match rest.find(char::is_whitespace) {
+                Some(at) => &rest[at..],
+                None => "",
+            };
+        }
+    }
+}
+// --- end src/utilcmds.rs ---------------------------------------------------
 
 // --- src/spawn.rs, src/editor.rs -----------------------------------------------------------
 
@@ -1932,6 +2428,301 @@ mod tests {
         );
     }
 // --- end src/prompt.rs ---------------------------------------------------------------------
+
+// --- src/utilcmds.rs -------------------------------------------------------
+    /// The three that carry another command, and the one rule that is easy to get wrong: the `;;`
+    /// belongs to what they carry.
+    #[test]
+    fn a_carried_command_keeps_its_own_chain() {
+        // Without `no_cmd_split` this parses as `Chain[later 1s tab-close, tab-close]`, and the
+        // second `tab-close` runs *now*. That is the whole bug this pair of tests exists for.
+        let Command::Later { ms, command } = parse("later 1s tab-close ;; tab-close").unwrap()
+        else {
+            panic!("expected later");
+        };
+        assert_eq!(ms, 1000);
+        let Command::Chain(parts) = *command else {
+            panic!("the carried command is the whole chain");
+        };
+        assert_eq!(parts.len(), 2);
+
+        // And the ordinary case still chains: `:tab-close ;; later 1s tab-close` is two commands.
+        let Command::Chain(parts) = parse("tab-close ;; later 1s tab-close").unwrap() else {
+            panic!("expected a chain");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts[1], Command::Later { .. }));
+
+        // Both spellings of each, because 2.0 renamed all three and kept the old names.
+        for (old, new) in [
+            ("later 1s scroll down", "cmd-later 1s scroll down"),
+            ("repeat 3 scroll down", "cmd-repeat 3 scroll down"),
+            ("run-with-count 3 scroll down", "cmd-run-with-count 3 scroll down"),
+        ] {
+            assert_eq!(parse(old).unwrap(), parse(new).unwrap(), "{old}");
+        }
+        assert_eq!(
+            parse("repeat 3 scroll down").unwrap(),
+            Command::Repeat {
+                times: 3,
+                command: Box::new(Command::Scroll(ScrollDirection::Down)),
+            }
+        );
+        assert_eq!(
+            parse("run-with-count 5 scroll-px 0 10").unwrap(),
+            Command::RunWithCount {
+                count: 5,
+                command: Box::new(Command::ScrollPx { dx: 0, dy: 10 }),
+            }
+        );
+        // A typo inside the carried command is a parse error *now*, at startup, rather than a
+        // second after the key is pressed.
+        assert!(parse("later 1s scroll sideways").is_err());
+        assert!(parse("later 1s").is_err());
+        assert!(parse("repeat three tab-close").is_err());
+    }
+
+    /// `utils.parse_duration`, in every shape its regex accepts and three it does not.
+    #[test]
+    fn a_duration_is_milliseconds_or_hours_minutes_seconds() {
+        let ms = |text: &str| match parse(&format!("later {text} tab-close")).unwrap() {
+            Command::Later { ms, .. } => ms,
+            _ => panic!("expected later"),
+        };
+        assert_eq!(ms("500"), 500);
+        assert_eq!(ms("1s"), 1000);
+        assert_eq!(ms("1m"), 60_000);
+        assert_eq!(ms("1h"), 3_600_000);
+        assert_eq!(ms("1h30m"), 5_400_000);
+        assert_eq!(ms("1h2m3s"), 3_723_000);
+        assert_eq!(ms("0.5s"), 500);
+        for bad in ["1x", "s", "1s1h", "1.2.3s", "-1s"] {
+            assert!(
+                parse(&format!("later {bad} tab-close")).is_err(),
+                "{bad:?} was accepted as a duration"
+            );
+        }
+    }
+
+    /// `jseval` is the other `no_cmd_split` command, and its argument is verbatim: the spacing and
+    /// the quotes inside a piece of JavaScript are part of it.
+    #[test]
+    fn jseval_keeps_the_code_exactly_as_it_was_typed() {
+        assert_eq!(
+            parse("jseval document.title").unwrap(),
+            Command::JsEval {
+                code: "document.title".to_string(),
+                file: false,
+                url: false,
+                quiet: false
+            }
+        );
+        let Command::JsEval { code, quiet, .. } = parse("jseval --quiet a ;; b + '  c'").unwrap()
+        else {
+            panic!("expected jseval");
+        };
+        assert_eq!(code, "a ;; b + '  c'");
+        assert!(quiet);
+        // Flags after the code belong to the code, as they do for `:open` and `:search`.
+        let Command::JsEval { code, file, .. } = parse("jseval x --file y").unwrap() else {
+            panic!("expected jseval");
+        };
+        assert_eq!(code, "x --file y");
+        assert!(!file);
+        // The two exclusive flags, and the world that cannot be honoured.
+        assert!(parse("jseval --file --url x").is_err());
+        assert!(parse("jseval --world application x").is_err());
+        assert_eq!(
+            parse("jseval --world main x").unwrap(),
+            Command::JsEval { code: "x".to_string(), file: false, url: false, quiet: false }
+        );
+        assert!(parse("jseval").is_err());
+    }
+
+    /// The flags that take a value of their own, which plain `Args` files as positionals.
+    #[test]
+    fn a_valued_flag_does_not_become_a_positional() {
+        assert_eq!(
+            parse("screenshot --rect 100x200+0+0 /tmp/x.png").unwrap(),
+            Command::Screenshot {
+                filename: "/tmp/x.png".to_string(),
+                rect: Some("100x200+0+0".to_string()),
+                force: false,
+            }
+        );
+        // The filename before the flag, which argparse allows and a hand-rolled reader forgets.
+        assert_eq!(
+            parse("screenshot /tmp/x.png --force --rect 1x1+0+0").unwrap(),
+            Command::Screenshot {
+                filename: "/tmp/x.png".to_string(),
+                rect: Some("1x1+0+0".to_string()),
+                force: true,
+            }
+        );
+        assert!(parse("screenshot --rect").is_err());
+        assert!(parse("screenshot").is_err());
+
+        assert_eq!(
+            parse("click-element css a.link --target tab-bg").unwrap(),
+            Command::ClickElement {
+                filter: ElementFilter::Css,
+                value: Some("a.link".to_string()),
+                target: ClickTarget::TabBg,
+                force_event: false,
+                select_first: false,
+            }
+        );
+        assert_eq!(
+            parse("click-element focused").unwrap(),
+            Command::ClickElement {
+                filter: ElementFilter::Focused,
+                value: None,
+                target: ClickTarget::Normal,
+                force_event: false,
+                select_first: false,
+            }
+        );
+        // "Argument 'value' is only optional with filter 'focused'!"
+        assert!(parse("click-element id").is_err());
+        assert!(parse("click-element sideways x").is_err());
+        assert!(parse("click-element css a --target yank").is_err());
+    }
+
+    /// The rest of the twenty-two, in the spellings a person would type.
+    #[test]
+    fn the_commands_that_had_no_arm() {
+        assert_eq!(
+            parse("tab-select 1/2").unwrap(),
+            Command::TabSelect { index: Some("1/2".to_string()) }
+        );
+        // maxsplit=0: a title fragment with a space in it is one argument.
+        assert_eq!(
+            parse("tab-select rust std").unwrap(),
+            Command::TabSelect { index: Some("rust std".to_string()) }
+        );
+        assert_eq!(parse("tab-select").unwrap(), Command::TabSelect { index: None });
+        assert_eq!(
+            parse("tab-take --keep 1/2").unwrap(),
+            Command::TabTake { index: "1/2".to_string(), keep: true }
+        );
+        assert!(parse("tab-take").is_err());
+        assert_eq!(parse("window-only").unwrap(), Command::WindowOnly);
+
+        assert_eq!(
+            parse("edit-url -t").unwrap(),
+            Command::EditUrl { url: None, tab: true, bg: false, window: false }
+        );
+        assert_eq!(parse("edit-command --run").unwrap(), Command::EditCommand { run: true });
+        // `cmd-edit` is the 2.0 name of the same thing.
+        assert_eq!(parse("cmd-edit").unwrap(), Command::EditCommand { run: false });
+
+        assert_eq!(
+            parse("quickmark-add https://example.com/ ex").unwrap(),
+            Command::QuickmarkAdd {
+                url: "https://example.com/".to_string(),
+                name: "ex".to_string(),
+            }
+        );
+        assert!(parse("quickmark-add https://example.com/").is_err());
+        assert!(parse("quickmark-add https://example.com/ two words").is_err());
+
+        assert_eq!(parse("history-clear").unwrap(), Command::HistoryClear { force: false });
+        assert_eq!(parse("history-clear --force").unwrap(), Command::HistoryClear { force: true });
+
+        assert_eq!(parse("restart").unwrap(), Command::Restart);
+        assert_eq!(parse("version").unwrap(), Command::Version);
+        assert!(parse("version --paste").is_err());
+
+        assert_eq!(
+            parse("messages").unwrap(),
+            Command::Messages {
+                level: "info".to_string(),
+                plain: false,
+                tab: false,
+                bg: false,
+                window: false,
+            }
+        );
+        assert_eq!(
+            parse("messages -t --plain warning").unwrap(),
+            Command::Messages {
+                level: "warning".to_string(),
+                plain: true,
+                tab: true,
+                bg: false,
+                window: false,
+            }
+        );
+        assert!(parse("messages nonsense").is_err());
+        assert!(parse("messages -f init").is_err());
+
+        assert_eq!(
+            parse("process").unwrap(),
+            Command::Process { pid: None, action: ProcessAction::Show }
+        );
+        assert_eq!(
+            parse("process 1234 kill").unwrap(),
+            Command::Process { pid: Some(1234), action: ProcessAction::Kill }
+        );
+        assert!(parse("process x").is_err());
+        assert!(parse("process 1 stop").is_err());
+
+        assert_eq!(
+            parse("scroll-to-anchor top").unwrap(),
+            Command::ScrollToAnchor { name: "top".to_string() }
+        );
+        assert!(parse("scroll-to-anchor").is_err());
+
+        assert_eq!(parse("download-remove").unwrap(), Command::DownloadRemove { all: false });
+        assert_eq!(parse("download-remove --all").unwrap(), Command::DownloadRemove { all: true });
+        assert_eq!(parse("clear-messages").unwrap(), Command::ClearMessages);
+        assert_eq!(
+            parse("quickmarks-reload").unwrap(),
+            Command::MarksReload { which: crate::utilcmds::Marks::Quickmarks }
+        );
+        assert_eq!(
+            parse("bookmarks-reload").unwrap(),
+            Command::MarksReload { which: crate::utilcmds::Marks::Bookmarks }
+        );
+    }
+
+    /// Every one of the twenty-two parses into a variant rather than into `Unimplemented`, which is
+    /// the state each of them was in this morning. Written as a list of command *strings* so that
+    /// the check is against the names a person types.
+    #[test]
+    fn none_of_the_twenty_two_is_unimplemented_any_more() {
+        let mut names = Vec::new();
+        for text in [
+            "tab-select 1",
+            "tab-take 1/1",
+            "window-only",
+            "screenshot /tmp/x.png",
+            "jseval 1+1",
+            "edit-url",
+            "edit-command",
+            "quickmark-add https://example.com/ ex",
+            "history-clear",
+            "later 1s tab-close",
+            "repeat 2 tab-close",
+            "run-with-count 2 tab-close",
+            "restart",
+            "version",
+            "messages",
+            "process",
+            "click-element focused",
+            "scroll-to-anchor top",
+            "download-remove",
+            "clear-messages",
+            "bookmarks-reload",
+            "quickmarks-reload",
+        ] {
+            let parsed = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(parsed.is_implemented(), "{text} still parses to Unimplemented");
+            names.push(text.split(' ').next().unwrap());
+        }
+        assert_eq!(names.len(), 22, "the workstream is twenty-two commands");
+    }
+// --- end src/utilcmds.rs ---------------------------------------------------
 
     #[test]
     fn caret_commands() {
