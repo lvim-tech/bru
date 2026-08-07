@@ -178,6 +178,12 @@ fn in_force(name: &str, snapshot: Option<&Snapshot>) -> String {
     if name == "start_page" {
         return crate::open::start_page();
     }
+    // The same for every setting bru answers itself. "not read yet" is a statement about
+    // *Chromium's* copy, and printing it against a setting Chromium has never heard of says the
+    // browser does not know its own value — which it does. `settings::value_of` is where it lives.
+    if let Some(value) = crate::settings::value_of(name) {
+        return value;
+    }
     match snapshot.and_then(|snapshot| snapshot.value(name)) {
         Some(value) => value.to_string(),
         // Before the first reading — a unit test, or a browser that has not run `refresh` yet.
@@ -310,7 +316,8 @@ mod tests {
         let html = page(None);
         assert!(html.contains("nothing has been read yet"));
         assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 2);
-        // `start_page` is answered in Rust and needs no reading, so it is never one of them.
+        // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
+        // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
     }
 

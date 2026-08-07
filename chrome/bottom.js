@@ -218,7 +218,16 @@
       // only names with an underscore in them; they are shown with a space
       // because the bar is read, not typed, and `:mode-enter set_mark` is where
       // the underscore belongs.
-      put("mode", (state.mode || "").replace(/_/g, " "));
+      // `statusbar.mode.style`: `full` is the whole word, `short` its first letter — NORMAL
+      // against N. The underscore in `set_mark` and `jump_mark` becomes a space, because the bar
+      // is read rather than typed and `:mode-enter set_mark` is where the underscore belongs.
+      var modeName = (state.mode || "").replace(/_/g, " ");
+      if (state.modestyle === "short" && modeName) {
+        // The first letter of each word, so `set mark` is `SM` and not `S` — two register modes
+        // that both begin with a letter nothing else uses would otherwise be the same badge.
+        modeName = modeName.split(" ").map(function (word) { return word.charAt(0); }).join("");
+      }
+      put("mode", modeName);
       put("search", state.search);
       put("url", state.url);
       put("scroll", state.scroll);

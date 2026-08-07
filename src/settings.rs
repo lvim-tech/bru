@@ -36,6 +36,10 @@ pub enum Kind {
     Bool,
     /// Free text — a URL, today.
     Text,
+    /// One of a fixed list. `config-cycle` with no values walks the list in order, the way it walks
+    /// `true`/`false` for a [`Kind::Bool`] — so `sm` on a key bound to it steps through the choices
+    /// rather than needing them spelled out at the binding.
+    Choice(&'static [&'static str]),
 }
 
 /// A setting's value, already validated against its [`Kind`].
@@ -60,6 +64,10 @@ impl std::fmt::Display for Value {
 enum Backing {
     /// Read by `open.rs` when it needs a start page; nothing to push.
     StartPage,
+    /// Something the bottom bar draws. Nothing to apply to Chromium — the value is read back out of
+    /// here when the bar is built, and setting it pushes every window's bar so the change is seen
+    /// without a reload.
+    Bar,
     /// A Chromium content setting, global or per-origin. See [`apply`].
     Content(ContentKind),
 }
@@ -125,6 +133,17 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::StartPage,
     },
     Def {
+        // bru's own, with no counterpart to copy: qutebrowser has no mode indicator to configure.
+        // `full` draws the mode's name, `short` its first letter — `NORMAL` against `N`. The
+        // default is the long one because a browser that has just been installed should say what
+        // it means, and the short one is what you move to once you know the colours.
+        name: "statusbar.mode.style",
+        kind: Kind::Choice(&["full", "short"]),
+        default: Some("full"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Bar,
+    },
+    Def {
         name: "content.javascript.enabled",
         kind: Kind::Bool,
         default: Some("true"),
@@ -184,6 +203,25 @@ pub const REFUSED: &[(&str, &str)] = &[
     ),
 ];
 
+/// The value of a setting bru answers itself, rather than reading back from Chromium.
+///
+/// `None` for the content settings, whose truth is Chromium's and is read there — see
+/// `chromium_value`. This is the other half: a `Backing::Bar` setting has no Chromium side at all,
+/// and `bru://chrome/settings` printing "not read yet" against one said bru did not know a value it
+/// had compiled in.
+pub fn value_of(name: &str) -> Option<String> {
+    let def = def(name)?;
+    if !matches!(def.backing, Backing::Bar) {
+        return None;
+    }
+    let live = with_live(|settings| settings.get(name, None).ok().flatten());
+    Some(match live {
+        Some(Value::Text(text)) => text,
+        Some(Value::Bool(flag)) => flag.to_string(),
+        None => def.default.unwrap_or_default().to_string(),
+    })
+}
+
 /// The reason a command string names a refused setting, for `bru://chrome/help`'s third state.
 ///
 /// `commands.rs` refuses to build a `ConfigCycle` for a setting this file does not have, so the
@@ -242,6 +280,17 @@ impl Def {
                     return Err(format!("{} cannot be empty", self.name));
                 }
                 Ok(Value::Text(text.to_string()))
+            }
+            Kind::Choice(choices) => {
+                if choices.contains(&text) {
+                    Ok(Value::Text(text.to_string()))
+                } else {
+                    Err(format!(
+                        "{}: {text:?} is not one of {}",
+                        self.name,
+                        choices.join(", ")
+                    ))
+                }
             }
         }
     }
@@ -500,6 +549,9 @@ impl Settings {
         let values = if values.is_empty() && def.kind == Kind::Bool {
             owned = vec!["true".to_string(), "false".to_string()];
             &owned
+        } else if let (true, Kind::Choice(choices)) = (values.is_empty(), def.kind) {
+            owned = choices.iter().map(|choice| choice.to_string()).collect();
+            &owned
         } else {
             values
         };
@@ -694,6 +746,11 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
     let kind = match applied.def.backing {
         // Nothing to push: `open.rs` reads it when it needs it.
         Backing::StartPage => return Ok(()),
+        // The bar reads it when it is built; setting it only has to make that happen again.
+        Backing::Bar => {
+            crate::ipc::push_bar_everywhere();
+            return Ok(());
+        }
         Backing::Content(kind) => kind,
     };
     let Value::Bool(allow) = applied.value else {
@@ -745,7 +802,8 @@ pub fn apply_at_startup() {
 pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let kind = match def(name)?.backing {
         Backing::Content(kind) => kind,
-        Backing::StartPage => return None,
+        // Neither is a Chromium content setting, so Chromium has no opinion to read back.
+        Backing::StartPage | Backing::Bar => return None,
     };
     let context = request_context_get_global_context()?;
     let url = CefString::from(url);
@@ -936,7 +994,10 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: bad default: {e}", def.name));
             }
         }
-        assert_eq!(SETTINGS.len(), 3);
+        // Four since `statusbar.mode.style`, which is bru's own rather than a name copied from
+        // qutebrowser — it has no mode indicator to configure. Raise this with the setting, never
+        // to make a failing build pass.
+        assert_eq!(SETTINGS.len(), 4);
     }
 
     #[test]

@@ -500,6 +500,19 @@ pub fn push_bar() {
     push();
 }
 
+/// The same for every window. A global setting the bar draws — `statusbar.mode.style` — changes what
+/// all of them show at once, and a window that is not in front has no reason to wait for a keypress
+/// to catch up.
+pub fn push_bar_everywhere() {
+    let windows: Vec<u32> = match chrome().lock() {
+        Ok(chrome) => chrome.iter().map(|entry| entry.window).collect(),
+        Err(_) => return,
+    };
+    for window in windows {
+        push_for(window);
+    }
+}
+
 /// Run one statement in the tab strip's frame.
 ///
 /// The one caller is `favicon.rs`, and it is a separate call rather than another key in the pushed
@@ -695,6 +708,10 @@ fn bar_json_for(window: u32) -> String {
     // there. Outside `with_window` for the same reason as the three above: the state mutex must
     // never be taken while the chrome mutex is held.
     let tabindex = tabindex_of(window);
+    // `statusbar.mode.style` — `full` draws the mode's name, `short` its first letter. Read here
+    // rather than kept on `BarState` for the same reason as `tabindex`: it is a pure function of a
+    // setting, and a copy is a copy somebody has to remember to update.
+    let mode_style = crate::settings::value_of("statusbar.mode.style").unwrap_or_default();
     with_window(window, |entry| {
         let bar = &entry.bar;
         format!(
@@ -702,13 +719,14 @@ fn bar_json_for(window: u32) -> String {
             // which ignores a key it has no element for: `search` is the find handler's match count,
             // `download` a running download's progress, `message` one line with a level and its own
             // timeout, `cmdline` the command line's text and cursor, `completion` the table under it.
-            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"keystring\":\"{}\",\"scroll\":\"{}\",\"tabindex\":\"{}\",\"modestyle\":\"{}\",\"search\":\"{}\",\"download\":\"{}\",\"cmdline\":{cmdline},\"completion\":{completion},\"message\":{message}}}",
             json_escape(&bar.url),
             json_escape(&bar.title),
             json_escape(if bar.mode.is_empty() { "normal" } else { &bar.mode }),
             json_escape(&bar.keystring),
             json_escape(&bar.scroll),
             json_escape(&tabindex),
+            json_escape(&mode_style),
             json_escape(&bar.search),
             json_escape(&bar.download),
         )
