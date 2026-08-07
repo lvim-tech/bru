@@ -998,7 +998,19 @@ pub fn schedule_script(steps: &str, interval_ms: i64) {
 }
 
 /// Read once the bottom strip has announced itself, because there is no command line before then.
+///
+/// **Once for the process, not once per strip**, which this did not do until 2026-08-07. It is the
+/// bug `ipc::start_cmdline_script` was already fixed for, in the line above the call to this one:
+/// the `ready` answer comes from *a* bottom strip and there is one per window, so a script that
+/// opened a second window scheduled itself a second time and every step after that ran twice. The
+/// two schedules also interleave on one clock, so the doubling is not even a clean repeat — it is
+/// two runs of the same steps offset by however long the second window took to come up. Left
+/// unfixed it would have made the two-window half of the checks below unreadable.
 pub fn start_script() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let Some(command_line) = command_line_get_global() else {
         return;
     };
