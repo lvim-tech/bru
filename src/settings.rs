@@ -263,6 +263,18 @@ enum Backing {
     /// on its own — `adblock.rs` says in as many words that it is "the only thing in bru that
     /// reaches the network on its own account, and it does it because somebody typed the command".
     AdblockLists,
+// --- content settings --------------------------------------------------------------------------
+    /// A Chromium **preference** — the other half of Chromium's settings, beside the
+    /// content-settings map. `RequestContext` implements `ImplPreferenceManager`, so both are
+    /// reachable from the same object, and [`dump_preferences`] is what found each of these.
+    ///
+    /// A preference is **global to the profile and has no URL dimension at all**, which is why
+    /// every setting backed by one is [`Scopes::GlobalOnly`] even where qutebrowser marks it
+    /// `supports_pattern: true`. That is the honest half of the trade: `content.headers.do_not_track`
+    /// per site is not a thing CEF 151 can express, and a `-u` that silently changed the whole
+    /// browser would be the failure `content.cookies.accept` is refused for.
+    Preference(PrefKind),
+// --- end content settings ----------------------------------------------------------------------
 }
 
 /// The content settings bru drives. Kept as bru's own enum rather than `ContentSettingTypes` so
@@ -271,6 +283,20 @@ enum Backing {
 enum ContentKind {
     Javascript,
     Images,
+// --- content settings --------------------------------------------------------------------------
+    Autoplay,
+    /// `content.mute`, and the one **inverted** member of this enum — see [`ContentKind::inverted`].
+    Sound,
+    Popups,
+    Notifications,
+    Geolocation,
+    MicrophoneCapture,
+    CameraCapture,
+    PointerLock,
+    ProtocolHandlers,
+    PersistentStorage,
+    Clipboard,
+// --- end content settings ----------------------------------------------------------------------
 }
 
 impl ContentKind {
@@ -278,9 +304,68 @@ impl ContentKind {
         match self {
             ContentKind::Javascript => ContentSettingTypes::JAVASCRIPT,
             ContentKind::Images => ContentSettingTypes::IMAGES,
+// --- content settings --------------------------------------------------------------------------
+            ContentKind::Autoplay => ContentSettingTypes::AUTOPLAY,
+            ContentKind::Sound => ContentSettingTypes::SOUND,
+            ContentKind::Popups => ContentSettingTypes::POPUPS,
+            ContentKind::Notifications => ContentSettingTypes::NOTIFICATIONS,
+            ContentKind::Geolocation => ContentSettingTypes::GEOLOCATION,
+            ContentKind::MicrophoneCapture => ContentSettingTypes::MEDIASTREAM_MIC,
+            ContentKind::CameraCapture => ContentSettingTypes::MEDIASTREAM_CAMERA,
+            ContentKind::PointerLock => ContentSettingTypes::POINTER_LOCK,
+            ContentKind::ProtocolHandlers => ContentSettingTypes::PROTOCOL_HANDLERS,
+            ContentKind::PersistentStorage => ContentSettingTypes::PERSISTENT_STORAGE,
+            ContentKind::Clipboard => ContentSettingTypes::CLIPBOARD_READ_WRITE,
+// --- end content settings ----------------------------------------------------------------------
+        }
+    }
+
+// --- content settings --------------------------------------------------------------------------
+    /// Whether the setting's `true` is Chromium's `BLOCK`.
+    ///
+    /// One member answers yes, and it is the only reason this function exists: qutebrowser spells
+    /// the option `content.mute` — *is the tab silent* — and Chromium spells the rule `SOUND` —
+    /// *may the tab make a noise*. `:set content.mute true` writing `ALLOW` would be a switch
+    /// wired backwards, and the name is the thing that cannot change: it is qutebrowser's, and
+    /// `<Alt-m>` is already bound to `tab-mute` beside it.
+    fn inverted(self) -> bool {
+        matches!(self, ContentKind::Sound)
+    }
+// --- end content settings ----------------------------------------------------------------------
+}
+
+// --- content settings ----------------------------------------------------------------------------
+/// The Chromium preferences bru drives, for the `content.*` names that have one rather than a
+/// content setting. bru's own enum for [`ContentKind`]'s reason: [`SETTINGS`] stays walkable
+/// without CEF.
+///
+/// **Each name here was measured to exist and to be settable**, with
+/// `--settings-probe='prefs:<dotted name>'`, before it was written down — and the dotted path
+/// matters: `get_all_preferences` answers a *nested* dictionary whose top-level keys are first
+/// components only, so `intl` is a dictionary and `intl.accept_languages` cannot be found by
+/// walking them. `has_preference`/`can_set_preference` answer for the full path and are what the
+/// probe asks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefKind {
+    /// `enable_do_not_track` — measured exists=1 settable=1 type=VTYPE_BOOL, 2026-08-07.
+    DoNotTrack,
+    /// `enable_a_ping` — the same, and it is `<a ping>` and `navigator.sendBeacon`'s switch.
+    HyperlinkAuditing,
+    /// `intl.accept_languages` — the same, type VTYPE_STRING once written.
+    AcceptLanguage,
+}
+
+impl PrefKind {
+    /// The dotted name CEF knows it by.
+    fn name(self) -> &'static str {
+        match self {
+            PrefKind::DoNotTrack => "enable_do_not_track",
+            PrefKind::HyperlinkAuditing => "enable_a_ping",
+            PrefKind::AcceptLanguage => "intl.accept_languages",
         }
     }
 }
+// --- end content settings ------------------------------------------------------------------------
 
 /// Which scopes a setting can be given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -376,6 +461,15 @@ pub static SEARCH_ENGINES: DictShape = DictShape {
     open_keys: true,
     value: DictValue::SearchTemplate,
 };
+
+// --- content settings --------------------------------------------------------------------------
+/// qutebrowser's `BoolAsk`, which is nine of its `content.*` options and seven of bru's.
+///
+/// The order is the order `config-cycle` with no values walks, and it is `true`, `false`, `ask`
+/// rather than alphabetical: the two decisive answers first, the one that asks last, so a key bound
+/// to a bare cycle steps allow → block → prompt and back rather than stopping to ask in the middle.
+pub static BOOL_ASK: &[&str] = &["true", "false", "ask"];
+// --- end content settings ----------------------------------------------------------------------
 
 /// Every setting bru has, and nothing else.
 ///
@@ -494,6 +588,165 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Insert,
     },
     // --- end src/focus.rs ---------------------------------------------------------------------
+// --- content settings --------------------------------------------------------------------------
+    // qutebrowser has 75 `content.*` options. These are the ones CEF 151 has something behind, and
+    // every one of them was measured on a page rather than only read back — the read-back and the
+    // behaviour are different claims and only the second is worth anything.
+    //
+    // **Twelve of them are one mechanism**: `RequestContext::set_content_setting`, which
+    // `content.javascript.enabled` and `content.images` already went through. Three are a Chromium
+    // *preference* instead, which is [`Backing::Preference`] and is global by construction.
+    //
+    // The three-valued ones spell their values `true` / `false` / `ask`, which is qutebrowser's
+    // `BoolAsk` verbatim, and `ask` is honest here only because `prompt.rs` has a permission
+    // handler: `on_show_permission_prompt` draws bru's own yes/no question. Without it `ask` would
+    // be a value that silently denied.
+    Def {
+        // `configdata.yml:464`. Chromium's own default is ALLOW, and so is bru's.
+        name: "content.autoplay",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Autoplay),
+    },
+    Def {
+        // `configdata.yml:1332`, and the one setting in this file whose `true` is Chromium's
+        // `BLOCK` — see `ContentKind::inverted`. bru already has `:tab-mute` on `<Alt-m>`; this is
+        // the same silence asked for by host instead of by tab.
+        name: "content.mute",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Sound),
+    },
+    Def {
+        // `configdata.yml:966`. Chromium calls it POPUPS and its header says the rule "governs both
+        // popups and unwanted redirects like tab-unders and framebusting", which is wider than the
+        // name promises and is a reason to keep qutebrowser's default of `false`.
+        //
+        // **It is not `on_before_popup`**, and the difference is worth the sentence: trap 14 has bru
+        // returning 1 from that callback so a `window.open` becomes a bru tab instead of a second
+        // window. This setting is upstream of it — Chromium never asks when the rule is BLOCK, so
+        // `popups.rs` never sees the call at all.
+        name: "content.javascript.can_open_tabs_automatically",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Popups),
+    },
+    Def {
+        // `configdata.yml:1147`.
+        name: "content.notifications.enabled",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Notifications),
+    },
+    Def {
+        // `configdata.yml:688`.
+        name: "content.geolocation",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Geolocation),
+    },
+    Def {
+        // `configdata.yml:1113`. Chromium keeps microphone and camera in two rules, which is why
+        // qutebrowser's third name for the pair is refused rather than implemented — see [`REFUSED`].
+        name: "content.media.audio_capture",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::MicrophoneCapture),
+    },
+    Def {
+        // `configdata.yml:1127`.
+        name: "content.media.video_capture",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::CameraCapture),
+    },
+    Def {
+        // `configdata.yml:694`. Chromium's POINTER_LOCK, which is the same API under its current
+        // name — `Element.requestPointerLock`, which used to be `webkitRequestPointerLock`.
+        name: "content.mouse_lock",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::PointerLock),
+    },
+    Def {
+        // `configdata.yml:1258`. `navigator.registerProtocolHandler`.
+        name: "content.register_protocol_handler",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::ProtocolHandlers),
+    },
+    Def {
+        // `configdata.yml:1211`. `navigator.storage.persist()` — whether the origin's storage
+        // survives Chromium's eviction, which is what qutebrowser's name means too.
+        name: "content.persistent_storage",
+        kind: Kind::Choice(BOOL_ASK),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::PersistentStorage),
+    },
+    Def {
+        // `configdata.yml:940`. qutebrowser has four values and bru has three, and the missing one
+        // is `access-paste`: Chromium keeps one rule, CLIPBOARD_READ_WRITE, whose header calls it
+        // "full access to the system clipboard (sanitized read without user gesture, and
+        // unsanitized read and write with user gesture)" — read and paste together. There is no
+        // rule that grants reading without pasting, so `access` and `access-paste` would be two
+        // spellings of one write. Shipping both would be a value typed and forgotten; the error
+        // lists the three that differ.
+        name: "content.javascript.clipboard",
+        kind: Kind::Choice(&["none", "access", "ask"]),
+        default: Some("ask"),
+        scopes: Scopes::Both,
+        backing: Backing::Content(ContentKind::Clipboard),
+    },
+    Def {
+        // `configdata.yml:728`. A **preference**, so global only, where qutebrowser allows a
+        // pattern — see [`Backing::Preference`].
+        name: "content.headers.do_not_track",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Preference(PrefKind::DoNotTrack),
+    },
+    Def {
+        // `configdata.yml:923`. `<a ping>` and `navigator.sendBeacon`, which is the tracking ping
+        // a link fires on its way out. qutebrowser ships it off and so does bru.
+        name: "content.hyperlink_auditing",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Preference(PrefKind::HyperlinkAuditing),
+    },
+    Def {
+        // `configdata.yml:701`, and **the value is not the header** — that is the one thing worth
+        // knowing here and it is measured rather than reasoned about. qutebrowser's default is the
+        // header text, `en-US,en;q=0.9`, because Qt sends the string as written. Chromium's
+        // `intl.accept_languages` is a *language list* and Chromium computes the quality values
+        // itself: measured 2026-08-07, `:set content.headers.accept_language de-DE,de,fr` produced
+        // `Accept-Language: de-DE,de;q=0.9,fr;q=0.8` on the wire, read off a request this machine
+        // served. Writing qutebrowser's spelling with the `;q=0.9` in it is accepted and then
+        // normalised back to `en-US,en`, so shipping that as bru's default would make
+        // `:set content.headers.accept_language?` and `bru://chrome/settings` print two different
+        // strings for one setting. bru ships the list.
+        //
+        // `Kind::Text` rather than a list because a comma-separated language list is one field
+        // value everywhere it is written down, and `:config-list-add` on it would be a new
+        // vocabulary for something the user already types as one string.
+        name: "content.headers.accept_language",
+        kind: Kind::Text,
+        default: Some("en-US,en"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Preference(PrefKind::AcceptLanguage),
+    },
+// --- end content settings ----------------------------------------------------------------------
 // --- config commands ---------------------------------------------------------------------------
     Def {
         // qutebrowser's name for qutebrowser's list (`configdata.yml:886`), and bru's own two
@@ -530,10 +783,14 @@ pub const REFUSED: &[(&str, &str)] = &[
         "content.plugins",
         "Chromium 151 has nothing behind this name. cef_browser_settings_t has no plugin field \
          at all, cef_content_setting_types_t's only plugin entry is DEPRECATED_PPAPI_BROKER, and \
-         the one settable preference in the family is plugins.always_open_pdf_externally — \"open \
-         PDFs in another application\", which is neither \"enable plugins\" nor scopeable to a \
-         URL. Measured 2026-08-06. NPAPI and PPAPI are gone, so these six keys are not waiting \
-         for work; there is no work that would make them act.",
+         the settable preferences in the family are plugins.always_open_pdf_externally — \"open \
+         PDFs in another application\" — and webkit.webprefs.plugins_enabled, which in Chromium \
+         151 governs the built-in PDF viewer and MimeHandlerView and nothing else. Measured \
+         2026-08-06, and the second preference re-measured 2026-08-07, which corrected this line: \
+         it used to say always_open_pdf_externally was the only one. Neither is \"enable plugins\" \
+         and neither can be scoped to a URL, which is how all six default bindings spell it. \
+         NPAPI and PPAPI are gone, so these six keys are not waiting for work; there is no work \
+         that would make them act.",
     ),
     (
         "content.cookies.accept",
@@ -1835,6 +2092,13 @@ fn reset(unset: &Unset) -> Result<(), String> {
         // Everything else is read out of bru's own store when it is wanted, so removing the value
         // is the whole of the work — except that the bar and the engine table are built eagerly and
         // have to be rebuilt.
+// --- content settings --------------------------------------------------------------------------
+        // A `Backing::Preference` comes through here too, and re-applying is exactly right for it:
+        // a preference has no `DEFAULT` sentinel the way a content setting does — Chromium either
+        // holds a value or holds Chromium's own — so putting bru's own back is the only spelling of
+        // "unset" that leaves the profile agreeing with what `:set <option>` now prints. Every
+        // preference-backed setting ships a default for that reason.
+// --- end content settings ----------------------------------------------------------------------
         _ => {
             let Some(value) = unset.value.clone() else {
                 return Ok(());
@@ -1922,19 +2186,19 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         }
         // Nothing to push, and deliberately nothing to fetch — see `Backing::AdblockLists`.
         Backing::AdblockLists => return Ok(()),
+// --- content settings --------------------------------------------------------------------------
+        Backing::Preference(pref) => return write_preference(pref, &applied.value),
+// --- end content settings ----------------------------------------------------------------------
         Backing::Content(kind) => kind,
     };
-    let Value::Bool(allow) = applied.value else {
-        return Err(format!("{}: a content setting must be a boolean", applied.def.name));
+    let Some(value) = content_value(kind, &applied.value) else {
+        return Err(format!(
+            "{}: {} is not a value a content setting can hold",
+            applied.def.name, applied.value
+        ));
     };
     let Some(context) = request_context_get_global_context() else {
         return Err("no request context — settings cannot reach Chromium".to_string());
-    };
-
-    let value = if allow {
-        ContentSettingValues::ALLOW
-    } else {
-        ContentSettingValues::BLOCK
     };
 
     match &applied.pattern {
@@ -1953,11 +2217,157 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
     Ok(())
 }
 
+// --- content settings ----------------------------------------------------------------------------
+/// One of bru's values as one of Chromium's, or `None` when the setting cannot hold it.
+///
+/// Three vocabularies meet here and the mapping is the whole of the translation:
+///
+/// - a [`Kind::Bool`] arrives as `Value::Bool`, and `true` is `ALLOW` — unless the kind is
+///   inverted, which is `content.mute` and nothing else (see [`ContentKind::inverted`]);
+/// - a [`Kind::Choice`] arrives as `Value::Text` holding one of [`BOOL_ASK`], and `ask` is
+///   `ContentSettingValues::ASK` — the value `prompt.rs`'s permission handler is what makes honest;
+/// - `content.javascript.clipboard` spells its two decisive values `none` and `access` instead,
+///   because that is qutebrowser's word for the same rule.
+///
+/// `None` is unreachable from `:set`, which parses against the `Kind` first. It is the belt to
+/// `Def::parse`'s braces, and it is what a dictionary or a list pointed at a content setting gets.
+fn content_value(kind: ContentKind, value: &Value) -> Option<ContentSettingValues> {
+    let (allow, block) = if kind.inverted() {
+        (ContentSettingValues::BLOCK, ContentSettingValues::ALLOW)
+    } else {
+        (ContentSettingValues::ALLOW, ContentSettingValues::BLOCK)
+    };
+    match value {
+        Value::Bool(true) => Some(allow),
+        Value::Bool(false) => Some(block),
+        Value::Text(text) => match text.as_str() {
+            "true" | "access" => Some(allow),
+            "false" | "none" => Some(block),
+            "ask" => Some(ContentSettingValues::ASK),
+            _ => None,
+        },
+        Value::Dict(_) | Value::List(_) => None,
+    }
+}
+
+/// Write one Chromium preference, or say why it could not be written.
+///
+/// `set_preference` fills an **out-parameter** with Chromium's own complaint when it refuses — a
+/// name that does not exist, or a value of the wrong type — and that string is worth more than a
+/// boolean, so it is what the error carries. Trap 9 does not bite here: the string is one CEF
+/// *writes*, and it is read back through `CefString::from(&…)` the way `app.rs` reads a switch.
+///
+/// `Value::Text` covers `intl.accept_languages` and `Value::Bool` the other two; a dictionary or a
+/// list has no preference behind it and says so rather than writing something shaped wrongly.
+fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
+    let Some(context) = request_context_get_global_context() else {
+        return Err("no request context — settings cannot reach Chromium".to_string());
+    };
+    let Some(mut cef_value) = value_create() else {
+        return Err(format!("{}: CEF would not make a value to write", pref.name()));
+    };
+    match value {
+        Value::Bool(flag) => {
+            cef_value.set_bool(i32::from(*flag));
+        }
+        Value::Text(text) => {
+            cef_value.set_string(Some(&CefString::from(text.as_str())));
+        }
+        Value::Dict(_) | Value::List(_) => {
+            return Err(format!(
+                "{}: a preference bru drives is a boolean or a string, not a table",
+                pref.name()
+            ));
+        }
+    }
+    let name = CefString::from(pref.name());
+    // **Not `CefString::default()`, and this is trap 9 read from the other end.** `Default` for a
+    // `CefStringData` is `Borrowed(None)`, and `From<&mut CefStringUtf16> for *mut
+    // _cef_string_utf16_t` answers a **null pointer** for the borrowed form — so CEF is handed
+    // nowhere to write, and every failure comes back with an empty reason. Measured 2026-08-07: the
+    // write below failed and said "Chromium refused the write and said nothing", twice, for two
+    // different reasons neither of which was visible. `CefString::from(&str)` is the `Clear` form,
+    // which owns a real `cef_string_utf16_t` for CEF to overwrite, and the placeholder has to be
+    // non-empty because `cef_string_utf8_to_utf16` of an empty string produces `None` and puts the
+    // null pointer back.
+    let mut error = CefString::from("-");
+    if context.set_preference(Some(&name), Some(&mut cef_value), Some(&mut error)) == 0 {
+        let error = error.to_string();
+        let error = if error == "-" { String::new() } else { error };
+        return Err(if error.is_empty() {
+            format!("{}: Chromium refused the write and said nothing", pref.name())
+        } else {
+            format!("{}: {error}", pref.name())
+        });
+    }
+    Ok(())
+}
+// --- end content settings ------------------------------------------------------------------------
+
+// --- content settings ----------------------------------------------------------------------------
+/// What Chromium holds for one preference right now, in words — the read-back half of
+/// [`write_preference`], and the same "ask Chromium, not bru's own store" rule
+/// [`chromium_value`] is built on.
+///
+/// **`ImplPreferenceManager::preference` is the one to use, and `get_all_preferences` is a trap.**
+/// Measured 2026-08-07, and this function was written the wrong way round first: the nested
+/// dictionary `get_all_preferences(1)` answers **does not contain the leaves**. `intl` is in it and
+/// is a `VTYPE_DICTIONARY`, and `--settings-probe='prefkeys:intl'` reports it has **0 keys** — after
+/// a successful write of `intl.accept_languages`, which `has_preference` and `can_set_preference`
+/// both answer 1 for and which `preference()` reads back as `de-DE,de`. Walking the dictionary
+/// therefore says "not a value bru reads (VTYPE_INVALID)" about a preference that is set.
+///
+/// So the rule is: **`has_preference` / `can_set_preference` / `preference` take the full dotted
+/// path and are the truth; `get_all_preferences` is for browsing the top level and nothing else.**
+/// (cef-rs spells `get_preference` as `preference` — it is easy to miss when scanning the trait.)
+///
+/// Must run on the UI thread, exactly as trap 15's `get_content_setting` must.
+fn read_preference(pref: PrefKind) -> Option<String> {
+    let context = request_context_get_global_context()?;
+    let name = CefString::from(pref.name());
+    let value = context.preference(Some(&name))?;
+    Some(match value.get_type() {
+        t if t == ValueType::BOOL => (value.bool() != 0).to_string(),
+        t if t == ValueType::STRING => CefString::from(&value.string()).to_string(),
+        t if t == ValueType::INT => value.int().to_string(),
+        // A name that is not there at all, or one holding a shape bru does not write. The type is
+        // in the string because "not set" alone cannot tell those two apart, and that ambiguity
+        // cost a measurement.
+        other => format!("not a value bru reads ({other:?})"),
+    })
+}
+// --- end content settings ------------------------------------------------------------------------
+
 /// Push everything `config.lua` set into Chromium. Called once from `app.rs`, after `Config::load`
 /// and before the first tab exists — a start page with JavaScript switched off has to load that way
 /// rather than load and then be corrected.
 pub fn apply_at_startup() {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
+// --- content settings --------------------------------------------------------------------------
+    // **A preference-backed setting has its default written even when nothing set it**, and that is
+    // the difference between DESIGN.md's "a bru with no `~/.config/bru/` is fully configured" and a
+    // browser that only reports its defaults. Measured 2026-08-07 on an untouched profile:
+    // Chromium's own `enable_do_not_track` is **false**, `enable_a_ping` is **true** and
+    // `intl.accept_languages` is **en-US,en**, while qutebrowser's — and therefore bru's — are
+    // true, false and `en-US,en;q=0.9`. Without this loop `:set content.headers.do_not_track?`
+    // would print `true` at a browser that was sending no DNT header at all, which is the exact
+    // shape of lie this file exists to refuse.
+    //
+    // A content setting needs no such loop: `ContentSettingValues::DEFAULT` *is* bru's default, so
+    // "nothing written" and "bru's own" are the same state there. A preference has no such
+    // sentinel — see `reset`.
+    for def in SETTINGS {
+        if !matches!(def.backing, Backing::Preference(_)) {
+            continue;
+        }
+        let Ok(Some(value)) = with_live(|settings| settings.get(def.name, None)) else {
+            continue;
+        };
+        if let Err(error) = apply(&Applied { def, value, pattern: None }) {
+            eprintln!("bru: {error}");
+        }
+    }
+// --- end content settings ----------------------------------------------------------------------
     let entries = with_live(|settings| settings.entries());
     for (pattern, def, value) in entries {
         if let Err(error) = apply(&Applied { def, value, pattern }) {
@@ -1973,6 +2383,13 @@ pub fn apply_at_startup() {
 pub fn chromium_value(name: &str, url: &str) -> Option<String> {
     let kind = match def(name)?.backing {
         Backing::Content(kind) => kind,
+// --- content settings --------------------------------------------------------------------------
+        // Chromium *does* have an opinion here, and it is not a content setting: it is a
+        // preference, read back out of the profile rather than out of the content-settings map.
+        // The URL is ignored, because a preference has no URL dimension — see
+        // [`Backing::Preference`].
+        Backing::Preference(pref) => return read_preference(pref),
+// --- end content settings ----------------------------------------------------------------------
         // None of these is a Chromium content setting, so Chromium has no opinion to read back.
         Backing::StartPage
         | Backing::Insert
@@ -1990,6 +2407,17 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
             v if v == ContentSettingValues::ALLOW => "allow",
             v if v == ContentSettingValues::BLOCK => "block",
             v if v == ContentSettingValues::DEFAULT => "default",
+// --- content settings --------------------------------------------------------------------------
+            // **Added because the answer was already arriving and being called `other`.** Measured
+            // 2026-08-07 on a profile that had never been written to: every one of the seven
+            // three-valued settings — notifications, geolocation, the two media captures, pointer
+            // lock, display capture, protocol handlers, persistent storage, the clipboard — read
+            // back as this, and the probe printed `other` for all of them. A word that lumps the
+            // browser's own default in with a value nobody has a name for is the wrong answer a
+            // reader believes, which is trap 15's lesson one layer up.
+            v if v == ContentSettingValues::ASK => "ask",
+            v if v == ContentSettingValues::SESSION_ONLY => "session only",
+// --- end content settings ----------------------------------------------------------------------
             _ => "other",
         }
         .to_string(),
@@ -2035,6 +2463,12 @@ wrap_task! {
                     probe_third_party_cookies(spec);
                     continue;
                 }
+// --- content settings --------------------------------------------------------------------------
+                if let Some(path) = pair.strip_prefix("prefkeys:") {
+                    dump_preference_keys(path);
+                    continue;
+                }
+// --- end content settings ----------------------------------------------------------------------
                 let Some((name, url)) = pair.split_once('@') else {
                     eprintln!("settings-probe: {pair:?} is not <setting>@<url>");
                     continue;
@@ -2057,6 +2491,51 @@ wrap_task! {
         }
     }
 }
+
+// --- content settings ----------------------------------------------------------------------------
+/// `--settings-probe='prefkeys:intl'` — the keys **inside** one nested preference dictionary, with
+/// their types.
+///
+/// [`dump_preferences`] lists only the top level, and that is the whole difficulty with
+/// `get_all_preferences`: `intl` is a dictionary and `intl.accept_languages` cannot be seen from
+/// outside it. An empty path lists the top level, which is what `prefs:` does with an empty needle.
+///
+/// It exists because a question this shape came up twice in one afternoon and both times the answer
+/// was a rebuild away. `prefkeys:` is one command.
+fn dump_preference_keys(path: &str) {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let Some(context) = request_context_get_global_context() else {
+        eprintln!("settings-probe: no request context");
+        return;
+    };
+    let Some(mut dict) = context.all_preferences(1) else {
+        eprintln!("settings-probe: no preferences");
+        return;
+    };
+    for part in path.split('.').filter(|part| !part.is_empty()) {
+        let key = CefString::from(part);
+        match dict.dictionary(Some(&key)) {
+            Some(inner) => dict = inner,
+            None => {
+                eprintln!("settings-probe: prefkeys {path}: {part:?} is not a dictionary here");
+                return;
+            }
+        }
+    }
+    let mut keys = CefStringList::new();
+    dict.keys(Some(&mut keys));
+    let mut count = 0;
+    for key in keys.into_iter() {
+        let name = CefString::from(key.as_str());
+        count += 1;
+        eprintln!(
+            "settings-probe: prefkeys {path}.{key} type={:?}",
+            dict.get_type(Some(&name))
+        );
+    }
+    eprintln!("settings-probe: prefkeys {path} has {count} key(s)");
+}
+// --- end content settings ------------------------------------------------------------------------
 
 /// `--settings-probe='prefs:cookie'` — every Chromium preference CEF exposes whose name contains
 /// `needle`, with whether CEF will let bru write it.
@@ -2180,7 +2659,13 @@ mod tests {
         // make a failing build pass.
         // Twelve since `content.blocking.adblock.lists`, which is bru's first `Kind::List` and was
         // `adblock::DEFAULT_LISTS` before it was a setting.
-        assert_eq!(SETTINGS.len(), 12);
+        // --- content settings -------------------------------------------------------------------
+        // Twenty-seven on this branch: the twelve above plus fifteen `content.*`, which are twelve
+        // Chromium content settings and three Chromium preferences. **This number conflicts three
+        // ways** — two other workstreams are adding settings at the same time — so it is what this
+        // branch has and the coordinator adds the deltas; +15 is this workstream's.
+        assert_eq!(SETTINGS.len(), 26);
+        // --- end content settings ---------------------------------------------------------------
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

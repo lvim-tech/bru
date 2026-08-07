@@ -418,7 +418,13 @@ mod tests {
         // like. It must not print a default and call it what Chromium is enforcing.
         let html = page(None);
         assert!(html.contains("nothing has been read yet"));
-        assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 2);
+// --- content settings ----------------------------------------------------------------------------
+        // Seventeen on this branch: the two content settings bru started with, twelve more, and the
+        // three whose value lives in a Chromium *preference* — which is Chromium's copy too, so
+        // "not read yet" is the honest cell for them before a reading. **This number conflicts with
+        // the other two settings workstreams**; +15 is this one's.
+        assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 16);
+// --- end content settings ------------------------------------------------------------------------
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
         // neither is ever one of them — the two above are the content settings.
         assert!(html.contains(&escape(&crate::open::start_page())));
