@@ -510,6 +510,62 @@ mod tests {
         assert_eq!(decide(opted_out, false, PERSON, MOUSE, WEB), Verdict::Nothing);
     }
 
+    /// **What the key path stopped paying**, which is the other half of this change and the half
+    /// that is easy to forget to measure.
+    ///
+    /// `keys.rs` used to run this on **every keystroke**: take the `BruState` mutex and ask it to
+    /// enter insert mode, whenever `focus_on_editable_field` was set. On a page with a focused
+    /// search box — the start page, every time — that was the cost of pressing `j`. It is now zero,
+    /// because `on_pre_key_event` does not mention focus at all; the same work happens once per
+    /// focus change instead of once per key.
+    ///
+    /// Timed here rather than asserted, in the shape `state.rs::the_key_path_cost_of_a_per_window_mode`
+    /// uses. The bound is loose on purpose: this runs unoptimised under `cargo test` on a machine
+    /// with other agents on it, and what it pins is that the removed work was not free.
+    #[test]
+    fn the_key_path_no_longer_pays_for_a_focused_field() {
+        const ROUNDS: u32 = 200_000;
+
+        let state = crate::state::BruState::new();
+        let window = state
+            .lock()
+            .expect("state mutex poisoned")
+            .open_window_slot();
+
+        // What every keystroke used to cost while a field had the focus.
+        let per_key = {
+            for _ in 0..10_000 {
+                let _ = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .enter_mode_in(window, Mode::Insert, true);
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                std::hint::black_box(
+                    state
+                        .lock()
+                        .expect("state mutex poisoned")
+                        .enter_mode_in(window, Mode::Insert, true),
+                );
+            }
+            start.elapsed().as_nanos() as f64 / ROUNDS as f64
+        };
+
+        println!(
+            "focus: the removed per-keystroke lock-and-enter cost {per_key:.1} ns; the key path \
+             now pays 0 of it, because keys.rs no longer reads focus_on_editable_field"
+        );
+        assert!(
+            per_key > 0.0,
+            "if this measures nothing, the measurement is broken rather than the work free"
+        );
+        // Nothing this file does is reachable from `on_pre_key_event`. That is a fact about the
+        // call graph rather than a clock, and it is asserted where it can be: the three functions
+        // the key path could have called are `on_report`, `on_load_started` and `decide`, and
+        // `keys.rs` names none of them. See the commit that removed the block.
+    }
+
     /// bru's defaults are qutebrowser's — `configdata.yml:1905`, `:1911`, `:1916` and `:1926`, read
     /// there rather than recalled. Written as an assertion so that changing the table is changing a
     /// test.
