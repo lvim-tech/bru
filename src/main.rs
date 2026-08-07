@@ -20,6 +20,9 @@ mod data;
 mod downloads;
 mod editor;
 mod devtools;
+// --- plugin events ------------------------------------------------------------------------------
+mod events;
+// --- end plugin events --------------------------------------------------------------------------
 mod exec;
 mod favicon;
 mod find;
@@ -31,6 +34,9 @@ mod history;
 mod ipc;
 mod keys;
 mod load;
+// --- plugin events (this module is workstream A's; see its head) --------------------------------
+mod lua;
+// --- end plugin events --------------------------------------------------------------------------
 mod macros;
 mod message;
 mod modes;

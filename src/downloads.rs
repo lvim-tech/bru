@@ -349,8 +349,20 @@ wrap_download_handler! {
             let received = item.received_bytes();
             let total = item.total_bytes();
 
+            let finished_now;
             {
                 let mut list = downloads().lock().expect("downloads mutex poisoned");
+// --- plugin events ---------------------------------------------------------
+                // `on_download_updated` arrives several times a second and keeps arriving after a
+                // download is done, so the edge — was not done, is done now — is the only thing
+                // that is "finished". Read before the row is written, because that is the last
+                // moment the previous state exists. A row that has never been seen counts as not
+                // done, so a download whose very first callback is `complete` still fires once.
+                finished_now = state.done()
+                    && !list
+                        .iter()
+                        .any(|entry| entry.id == id && entry.state.done());
+// --- end plugin events -----------------------------------------------------
                 let entry = match list.iter_mut().position(|entry| entry.id == id) {
                     Some(at) => &mut list[at],
                     None => {
@@ -374,7 +386,10 @@ wrap_download_handler! {
                     entry.path = PathBuf::from(&path);
                 }
                 if entry.url.is_empty() {
-                    entry.url = url;
+                    // Cloned rather than moved since `plugin events`: `download-finished` names the
+                    // URL below, and a conditional move here would leave `url` unusable afterwards.
+                    // The clone only happens on the callback that first learns the address.
+                    entry.url = url.clone();
                 }
                 // A finished download's callback is of no use and must not be kept — the only
                 // caller would be `download-cancel`, and cancelling a finished download is what
@@ -412,6 +427,48 @@ wrap_download_handler! {
 // --- end unhardcoded -------------------------------------------------------
             }
 // --- end src/prompt.rs -----------------------------------------------------
+
+// --- plugin events ---------------------------------------------------------
+            // `download-finished`, once per download, on the edge computed above.
+            //
+            // The window is the one the *browser that started the download* is in, taken from the
+            // callback's own browser rather than from the focus — a download landing while the user
+            // has moved to the other window belongs to the window that asked for it. It is `nil`
+            // when CEF hands no browser, which is the honest answer and is never a fabricated 0.
+            if finished_now {
+                let window = _browser
+                    .as_deref()
+                    .map(|browser| browser.identifier())
+                    .and_then(|id| {
+                        crate::state::BruState::instance().and_then(|state| {
+                            state
+                                .lock()
+                                .ok()
+                                .and_then(|state| state.window_of_browser(id))
+                        })
+                    });
+                crate::events::fire(crate::events::Event::DownloadFinished, window, || {
+                    let path = downloads()
+                        .lock()
+                        .ok()
+                        .and_then(|list| {
+                            list.iter()
+                                .find(|entry| entry.id == id)
+                                .map(|entry| entry.name())
+                        })
+                        .unwrap_or_default();
+                    vec![
+                        ("filename", crate::lua::Arg::Text(path)),
+                        ("url", crate::lua::Arg::Text(url.clone())),
+                        // Cancelled and interrupted are both "did not succeed"; a plugin that wants
+                        // to tell them apart has `state` — but `succeeded` is the question almost
+                        // every handler is actually asking, and one boolean is what it deserves.
+                        ("succeeded", crate::lua::Arg::Bool(state == State::Complete)),
+                        ("state", crate::lua::Arg::Text(state.name().to_string())),
+                    ]
+                });
+            }
+// --- end plugin events -----------------------------------------------------
 
             // Filtered inside `ipc`, which pushes only when the string changes: this arrives several
             // times a second and the percentage does not.

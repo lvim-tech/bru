@@ -265,6 +265,22 @@ wrap_browser_process_handler! {
             // above, which is what installs the search engines from config.lua.
             crate::completion::install(Box::new(crate::data::DataSources));
 
+// --- plugin events ---------------------------------------------------------
+            // The Lua state and the plugins, before the first window exists — so that a plugin
+            // watching `page-loaded` sees the start page load rather than starting one navigation
+            // behind. `--plugin-dir=<path>` replaces the search directory, which is how a shipped
+            // plugin (and a test fixture) is run without installing anything.
+            //
+            // This block is workstream A's `plugins.rs`/`lua.rs` bootstrap; see `src/lua.rs`'s head.
+            {
+                let plugin_dir = CefString::from(
+                    &command_line.switch_value(Some(&CefString::from("plugin-dir"))),
+                )
+                .to_string();
+                crate::lua::boot(Some(plugin_dir.as_str()));
+            }
+// --- end plugin events -----------------------------------------------------
+
             // Four modules that were built in parallel and each left a hole where another one
             // belongs. Each hole was deliberate — a second `wl-copy` or a second download path
             // would have been the wrong kind of duplication — so this is where they are introduced

@@ -943,6 +943,19 @@ pub fn run_source(filename: Option<&str>, clear: bool) {
         Ok(config) => {
             install_over_the_running_browser(config);
             crate::message::info(&format!("sourced {}", path.display()));
+// --- plugin events (this file is workstream A's — one call, after the install) --------------
+            // `config-sourced`, after the new bindings and settings are live, so a handler that
+            // asks `bru.get` gets the file's answer and not the one it replaced. `:config-source`
+            // is typed in a window and the window is the one it was typed in.
+            let window = crate::state::BruState::instance()
+                .and_then(|state| state.lock().ok().and_then(|state| state.current_window_id()));
+            crate::events::fire(crate::events::Event::ConfigSourced, window, || {
+                vec![
+                    ("path", crate::lua::Arg::Text(path.display().to_string())),
+                    ("cleared", crate::lua::Arg::Bool(clear)),
+                ]
+            });
+// --- end plugin events ---------------------------------------------------------------------
         }
         Err(error) => crate::message::error(&format!("config-source: {error}")),
     }

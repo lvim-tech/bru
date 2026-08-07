@@ -459,6 +459,29 @@ pub fn forget_window(window: u32) {
 
 /// From `DisplayHandler::on_address_change` on the main frame, for the window the tab is in.
 pub fn set_url_for(window: u32, url: String) {
+// --- plugin events ---------------------------------------------------------
+    // `url-changed`, where the bar is told — which is `on_address_change` **and** a tab switch, the
+    // two ways a window's address moves. The guard is "the bar did not already hold this": both
+    // routes push unconditionally, and a plugin asked to be told when the address changed must not
+    // be told again because something else pushed the same string.
+    //
+    // The whole block is behind the handler count, not just `fire`: the freshness test takes the
+    // chrome mutex, and a bru with no plugins must not pay a lock per navigation for an answer
+    // nobody wants.
+    //
+    // An **empty** address is not one. A tab switch pushes whatever the new tab has recorded, and a
+    // tab whose page has not committed yet has recorded nothing; measured, that put a
+    // `url-changed` with `url = ""` between the switch and the real address. A plugin asked to be
+    // told the address changed is owed an address.
+    if crate::events::handler_count(crate::events::Event::UrlChanged) != 0
+        && !url.is_empty()
+        && with_window(window, |entry| entry.bar.url != url).unwrap_or(false)
+    {
+        crate::events::fire(crate::events::Event::UrlChanged, Some(window), || {
+            vec![("url", crate::lua::Arg::Text(url.clone()))]
+        });
+    }
+// --- end plugin events -----------------------------------------------------
     with_window(window, |entry| entry.bar.url = url);
     push_for(window);
 }
@@ -480,6 +503,33 @@ pub fn set_title_for(window: u32, title: String) {
 /// reason: bru keeps a `ModeManager` per window, so `insert` in window 1 is not a fact about
 /// window 0 and must not be pushed into its bar.
 pub fn set_mode_for(window: u32, mode: String) {
+// --- plugin events ---------------------------------------------------------
+    // `mode-changed`, with both ends of the transition.
+    //
+    // **It is not in `modes.rs`, and that is not where it could have been.** `ModeManager` is a
+    // pure state machine over an enum — its own head says so — and it knows no window; the place
+    // that has both ends *and* a window id is `state::BruState::apply`, which runs with the state
+    // mutex held, and a Lua handler called under that lock is a deadlock waiting for the first
+    // entry point that reaches back into `BruState`. This function is the funnel every mode change
+    // in a window already passes through (`prompt.rs:416` says so in as many words), it is called
+    // after the lock is released, and the mode the bar is holding *is* the mode being left. Same
+    // ordering rule as the two blocks below it: the event is fired before anything is overwritten.
+    //
+    // A bar that has never been told a mode holds `""`; the window was in normal mode, which is
+    // what bru starts every window in, so that is what `from` says.
+    if crate::events::handler_count(crate::events::Event::ModeChanged) != 0 {
+        let from = with_window(window, |entry| entry.bar.mode.clone()).unwrap_or_default();
+        let from = if from.is_empty() { crate::modes::Mode::Normal.name().to_string() } else { from };
+        if from != mode {
+            crate::events::fire(crate::events::Event::ModeChanged, Some(window), || {
+                vec![
+                    ("from", crate::lua::Arg::Text(from)),
+                    ("to", crate::lua::Arg::Text(mode.clone())),
+                ]
+            });
+        }
+    }
+// --- end plugin events -----------------------------------------------------
     // Every route out of command mode passes through here — `mode-leave`, an accepted command, a
     // page focusing a field — so this is where the line is cleared and the page gets its focus
     // back. Hanging it off the mode change rather than off the `mode-leave` command is what keeps
