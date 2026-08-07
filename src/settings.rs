@@ -3878,6 +3878,10 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
                 // fetch is a warning nobody reads.
                 if applied.def.name.starts_with("colors.") {
                     crate::chrome::warn_if_incomplete();
+                    // A colour reaches the pages as well as the strips; a font does not, and
+                    // repainting every page for one would be work for nothing.
+                    crate::ipc::reapply_theme_everywhere();
+                    return Ok(());
                 }
                 // --- end src/chrome.rs: themes ---------------------------------------------
                 crate::ipc::reload_chrome_everywhere();

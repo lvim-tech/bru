@@ -164,7 +164,10 @@ wrap_task! {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             crate::chrome::warn_if_incomplete();
-            crate::ipc::reload_chrome_everywhere();
+            // The chrome **and** the two pieces of the theme a page carries — see
+            // `ipc::reapply_theme_everywhere` for what those are and what reloading only the
+            // chrome left behind.
+            crate::ipc::reapply_theme_everywhere();
             eprintln!("bru[theme]: ~/.config/bru/theme.css was rewritten — re-read");
         }
     }

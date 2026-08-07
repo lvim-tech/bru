@@ -771,7 +771,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             // copy did not move.
             let _ = name;
             crate::chrome::warn_if_incomplete();
-            crate::ipc::reload_chrome_everywhere();
+            crate::ipc::reapply_theme_everywhere();
             crate::message::info("re-read ~/.config/bru/theme.css");
         }
         Command::Colorscheme { name, .. } => match name {

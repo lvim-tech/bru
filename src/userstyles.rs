@@ -243,6 +243,23 @@ pub fn push_enabled(on: bool) {
     }
 }
 
+/// Re-apply the per-site stylesheets in every open page, because the theme underneath them moved.
+///
+/// **A page carries the theme, and the theme is not the page's.** `css_for` prepends `theme.css` to
+/// whatever the site's folder holds, so a stylesheet that says `var(--bg)` is resolved against the
+/// theme **as it was when the document loaded**. `theme_watch.rs` re-reads the file and reloads
+/// bru's own chrome, and until this existed that was the whole of applying a theme: the strips
+/// changed colour and the page under them kept the old one until it was reloaded by hand. Measured
+/// 2026-08-08 — `--bg` still `#292f33` on a page whose theme file had been rewritten to Gruvbox,
+/// with bru's own log line saying it had noticed.
+///
+/// It is `push_enabled` with the value unchanged, and that is not a trick: the renderer's handler
+/// already re-reads the folder and hands the result to the keeper already in the page, which is
+/// exactly "apply the current answer again". Nothing reloads.
+pub fn repaint() {
+    push_enabled(crate::settings::is_on("content.user_styles"));
+}
+
 /// One `SET_ENABLED` message, to one frame. The only place that message is built.
 fn send_enabled(frame: &Frame, on: bool) {
     let Some(mut message) = process_message_create(Some(&CefString::from(SET_ENABLED))) else {

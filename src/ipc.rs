@@ -1010,6 +1010,34 @@ pub fn reload_chrome_everywhere() {
         }
     }
 }
+
+/// **The theme moved: re-apply it to the chrome AND to every page.**
+///
+/// `reload_chrome_everywhere` above is half of applying a theme, and for a long time it was the
+/// whole of it. A page carries two pieces of the theme that its own reload never touches:
+///
+/// - the per-site stylesheet, which has `theme.css` prepended by `userstyles::css_for` so that a
+///   rule written for a site can say `var(--bg)`;
+/// - the page scrollbar, whose two colours `scrollbar::rules` resolves **out of** `theme.css`
+///   before handing them over, because a page never loads that file.
+///
+/// Both are composed when the document loads. So a theme switch repainted the strips and left every
+/// page wearing the old colours until it was reloaded by hand — measured 2026-08-08 with themer's
+/// own path: `--bg` still `#292f33` on a page whose theme file had just been rewritten to Gruvbox,
+/// with bru's log line saying it had noticed the rewrite.
+///
+/// **Three callers, and that is why this exists rather than two more lines at each.** The file
+/// changing under a running browser, `:colorscheme --reload` by hand, and `:set colors.*`. The
+/// first was fixed alone first; the other two would have been found later, one report at a time.
+///
+/// Nothing here reloads a page: both halves hand new CSS to a keeper that is already in it, so a
+/// half-filled form survives a theme switch. Verified by marking the page and finding the mark
+/// after.
+pub fn reapply_theme_everywhere() {
+    reload_chrome_everywhere();
+    crate::userstyles::repaint();
+    crate::scrollbar::push_rules();
+}
 // --- end src/chrome.rs: fonts ----------------------------------------------
 
 /// The top strip's frame, [`bottom_frame_for`]'s twin. Both are recorded by the `ready` handshake.
