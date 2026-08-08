@@ -1294,10 +1294,10 @@ pub const SETTINGS: &[Def] = &[
 // --- end config commands -----------------------------------------------------------------------
 // --- src/devtools.rs ---------------------------------------------------------------------------
     Def {
-        // How tall the docked inspector is. The panel is a flex-0 child of the window's box
-        // layout and its delegate answers `preferred_size` with this, which is the same
-        // arrangement the two chrome strips already have — so the number is the height, not a
-        // suggestion, and the pages absorb whatever is left.
+        // How tall the docked inspector asks to be. **A request, not the height**, and that is a
+        // limitation of the layout rather than of this setting: the first layout after a dock
+        // honours it exactly, and every layout after that drifts to an even split with the page.
+        // Measured, with the alternatives that do not help, in CEF-NOTES trap 25.
         //
         // **bru's own name, because qutebrowser has nothing to copy.** Its `devtools_position` is
         // a placement, and it has no size setting at all: its inspector lives in a `QSplitter` and

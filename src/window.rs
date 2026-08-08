@@ -1046,9 +1046,14 @@ wrap_browser_view_delegate! {
             _client: Option<&mut Client>,
             is_devtools: ::std::os::raw::c_int,
         ) -> Option<BrowserViewDelegate> {
+            crate::devtools::trace(&format!(
+                "delegate_for_popup: entered, is_devtools={is_devtools}"
+            ));
             if is_devtools == 0 || !crate::devtools::docking() {
+                crate::devtools::trace("delegate_for_popup: declining");
                 return None;
             }
+            crate::devtools::trace("delegate_for_popup: handing over an inspector delegate");
             Some(BruInspectorViewDelegate::new(self.state.clone(), self.window_id))
         }
 
@@ -1058,13 +1063,18 @@ wrap_browser_view_delegate! {
             popup_browser_view: Option<&mut BrowserView>,
             is_devtools: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
+            crate::devtools::trace(&format!(
+                "on_popup_created (parent delegate): is_devtools={is_devtools}"
+            ));
             let Some(view) = popup_browser_view else {
                 return 0;
             };
             if is_devtools == 0 {
                 return 0;
             }
-            i32::from(crate::devtools::on_popup_view(&self.state, self.window_id, view))
+            let placed = crate::devtools::on_popup_view(&self.state, self.window_id, view);
+            crate::devtools::trace(&format!("on_popup_created: placed={placed}"));
+            i32::from(placed)
         }
         // --- end src/devtools.rs -----------------------------------------------------------
     }
@@ -1083,14 +1093,36 @@ wrap_browser_view_delegate! {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
             // Width is ignored — the box layout stretches it across the window, as it does the
             // strips. Only the height is a real request, and it is `devtools.height`.
+            let height = crate::devtools::height();
+            crate::devtools::trace(&format!("inspector preferred_size -> {height}"));
+            Size { width: 0, height }
+        }
+
+        // **Pinned, not merely preferred.** With flex 1 the box layout honours the preferred size
+        // on the first layout and then lets the child grow into any surplus: measured 2026-08-08,
+        // the inspector docked at exactly 400 and every later layout gave it 662. Answering the
+        // same number for minimum and maximum is what makes `devtools.height` the height at every
+        // layout rather than only the first.
+        fn minimum_size(&self, _view: Option<&mut View>) -> Size {
             Size { width: 0, height: crate::devtools::height() }
+        }
+
+        fn maximum_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: 0, height: crate::devtools::height() }
+        }
+
+        fn on_layout_changed(&self, _view: Option<&mut View>, new_bounds: Option<&Rect>) {
+            if let Some(b) = new_bounds {
+                crate::devtools::trace(&format!(
+                    "inspector laid out at {}x{} @{},{}",
+                    b.width, b.height, b.x, b.y
+                ));
+            }
         }
     }
 
     impl BrowserViewDelegate {
-        fn browser_runtime_style(&self) -> RuntimeStyle {
-            VIEW_STYLE
-        }
+        // NOTE(probe): `browser_runtime_style` deliberately not answered here — testing H3.
 
         // **Where a docked inspector is removed, and the only safe place for it.** Taking the view
         // out from `LifeSpanHandler::on_before_close` — or before calling `close_dev_tools` — ended
@@ -1101,6 +1133,7 @@ wrap_browser_view_delegate! {
             _browser_view: Option<&mut BrowserView>,
             _browser: Option<&mut Browser>,
         ) {
+            crate::devtools::trace("inspector on_browser_destroyed");
             crate::devtools::undock(&self.state, self.window_id);
         }
     }
