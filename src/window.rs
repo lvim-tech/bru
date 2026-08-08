@@ -1091,25 +1091,23 @@ wrap_browser_view_delegate! {
 
     impl ViewDelegate {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
-            // Width is ignored — the box layout stretches it across the window, as it does the
-            // strips. Only the height is a real request, and it is `devtools.height`.
+            // **The width is not ignored, and answering 0 threw the height away with it.**
+            // `CefSize::IsEmpty()` is `width <= 0 || height <= 0` (installed distribution,
+            // `include/internal/cef_types_wrappers.h:236`), and `CefViewView::CalculatePreferredSize`
+            // discards an empty answer and falls back to the view's *current* size. So every height
+            // this delegate answered was classified as "no answer" and never read. The strips hold
+            // their 40 and 24 through every layout because they answer a nonzero width — 1280, at
+            // line 1194 — and that number was the whole difference. Same number here, same reason.
             let height = crate::devtools::height();
             crate::devtools::trace(&format!("inspector preferred_size -> {height}"));
-            Size { width: 0, height }
+            Size { width: 1280, height }
         }
 
-        // **Pinned, not merely preferred.** With flex 1 the box layout honours the preferred size
-        // on the first layout and then lets the child grow into any surplus: measured 2026-08-08,
-        // the inspector docked at exactly 400 and every later layout gave it 662. Answering the
-        // same number for minimum and maximum is what makes `devtools.height` the height at every
-        // layout rather than only the first.
-        fn minimum_size(&self, _view: Option<&mut View>) -> Size {
-            Size { width: 0, height: crate::devtools::height() }
-        }
-
-        fn maximum_size(&self, _view: Option<&mut View>) -> Size {
-            Size { width: 0, height: crate::devtools::height() }
-        }
+        // No `minimum_size`, no `maximum_size`. They were written to pin a height the layout kept
+        // losing, and they could never have: `BoxLayout::GetMinimumSizeForView` returns 0 unless
+        // the flex specification carries `use_min_size`, which CEF's `SetFlexForView` never passes,
+        // and `GetMaximumSize` is not called anywhere in `box_layout.cc`. The preferred size, once
+        // it is non-empty, is the only thing that speaks.
 
         fn on_layout_changed(&self, _view: Option<&mut View>, new_bounds: Option<&Rect>) {
             if let Some(b) = new_bounds {

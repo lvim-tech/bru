@@ -739,6 +739,14 @@ enum Backing {
     /// changing `hints.chars` mid-session does not relabel a page that is already labelled. That is
     /// a property of the reader and not of this arm; nothing here has to know about it.
     Read,
+    // --- src/devtools.rs -------------------------------------------------------------------------
+    /// The docked inspector's height. Nothing in Chromium holds it — it is an answer bru's own view
+    /// delegate gives the box layout — so applying it means asking every window that has an
+    /// inspector docked to lay out again, which is when the delegate is asked afresh. Without this
+    /// arm the setting is honoured only at the next layout that happens for some other reason, and
+    /// `:set devtools.height` looks broken while being perfectly stored.
+    Devtools,
+    // --- end src/devtools.rs ---------------------------------------------------------------------
     /// `scroll.rs`'s cached step. **The one setting in this group that is on the key path**, and
     /// the only reason it is not [`Backing::Read`]: `j` must not take the settings mutex, so the
     /// value lives in an `AtomicI32` beside the wheel code and this pushes it there. Measured — see
@@ -1294,10 +1302,11 @@ pub const SETTINGS: &[Def] = &[
 // --- end config commands -----------------------------------------------------------------------
 // --- src/devtools.rs ---------------------------------------------------------------------------
     Def {
-        // How tall the docked inspector asks to be. **A request, not the height**, and that is a
-        // limitation of the layout rather than of this setting: the first layout after a dock
-        // honours it exactly, and every layout after that drifts to an even split with the page.
-        // Measured, with the alternatives that do not help, in CEF-NOTES trap 25.
+        // How tall the docked inspector is. **The height, not a request** — it was written up as a
+        // request when the delegate's answer was being discarded for its zero width, which made the
+        // panel drift to an even split with the page on every layout after the first. With a
+        // non-empty size answered the layout honours it at every pass; see the comment on
+        // `BruInspectorViewDelegate::preferred_size` and CEF-NOTES trap 25.
         //
         // **bru's own name, because qutebrowser has nothing to copy.** Its `devtools_position` is
         // a placement, and it has no size setting at all: its inspector lives in a `QSplitter` and
@@ -1308,7 +1317,7 @@ pub const SETTINGS: &[Def] = &[
         kind: Kind::Int(&DEVTOOLS_HEIGHT),
         default: Some("400"),
         scopes: Scopes::GlobalOnly,
-        backing: Backing::Read,
+        backing: Backing::Devtools,
     },
 // --- end src/devtools.rs -----------------------------------------------------------------------
 // --- src/csp.rs --------------------------------------------------------------------------------
@@ -2143,6 +2152,9 @@ pub fn value_of(name: &str) -> Option<String> {
             | Backing::Read
             | Backing::ScrollStep
             // --- end unhardcoded ---------------------------------------------------------------
+            // --- src/devtools.rs ---------------------------------------------------------------
+            | Backing::Devtools
+            // --- end src/devtools.rs -----------------------------------------------------------
             // --- src/scrollbar.rs --------------------------------------------------------------
             | Backing::Scrollbar
             // --- end src/scrollbar.rs ----------------------------------------------------------
@@ -3986,6 +3998,12 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         // Nothing to push: the file that used to hold the constant reads the setting where the
         // constant stood. See `Backing::Read`.
         Backing::Read => return Ok(()),
+        // --- src/devtools.rs ---------------------------------------------------------------------
+        Backing::Devtools => {
+            crate::devtools::apply_height_everywhere();
+            return Ok(());
+        }
+        // --- end src/devtools.rs -----------------------------------------------------------------
         // The one exception, and the reason it is its own arm: `j` may not take this mutex, so the
         // step is kept in an atomic beside the wheel code and this is what puts it there.
         Backing::ScrollStep => {
@@ -4252,6 +4270,9 @@ pub fn chromium_value(name: &str, url: &str) -> Option<String> {
         | Backing::Read
         | Backing::ScrollStep
         // --- end unhardcoded -------------------------------------------------------------------
+        // --- src/devtools.rs -------------------------------------------------------------------
+        | Backing::Devtools
+        // --- end src/devtools.rs ---------------------------------------------------------------
         // --- src/scrollbar.rs ------------------------------------------------------------------
         | Backing::Scrollbar
         // --- end src/scrollbar.rs --------------------------------------------------------------

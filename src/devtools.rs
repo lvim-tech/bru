@@ -293,22 +293,66 @@ pub fn follow_tab(state: &crate::tabs::SharedState, window_id: u32, showing: Opt
     View::from(&view).set_visible(i32::from(showing == Some(inspects)));
 }
 
-/// **Flex 1, and it is not the 0 every other fixed-height child of this window carries.**
+/// Lay out again every window that has an inspector docked, so a new `devtools.height` is on screen.
 ///
-/// Measured 2026-08-08 on one build, three values, with `invalidate_layout` already in place:
+/// **The setting is not read here, and that is the point.** The height reaches the layout through
+/// `BruInspectorViewDelegate::preferred_size`, which is asked afresh during a layout pass and reads
+/// the store itself; all this has to do is cause the pass. The three calls are
+/// `prompt.rs::resize_bar`'s, the same recipe that changes a strip's height under a running window.
 ///
-///     flex 0  ->  inspector 800   the DevTools browser's own preferred size; the delegate ignored
-///     flex 1  ->  inspector 400   exactly `devtools.height`
+/// Called from `Backing::Devtools`. A window with no inspector is skipped rather than laid out for
+/// nothing, and a hidden inspector is relayed out too — it is the height it will have when its tab
+/// comes back.
+pub fn apply_height_everywhere() {
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let work: Vec<_> = {
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        state
+            .window_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let (view, _) = state.inspector_in(id)?;
+                Some((view, state.window_handle(id)?))
+            })
+            .collect()
+    };
+    for (view, window) in work {
+        let child = View::from(&view);
+        child.invalidate_layout();
+        View::from(&window).invalidate_layout();
+        window.layout();
+        trace(&format!(
+            "apply_height: relaid out at {}x{}",
+            child.bounds().width,
+            child.bounds().height
+        ));
+    }
+}
+
+/// **Flex 0, the same as every other fixed-height child of this window.**
+///
+/// It was 1, on a reading of these measurements, taken 2026-08-08 on one build with
+/// `invalidate_layout` already in place:
+///
+///     flex 0  ->  inspector 800
+///     flex 1  ->  inspector 400
 ///     flex 3  ->  inspector 200
 ///     flex 9  ->  inspector 80
 ///
-/// So here flex is the weight by which a child is allowed to **shrink** from its preferred size
-/// when the box is over-subscribed, and 0 means "never shrink" — which for this child means it
-/// keeps the 800 CEF gave the browser and the delegate is never consulted. 1 is the value at which
-/// the delegate's answer is the height, which is the whole point of having one. The strips get away
-/// with 0 because their preferred size *is* what bru asked for at creation; this view was created
-/// by CEF, and 800 is what CEF asked for.
-const INSPECTOR_FLEX: i32 = 1;
+/// The reading was that flex is a shrink weight and 1 is the value at which the delegate is heard.
+/// It is not. Those four numbers are `800 / (flex + 1)` exactly, and they say nothing about the
+/// delegate: the delegate's answer was being discarded for its zero width (see the comment on
+/// `BruInspectorViewDelegate::preferred_size`), so both flexed children fell back to their current
+/// size as their preferred size. The page filled the content area and contributed no free space,
+/// leaving the popup's own 800 as the entire deficit, shared between page and inspector as
+/// `flex / (flex + 1)`. "Flex 1 gave exactly 400" was `800 / 2` — a coincidence, and the reason
+/// every later attempt to hold that 400 failed. Flex is the documented symmetric grow/shrink
+/// weight (`views::BoxLayout`, box_layout.h:145), and a child that must not move takes 0.
+const INSPECTOR_FLEX: i32 = 0;
 
 /// How tall a docked inspector is, from `devtools.height`.
 pub fn height() -> i32 {
