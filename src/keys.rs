@@ -459,10 +459,29 @@ wrap_request_handler! {
             &self,
             browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
-            _request: Option<&mut Request>,
+            request: Option<&mut Request>,
             _user_gesture: ::std::os::raw::c_int,
             _is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
+            // --- src/csp.rs ------------------------------------------------------------------
+            // **This one can say no**, and it is the only thing here that can: when the CSP answer
+            // for the URL differs from the one in force, the navigation is cancelled and asked for
+            // again from a posted task, because the flag only reaches the document after the one
+            // being fetched. See `csp.rs`, which carries the measurement.
+            let refused = match request {
+                Some(request) => crate::csp::on_before_browse(
+                    browser.as_deref().cloned().as_mut(),
+                    frame.as_deref(),
+                    &CefString::from(&request.url()).to_string(),
+                    &CefString::from(&request.method()).to_string(),
+                ),
+                None => false,
+            };
+            if refused {
+                // The router is told about navigations that proceed, and this one does not.
+                return 1;
+            }
+            // --- end src/csp.rs --------------------------------------------------------------
             // The router is told only about navigations that are allowed to proceed, so this call
             // has to come before the return, and the return has to be "allow".
             crate::ipc::on_before_browse(browser, frame);

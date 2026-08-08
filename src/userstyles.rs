@@ -416,6 +416,23 @@ fn site_of(host: &str) -> Option<String> {
     candidates(host).into_iter().next()
 }
 
+/// Whether a folder called `name` would dress the page at `url`.
+///
+/// The predicate behind [`candidates`], given a name to test instead of a list to build: `name` is
+/// the page's host, or a suffix of it at a label boundary. `duckduckgo.com` covers
+/// `html.duckduckgo.com`; `com` covers nothing, because the last label alone is never a candidate;
+/// `notduckduckgo.com` is not covered by `duckduckgo.com`, which is the boundary a plain
+/// `ends_with` would get wrong.
+///
+/// Public because [`crate::csp`] needs the same answer for its list, and two spellings of "this
+/// site" that disagreed would be a trap. `www.` is stripped by [`host_of`], so both spellings of a
+/// host are the one site here too.
+pub fn covers(name: &str, url: &str) -> bool {
+    let Some(host) = host_of(url) else { return false };
+    let name = name.trim().trim_start_matches("www.").to_ascii_lowercase();
+    candidates(&host).iter().any(|candidate| *candidate == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

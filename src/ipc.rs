@@ -94,6 +94,13 @@ pub fn on_process_message_received(
 
 /// Forward from `LifeSpanHandler::on_before_close`.
 pub fn on_before_close(browser: Option<&mut Browser>) {
+    // --- src/csp.rs ---------------------------------------------------------------------------
+    // Identifiers are reused, and the CSP answer is remembered against one — a new tab that took
+    // this number back would inherit a bypass nothing had set on it.
+    if let Some(browser) = browser.as_deref() {
+        crate::csp::forget(browser.identifier());
+    }
+    // --- end src/csp.rs -----------------------------------------------------------------------
     forget_chrome_frames_of(browser.as_deref());
     browser_router().on_before_close(browser.cloned());
 }

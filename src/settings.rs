@@ -245,6 +245,16 @@ pub enum ListValue {
     StatusbarWidget,
     // --- end tabs and statusbar ----------------------------------------------------------------
     // --- unhardcoded ---------------------------------------------------------------------------
+    // --- src/csp.rs ----------------------------------------------------------------------------
+    /// A host, as it appears in a URL — `duckduckgo.com`, `html.duckduckgo.com`. Not a URL and not
+    /// a pattern: the entry is matched by `userstyles::covers`, the suffix walk that already
+    /// decides which `styles/<host>/` folders dress a page, so an entry covers its subdomains and
+    /// the two spellings of "this site" cannot disagree.
+    ///
+    /// Checked here rather than at navigation time because the only symptom of a typo would be a
+    /// policy that quietly stays on — the exact silence `content.csp.bypass` exists to end.
+    Host,
+    // --- end src/csp.rs ------------------------------------------------------------------------
     /// A zoom level, in percent, spelled qutebrowser's way (`150%`) or bru's (`150`). Both are
     /// taken because `:zoom 150` and `:zoom 150%` are already the same command here — the `%` is a
     /// suffix `commands.rs` strips — and a list that refused the spelling its own command accepts
@@ -295,6 +305,32 @@ impl ListShape {
                 ))
             }
             // --- end tabs and statusbar --------------------------------------------------------
+            // --- src/csp.rs --------------------------------------------------------------------
+            ListValue::Host => {
+                if value.contains("://") || value.contains('/') {
+                    return Err(format!(
+                        "{name}: {value:?} is a URL — this list takes a host, so \
+                         \"html.duckduckgo.com\" rather than \"https://html.duckduckgo.com/\""
+                    ));
+                }
+                if value.contains(char::is_whitespace) || value.contains(['*', '?', ':']) {
+                    return Err(format!(
+                        "{name}: {value:?} is not a host — no spaces, no port, and no wildcard; an \
+                         entry already covers its subdomains"
+                    ));
+                }
+                // The last label on its own would be a hole for a third of the web, and
+                // `userstyles::covers` refuses to match it anyway — so it is refused where it is
+                // typed, rather than accepted and then silently inert.
+                if !value.contains('.') && value != "localhost" {
+                    return Err(format!(
+                        "{name}: {value:?} is a single label — name the whole host, as in \
+                         \"duckduckgo.com\""
+                    ));
+                }
+                Ok(())
+            }
+            // --- end src/csp.rs ----------------------------------------------------------------
             // --- unhardcoded -------------------------------------------------------------------
             ListValue::Percent => match percent_of(value) {
                 Some(percent) if (1..=10_000).contains(&percent) => Ok(()),
@@ -341,6 +377,17 @@ pub static ADBLOCK_LISTS: ListShape = ListShape {
     defaults: &crate::adblock::DEFAULT_LISTS,
     value: ListValue::FetchableUrl,
 };
+
+// --- src/csp.rs --------------------------------------------------------------------------------
+/// The sites whose Content Security Policy bru turns off. See [`crate::csp`] for what that costs.
+///
+/// **Empty, and that is the whole design.** Every other list here ships bru's own entries because
+/// the thing it configures was already happening; this one configures a protection being removed, so
+/// a bru nobody has configured removes none. The default that would have been convenient —
+/// DuckDuckGo's two static hosts, the ones the hole was found on — is exactly the default that would
+/// have opened a hole nobody asked for.
+pub static CSP_BYPASS: ListShape = ListShape { defaults: &[], value: ListValue::Host };
+// --- end src/csp.rs ----------------------------------------------------------------------------
 
 // --- tabs and statusbar ------------------------------------------------------------------------
 
@@ -1240,6 +1287,27 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::AdblockLists,
     },
 // --- end config commands -----------------------------------------------------------------------
+// --- src/csp.rs --------------------------------------------------------------------------------
+    Def {
+        // **bru's own name; qutebrowser has nothing to copy.** It has no CSP setting at all, and the
+        // nearest thing in Chromium's own settings is not a setting either — it is a DevTools
+        // method, `Page.setBypassCSP`, which is what `csp.rs` calls.
+        //
+        // `content.` because that is where every setting that changes what a page is allowed to do
+        // lives, and `.bypass` rather than `.disable` because the policy is still sent, still
+        // parsed, and still there for the page to read; it is bru that stops honouring it.
+        //
+        // The list ships empty — see [`CSP_BYPASS`] — and `Backing::Read` because the reader is
+        // `csp::on_before_browse`, which asks at the moment a navigation starts. There is nothing
+        // to push: the next navigation to a site the user has just added is the one that carries
+        // the new answer, and a site removed from the list is honoured again on its next load.
+        name: "content.csp.bypass",
+        kind: Kind::List(&CSP_BYPASS),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+// --- end src/csp.rs ----------------------------------------------------------------------------
 // --- tabs and statusbar ------------------------------------------------------------------------
 // The two strips bru draws itself, made configurable. None of this reaches CEF's content settings:
 // the tab strip and the status line are HTML pages bru writes, and the window is a `BoxLayout` bru
@@ -4530,7 +4598,9 @@ mod tests {
         // **Sixty-one**, +3 for the `fonts.*` block: a family, a size and a weight. They are
         // one workstream's and split three ways because CSS keeps them apart — Qt's
         // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
-        assert_eq!(SETTINGS.len(), 64);
+        // **Sixty-five**, +1 for `content.csp.bypass`: bru's second `Kind::List`, and the first
+        // whose defaults are deliberately empty — see [`CSP_BYPASS`].
+        assert_eq!(SETTINGS.len(), 65);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

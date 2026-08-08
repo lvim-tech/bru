@@ -16,6 +16,7 @@ mod completers;
 mod completion;
 mod config;
 mod cookies;
+mod csp;
 mod data;
 mod downloads;
 mod editor;
