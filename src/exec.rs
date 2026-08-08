@@ -1822,7 +1822,9 @@ mod tests {
         // `register:` (3991); 264 once macros brought the other two modes that read it.
         // 298 with src/prompt.rs, which brought `bindings.default.prompt`'s 26 rows and
         // `.yesno`'s 8 — the last two sections of `configdata.yml` bru had no mode for.
-        assert_eq!(DEFAULT_BINDINGS.len(), 299);
+        // 293 since the inspector kept `wi` and lost `wIh`, `wIj`, `wIk`, `wIl`, `wIw` and `wIf`:
+        // five of the six bound a docked position CEF cannot draw. The only fall in this number.
+        assert_eq!(DEFAULT_BINDINGS.len(), 293);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1875,8 +1877,13 @@ mod tests {
         // The denominator does not move — the row was always in the table.
         // --- end unhardcoded -------------------------------------------------------------
         //
+        // **281 since the inspector kept one key of seven.** The six that went — `wIh`, `wIj`,
+        // `wIk`, `wIl`, `wIw`, `wIf` — were all live, because `devtools` is implemented; what was
+        // wrong was the docked placement five of them named, which CEF cannot draw. Here the
+        // denominator moves with the numerator, since the rows left the table.
+        //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 287, "the live-binding count moved");
+        assert_eq!(live, 281, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1910,7 +1917,9 @@ mod tests {
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        assert_eq!(live, 287);
+        // 281: the six inspector keys that went were all live, since `devtools` is implemented —
+        // what was wrong with them was the placement they promised, not the command behind them.
+        assert_eq!(live, 281);
         assert_eq!(
             refused,
             [

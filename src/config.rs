@@ -164,13 +164,15 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "gU", "navigate up -t"),
     ("normal", "<Ctrl-A>", "navigate increment"),
     ("normal", "<Ctrl-X>", "navigate decrement"),
+    // **One key for the inspector, where qutebrowser has seven.** Its `wIh`, `wIj`, `wIk` and `wIl`
+    // dock the inspector to a side and `wIw` gives it a window; CEF has no docked inspector to
+    // offer, so all five opened the same window and four of them promised a placement that could
+    // not happen — see `devtools.rs`, which carries the quote from the C API. `wIf`
+    // (`devtools-focus`) went with them: it differs from `wi` only in refusing to close what is
+    // already open, which is not worth a second key on a toggle. Both commands are still there and
+    // still take their arguments, so a line copied out of a `config.py` keeps working; what is
+    // gone is bru pretending in its own defaults that the position means something.
     ("normal", "wi", "devtools"),
-    ("normal", "wIh", "devtools left"),
-    ("normal", "wIj", "devtools bottom"),
-    ("normal", "wIk", "devtools top"),
-    ("normal", "wIl", "devtools right"),
-    ("normal", "wIw", "devtools window"),
-    ("normal", "wIf", "devtools-focus"),
     ("normal", "gd", "download"),
     ("normal", "ad", "download-cancel"),
     ("normal", "cd", "download-clear"),
@@ -1351,7 +1353,10 @@ mod tests {
         // **299, not 298.** qutebrowser's table is 298; the extra one is bru's own `ts`
         // (`styles-toggle`), which qutebrowser has no command for. A number that grows is a number
         // that has to say which of the two it is counting.
-        assert_eq!(total, 299, "the default table is not the one transcribed from configdata.yml");
+        // **293 since the inspector lost six of its seven keys** — `wIh`, `wIj`, `wIk`, `wIl`,
+        // `wIw` and `wIf`. Five of them bound a docked position CEF cannot draw. A number that
+        // shrinks has to say why as plainly as one that grows.
+        assert_eq!(total, 293, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1364,7 +1369,8 @@ mod tests {
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
         // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
-        assert_eq!(bindings.len(Mode::Normal), 190);
+        // **184, six fewer than the 190 this counted until the inspector kept one key of seven.**
+        assert_eq!(bindings.len(Mode::Normal), 184);
         assert_eq!(bindings.len(Mode::Insert), 4);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
@@ -1662,7 +1668,7 @@ mod tests {
             "a syntax error means nothing in the file ran, so J is still the default"
         );
         assert_eq!(config.bindings.command_for(Mode::Normal, "j"), Some("scroll down"));
-        assert_eq!(config.bindings.len(Mode::Normal), 190);
+        assert_eq!(config.bindings.len(Mode::Normal), 184);
     }
 
     #[test]
