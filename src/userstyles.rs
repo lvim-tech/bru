@@ -326,7 +326,10 @@ fn apply(frame: &Frame) {
         );
         return;
     }
-    let css = css_for(&CefString::from(&frame.url()).to_string());
+    let Some(wears) = dressed_as(frame) else {
+        return;
+    };
+    let css = css_for(&wears);
     if css.trim().is_empty() {
         crate::greasemonkey::evaluate(
             frame,
@@ -347,11 +350,51 @@ fn apply(frame: &Frame) {
 /// An advert in an iframe is not the site the folder was named after, and `bru://` chrome links
 /// `chrome.css`, which already carries the theme.
 fn styleable(frame: &Frame) -> bool {
-    if frame.is_main() == 0 {
-        return false;
-    }
+    dressed_as(frame).is_some()
+}
+
+/// The URL whose folder this frame should wear, or `None` when it should wear nothing.
+///
+/// **A subframe of the same site is the site.** Until 2026-08-08 this answered for the main frame
+/// only, with the argument that "an advert in an iframe is not the site the folder was named
+/// after". That argument is right about adverts and wrong about a site's own panels: Google puts
+/// its settings panel in an `about:blank` iframe, 436x539, which has no host of its own and so
+/// matched no folder — and no selector in any stylesheet can cross a frame boundary, so it stayed
+/// unthemed while everything around it was themed. Found 2026-08-08 while covering google.com.
+///
+/// So the rule is **same host**, and it keeps the advert out by construction:
+///
+/// - the main frame wears its own URL, as before;
+/// - a subframe with no host of its own — `about:blank`, `about:srcdoc`, a `data:` document — is
+///   filled by the page that made it, so it wears the page's;
+/// - a subframe with a host wears its own only when that host is the page's;
+/// - anything else, which is every third-party embed, wears nothing.
+fn dressed_as(frame: &Frame) -> Option<String> {
     let url = CefString::from(&frame.url()).to_string();
-    !url.starts_with("bru://") && url.contains("://")
+    if url.starts_with("bru://") {
+        return None;
+    }
+    if frame.is_main() != 0 {
+        return url.contains("://").then_some(url);
+    }
+    // The page this frame belongs to. `browser()` exists on a renderer-side frame, and the main
+    // frame is the one whose folder the page was styled from a moment ago.
+    let page = frame
+        .browser()
+        .and_then(|browser| browser.main_frame())
+        .map(|main| CefString::from(&main.url()).to_string())?;
+    same_site(&url, &page)
+}
+
+/// [`dressed_as`]'s decision for a subframe, as a function of two strings so it can be tested.
+fn same_site(frame_url: &str, page_url: &str) -> Option<String> {
+    let page_host = host_of(page_url)?;
+    match host_of(frame_url) {
+        // Its own host: only when it is the page's. A third-party embed answers `None` here.
+        Some(host) => (host == page_host).then_some(frame_url.to_string()),
+        // No host at all — the page wrote this document, so it is the page's.
+        None => Some(page_url.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +456,42 @@ mod tests {
     #[test]
     fn a_site_with_no_folder_gets_nothing() {
         assert!(css_for("https://a-site-nobody-has-styled.example/").trim().is_empty());
+    }
+
+    /// **A subframe of the same site is the site; a third party is not.**
+    ///
+    /// The rule that decides it, without a browser: Google's settings panel is an `about:blank`
+    /// frame the page fills itself, and it went unthemed for as long as this answered for the main
+    /// frame only. An advert has a host of its own, and that is exactly what keeps it out.
+    #[test]
+    fn a_frame_wears_the_page_it_belongs_to_only_when_it_is_the_page() {
+        let page = "https://www.google.com/search?q=x";
+        // No host of its own: the page wrote this document, so it wears the page's folder.
+        assert_eq!(same_site("about:blank", page), Some(page.to_string()));
+        assert_eq!(same_site("about:srcdoc", page), Some(page.to_string()));
+        assert_eq!(same_site("", page), Some(page.to_string()));
+        // Its own host, and it is the page's — `www.` is stripped by `host_of` on both sides.
+        let own = "https://google.com/inner";
+        assert_eq!(same_site(own, page), Some(own.to_string()));
+        // A third party. This is the advert the old rule existed to keep out, and it still is.
+        assert_eq!(same_site("https://doubleclick.net/ad", page), None);
+        assert_eq!(same_site("https://evil.example/", page), None);
+    }
+
+    /// A page with no host cannot lend one. `about:blank` inside `about:blank` is nobody's site.
+    #[test]
+    fn a_page_without_a_host_dresses_nothing() {
+        assert_eq!(same_site("about:blank", "about:blank"), None);
+        assert_eq!(same_site("https://google.com/", ""), None);
+    }
+
+    /// A subdomain is not the same host, and it does not need to be: `css_for` walks the folders the
+    /// host ends in, so `mail.google.com` in a `google.com` page already gets `google.com/`.
+    #[test]
+    fn a_subdomain_frame_wears_its_own_url_and_the_walk_does_the_rest() {
+        let page = "https://google.com/search";
+        assert_eq!(same_site("https://mail.google.com/x", page), None);
+        assert_eq!(candidates("mail.google.com"), vec!["google.com", "mail.google.com"]);
     }
 
     /// **The keeper is the thing that survives a document being replaced**, and it has to be in the
