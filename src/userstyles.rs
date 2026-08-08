@@ -367,7 +367,8 @@ fn styleable(frame: &Frame) -> bool {
 /// - the main frame wears its own URL, as before;
 /// - a subframe with no host of its own — `about:blank`, `about:srcdoc`, a `data:` document — is
 ///   filled by the page that made it, so it wears the page's;
-/// - a subframe with a host wears its own only when that host is the page's;
+/// - a subframe with a host wears its own when that host is on the page's site — see
+///   [`same_site`] for the panel that turned "same host" into "same site";
 /// - anything else, which is every third-party embed, wears nothing.
 fn dressed_as(frame: &Frame) -> Option<String> {
     let url = CefString::from(&frame.url()).to_string();
@@ -387,14 +388,32 @@ fn dressed_as(frame: &Frame) -> Option<String> {
 }
 
 /// [`dressed_as`]'s decision for a subframe, as a function of two strings so it can be tested.
+///
+/// **Same site, not same host, and the difference is the panel this rule exists for.** Google's
+/// settings panel measures as `src="about:blank"` from the page — but it carries `name="account"`
+/// and is navigated to `accounts.google.com`, which is why its `contentDocument` answers null to
+/// the page that made it. Measured 2026-08-08, chasing why the panel stayed grey after blank
+/// subframes learned to dress: the frame's real URL has a host, the host is not `google.com`, and
+/// the equality below said no. The site — the least specific name `candidates` walks, the one a
+/// folder for the whole property carries — is what both hosts share, and it is the same test the
+/// folder match itself would apply.
 fn same_site(frame_url: &str, page_url: &str) -> Option<String> {
     let page_host = host_of(page_url)?;
     match host_of(frame_url) {
-        // Its own host: only when it is the page's. A third-party embed answers `None` here.
-        Some(host) => (host == page_host).then_some(frame_url.to_string()),
+        // Its own host: when it is on the page's site. A third-party embed shares no site and
+        // answers `None` here, which is the advert the old main-frame-only rule existed to keep
+        // out.
+        Some(host) => (site_of(&host) == site_of(&page_host)).then_some(frame_url.to_string()),
         // No host at all — the page wrote this document, so it is the page's.
         None => Some(page_url.to_string()),
     }
+}
+
+/// The site a host belongs to: `candidates`' least specific answer, the two-label tail. It is the
+/// name a style folder for the whole property would carry, so "same site" and "the same folder
+/// could dress both" are one predicate.
+fn site_of(host: &str) -> Option<String> {
+    candidates(host).into_iter().next()
 }
 
 #[cfg(test)]
@@ -485,13 +504,26 @@ mod tests {
         assert_eq!(same_site("https://google.com/", ""), None);
     }
 
-    /// A subdomain is not the same host, and it does not need to be: `css_for` walks the folders the
-    /// host ends in, so `mail.google.com` in a `google.com` page already gets `google.com/`.
+    /// A subdomain frame is the site's own panel, and it wears its own URL — `css_for` walks the
+    /// folders the host ends in, so `accounts.google.com` gets the `google.com/` folder plus any
+    /// more specific one. This test asserted `None` for one day, with a comment that already
+    /// described the walk doing the rest; the panel it was written about stayed grey until the
+    /// assertion agreed with the comment.
     #[test]
     fn a_subdomain_frame_wears_its_own_url_and_the_walk_does_the_rest() {
         let page = "https://google.com/search";
-        assert_eq!(same_site("https://mail.google.com/x", page), None);
+        assert_eq!(
+            same_site("https://mail.google.com/x", page),
+            Some("https://mail.google.com/x".to_string())
+        );
         assert_eq!(candidates("mail.google.com"), vec!["google.com", "mail.google.com"]);
+        // The panel that found the rule: accounts.google.com inside www.google.com.
+        assert_eq!(
+            same_site("https://accounts.google.com/embedded/xyz", "https://www.google.com/search"),
+            Some("https://accounts.google.com/embedded/xyz".to_string())
+        );
+        // A third party still wears nothing: sharing a public suffix is not sharing a site.
+        assert_eq!(same_site("https://doubleclick.net/ad", page), None);
     }
 
     /// **The keeper is the thing that survives a document being replaced**, and it has to be in the
