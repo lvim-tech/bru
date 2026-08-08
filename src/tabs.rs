@@ -674,7 +674,7 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
         return;
     };
 
-    let mut delegate = BruBrowserViewDelegate::new(state.clone());
+    let mut delegate = BruBrowserViewDelegate::new(state.clone(), window_id);
     let settings = BrowserSettings::default();
     let Some(view) = browser_view_create(
         Some(&mut client),
@@ -799,6 +799,16 @@ pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
     // Visibility alone does not move focus, and a hidden view that keeps it swallows every key —
     // the new tab would look right and answer nothing.
     View::from(&views[index]).request_focus();
+
+    // --- src/devtools.rs ------------------------------------------------------------------------
+    // An inspector belongs to one browser, so it is shown only while that browser's tab is. Without
+    // this it would stay open under a page it knows nothing about.
+    let showing = state
+        .lock()
+        .expect("state mutex poisoned")
+        .tab_browser_in(window_id, index);
+    crate::devtools::follow_tab(state, window_id, showing);
+    // --- end src/devtools.rs --------------------------------------------------------------------
 
     // The bar's scroll percentage and match count belong to the page that was showing, and the new
     // tab is somewhere else in a document of its own. Clearing them is what stops `[73%]` sitting

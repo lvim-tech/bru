@@ -992,6 +992,12 @@ wrap_browser_view_delegate! {
     // the braces even with no fields.
     pub struct BruBrowserViewDelegate {
         state: Arc<Mutex<BruState>>,
+        // --- src/devtools.rs ---------------------------------------------------------------
+        // Which window this tab belongs to. Added for the inspector: the popup hook below is
+        // handed the view and nothing else, and a docked inspector has to go into the window its
+        // tab is in — with two windows open, "the current one" is a guess.
+        window_id: u32,
+        // --- end src/devtools.rs -----------------------------------------------------------
     }
 
     impl ViewDelegate {}
@@ -1018,8 +1024,88 @@ wrap_browser_view_delegate! {
                 .expect("state mutex poisoned")
                 .note_tab_browser(browser_view, browser.identifier());
         }
+
+        // --- src/devtools.rs ---------------------------------------------------------------
+        // **Where a docked inspector is placed.** CEF hands over the DevTools browser as a view
+        // and asks what to do with it: "Optionally add |popup_browser_view| to the views hierarchy
+        // yourself and return true (1). Otherwise return false (0) and a default cef_window_t will
+        // be created for the popup."
+        //
+        // Anything that is not an inspector keeps CEF's own answer. bru has no docked place for a
+        // page popup, and returning 1 without adding the view would lose it.
+        // **A delegate for the inspector, which is what makes it a panel rather than a guest.**
+        // CEF asks the parent view's delegate what delegate the popup should have; without one the
+        // popup view has no `preferred_size` to give a BoxLayout and no `on_browser_destroyed` to
+        // be taken out on. Both were measured missing before this existed: the inspector laid out
+        // at whatever CEF preferred, which on a 1399px page left it **20 pixels**, and closing it
+        // killed the process outright — a silent exit, no panic, three times out of three.
+        fn delegate_for_popup_browser_view(
+            &self,
+            _browser_view: Option<&mut BrowserView>,
+            _settings: Option<&BrowserSettings>,
+            _client: Option<&mut Client>,
+            is_devtools: ::std::os::raw::c_int,
+        ) -> Option<BrowserViewDelegate> {
+            if is_devtools == 0 || !crate::devtools::docking() {
+                return None;
+            }
+            Some(BruInspectorViewDelegate::new(self.state.clone(), self.window_id))
+        }
+
+        fn on_popup_browser_view_created(
+            &self,
+            _browser_view: Option<&mut BrowserView>,
+            popup_browser_view: Option<&mut BrowserView>,
+            is_devtools: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(view) = popup_browser_view else {
+                return 0;
+            };
+            if is_devtools == 0 {
+                return 0;
+            }
+            i32::from(crate::devtools::on_popup_view(&self.state, self.window_id, view))
+        }
+        // --- end src/devtools.rs -----------------------------------------------------------
     }
 }
+
+// --- src/devtools.rs ---------------------------------------------------------------------------
+// The docked inspector's own delegate: a height, and the one callback that says when to take it out
+// of the window. Both are the reason it exists — see `delegate_for_popup_browser_view` above.
+wrap_browser_view_delegate! {
+    pub struct BruInspectorViewDelegate {
+        state: Arc<Mutex<BruState>>,
+        window_id: u32,
+    }
+
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            // Width is ignored — the box layout stretches it across the window, as it does the
+            // strips. Only the height is a real request, and it is `devtools.height`.
+            Size { width: 0, height: crate::devtools::height() }
+        }
+    }
+
+    impl BrowserViewDelegate {
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            VIEW_STYLE
+        }
+
+        // **Where a docked inspector is removed, and the only safe place for it.** Taking the view
+        // out from `LifeSpanHandler::on_before_close` — or before calling `close_dev_tools` — ended
+        // the process both ways, measured 2026-08-08. This callback is CEF saying the browser is
+        // gone and the view is now bru's to dispose of.
+        fn on_browser_destroyed(
+            &self,
+            _browser_view: Option<&mut BrowserView>,
+            _browser: Option<&mut Browser>,
+        ) {
+            crate::devtools::undock(&self.state, self.window_id);
+        }
+    }
+}
+// --- end src/devtools.rs -------------------------------------------------------------------------
 
 // A chrome strip: a browser view that asks for a fixed height and tells the state which browser
 // ended up behind it. `on_browser_created` is the reliable place for that — it hands over the

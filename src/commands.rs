@@ -468,7 +468,7 @@ pub enum Command {
     Print,
     /// `devtools [position]` — open the web inspector, or close it if it is open. Every position
     /// opens a window; see `devtools.rs` for why CEF offers no docked one.
-    DevTools,
+    DevTools(crate::devtools::Place),
     /// `devtools-focus` — bring the inspector forward.
     DevToolsFocus,
     /// `message-info` / `message-warning` / `message-error <text>` — say something in the bar.
@@ -1740,8 +1740,22 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         }
         // Every position is the same window — see `devtools.rs`. An unknown one is still an error,
         // so a typo says so rather than opening the inspector somewhere unexpected.
+        // **Two placements, not qutebrowser's five, and the other three are refused rather than
+        // silently treated as one of these.** `bottom` docks the inspector under the pages;
+        // `window` gives it a window of its own, which is what CEF does when bru declines to place
+        // it. `top`, `left` and `right` are qutebrowser's and bru cannot draw them yet — left and
+        // right need a horizontal box nested in the window's vertical one, the same unbuilt piece
+        // `tabs.position left` waits on. Answering with the reason is what stops a line copied out
+        // of a `config.py` quietly doing something else.
         "devtools" => match args.arg(0) {
-            None | Some("window" | "left" | "right" | "top" | "bottom") => Command::DevTools,
+            None | Some("bottom") => Command::DevTools(crate::devtools::Place::Bottom),
+            Some("window") => Command::DevTools(crate::devtools::Place::Window),
+            Some(side @ ("left" | "right" | "top")) => {
+                return Err(bad(&format!(
+                    "bru cannot dock the inspector {side} yet — `devtools bottom` docks it under \
+                     the page, `devtools window` gives it a window"
+                )))
+            }
             Some(other) => return Err(bad(&format!("invalid position {other:?}"))),
         },
         "devtools-focus" => Command::DevToolsFocus,

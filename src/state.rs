@@ -19,6 +19,18 @@ static INSTANCE: OnceLock<Weak<Mutex<BruState>>> = OnceLock::new();
 /// Everything in here used to be a field of [`BruState`], because there was one window. Splitting
 /// it out is what makes `gD`, `U` and every `-w` spelling mean something — and it is also what keeps
 /// two windows from pushing into each other's tab strip, which a single `active` index could not.
+// --- src/devtools.rs -----------------------------------------------------------------------------
+/// A docked inspector: the view in the window, and who it is for.
+struct Docked {
+    view: BrowserView,
+    /// The browser being inspected. `follow_tab` compares it with the tab on screen.
+    inspects: i32,
+    /// The inspector's *own* browser, learned from the view the moment it is docked. It is what
+    /// `on_before_close` sees when the panel is closed by its own button rather than by `:devtools`.
+    browser_id: Option<i32>,
+}
+// --- end src/devtools.rs -------------------------------------------------------------------------
+
 pub struct WindowState {
     /// bru's own identifier for the window, and the one `:tab-give 1` names. Zero-based, like
     /// qutebrowser's `win_id`, so a count of `n` means window `n - 1` (`commands.py:475`).
@@ -50,6 +62,14 @@ pub struct WindowState {
     /// minutes ago. The manager itself was already written as "one per window" — nothing in it is
     /// shared — so this is where it always belonged.
     modes: crate::modes::ModeManager,
+    // --- src/devtools.rs ------------------------------------------------------------------------
+    /// The inspector docked under this window's pages, if one is.
+    ///
+    /// One per window rather than one per tab: CEF makes an inspector per browser, but only one can
+    /// be under the pages at a time, and which one that is follows the tab on screen — see
+    /// `devtools::follow_tab`.
+    devtools: Option<Docked>,
+    // --- end src/devtools.rs --------------------------------------------------------------------
     /// The half-typed key chain and count this window is holding, and the mode they belong to.
     ///
     /// qutebrowser's parsers are per window too — `modeparsers` are built inside
@@ -191,6 +211,7 @@ impl BruState {
             tabs: Vec::new(),
             active: 0,
             last_active: None,
+            devtools: None,
             modes: crate::modes::ModeManager::new(),
             pending_keys: (crate::modes::Mode::Normal, Vec::new(), String::new()),
         });
@@ -261,6 +282,52 @@ impl BruState {
     pub fn layout_handle(&self, id: u32) -> Option<BoxLayout> {
         self.slot(id).and_then(|slot| slot.layout.clone())
     }
+
+    // --- src/devtools.rs --------------------------------------------------------------------
+    /// The browser behind one tab of a window, which is what an inspector is matched against.
+    pub fn tab_browser_in(&self, id: u32, index: usize) -> Option<i32> {
+        self.slot(id)
+            .and_then(|slot| slot.tabs.get(index))
+            .and_then(|tab| tab.browser_id)
+    }
+
+    /// Remember the inspector now under this window's pages. Replaces whatever was there, which is
+    /// what a second `:devtools` in a window with one already docked means.
+    pub fn set_inspector(&mut self, id: u32, view: BrowserView, inspects: i32) {
+        let browser_id = view.browser().map(|browser| browser.identifier());
+        if let Some(slot) = self.slot_mut(id) {
+            slot.devtools = Some(Docked { view, inspects, browser_id });
+        }
+    }
+
+    /// The docked view and the browser it is for.
+    pub fn inspector_in(&self, id: u32) -> Option<(BrowserView, i32)> {
+        self.slot(id)
+            .and_then(|slot| slot.devtools.as_ref())
+            .map(|docked| (docked.view.clone(), docked.inspects))
+    }
+
+    /// Forget it and hand the view back, so the caller can take it out of the window.
+    pub fn take_inspector(&mut self, id: u32) -> Option<BrowserView> {
+        self.slot_mut(id)
+            .and_then(|slot| slot.devtools.take())
+            .map(|docked| docked.view)
+    }
+
+    /// Which window holds an inspector whose own browser is `identifier`, if any. What
+    /// `on_before_close` asks when a browser goes and nothing else knows what it was.
+    pub fn window_of_inspector(&self, identifier: i32) -> Option<u32> {
+        self.windows
+            .iter()
+            .find(|slot| {
+                slot.devtools
+                    .as_ref()
+                    .and_then(|docked| docked.browser_id)
+                    == Some(identifier)
+            })
+            .map(|slot| slot.id)
+    }
+    // --- end src/devtools.rs ----------------------------------------------------------------
 
     /// The current window's CEF handle.
     pub fn window(&self) -> Option<Window> {

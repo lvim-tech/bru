@@ -1673,7 +1673,7 @@ mod tests {
 // --- end lua runtime ---------------------------------------------------------------------------
                 Command::ViewSource => "ViewSource",
                 Command::Print => "Print",
-                Command::DevTools => "DevTools",
+                Command::DevTools(_) => "DevTools",
                 Command::DevToolsFocus => "DevToolsFocus",
                 Command::Message { .. } => "Message",
                 Command::MacroRecord { .. } => "MacroRecord",

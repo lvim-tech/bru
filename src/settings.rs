@@ -378,7 +378,12 @@ pub static ADBLOCK_LISTS: ListShape = ListShape {
     value: ListValue::FetchableUrl,
 };
 
-// --- src/csp.rs --------------------------------------------------------------------------------
+// --- src/devtools.rs ---------------------------------------------------------------------------
+/// How much of the page area a docked inspector takes, as a flex share against the pages' own 1.
+static DEVTOOLS_HEIGHT: IntShape =
+    IntShape { min: 80, max: 4000, unit: "pixels", sentinel: "" };
+// --- end src/devtools.rs -----------------------------------------------------------------------
+
 /// The sites whose Content Security Policy bru turns off. See [`crate::csp`] for what that costs.
 ///
 /// **Empty, and that is the whole design.** Every other list here ships bru's own entries because
@@ -1287,6 +1292,25 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::AdblockLists,
     },
 // --- end config commands -----------------------------------------------------------------------
+// --- src/devtools.rs ---------------------------------------------------------------------------
+    Def {
+        // How tall the docked inspector is. The panel is a flex-0 child of the window's box
+        // layout and its delegate answers `preferred_size` with this, which is the same
+        // arrangement the two chrome strips already have — so the number is the height, not a
+        // suggestion, and the pages absorb whatever is left.
+        //
+        // **bru's own name, because qutebrowser has nothing to copy.** Its `devtools_position` is
+        // a placement, and it has no size setting at all: its inspector lives in a `QSplitter` and
+        // the divider is dragged. CEF's Views toolkit has no splitter — `cef_browser_view_create`
+        // and `cef_scroll_view_create` are the only creatable views — so here the height is typed
+        // rather than dragged, and `:set devtools.height` is what a drag would have been.
+        name: "devtools.height",
+        kind: Kind::Int(&DEVTOOLS_HEIGHT),
+        default: Some("400"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+// --- end src/devtools.rs -----------------------------------------------------------------------
 // --- src/csp.rs --------------------------------------------------------------------------------
     Def {
         // **bru's own name; qutebrowser has nothing to copy.** It has no CSP setting at all, and the
@@ -4600,7 +4624,9 @@ mod tests {
         // `"Ubuntu Font Bold"` is a family *and* a weight in one string and CSS has no such value.
         // **Sixty-five**, +1 for `content.csp.bypass`: bru's second `Kind::List`, and the first
         // whose defaults are deliberately empty — see [`CSP_BYPASS`].
-        assert_eq!(SETTINGS.len(), 65);
+        // **Sixty-six**, +1 for `devtools.flex`, which is how tall the docked inspector is — a
+        // share rather than a height, for the reason its own `Def` gives.
+        assert_eq!(SETTINGS.len(), 66);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

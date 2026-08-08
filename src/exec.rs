@@ -697,7 +697,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 host.print();
             }
         }
-        Command::DevTools => crate::devtools::toggle(browser),
+        Command::DevTools(place) => crate::devtools::toggle(browser, *place),
         Command::DevToolsFocus => crate::devtools::focus(browser),
         // Through the three named entry points rather than through `show`, because those are what
         // every other workstream will call — `message::info("yanked")` reads as what it does.
@@ -1241,7 +1241,7 @@ pub fn is_live(command: &Command) -> bool {
         Command::ViewSource | Command::Print => true,
         // Every `devtools <position>` is live, and every one of them opens a window: CEF has no
         // docked inspector to give a BrowserView. See `devtools.rs`.
-        Command::DevTools | Command::DevToolsFocus => true,
+        Command::DevTools(_) | Command::DevToolsFocus => true,
         // No default binding names these; they are here so a workstream can say something and so
         // `:message-error x` can be typed. They cost the live count nothing either way.
         Command::Message { .. } => true,

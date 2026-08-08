@@ -101,6 +101,22 @@ pub fn on_before_close(browser: Option<&mut Browser>) {
         crate::csp::forget(browser.identifier());
     }
     // --- end src/csp.rs -----------------------------------------------------------------------
+    // --- src/devtools.rs ------------------------------------------------------------------------
+    // A docked inspector closed by its own button, not by `:devtools`. Nothing else hears about
+    // that, and the view would stay in the window holding the space of a browser that is gone.
+    if let Some(browser) = browser.as_deref() {
+        let id = browser.identifier();
+        if let Some(state) = crate::state::BruState::instance() {
+            let window = state
+                .lock()
+                .expect("state mutex poisoned")
+                .window_of_inspector(id);
+            if let Some(window) = window {
+                crate::devtools::undock(&state, window);
+            }
+        }
+    }
+    // --- end src/devtools.rs --------------------------------------------------------------------
     forget_chrome_frames_of(browser.as_deref());
     browser_router().on_before_close(browser.cloned());
 }
