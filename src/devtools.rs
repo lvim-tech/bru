@@ -21,8 +21,8 @@
 //! So the four side positions are accepted and open the same window `wIw` used to, and bru's
 //! defaults no longer bind them — a key that names a placement nothing performs is a key that lies.
 //! What docking actually needs is written up in CEF-NOTES trap 24, including the part CEF does not
-//! give: there is no splitter in its Views toolkit, only `cef_browser_view_create` and
-//! `cef_scroll_view_create`, so a draggable divider is bru's to build or to do without.
+//! give: there is no splitter and no resize area, and a `ViewDelegate` is never handed a pointer
+//! event, so a draggable divider has to be a `bru://` page like the rest of bru's chrome.
 
 use cef::*;
 
