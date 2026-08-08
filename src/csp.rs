@@ -60,11 +60,17 @@
 //! the new value is in force and the document comes up under it. Nothing has been fetched at that
 //! point, so nothing flashes; `on_before_browse` runs before the request goes out.
 //!
-//! **A navigation that is not a GET is never cancelled.** Re-issuing it with `load_url` would send
-//! a GET where the page sent a POST, which loses whatever was typed into the form — so such a load
-//! keeps the policy it was given, and the load after it is right. A form post to a site whose CSP
-//! the user has chosen to bypass is rare; losing a form's contents to make its colours right is not
-//! a trade this gets to make.
+//! **Two kinds of navigation are never cancelled**, and both for the same reason: re-issuing them
+//! with `load_url` would not be the same navigation.
+//!
+//! - **A POST.** `load_url` sends a GET, which loses whatever was typed into the form. A form post
+//!   to a site whose CSP the user has chosen to bypass is rare; losing a form's contents to make its
+//!   colours right is not a trade this gets to make.
+//! - **A step through history**, which `TransitionType::FORWARD_BACK_FLAG` names. `load_url` pushes
+//!   a *new* entry, so cancelling `<Back>` and re-issuing it would leave the tab on the right page
+//!   with the history wrong and nothing to go forward to — a worse bug than the one being fixed.
+//!
+//! Both take the policy they were given for one load, and the load after them is right.
 //!
 //! **The state is remembered per browser, and forgotten when the browser closes.** Chromium starts
 //! every browser honouring policies, so an unknown browser is `false`; if a closed browser's
@@ -112,6 +118,7 @@ pub fn on_before_browse(
     frame: Option<&Frame>,
     url: &str,
     method: &str,
+    reissuable: bool,
 ) -> bool {
     let Some(frame) = frame else { return false };
     if frame.is_main() == 0 {
@@ -131,8 +138,8 @@ pub fn on_before_browse(
     let Some(host) = browser.host() else { return false };
     set_bypass(&host, wanted);
     // See the module note: the value only reaches the *next* document, so the one being asked for
-    // has to be asked for again. Not for a POST, whose body `load_url` cannot carry.
-    if !method.eq_ignore_ascii_case("GET") {
+    // has to be asked for again — unless asking again would not be the same navigation.
+    if !method.eq_ignore_ascii_case("GET") || !reissuable {
         return false;
     }
     let mut task = Reload::new(id, url.to_string());

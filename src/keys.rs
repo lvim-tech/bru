@@ -469,12 +469,23 @@ wrap_request_handler! {
             // again from a posted task, because the flag only reaches the document after the one
             // being fetched. See `csp.rs`, which carries the measurement.
             let refused = match request {
-                Some(request) => crate::csp::on_before_browse(
-                    browser.as_deref().cloned().as_mut(),
-                    frame.as_deref(),
-                    &CefString::from(&request.url()).to_string(),
-                    &CefString::from(&request.method()).to_string(),
-                ),
+                Some(request) => {
+                    // A step through history cannot be re-issued: `load_url` pushes a new entry,
+                    // so a cancelled `<Back>` would land on the right page with nothing to go
+                    // forward to. `csp.rs` carries the argument.
+                    // The type is one source value ORed with qualifier bits, so it is read as a
+                    // number: a value carrying the flag matches no named variant.
+                    const FORWARD_BACK: u32 = 0x0100_0000;
+                    let transition = *request.transition_type().as_ref() as u32;
+                    let history = transition & FORWARD_BACK != 0;
+                    crate::csp::on_before_browse(
+                        browser.as_deref().cloned().as_mut(),
+                        frame.as_deref(),
+                        &CefString::from(&request.url()).to_string(),
+                        &CefString::from(&request.method()).to_string(),
+                        !history,
+                    )
+                }
                 None => false,
             };
             if refused {
