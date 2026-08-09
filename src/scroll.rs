@@ -355,6 +355,22 @@ pub fn forget() {
 /// posts a task; only the task holding the latest number asks. A burst of presses therefore costs
 /// one round trip, `SETTLE_MS` after the last of them — by which time Chromium's scroll animation
 /// has finished, so the number reported is the one the page came to rest at.
+///
+/// **What is debounced is the round trip; what is not is this function.** Every press still clones a
+/// `Frame` out of `main_frame()` and constructs a task to post. Against the project's rule that `j`
+/// must not allocate, this is the one place the letter of it is not met — the movement itself
+/// (`wheel`, below) takes no lock and no heap, and the allocation here is off that path and off the
+/// render path. Named in the 2026-08-09 audit as its only performance finding, and **left alone on
+/// purpose**: the audit's own instruction was not to change it without a measurement, and there is
+/// no honest measurement to be had from a unit test, because both costs are CEF calls that need a
+/// live browser. A benchmark of something else shaped like it would be a number that means nothing.
+///
+/// The experiment, for whoever wants it: run bru under `--hint-script`-style scripting with a held
+/// `j` for a few hundred presses, time this function around the two calls, and print ns per press
+/// beside the frame budget. If it is worth removing, the cheap change is a per-browser "last posted
+/// at" instant so a burst posts once rather than once per press, keeping the sequence number as the
+/// correctness backstop. **Not** by making the read synchronous or moving it onto the movement path:
+/// that is the thing this whole design exists to avoid.
 pub fn request_position(browser: &mut Browser) {
     const SETTLE_MS: i64 = 150;
 
@@ -773,4 +789,21 @@ mod tests {
         );
     }
     // --- end unhardcoded -------------------------------------------------------------------
+    /// Malformed input returns `None` rather than panicking.
+    ///
+    /// **The positive case was tested and the negative was not, and only the negative matters here.**
+    /// This parses a string a *renderer* sends; a panic on it would end the browser process rather
+    /// than drop one report. Remove the `?`s and these panic — that is the with-and-without.
+    #[test]
+    fn a_malformed_report_is_dropped_rather_than_fatal() {
+        assert!(parse_report("garbage").is_none());
+        assert!(parse_report("").is_none());
+        assert!(parse_report("1,2,3").is_none(), "too few fields");
+        assert!(parse_report("1,2,3,4,5,nan!").is_none());
+        assert!(parse_report("1,2,3,4,5,6,7").is_some(), "extra fields are ignored");
+        // The well-formed shape still parses, so the guard did not swallow the feature.
+        let position = parse_report("10,20,100,200,800,600").expect("well-formed report");
+        assert_eq!((position.x, position.y), (10.0, 20.0));
+    }
+
 }
