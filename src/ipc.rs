@@ -56,6 +56,12 @@ pub fn on_process_message_received(
     if crate::adblock::on_cosmetic_ask(frame.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/passwords.rs -----------------------------------------------------------------------
+    // What the renderer made of a fill. One short word, never the secret.
+    if crate::passwords::on_filled(message.as_deref()) {
+        return 1;
+    }
+    // --- end src/passwords.rs -------------------------------------------------------------------
     // --- end src/adblock.rs ---------------------------------------------------------------------
     // --- src/editor.rs ----------------------------------------------------------------------
     // The answer to a question `editor.rs` asked the page — what the focused field holds. Same
@@ -1371,6 +1377,12 @@ pub fn renderer_on_process_message_received(
     if crate::adblock::renderer_on_cosmetic_css(frame.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/passwords.rs -----------------------------------------------------------------------
+    // The secret, and the one place that can tell a password field from a search box.
+    if crate::passwords::renderer_on_fill(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/passwords.rs -------------------------------------------------------------------
     // --- end src/adblock.rs ---------------------------------------------------------------------
     // --- src/editor.rs ----------------------------------------------------------------------
     // The renderer half of the same channel: evaluate what the browser process asked for and send

@@ -45,6 +45,9 @@ mod message;
 mod modes;
 mod navigate;
 mod open;
+// Filling a website password from whatever manager the config names. The secret never enters
+// Lua, argv, the command grammar or a file bru writes — see the module head.
+mod passwords;
 mod popups;
 // --- lua runtime -------------------------------------------------------------------------------
 mod plugins;

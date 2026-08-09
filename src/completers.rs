@@ -67,6 +67,15 @@ enum Which {
     /// removes without telling bru.
     Themes,
     // --- end src/chrome.rs: themes -------------------------------------------------------------
+    // --- src/passwords.rs ----------------------------------------------------------------------
+    /// `:password-fill` — the entry **names** the last bare run matched, and never a value.
+    ///
+    /// **The model never spawns a process**, and that is a hard rule rather than an optimisation:
+    /// completion models are built on the UI thread, and a backend that blocks on a passphrase
+    /// prompt would freeze the strip behind a dialog the strip is supposed to be drawing. So this
+    /// reads the names `passwords::fill` already found and left behind — nothing more.
+    PasswordEntry,
+    // --- end src/passwords.rs ------------------------------------------------------------------
     /// `:` alone, `:m`, and the second argument of `:bind` — every command bru understands, with
     /// what it does and the keys that reach it (`miscmodels.py:17-23`, `util.py:16-43`). The rows
     /// are `src/help.rs`'s, because the join to the key table is already written there.
@@ -173,6 +182,10 @@ const SPECS: &[Spec] = &[
     // `:930`) and because their argument may be a title fragment with a space in it.
     Spec { name: "tab-select", argpos: 0, which: Which::AllTabs, rest_from: Some(0), vararg: false },
     Spec { name: "tab-take", argpos: 0, which: Which::OtherTabs, rest_from: Some(0), vararg: false },
+// --- src/passwords.rs -------------------------------------------------------
+    // Rest of the line, because an entry name may contain spaces — `tab-select`'s reasoning.
+    Spec { name: "password-fill", argpos: 0, which: Which::PasswordEntry, rest_from: Some(0), vararg: false },
+// --- end src/passwords.rs ---------------------------------------------------
 // --- end src/utilcmds.rs ---------------------------------------------------
     Spec { name: "tab-focus", argpos: 0, which: Which::Tabs { special: true }, rest_from: None, vararg: false },
     // --- src/chrome.rs: themes -----------------------------------------------------------------
@@ -535,6 +548,12 @@ fn window_name(id: u32) -> &'static str {
 // --- end src/utilcmds.rs ---------------------------------------------------
 /// `miscmodels.py:49,68` — `column_widths=(30, 70, 0)`.
 const MARK_WIDTHS: &[u8] = &[30, 70];
+
+// --- src/passwords.rs -----------------------------------------------------------------------
+/// One column, the whole width: an entry is a path and there is nothing to put beside it. What
+/// must never be beside it is the value, which is why this model has one column and not two.
+const PASSWORD_WIDTHS: &[u8] = &[100];
+// --- end src/passwords.rs -------------------------------------------------------------------
 
 /// `miscmodels.py:19` — `column_widths=(20, 60, 20)`: the name, what it does, the keys.
 const COMMAND_WIDTHS: &[u8] = &[20, 60, 20];
@@ -913,6 +932,17 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
                 .collect()
         }
 
+        // --- src/passwords.rs --------------------------------------------------------------
+        Which::PasswordEntry => {
+            let rows = crate::passwords::candidates()
+                .into_iter()
+                .map(|entry| vec![entry])
+                .collect();
+            completion::list_category("Password entries", PASSWORD_WIDTHS, rows, pattern)
+                .into_iter()
+                .collect()
+        }
+        // --- end src/passwords.rs ----------------------------------------------------------
         Which::Bookmark => {
             let rows = completion::sources()
                 .map(|sources| sources.bookmarks())
@@ -1750,7 +1780,8 @@ mod tests {
         let names: usize = crate::help::COMMANDS.iter().map(|doc| doc.names.len()).sum();
         assert_eq!(cats[0].items.len(), names);
         // 173 since `config-write` — see the same count in `help.rs`.
-        assert_eq!(names, 173);
+        // 174 since `password-fill`.
+        assert_eq!(names, 174);
 
         let row = |name: &str| {
             cats[0]
@@ -1837,7 +1868,8 @@ mod tests {
         let cats = build_which(Which::Commands, "");
         let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
         // 173 since `config-write`.
-        assert_eq!(rows, 173);
+        // 174 since `password-fill`.
+        assert_eq!(rows, 174);
         // `resize_bar`'s arithmetic, which is `chrome.css:186-191`'s: 20px per row and per header,
         // capped at --completion-max-h and one pixel for the border. 166 rows want 3,340px and get
         // 301, because past the cap the table scrolls inside itself.

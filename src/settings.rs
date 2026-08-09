@@ -634,6 +634,23 @@ static EDITOR_COMMAND: FnShape = FnShape {
     fields: &["file", "line", "column"],
     called: "once per :open-editor",
 };
+
+/// The table `passwords.show` hands its function: which entry, and the host it was chosen for.
+///
+/// The same `{}` the literal form substitutes, under a name — `entry` — plus the `host`, which the
+/// template has no way to reach and a function may want: a store that keys by site rather than by
+/// path can build the whole reference from it.
+static PASSWORDS_SHOW: FnShape = FnShape {
+    fields: &["entry", "host"],
+    called: "once per :password-fill, after the entry has been chosen",
+};
+
+/// The table `passwords.list` hands its function. Only the host, because listing is the step that
+/// has not chosen an entry yet — that is what it is for.
+static PASSWORDS_LIST: FnShape = FnShape {
+    fields: &["host"],
+    called: "once per :password-fill with no entry named, and when the completion refreshes",
+};
 // --- end setting functions -------------------------------------------------------------------------
 
 /// A setting's value, already validated against its [`Kind`].
@@ -1334,6 +1351,51 @@ pub const SETTINGS: &[Def] = &[
         default: Some("en-US,en"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Preference(PrefKind::AcceptLanguage),
+    },
+    Def {
+        // **bru does not decide which password manager you use.** The contract is one sentence and
+        // it is checkable: a program that takes the entry name as an argument and prints the secret
+        // on **stdout**. `pass show {}`, `gopass show -o {}`, `op read op://vault/{}/password`,
+        // `bw get password {}` all fit, and a `keepassxc-cli` invocation fits through the function
+        // form because its database path is local knowledge a template cannot carry.
+        //
+        // **stdout and never an argument**, and that is not a convenience: `keyforge`'s first
+        // principle is that no secret passes on a command line, because `/proc` makes it readable
+        // by any local user for as long as the process runs. It is also how `keyforge` itself
+        // drives `pass`.
+        //
+        // `{}` is the entry name, substituted into each argv element the way `editor.command`
+        // substitutes its own — with `str::replace` and never with `spawn::replace_variables`, so
+        // that an entry containing `{url}` stays eight characters rather than becoming the page's
+        // address. With no `{}` anywhere the entry is appended, which is `editor_argv`'s rule: a
+        // command with no placeholder is a program, not a command line.
+        //
+        // `Backing::Read` because `passwords.rs` asks at the moment the command runs; there is
+        // nothing to push and a `:set` takes effect on the very next fill.
+        name: "passwords.show",
+        kind: Kind::TextOrFn(&PASSWORDS_SHOW),
+        default: Some(crate::passwords::DEFAULT_SHOW),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // **Unset means bru's own walk of the store**, which is the right default and not a
+        // shortcut: `pass ls` shells out to `tree -C`, so what it prints is a drawing with box
+        // characters and colour in it rather than a list. browserpass and qute-pass walk the store
+        // for the same reason, and a bru with no configuration then finds the entries by itself.
+        //
+        // Set it to a command that prints **one entry name per line** for a store that is not a
+        // directory of files. `{}` is the host, for a backend that can filter — bru filters by host
+        // itself regardless, so a lister that ignores it is still correct.
+        //
+        // The lister is given five seconds and then killed, unlike `passwords.show`, which is given
+        // for ever: showing blocks on a passphrase prompt, which is a person typing, and listing is
+        // non-interactive by contract.
+        name: "passwords.list",
+        kind: Kind::TextOrFn(&PASSWORDS_LIST),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
     },
     Def {
         // qutebrowser's own name, its own type and its own default (`configdata.yml:449-457`),
@@ -3444,6 +3506,37 @@ impl Template {
 /// `None` means nothing has set it **and bru ships no default**, which is [`text_of`]'s own
 /// contract and is meaningful for the three settings that use it — `editor.command` unset is the
 /// `$BRU_EDITOR` chain.
+/// A [`Kind::TextOrFn`] setting read as a **command**: a line to split, or an argv already in
+/// pieces.
+///
+/// [`template_of`] cannot serve this, and the difference is the whole reason `passwords.show` may
+/// answer with a list: a `Template` answers text, and text has to be split, and splitting is what
+/// a database path with a space in it cannot survive. The literal form still comes back as
+/// `Spec::Line` and is still split — a function is a way of choosing the command, not a second
+/// templating language.
+///
+/// `None` is "nothing is set", which every caller reads as "use bru's own default". A function that
+/// threw is reported through the same sink every other broken setting function uses and then also
+/// answers `None`, so a browser in the middle of a command still has somewhere to go.
+pub fn command_spec(
+    name: &str,
+    fields: &[(&'static str, crate::lua::Arg)],
+) -> Option<crate::passwords::Spec> {
+    match with_live(|settings| settings.get(name, None)) {
+        Ok(Some(Value::Text(text))) => Some(crate::passwords::Spec::Line(text)),
+        Ok(Some(Value::Fn(handle))) => match crate::lua::call_argv(&handle, fields) {
+            Ok(spec) => Some(spec),
+            Err(why) => {
+                if let Some(def) = def(name) {
+                    report_fn_error(def, &why);
+                }
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
 pub fn template_of(name: &str) -> Option<Template> {
     let def = def(name)?;
     match with_live(|settings| settings.get(name, None)) {
@@ -4625,7 +4718,11 @@ mod tests {
         // (`configdata.yml:449`). One setting for both halves, because saving without restoring
         // writes a file nobody reads and restoring without saving restores whatever was last
         // written by hand; the pair is the feature. See `lifetime.rs` for where it is read.
-        assert_eq!(SETTINGS.len(), 69);
+        // **Seventy-one**, +2 for `passwords.show` and `passwords.list`. They are what stops bru
+        // having an opinion about which password manager you use: the first names a program that
+        // prints the secret on stdout, the second one that lists entry names, and both take a
+        // function for the stores a template cannot express. See `src/passwords.rs`.
+        assert_eq!(SETTINGS.len(), 71);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
@@ -5798,11 +5895,15 @@ mod tests {
                 );
             }
         }
-        // Three: the two tab titles and `editor.command`. Raise this with the setting.
-        assert_eq!(found, 3);
+        // Five: the two tab titles, `editor.command`, and the two `passwords.*`. Raise this with
+        // the setting. The password pair is here for the reason the kind exists — a store whose
+        // reference a template cannot spell, such as a `keepassxc-cli` database path with a space
+        // in it, is a function's job and not a second templating language's.
+        assert_eq!(found, 5);
         assert_eq!(
             fn_setting_names(),
-            "tabs.title.format, tabs.title.format_pinned, editor.command"
+            "passwords.show, passwords.list, tabs.title.format, tabs.title.format_pinned, \
+             editor.command"
         );
     }
 

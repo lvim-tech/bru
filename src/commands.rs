@@ -320,6 +320,9 @@ pub enum Command {
     /// other side: what a reader of either command wants is the lines to put in the file that is
     /// theirs, and the only difference between the two commands is who writes the file.
     ConfigDiff,
+    /// `password-fill [entry]` — put a password from the configured manager into the focused
+    /// password field. With no entry, the host of the tab chooses. See `src/passwords.rs`.
+    PasswordFill { entry: Option<String> },
     /// `config-write <file> [--defaults] [--force]` — the Lua of [`ConfigDiff`], or all of bru's
     /// own defaults commented out, into a file.
     ConfigWrite {
@@ -1611,6 +1614,14 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // every name in `settings::SETTINGS` is one a person may type — so the flag would name
         // nothing and is not accepted rather than accepted and ignored.
         "config-diff" => Command::ConfigDiff,
+        // maxsplit=0: an entry name may contain spaces, and there are no flags. The name is data
+        // and never re-parsed — `passwords::show_argv` puts it in one argv element.
+        "password-fill" => {
+            let entry = tokens[1..].join(" ").trim().to_string();
+            Command::PasswordFill {
+                entry: (!entry.is_empty()).then_some(entry),
+            }
+        }
         // qutebrowser's `config-write-py [file] [--force] [--defaults]`
         // (`configcommands.py:456`), spelled for a browser whose config is Lua. maxsplit=0 for
         // `config-source`'s reason: a path may contain spaces.

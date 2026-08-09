@@ -442,6 +442,12 @@ pub const COMMANDS: &[Doc] = &[
         what: "Open everything this browser is running that is not bru's own, as the Lua that \
                would reproduce it.",
         example: "config-diff" },
+    Doc { names: &["password-fill"], args: "[entry]", flags: &[],
+        what: "Put a password into the focused password field, from whatever manager \
+               `passwords.show` names. With no entry, the host of this tab chooses one; several \
+               matches open the completion. The field has to be focused first — follow a hint into \
+               it. The secret never enters Lua, argv, the command line or any file bru writes.",
+        example: "password-fill" },
     Doc { names: &["config-write"], args: "<file>", flags: &["--defaults", "--force"],
         what: "Write that same Lua to a file. With --defaults, write every setting and binding bru \
                ships instead, commented out — a reference, not a configuration. Refuses to \
@@ -1399,7 +1405,8 @@ mod tests {
         // --- end lua runtime -----------------------------------------------------------------
         // 173 since `config-write`, which is `config-diff`'s Lua into a file and, with
         // `--defaults`, every setting and binding bru ships. Raise this with the command.
-        assert_eq!(source.len(), 173, "the scrape found a different number of commands");
+        // 174 since `password-fill`. Raise this with the command.
+        assert_eq!(source.len(), 174, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1538,6 +1545,7 @@ mod tests {
                 Command::ConfigClear { .. } => "ConfigClear",
                 Command::ConfigDiff => "ConfigDiff",
                 Command::ConfigWrite { .. } => "ConfigWrite",
+                Command::PasswordFill { .. } => "PasswordFill",
                 Command::ConfigListAdd { .. } => "ConfigListAdd",
                 Command::ConfigListRemove { .. } => "ConfigListRemove",
                 Command::ConfigSource { .. } => "ConfigSource",
@@ -1660,6 +1668,7 @@ mod tests {
         "SelectionReverse", "SelectionFollow", "MoveTo", "CmdSetText", "CommandAccept", "Spawn",
         "EditText", "InsertText", "FakeKey", "Set", "ConfigCycle", "ConfigDictAdd",
         "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigWrite",
+        "PasswordFill",
         "ConfigListAdd",
         "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind", "DevToolsClose",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",

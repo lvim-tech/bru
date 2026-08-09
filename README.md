@@ -13,7 +13,7 @@ Everything else follows from keeping that true.
 
 - **qutebrowser's vocabulary.** The default bindings are transcribed from `configdata.yml`, so `f`
   hints, `o` opens, `d` closes a tab, `gg` and `G` jump, `:` is the command line.
-  **288 default bindings, 173 commands, 69 settings.**
+  **288 default bindings, 174 commands, 71 settings.**
 - **One binary.** No embedded runtime to install, no Python, no Qt. CEF is a prebuilt Chromium
   distribution — nothing here compiles a browser engine.
 - **Its own data.** `~/.local/share/bru/` holds history, quickmarks, bookmarks, sessions and the
@@ -645,6 +645,7 @@ one vocabulary, three doors. Arguments in `<>` are required and `[]` optional.
 | `config-unset` | `<option>` | `-p/--print`, `-t/--temp`, `-u/--pattern/--url` | Put one setting back to bru's own value. |
 | `config-clear` | — | `--save` |  |
 | `config-diff` | — | — |  |
+| `password-fill` | `[entry]` | — | Put a password into the focused password field, from whatever manager `passwords.show` names. |
 | `config-write` | `<file>` | `--defaults`, `--force` |  |
 | `config-source` | `[filename]` | `--clear` | Re-read config.lua over the running browser. |
 | `config-edit` | — | `--no-source/--no_source` |  |
@@ -771,6 +772,56 @@ id-keyed, are applied. Of uBlock's roughly two hundred scriptlets bru ships **tw
 and `trusted-replace-fetch-response` — because each one is code bru runs in every page a rule names,
 so each is here only when something is actually asking for it. Only `fetch` is wrapped, not
 `XMLHttpRequest`: measured 2026-08-09, YouTube uses XHR for logging alone.
+
+## Passwords
+
+`:password-fill` puts a password into the focused password field. bru stores nothing and generates
+nothing: it runs whatever your password manager's command is and reads the secret off its **stdout**.
+
+```lua
+bru.set("passwords.show", "pass show {}")     -- the default
+bru.set("passwords.show", "gopass show -o {}")
+bru.set("passwords.show", "op read op://vault/{}/password")
+bru.set("passwords.show", function(p)         -- when a template cannot say it
+  return { "keepassxc-cli", "show", "-a", "Password", os.getenv("HOME") .. "/my db.kdbx", p.entry }
+end)
+```
+
+`{}` is the entry name. With no `{}` anywhere it is appended, which is what `$EDITOR file` means
+everywhere else. A function is handed `entry` and `host` and returns either a command line or an
+argv already in pieces — the second form exists because a database path may contain a space, and
+splitting is exactly what it has to survive.
+
+`passwords.list` is the other half, and unset means **bru walks the store itself** — `pass ls`
+shells out to `tree -C`, so what it prints is a drawing rather than a list. Set it to a command
+printing one entry name per line for a store that is not a directory of files.
+
+**Choosing an entry.** Bare, `:password-fill` takes the host of the tab and looks for an entry whose
+path contains it: `websites/abv.bg/me` answers for `abv.bg` and for `www.abv.bg`, because
+credentials are issued per domain and used on subdomains. One match fills, several open the
+completion, none says so and names the host it looked for. `:password-fill <entry>` skips all of it.
+
+**Focus the field first** — follow a hint into it. bru refuses to fill anything that is not a
+password field, and it asks CEF's own form-control model rather than the page: a page can shadow
+`document.activeElement`, and it cannot shadow that.
+
+### What is claimed, and what is not
+
+**Routing confinement**, and every part of it is checkable: the secret never enters Lua, never
+appears in `argv`, never enters bru's command grammar, never reaches a message or a debug line, and
+never touches a file bru writes. The entry *name* travels; the value does not. That is why this is
+Rust and not a plugin — a plugin can only fill through `:insert-text`, and that string is split on
+`;;` and run through `{url}` substitution. Measured 2026-08-09: a password of
+`S3cret;;message-info pwned{url}` sent that way put **`S3cret`** in the field and *ran the rest as a
+command*; through `:password-fill` the same password arrives whole.
+
+**Not memory hygiene.** Once the fill lands, the secret is in Blink's DOM and in V8 in copies
+nothing can zero. Anyone who can read this process's memory reads the renderer, and saying otherwise
+would be a comfort rather than a property.
+
+**A late answer is dropped.** `pass show` blocks on a passphrase prompt, which is a person typing.
+If the page changes while it is open, the secret is discarded rather than typed into whatever is
+there now.
 
 ## Lua
 
@@ -945,6 +996,7 @@ Flags come before the file: `:config-write --defaults ~/bru-defaults.lua`.
 
 | setting | default |
 |---|---|
+| `start_page` | *(none — leaving it unset is what it means)* |
 | `statusbar.mode.style` | `"full"` |
 | `statusbar.mode.labels` | `{ ["normal"] = "normal", ["insert"] = "insert", ["caret"] = "caret", ["command"] = "com…` |
 | `url.searchengines` | `{ ["DEFAULT"] = "https://duckduckgo.com/?q={}", ["am"] = "https://www.amazon.com/s?k={}…` |
@@ -969,6 +1021,9 @@ Flags come before the file: `:config-write --defaults ~/bru-defaults.lua`.
 | `content.headers.do_not_track` | `true` |
 | `content.hyperlink_auditing` | `false` |
 | `content.headers.accept_language` | `"en-US,en"` |
+| `passwords.show` | `"pass show {}"` |
+| `passwords.list` | *(none — leaving it unset is what it means)* |
+| `auto_save.session` | `false` |
 | `content.autofill` | `false` |
 | `content.blocking.adblock.lists` | `{ "https://easylist.to/easylist/easylist.txt", "https://easylist.to/easylist/easyprivac…` |
 | `devtools.height` | `400` |
@@ -992,8 +1047,12 @@ Flags come before the file: `:config-write --defaults ~/bru-defaults.lua`.
 | `hints.uppercase` | `false` |
 | `hints.scatter` | `true` |
 | `scrollbar.width` | `12` |
+| `scrollbar.thumb` | *(none — leaving it unset is what it means)* |
+| `scrollbar.track` | *(none — leaving it unset is what it means)* |
 | `scrollbar.style` | `true` |
 | `scrollbar.page_overrides` | `true` |
+| `editor.command` | *(none — leaving it unset is what it means)* |
+| `downloads.location.directory` | *(none — leaving it unset is what it means)* |
 | `downloads.location.prompt` | `true` |
 | `downloads.remove_finished` | `-1` |
 | `messages.timeout` | `3000` |
@@ -1006,13 +1065,8 @@ Flags come before the file: `:config-write --defaults ~/bru-defaults.lua`.
 | `fonts.default_family` | `"monospace"` |
 | `fonts.default_size` | `13` |
 | `fonts.default_weight` | `"normal"` |
-| `completion.height` | `300` |
-| `start_page` | *(none — leaving it unset is what it means)* |
-| `scrollbar.thumb` | *(none — leaving it unset is what it means)* |
-| `scrollbar.track` | *(none — leaving it unset is what it means)* |
-| `editor.command` | *(none — leaving it unset is what it means)* |
-| `downloads.location.directory` | *(none — leaving it unset is what it means)* |
 | `colors.scheme` | *(none — leaving it unset is what it means)* |
+| `completion.height` | `300` |
 
 ## Scripting
 

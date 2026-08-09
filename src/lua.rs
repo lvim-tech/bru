@@ -381,6 +381,60 @@ pub fn call_string(handle: &FnRef, fields: &[(&'static str, Arg)]) -> Result<Str
 }
 // --- end setting functions ---------------------------------------------------------------------
 
+/// Call a function with named fields and take back **either a command line or an argv** — the shape
+/// `passwords.show` and `passwords.list` have.
+///
+/// The twin of [`call_string`], and the second answer is the reason it exists rather than a
+/// convenience: a `keepassxc-cli` invocation carries a database path, and a path may contain a
+/// space. A string would have to be split, and splitting is what the array form exists to refuse.
+/// A string answer is still accepted and still split, so
+/// `function(p) return "pass show " .. p.entry end` keeps working — a function is a way of choosing
+/// the command line, not a second templating language.
+pub fn call_argv(
+    handle: &FnRef,
+    fields: &[(&'static str, Arg)],
+) -> Result<crate::passwords::Spec, String> {
+    let (lua, function) = look_up(handle)?;
+    let table = fields_table(&lua, handle, fields)?;
+    match function.call::<mlua::Value>(table) {
+        Ok(mlua::Value::String(text)) => text
+            .to_str()
+            .map(|text| crate::passwords::Spec::Line(text.to_string()))
+            .map_err(|e| format!("{handle}: its answer is not text bru can read: {e}")),
+        Ok(mlua::Value::Table(table)) => {
+            let mut argv = Vec::new();
+            for (index, value) in table.sequence_values::<mlua::Value>().enumerate() {
+                match value {
+                    Ok(mlua::Value::String(text)) => match text.to_str() {
+                        Ok(text) => argv.push(text.to_string()),
+                        Err(e) => {
+                            return Err(format!("{handle}: element {} is not text: {e}", index + 1))
+                        }
+                    },
+                    Ok(other) => {
+                        return Err(format!(
+                            "{handle}: element {} is {}, and every element of a command has to be \
+                             a string",
+                            index + 1,
+                            other.type_name()
+                        ))
+                    }
+                    Err(e) => return Err(format!("{handle}: {e}")),
+                }
+            }
+            if argv.is_empty() {
+                return Err(format!("{handle}: returned an empty command"));
+            }
+            Ok(crate::passwords::Spec::Argv(argv))
+        }
+        Ok(other) => Err(format!(
+            "{handle}: returned {}, and what is wanted here is a string or an array of strings",
+            other.type_name()
+        )),
+        Err(e) => Err(format!("{handle}: {e}")),
+    }
+}
+
 /// Call a function with named fields and ignore whatever it answers — the shape an **event** hook
 /// has (`bru.on(event, fn)`, `fn(table) -> nil`).
 ///

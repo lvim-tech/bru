@@ -608,6 +608,14 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::ConfigDiff => {
             crate::open::open(state, browser, Some("bru://chrome/config"), true, false)
         }
+        // --- src/passwords.rs ---------------------------------------------------------------
+        // Nothing waits here: `passwords::fill` builds the command on this thread, because Lua is
+        // this thread's, and everything after it happens elsewhere. A backend blocking on a
+        // passphrase prompt must not be a browser that has stopped drawing.
+        Command::PasswordFill { entry } => {
+            crate::passwords::fill(state, entry.as_deref())
+        }
+        // --- end src/passwords.rs -----------------------------------------------------------
         Command::ConfigWrite { filename, defaults, force } => {
             crate::config::run_write(filename, *defaults, *force)
         }
@@ -1062,6 +1070,7 @@ pub fn is_live(command: &Command) -> bool {
         | Command::ConfigClear { .. }
         | Command::ConfigDiff
         | Command::ConfigWrite { .. }
+        | Command::PasswordFill { .. }
         | Command::ConfigListAdd { .. }
         | Command::ConfigListRemove { .. }
         | Command::ConfigSource { .. }
