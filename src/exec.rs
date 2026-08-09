@@ -253,6 +253,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
         Command::SessionLoad { name, clear, history } => {
+            // --- src/lifetime.rs --------------------------------------------------------------
+            // **Write the session being left, before the one being loaded replaces it**, and only
+            // if this run has not already been taken over by hand — a second `:session-load` is
+            // leaving a session the user chose, and bru does not write over one of those.
+            //
+            // Then stand down for the rest of the run: from here the open tabs are a session the
+            // user picked, and neither it nor the one restored at startup is written on their
+            // behalf. `session::loaded_by_hand` has the sequence that made this necessary.
+            if !crate::session::loaded_by_hand() {
+                crate::lifetime::autosave(state);
+            }
+            crate::session::note_loaded_by_hand();
+            // --- end src/lifetime.rs ----------------------------------------------------------
             match crate::session::load(state, name, *clear, *history) {
                 Ok(opened) => eprintln!("bru: loaded {opened} tabs from session {name:?}"),
                 Err(e) => eprintln!("bru: could not load session {name:?}: {e}"),

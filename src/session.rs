@@ -640,13 +640,66 @@ impl ReplayStep {
 ///
 /// Answers whether it opened anything: `app.rs` skips the start page when it did, because a start
 /// page opened and then closed is a flash of the wrong site on every restore.
+/// Whether a session was loaded **by hand** during this run.
+///
+/// See [`loaded_by_hand`] for what it is for. An `AtomicBool` and not a name, because what matters
+/// is that the user took charge of which tabs are open, not which session they took charge with.
+static BY_HAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `:session-load` ran. Called from `exec.rs`, and **not** from [`restore_at_startup`] — the
+/// startup restore is bru's own doing, and this flag is about the user's.
+pub fn note_loaded_by_hand() {
+    BY_HAND.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the tabs now open came from a session the user loaded themselves.
+///
+/// **`session.auto_save` stands down when this is true, and that is a data-loss fix rather than a
+/// nicety.** The sequence that found it, 2026-08-09: bru restores `default` at startup, the user
+/// runs `:session-load работа`, and on exit the automatic save writes the *work* tabs over
+/// `default`. Two sessions damaged by one exit — `default` is no longer what it was, and `работа`
+/// was never updated either.
+///
+/// The rule that follows: a session you loaded by name is a thing you are holding, and bru does not
+/// write over it or over anything else on your behalf. `:session-save` is how you say when. The
+/// startup restore does **not** set this, because that session is the one the setting named and
+/// writing it back is exactly what the setting is for.
+pub fn loaded_by_hand() -> bool {
+    BY_HAND.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Which session a `session.auto_*` setting names, or `None` when it is off.
+///
+/// **The name is optional, and that is the whole of this function.** The setting takes three
+/// answers and a person should be able to give whichever fits:
+///
+/// | written | means |
+/// |---|---|
+/// | nothing | off — a bru with no configuration saves and restores nothing |
+/// | `true` | on, using [`DEFAULT_NAME`] — the session `:quit --save` already writes |
+/// | `"work"` | on, using that session |
+///
+/// `true` arriving as the text `"true"` is not a coincidence to rely on quietly: `bru.set` turns
+/// every scalar into text before the setting sees it (`config.rs`), so a Lua boolean and a typed
+/// `:set session.auto_save true` are the same six characters by the time they get here. That is
+/// why the kind is `Text` and not a new one — the three answers fit in it, and a boolean spelling
+/// that only worked from one of the two doors would be worse than none.
+pub fn auto_name(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    match value {
+        "" | "false" | "no" | "off" | "0" => None,
+        "true" | "yes" | "on" | "1" => Some(DEFAULT_NAME.to_string()),
+        name => Some(name.to_string()),
+    }
+}
+
 pub fn restore_at_startup(state: &SharedState) -> bool {
     let Some(command_line) = command_line_get_global() else {
         return false;
     };
     let name = CefString::from(&command_line.switch_value(Some(&CefString::from("restore"))))
         .to_string();
-    // **`auto_save.session` is the other way to ask**, and it asks for the same session by the
+    // **`session.auto_restore` is the other way to ask**, and it asks for the same session by the
     // same name — the one `:quit --save` writes and `--restore=default` reads. A switch on the
     // command line still wins: it names a session on purpose, and a setting must not overrule
     // something typed.
@@ -661,10 +714,14 @@ pub fn restore_at_startup(state: &SharedState) -> bool {
                 command_line.arguments(Some(&mut bare));
                 bare.into_iter().any(|argument| !argument.trim().is_empty())
             };
-        if asked_for_a_page || !crate::settings::is_on("auto_save.session") {
+        if asked_for_a_page {
             return false;
         }
-        DEFAULT_NAME.to_string()
+        let Some(named) = auto_name(crate::settings::text_of("session.auto_restore").as_deref())
+        else {
+            return false;
+        };
+        named
     } else {
         name
     };
@@ -904,5 +961,24 @@ mod tests {
     fn an_empty_session_is_not_written() {
         assert_eq!(Session::default().to_text(), "bru-session 1\n");
         assert!(Session::parse("bru-session 1\n").tabs.is_empty());
+    }
+
+    /// **The three answers, and the one that makes the name optional.** `true` is what a person
+    /// writes when they do not care which session; a name is what they write when they do. Take
+    /// the `"true"` arm out and `bru.set("session.auto_save", true)` starts saving to a session
+    /// literally called `true`.
+    #[test]
+    fn a_session_setting_takes_a_name_or_merely_yes() {
+        assert_eq!(auto_name(Some("true")).as_deref(), Some(DEFAULT_NAME));
+        assert_eq!(auto_name(Some("yes")).as_deref(), Some(DEFAULT_NAME));
+        assert_eq!(auto_name(Some("1")).as_deref(), Some(DEFAULT_NAME));
+
+        assert_eq!(auto_name(Some("work")).as_deref(), Some("work"));
+        assert_eq!(auto_name(Some("  work  ")).as_deref(), Some("work"));
+
+        assert_eq!(auto_name(None), None, "unset is off");
+        assert_eq!(auto_name(Some("")), None);
+        assert_eq!(auto_name(Some("false")), None);
+        assert_eq!(auto_name(Some("off")), None);
     }
 }

@@ -14,7 +14,7 @@
 //!
 //! ```text
 //!   :quit          ─┐
-//!                   ├─→  on_quitting()  ─→  the `quit` event, then auto_save.session
+//!                   ├─→  on_quitting()  ─→  the `quit` event, then session.auto_save
 //!   window close   ─┘         (once)
 //! ```
 //!
@@ -54,14 +54,44 @@ pub fn on_quitting(state: &SharedState) {
 
     crate::events::fire(crate::events::Event::Quit, None, Vec::new);
 
-    // qutebrowser's `auto_save.session`: with it on, every way out saves; with it off, only
-    // `:quit --save` does. Same name, same default, same sentence — see its `Def`.
-    if !crate::settings::is_on("auto_save.session") {
+    // **A session loaded by hand is not written over.** Restore `default`, `:session-load работа`,
+    // then quit: without this the work tabs would be saved as `default`, damaging the session that
+    // was restored and leaving the one that was loaded untouched. See `session::loaded_by_hand`.
+    if crate::session::loaded_by_hand() {
+        eprintln!(
+            "bru: session.auto_save: a session was loaded by hand, so nothing was written \
+             automatically — :session-save writes it when you say so"
+        );
         return;
     }
-    match crate::session::save(state, crate::session::DEFAULT_NAME) {
-        Ok(path) => eprintln!("bru: auto_save.session: saved to {}", path.display()),
-        Err(e) => eprintln!("bru: auto_save.session: could not save: {e}"),
+    autosave(state);
+}
+
+/// **Leaving a session by loading another is leaving it**, so this runs there too.
+///
+/// `:session-load` calls it *before* it opens anything, while the tabs it is about to replace are
+/// still there to be written. Without it the sequence "work all morning in `default`, load
+/// `работа` at noon" loses the morning: the automatic save at exit stands down because a session
+/// was loaded by hand, and nothing ever wrote what was open before the load.
+///
+/// It answers whether it wrote, so the caller can say so beside its own line.
+pub fn autosave(state: &SharedState) -> bool {
+    // `session.auto_save` names the session to write, or says nothing and writes none. `true` is
+    // the short way of saying `default`; see `session::auto_name` for the three answers.
+    let Some(name) =
+        crate::session::auto_name(crate::settings::text_of("session.auto_save").as_deref())
+    else {
+        return false;
+    };
+    match crate::session::save(state, &name) {
+        Ok(path) => {
+            eprintln!("bru: session.auto_save: saved to {}", path.display());
+            true
+        }
+        Err(e) => {
+            eprintln!("bru: session.auto_save: could not save: {e}");
+            false
+        }
     }
 }
 

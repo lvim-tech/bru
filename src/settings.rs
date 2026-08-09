@@ -1398,10 +1398,48 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Read,
     },
     Def {
-        // qutebrowser's own name, its own type and its own default (`configdata.yml:449-457`),
-        // and its own description reads like the request that asked for it: "Always restore open
-        // sites when qutebrowser is reopened. Without this option set, `:wq` (`:quit --save`)
-        // needs to be used."
+        // **The other half of `session.auto_save`, split from it at the user's request
+        // 2026-08-09** — and the split is a departure from qutebrowser, which is worth saying
+        // rather than hiding. There one setting does both, and its own description is "Always
+        // restore open sites when qutebrowser is reopened"; the argument for one was that saving
+        // without restoring writes a file nobody reads.
+        //
+        // The argument for two is the case that argument misses: **saving is insurance and
+        // restoring is a habit.** A person may want every exit recorded — so that a crash or a
+        // mis-clicked close is recoverable through `:session-load` — and still want a clean
+        // browser every morning. One setting cannot say that, and the file it writes is read by
+        // hand rather than by nobody.
+        //
+        // **A session name rather than a switch**, and its twin is the same. A boolean can only
+        // point at one session, and there is no reason the one restored at startup has to be the
+        // one every exit overwrites: `session.auto_save = "last"` and
+        // `session.auto_restore = "work"` is a browser that records where you got to and still
+        // opens the set of tabs you actually work in. `default` is the ordinary answer and is the
+        // session `:quit --save` and `--restore=default` already use.
+        //
+        // Unset is off — `editor.command`'s and `passwords.list`'s precedent, where "nothing is
+        // set" means bru's own behaviour, and bru's own behaviour here is to restore nothing. So a
+        // bru with no configuration starts where it always started.
+        //
+        // Only consulted when no page was named: handed a URL, bru opens that.
+        name: "session.auto_restore",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
+        // qutebrowser's type and default (`configdata.yml:449-457`), and its description reads
+        // like the request that asked for it: "Always restore open sites when qutebrowser is
+        // reopened. Without this option set, `:wq` (`:quit --save`) needs to be used."
+        //
+        // **The name is bru's, and the departure is deliberate.** qutebrowser calls this
+        // `auto_save.session` — a group named after the *action*. Every one of bru's eighteen
+        // other groups is named after the *subject*: `content.`, `tabs.`, `hints.`, `downloads.`,
+        // `passwords.`. Parity would have been worth the oddity if the behaviour matched, but bru
+        // splits this in two and qutebrowser does not, so a qutebrowser user who found
+        // `auto_save.session` here would find a setting that does **half** of what theirs does —
+        // which is worse than a different name that does what it says.
         //
         // **One setting, not two, and that is qutebrowser's shape rather than a shortcut.** Saving
         // without restoring writes a file nobody reads; restoring without saving restores whatever
@@ -1415,9 +1453,9 @@ pub const SETTINGS: &[Def] = &[
         // `Backing::Read`: nothing is pushed anywhere. `lifetime::on_quitting` asks at the moment
         // the browser is going away and `session::restore_at_startup` asks once at startup, so a
         // `:set` takes effect on the very next quit with nothing to rebuild.
-        name: "auto_save.session",
-        kind: Kind::Bool,
-        default: Some("false"),
+        name: "session.auto_save",
+        kind: Kind::Text,
+        default: None,
         scopes: Scopes::GlobalOnly,
         backing: Backing::Read,
     },
@@ -4714,7 +4752,7 @@ mod tests {
         // bru's own choice rather than qutebrowser's, because QtWebEngine has no such dropdown to
         // have an opinion about. See [`PrefKind::Autofill`], including for the Escape bug it was
         // first written against and measurably does not end.
-        // **Sixty-nine**, +1 for `auto_save.session` — qutebrowser's own name, type and default
+        // **Sixty-nine**, +1 for `session.auto_save` — qutebrowser's own name, type and default
         // (`configdata.yml:449`). One setting for both halves, because saving without restoring
         // writes a file nobody reads and restoring without saving restores whatever was last
         // written by hand; the pair is the feature. See `lifetime.rs` for where it is read.
@@ -4722,7 +4760,10 @@ mod tests {
         // having an opinion about which password manager you use: the first names a program that
         // prints the secret on stdout, the second one that lists entry names, and both take a
         // function for the stores a template cannot express. See `src/passwords.rs`.
-        assert_eq!(SETTINGS.len(), 71);
+        // **Seventy-two**, +1 for `session.auto_restore`. Split from `session.auto_save` at the
+        // user's request: saving is insurance and restoring is a habit, and one setting cannot
+        // say "record every exit, but start clean".
+        assert_eq!(SETTINGS.len(), 72);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
