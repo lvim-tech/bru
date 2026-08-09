@@ -1293,6 +1293,142 @@ pub fn binding_diff() -> Vec<String> {
         .map(|bindings| bindings.diff())
         .unwrap_or_default()
 }
+
+/// Every binding bru ships, as commented-out Lua, for the same reason and in the same shape as
+/// `settings::defaults_lua`. Built from [`DEFAULT_BINDINGS`] rather than from the live table: this
+/// answers "what is bru's own", and the live table is bru's own *plus the user's*.
+pub fn default_bindings_lua() -> Vec<String> {
+    Bindings::defaults()
+        .all()
+        .into_iter()
+        .map(|(mode, keys, command)| {
+            format!("-- bru.bind({:?}, {:?}, {:?})", mode.name(), keys, command)
+        })
+        .collect()
+}
+
+/// The two halves of "what have I changed", as the Lua that would reproduce it.
+///
+/// One function because it is one question, and because [`run_write`] and the page must not be able
+/// to answer it differently from each other.
+pub fn diff_lua() -> Vec<String> {
+    let mut lines = crate::settings::diff_lines();
+    lines.extend(binding_diff());
+    lines
+}
+
+/// Everything bru ships, settings then bindings, all commented out.
+pub fn defaults_lua() -> Vec<String> {
+    let mut lines = vec![
+        "-- Every setting and binding bru ships, with the value it already has.".to_string(),
+        "-- Nothing here is in force *because* it is written here: these are bru's own defaults,".to_string(),
+        "-- compiled into the binary, and this file is a reference. Un-comment a line to take it".to_string(),
+        "-- over — and then it is yours, and a later bru changing its own default will not move it.".to_string(),
+        String::new(),
+        "-- settings".to_string(),
+    ];
+    lines.extend(crate::settings::defaults_lua());
+    lines.push(String::new());
+    lines.push("-- bindings".to_string());
+    lines.extend(default_bindings_lua());
+    lines
+}
+
+/// `:config-write [--defaults] [--force] <file>` — put one of the two above into a file.
+///
+/// **It refuses to overwrite, and it refuses `config.lua` twice as hard.** A command that writes
+/// where it is told is a command that can destroy the file the user has been editing all week; the
+/// one that names their real configuration is the one worth naming in the refusal, because
+/// `:config-write ~/.config/bru/config.lua` is the plausible typo, not a wild path.
+pub fn run_write(filename: &str, defaults: bool, force: bool) {
+    let path = PathBuf::from(shellexpand(filename));
+    let lines = if defaults { defaults_lua() } else { diff_lua() };
+
+    if path.exists() && !force {
+        let what = if config_path().as_deref() == Some(path.as_path()) {
+            " — and that is your own config.lua, which bru reads at startup"
+        } else {
+            ""
+        };
+        crate::message::error(&format!(
+            "config-write: {} exists{what}. Pass --force to overwrite it.",
+            path.display()
+        ));
+        return;
+    }
+
+    let mut text = lines.join("\n");
+    text.push('\n');
+    match std::fs::write(&path, text.as_bytes()) {
+        Ok(()) => crate::message::info(&format!(
+            "config-write: {} line(s) to {}",
+            lines.len(),
+            path.display()
+        )),
+        Err(e) => crate::message::error(&format!("config-write: {}: {e}", path.display())),
+    }
+}
+
+/// `~` at the front, and nothing else. A path a person types at `:` starts with `~` often enough to
+/// be worth expanding and never contains the rest of a shell's vocabulary — `$VAR` and globbing are
+/// the shell's, and bru is not one.
+fn shellexpand(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest).to_string_lossy().into_owned(),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
+/// `bru://chrome/config` and `bru://chrome/config/defaults`, generated from the same two builders
+/// the file gets — so the page and the file can never say different things.
+///
+/// **This is where `:config-diff`'s answer goes now.** It used to `eprintln!` the Lua and put
+/// "6 line(s) on stderr" in the status bar, which is an answer nobody launching bru from a desktop
+/// entry can read; reported by the user 2026-08-09 as "config-diff does nothing". The status bar is
+/// one line and this is many, so the answer belongs on a page, which is what `bru://chrome/help`
+/// and `bru://chrome/settings` already are.
+pub fn page(defaults: bool) -> String {
+    let lines = if defaults { defaults_lua() } else { diff_lua() };
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>bru — config</title>
+<link rel="stylesheet" href="chrome.css">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="user.css">
+<body data-view="help">
+<main id="help">
+<h1>bru</h1>
+"#,
+    );
+    if defaults {
+        out.push_str(
+            "<p class=\"summary\">Every setting and binding bru ships, with the value it already \
+             has. bru writes no configuration file and needs none: these are compiled into the \
+             binary. Commented out, because this is a reference — un-comment a line only to take \
+             that one over. <code>:config-write --defaults &lt;file&gt;</code> writes this.</p>\n",
+        );
+    } else {
+        out.push_str(
+            "<p class=\"summary\">Everything this browser is running that is not bru's own, as the \
+             Lua that would reproduce it. <code>:config-write &lt;file&gt;</code> writes this.</p>\n",
+        );
+    }
+    if lines.iter().all(|line| line.trim().is_empty()) {
+        out.push_str("<p class=\"summary\">Nothing is customized.</p>\n");
+    }
+    out.push_str("<pre class=\"cmd\">");
+    for line in &lines {
+        out.push_str(&crate::help::escape(line));
+        out.push('\n');
+    }
+    out.push_str("</pre>\n</main>\n");
+    out
+}
 // --- end config commands -----------------------------------------------------------------------
 
 #[cfg(test)]

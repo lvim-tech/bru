@@ -591,20 +591,17 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         Command::ConfigClear { save } => crate::settings::run_clear(*save),
         // The settings half and the bindings half, printed together: two commands' worth of state
         // in one answer, because "what have I changed" is one question.
+        // **The answer goes where the person who typed it is looking**, which is the same
+        // correction commit `a2aac60` made for the adblock commands and this one was missed by.
+        // It used to `eprintln!` the Lua and say "6 line(s) on stderr" in the bar — an answer
+        // nobody who launched bru from a desktop entry can read. Reported by the user 2026-08-09
+        // as "config-diff does nothing"; it was doing all of it, into a terminal that was not
+        // there. The bar is one line and this is many, so it is a page.
         Command::ConfigDiff => {
-            let mut lines = crate::settings::diff_lines();
-            lines.extend(crate::config::binding_diff());
-            if lines.is_empty() {
-                crate::message::info("config-diff: nothing is customized");
-            } else {
-                let count = lines.len();
-                for line in &lines {
-                    eprintln!("bru: {line}");
-                }
-                crate::message::info(&format!(
-                    "config-diff: {count} line(s) on stderr — the Lua that would reproduce this"
-                ));
-            }
+            crate::open::open(state, browser, Some("bru://chrome/config"), true, false)
+        }
+        Command::ConfigWrite { filename, defaults, force } => {
+            crate::config::run_write(filename, *defaults, *force)
         }
         // A second Lua state, at runtime. `config::source_over` carries the argument for why that
         // respects "Lua is never on the key path" rather than breaking it.
@@ -1051,11 +1048,12 @@ pub fn is_live(command: &Command) -> bool {
 // --- end src/settings.rs ---------------------------------------------------
 
 // --- config commands ---------------------------------------------------------------------------
-        // All nine act, and none of them is bound by default, so the live-binding count is
+        // All ten act, and none of them is bound by default, so the live-binding count is
         // untouched by the whole group — checked in `the_config_commands_raise_no_binding`.
         Command::ConfigUnset { .. }
         | Command::ConfigClear { .. }
         | Command::ConfigDiff
+        | Command::ConfigWrite { .. }
         | Command::ConfigListAdd { .. }
         | Command::ConfigListRemove { .. }
         | Command::ConfigSource { .. }

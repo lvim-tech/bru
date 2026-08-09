@@ -320,6 +320,13 @@ pub enum Command {
     /// other side: what a reader of either command wants is the lines to put in the file that is
     /// theirs, and the only difference between the two commands is who writes the file.
     ConfigDiff,
+    /// `config-write <file> [--defaults] [--force]` — the Lua of [`ConfigDiff`], or all of bru's
+    /// own defaults commented out, into a file.
+    ConfigWrite {
+        filename: String,
+        defaults: bool,
+        force: bool,
+    },
     /// `config-list-add [-t] [-p] <option> <value>` — `configcommands.py:286-307`.
     ConfigListAdd { option: String, value: String, print: bool },
     /// `config-list-remove [-t] [-p] <option> <value>` — `configcommands.py:341-367`.
@@ -1604,6 +1611,25 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // every name in `settings::SETTINGS` is one a person may type — so the flag would name
         // nothing and is not accepted rather than accepted and ignored.
         "config-diff" => Command::ConfigDiff,
+        // qutebrowser's `config-write-py [file] [--force] [--defaults]`
+        // (`configcommands.py:456`), spelled for a browser whose config is Lua. maxsplit=0 for
+        // `config-source`'s reason: a path may contain spaces.
+        //
+        // **The file is required, where qutebrowser's is optional.** Its default destination is
+        // the real `config.py`; bru's would be `config.lua`, the file the user hand-writes and bru
+        // never touches. A command whose bare form overwrites that is a command one keystroke away
+        // from losing somebody's configuration, so bru asks where.
+        "config-write" => {
+            let args = Args::maxsplit0(&tokens[1..]);
+            match args.arg(0).filter(|name| !name.is_empty()) {
+                Some(filename) => Command::ConfigWrite {
+                    filename: filename.to_string(),
+                    defaults: args.has("defaults"),
+                    force: args.has("force"),
+                },
+                None => return Err(bad("needs a file to write to")),
+            }
+        }
         // maxsplit=0: a path may contain spaces, and `--clear` is the only flag.
         "config-source" => {
             let args = Args::maxsplit0(&tokens[1..]);

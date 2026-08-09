@@ -439,9 +439,14 @@ pub const COMMANDS: &[Doc] = &[
                --save is refused out loud rather than ignored: the file it would empty is not bru's.",
         example: "config-clear" },
     Doc { names: &["config-diff"], args: "", flags: &[],
-        what: "Print everything this browser is running that is not bru's own, as the Lua that \
+        what: "Open everything this browser is running that is not bru's own, as the Lua that \
                would reproduce it.",
         example: "config-diff" },
+    Doc { names: &["config-write"], args: "<file>", flags: &["--defaults", "--force"],
+        what: "Write that same Lua to a file. With --defaults, write every setting and binding bru \
+               ships instead, commented out — a reference, not a configuration. Refuses to \
+               overwrite without --force.",
+        example: "config-write --defaults ~/bru-defaults.lua" },
     Doc { names: &["config-source"], args: "[filename]", flags: &["--clear"],
         what: "Re-read config.lua over the running browser.", example: "config-source" },
     Doc { names: &["config-edit"], args: "", flags: &["--no-source/--no_source"],
@@ -1041,7 +1046,7 @@ pub fn is_a_name_bru_ships(name: &str) -> bool {
 
 /// The page is built from command strings, which come from `config.lua` — the user's own file, but
 /// still a file, and one typo away from putting a `<` where markup begins.
-fn escape(s: &str) -> String {
+pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1361,7 +1366,9 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 172, "the scrape found a different number of commands");
+        // 173 since `config-write`, which is `config-diff`'s Lua into a file and, with
+        // `--defaults`, every setting and binding bru ships. Raise this with the command.
+        assert_eq!(source.len(), 173, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1499,6 +1506,7 @@ mod tests {
                 Command::ConfigUnset { .. } => "ConfigUnset",
                 Command::ConfigClear { .. } => "ConfigClear",
                 Command::ConfigDiff => "ConfigDiff",
+                Command::ConfigWrite { .. } => "ConfigWrite",
                 Command::ConfigListAdd { .. } => "ConfigListAdd",
                 Command::ConfigListRemove { .. } => "ConfigListRemove",
                 Command::ConfigSource { .. } => "ConfigSource",
@@ -1620,7 +1628,8 @@ mod tests {
         "SearchNext", "SearchPrev", "Navigate", "SelectionToggle", "SelectionDrop",
         "SelectionReverse", "SelectionFollow", "MoveTo", "CmdSetText", "CommandAccept", "Spawn",
         "EditText", "InsertText", "FakeKey", "Set", "ConfigCycle", "ConfigDictAdd",
-        "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigListAdd",
+        "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigWrite",
+        "ConfigListAdd",
         "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind", "DevToolsClose",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",
         "PromptDir", "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",

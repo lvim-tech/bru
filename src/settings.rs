@@ -3729,6 +3729,71 @@ pub fn diff_lines() -> Vec<String> {
     with_live(|settings| settings.diff())
 }
 
+/// Every setting bru ships, written as the Lua that would set it to the value it already has —
+/// and **commented out, every line of it**.
+///
+/// `:config-write --defaults` is what asks. The comment marker is not decoration and not caution;
+/// it is the difference between a reference and a trap. `config.lua` is the user's *overrides*
+/// (DESIGN.md), and a file holding all sixty-eight values uncommented would pin each of them to
+/// what bru happened to ship on the day it was written: change a default in bru tomorrow and every
+/// such file silently keeps yesterday's, with nothing to say so. Commented, the file answers "what
+/// is there and what is it set to", and un-commenting one line is how it becomes an override —
+/// which is the only line the user then owns.
+///
+/// A setting with no default is named rather than skipped: `start_page`'s absence is meaningful —
+/// it is what leaves `crate::app::HOME` standing (DECISIONS.md item 7) — and a reference that
+/// silently omitted it would be a reference with a hole.
+pub fn defaults_lua() -> Vec<String> {
+    let mut out = Vec::with_capacity(SETTINGS.len());
+    for def in SETTINGS {
+        let value = match def.kind {
+            Kind::Dict(shape) => {
+                let pairs: Vec<String> = shape
+                    .defaults
+                    .iter()
+                    .map(|(key, value)| format!("[{}] = {}", lua_string(key), lua_string(value)))
+                    .collect();
+                if pairs.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{ {} }}", pairs.join(", "))
+                }
+            }
+            Kind::List(shape) => {
+                let items: Vec<String> =
+                    shape.defaults.iter().map(|entry| lua_string(entry)).collect();
+                if items.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{ {} }}", items.join(", "))
+                }
+            }
+            // A boolean and a number are Lua literals; everything else is a string. Writing `true`
+            // as `"true"` would produce a file that sets the wrong type the moment a line is
+            // un-commented, which is exactly the failure a reference file must not have.
+            Kind::Bool | Kind::Int(_) => match def.default {
+                Some(text) => text.to_string(),
+                None => {
+                    out.push(format!("-- {} has no default", def.name));
+                    continue;
+                }
+            },
+            _ => match def.default {
+                Some(text) => lua_string(text),
+                None => {
+                    out.push(format!(
+                        "-- {} has no default: leaving it unset is what it means",
+                        def.name
+                    ));
+                    continue;
+                }
+            },
+        };
+        out.push(format!("-- bru.set({}, {})", lua_string(def.name), value));
+    }
+    out
+}
+
 /// Put Chromium back where an [`Unset`] left bru.
 ///
 /// **Forgetting a content setting is not the same as unsetting it**, and this is the whole reason

@@ -130,6 +130,13 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/settings" | "/settings.html" => {
             Some(("text/html", crate::settingspage::current_page().into_bytes()))
         }
+// --- config commands -------------------------------------------------------
+        // What `:config-diff` opens, and where its answer goes now that it is no longer written to
+        // stderr — see `config::page`. Generated per request from the live store and the live
+        // binding table, for the same reason `/help` is.
+        "/config" | "/config.html" => Some(("text/html", crate::config::page(false).into_bytes())),
+        "/config/defaults" => Some(("text/html", crate::config::page(true).into_bytes())),
+// --- end config commands ---------------------------------------------------
 // --- end src/settingspage.rs -----------------------------------------------
 // --- src/cookies.rs --------------------------------------------------------
         // The one generated page here that carries **no data at all**. Cookies come from an
