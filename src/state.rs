@@ -451,6 +451,19 @@ impl BruState {
         let Some(index) = self.windows.iter().position(|slot| slot.id == id) else {
             return;
         };
+        // **Which window is current is remembered by id, because `current` is an index.**
+        //
+        // Removing a slot shifts every higher index down by one. Clamping alone — which is all this
+        // did — corrects the single case where `current` has fallen off the end, and silently
+        // mis-corrects the commoner one: three windows, the user looking at the middle, the first
+        // closing in the background. `current` stays 1, which is still in range, and now names the
+        // *third* window. Nothing re-syncs it, because a window that was not focused when it closed
+        // raises no activation change — so the next `:open` with no window named opens in a window
+        // the user is not looking at.
+        //
+        // This is the multi-window bug the mode and keychain work was done to prevent, surviving in
+        // the one place that still assumed a clamp was the only correction a removal needs.
+        let current_id = self.windows.get(self.current).map(|slot| slot.id);
         let slot = self.windows.remove(index);
         let urls: Vec<String> = slot
             .tabs
@@ -461,9 +474,17 @@ impl BruState {
         if !urls.is_empty() {
             self.closed_windows.push(urls);
         }
-        if self.current >= self.windows.len() {
-            self.current = self.windows.len().saturating_sub(1);
-        }
+        self.current = match current_id.filter(|current| *current != id) {
+            // The focused window is still open: find where it landed.
+            Some(current) => self
+                .windows
+                .iter()
+                .position(|slot| slot.id == current)
+                .unwrap_or(0),
+            // The focused window is the one that closed, or there was none. Clamp into range, which
+            // is what this always did and is right for exactly this case.
+            None => self.current.min(self.windows.len().saturating_sub(1)),
+        };
     }
 
     /// The `depth`-th most recently closed window's tabs, removed from the undo stack.
@@ -885,8 +906,11 @@ wrap_task! {
             let Some(state) = BruState::instance() else {
                 return;
             };
-            let state = state.lock().expect("state mutex poisoned");
-            eprintln!("open-script: chromium is at {}", state.tabs_json());
+            let snapshot = state.lock().expect("state mutex poisoned").tabs_snapshot();
+            eprintln!(
+                "open-script: chromium is at {}",
+                crate::tabs::render_tabs(&snapshot)
+            );
         }
     }
 }
@@ -981,6 +1005,31 @@ mod tests {
         // `open_window_slot` makes each new window current; start from the first, as a session does.
         state.current = 0;
         state
+    }
+
+    /// A window closing in the background must not move which window is current.
+    ///
+    /// `current` is an index, and removing a slot below it shifts every higher index down. Clamping
+    /// alone leaves it pointing one window along — and because the window that closed was not the
+    /// focused one, no activation change follows to put it right.
+    #[test]
+    fn closing_a_lower_window_keeps_the_focused_one_current() {
+        let mut state = bare(3);
+        assert!(state.focus_window(1));
+        assert_eq!(state.current_window_id(), Some(1));
+
+        // A background window *below* the focused one closes.
+        state.forget_window(0);
+        assert_eq!(
+            state.current_window_id(),
+            Some(1),
+            "the window the user is looking at must stay current"
+        );
+
+        // And the case the old clamp did get right: the focused window itself closing.
+        state.forget_window(1);
+        assert_eq!(state.current_window_id(), Some(2));
+        assert_eq!(state.window_count(), 1);
     }
 
     /// The whole of this workstream in one test: a mode is one window's.
