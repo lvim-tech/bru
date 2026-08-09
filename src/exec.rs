@@ -905,12 +905,21 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             });
         }
         // --- end src/userstyles.rs ---------------------------------------------------------------
+        // **These two answer in the status bar, not on stderr.** They are questions the user asks
+        // and both used `eprintln!`, so a `:adblock-toggle` typed in the browser reported to a
+        // terminal the user may not even have — it looked like the command did nothing. Everything
+        // else in `adblock.rs` still logs to stderr, and should: those are diagnostics about
+        // fetching and compiling, not answers to a keystroke.
         Command::AdblockToggle => {
             let on = crate::adblock::toggle();
-            eprintln!("bru[adblock]: blocking {}", if on { "on" } else { "off" });
+            crate::message::info(if on {
+                "adblock: blocking on"
+            } else {
+                "adblock: blocking off for this session"
+            });
         }
         Command::AdblockInfo => {
-            eprintln!("bru[adblock]: {}", crate::adblock::info(browser.identifier()));
+            crate::message::info(&format!("adblock: {}", crate::adblock::info(browser.identifier())));
         }
 // --- end adblock -----------------------------------------------------------------------------
 

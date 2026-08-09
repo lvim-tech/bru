@@ -226,6 +226,12 @@ fn compile(lists: &[PathBuf]) {
     }
     install(engine);
 
+    // The other half of the answer: compiling takes about a second and happens on a thread of its
+    // own, so "downloaded" and "blocking now" are two different moments and both are worth saying.
+    crate::message::info(&format!(
+        "adblock: {} lists compiled, {lines} rules — blocking",
+        lists.len()
+    ));
     eprintln!(
         "bru[adblock]: {} lists, {lines} lines — read {read_ms:.0} ms, compiled {compile_ms:.0} ms, \
          cache {} bytes",
@@ -615,10 +621,20 @@ fn finish_one(ok: bool) {
         written
     };
 
+    // **The user is told, in the bar.** `:adblock-update` is asynchronous — it returns the instant
+    // it is typed and the fetch lands seconds later — so without this the command looked like it
+    // did nothing at all, and the only sign it had worked was a line on a stderr the user may not
+    // be watching. The compile that follows is reported by `compile` on stderr, which is right:
+    // that is a diagnostic with milliseconds in it, not an answer to a keystroke.
     if done == 0 {
+        crate::message::error("adblock: no lists were downloaded — nothing changed");
         eprintln!("bru[adblock]: no lists were downloaded — nothing changed");
         return;
     }
+    crate::message::info(&format!(
+        "adblock: {done} list{} downloaded, compiling",
+        if done == 1 { "" } else { "s" }
+    ));
     eprintln!("bru[adblock]: {done} lists downloaded, recompiling");
     std::thread::spawn(|| {
         if let Some(dir) = lists_dir() {
