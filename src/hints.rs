@@ -575,10 +575,35 @@ fn leave_mode(state: &SharedState, window: u32) {
 
 /// A token no page can guess, so that the only `hints` answer bru believes is the one it asked for.
 ///
-/// Not a cryptographic RNG — bru has no dependency for one and this is not a key. It is a nonce
-/// against a page volunteering coordinates, and it is combined with two other checks (an open
-/// session, and the right browser).
-fn mint_token() -> String {
+/// **It is a nonce and not a key, and that argument still holds — but it is not the only guard by
+/// accident, so it should not be the weak one by construction either.** Two other checks stand
+/// beside it: a session bru itself opened must be live in this window, and the query must come from
+/// that session's browser. To forge an answer a page must already *be* the page bru is hinting, and
+/// then produce a value it cannot read.
+///
+/// What that argument does not cover is prediction. `RandomState` is designed to stop hash-flooding,
+/// not to resist an adversary, and a nanosecond clock is low-entropy and observable from the page
+/// itself. Guessing wrong costs nothing — the query simply fails, and nothing rate-limits the
+/// attempts — so a value that merely *looks* like 128 bits is the wrong shape for the one check
+/// that stands between a page and steering its own hint resolution.
+///
+/// Sixteen bytes from `/dev/urandom`, then. bru has no RNG dependency and does not need one for a
+/// single read on a path that runs once per hint session; the old construction stays as the
+/// fallback for the case where the device cannot be opened, because a browser that refuses to hint
+/// because `/dev/urandom` is missing is worse than one that hints with a weaker nonce.
+///
+/// Shared with `caret.rs`, which asks the same question of the same kind of page answer. It was
+/// copied there and the copies were identical; a security primitive in two places is a primitive
+/// that drifts.
+pub(crate) fn mint_token() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut buf))
+        .is_ok()
+    {
+        return buf.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
     use std::hash::{BuildHasher, Hasher, RandomState};
     let a = RandomState::new().build_hasher().finish();
     let b = std::time::SystemTime::now()
@@ -607,10 +632,15 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
         return false;
     };
     let id = browser.identifier();
-    let (Some(token), Some(kind), Some(data)) = (
+    // **The raw field is taken here; it is decoded after the checks below pass.** `data` is
+    // page-controlled bytes, and `percent_decode` is a parser running on hostile input — so it runs
+    // only for a query bru has already decided to believe. It is panic-free today (see its own
+    // comment on the bound), and this ordering is what keeps a future edit to it from becoming a
+    // page-triggered abort of the whole process rather than a refused query.
+    let (Some(token), Some(kind), Some(raw)) = (
         field(request, "token"),
         field(request, "kind"),
-        field(request, "data").map(|d| percent_decode(&d)),
+        field(request, "data"),
     ) else {
         return false;
     };
@@ -636,6 +666,8 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
         }
     }
 
+    // Believed now, and only now decoded.
+    let data = percent_decode(&raw);
     let mut browser = browser.clone();
 
     match kind.as_str() {
@@ -1653,13 +1685,21 @@ fn field(src: &str, key: &str) -> Option<String> {
 
 /// Undo `encodeURIComponent`. Only the bytes it escapes appear, and it always emits `%XX` pairs.
 fn percent_decode(src: &str) -> String {
+    // **Bytes throughout, and never a slice of the `str`.** This read `&src[i + 1..i + 3]` and
+    // parsed that, which panics the moment the two bytes after a `%` are not a character boundary —
+    // `percent_decode("%aé")` aborted the process, because index 3 lands inside the two bytes of
+    // `é`. The input is a page-controlled field on the one query a web page is allowed to send, and
+    // a panic on the UI thread ends the browser: any site could have closed bru with one string.
+    // Measured 2026-08-09, standalone, before the fix. Indexing the byte array cannot panic on a
+    // boundary because a byte array has none.
     let bytes = src.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
+    let hex = |byte: u8| (byte as char).to_digit(16);
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&src[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((high * 16 + low) as u8);
                 i += 3;
                 continue;
             }
@@ -1667,6 +1707,8 @@ fn percent_decode(src: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
+    // Whatever the bytes turn out to be, this is where malformed UTF-8 stops: a page can send any
+    // sequence and gets replacement characters rather than an error path.
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -2404,4 +2446,50 @@ mod tests {
         assert_ne!(a, b, "two sessions must not share a token");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    /// **This does not prove the token is unpredictable, and it does not distinguish the CSPRNG from
+    /// what came before it.** Run against the old `RandomState` + clock construction on 2026-08-09 it
+    /// passed unchanged — `RandomState` reseeds per call, so its prefixes differ too. By this
+    /// project's rule a test that passes with and without the fix is worth nothing *as verification
+    /// of that fix*, and this one is not offered as such: the property that changed is statistical
+    /// and a unit test cannot hold it. The argument for `/dev/urandom` is in `mint_token`'s own
+    /// comment, and it is an argument, not a measurement.
+    ///
+    /// What this is worth keeping for is the failure that would actually happen one day: a mint that
+    /// stops varying, or varies only in its tail because a clock has quietly become the only source.
+    /// A thousand tokens sharing a prefix is that shape, and nothing else here would notice it.
+    #[test]
+    fn a_thousand_tokens_share_no_prefix() {
+        let tokens: Vec<String> = (0..1000).map(|_| mint_token()).collect();
+        let whole: std::collections::HashSet<&String> = tokens.iter().collect();
+        assert_eq!(whole.len(), 1000, "a token was minted twice");
+        let prefixes: std::collections::HashSet<&str> =
+            tokens.iter().map(|token| &token[..8]).collect();
+        assert_eq!(
+            prefixes.len(),
+            1000,
+            "two tokens share their first 32 bits — the entropy is not where it should be"
+        );
+    }
+    /// A page cannot end the browser with a percent sign in front of a multi-byte character.
+    ///
+    /// **This aborted the process before 2026-08-09.** The decoder parsed `&src[i + 1..i + 3]` — a
+    /// slice of the `str` by byte index — and `%aé` puts index 3 inside the two bytes of `é`, which
+    /// is a panic, on the UI thread, from the one field a web page is allowed to put bytes in.
+    /// Every case below returns the input unchanged because none of them is a valid escape; what is
+    /// being asserted is that they *return*.
+    #[test]
+    fn a_malformed_escape_is_left_alone_rather_than_ending_the_process() {
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%A"), "%A");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%%41"), "%A");
+        // And a well-formed one still decodes, so the guard did not swallow the feature.
+        assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
+        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+    }
+
 }

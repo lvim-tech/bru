@@ -698,16 +698,20 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
         return false;
     };
     let id = browser.identifier();
-    let (Some(token), Some(kind), Some(data)) = (
+    // **Raw here; decoded inside each arm, after that arm's token check has passed.** Both fields
+    // are page-controlled bytes and `percent_decode` is a parser running on hostile input, so it runs
+    // only for an answer bru has already decided to believe. It is panic-free today; the ordering is
+    // what stops a future edit to it turning a forged query into an abort of the whole process.
+    // `hints.rs::on_page_query` does the same, one check earlier — it has a single guard, this has
+    // one per kind.
+    let (Some(token), Some(kind), Some(raw_data)) = (
         field(request, "token"),
         field(request, "kind"),
-        field(request, "data").map(|d| percent_decode(&d)),
+        field(request, "data"),
     ) else {
         return false;
     };
-    let text = field(request, "text")
-        .map(|t| percent_decode(&t))
-        .unwrap_or_default();
+    let raw_text = field(request, "text").unwrap_or_default();
 
     let Some(state) = BruState::instance() else {
         return false;
@@ -743,6 +747,8 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
                     return false;
                 }
             }
+            let data = percent_decode(&raw_data);
+            let text = percent_decode(&raw_text);
             on_state(&state, window, &mut browser, &data, text);
         }
         "mark" | "follow" => {
@@ -758,6 +764,8 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
             let Some(what) = asked else {
                 return false;
             };
+            let data = percent_decode(&raw_data);
+            let text = percent_decode(&raw_text);
             match what {
                 AskWhat::SetMark(key) | AskWhat::JumpMark(key) => {
                     on_mark(&state, window, &mut browser, what_is_jump(&data), key, &data)
@@ -1055,16 +1063,11 @@ wrap_task! {
 
 /// A token no page can guess, so that the only caret answer bru believes is the one it asked for.
 ///
-/// Not a cryptographic RNG — the same reasoning as `src/hints.rs::mint_token`: this is a nonce
-/// against a page volunteering a selection, combined with two other checks.
+/// **The same function `hints.rs` uses, called rather than copied.** It was a copy — byte for byte
+/// identical — and the two would have had to be fixed twice; the reasoning for what the token is
+/// and is not lives with it there.
 fn mint_token() -> String {
-    use std::hash::{BuildHasher, Hasher, RandomState};
-    let a = RandomState::new().build_hasher().finish();
-    let b = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("{a:016x}{b:016x}")
+    crate::hints::mint_token()
 }
 
 /// One field out of the flat object `chrome/caret.js` sends. Both of its values are
@@ -1079,13 +1082,21 @@ fn field(src: &str, key: &str) -> Option<String> {
 
 /// Undo `encodeURIComponent`. Only the bytes it escapes appear, and it always emits `%XX` pairs.
 fn percent_decode(src: &str) -> String {
+    // **Bytes throughout, and never a slice of the `str`.** This read `&src[i + 1..i + 3]` and
+    // parsed that, which panics the moment the two bytes after a `%` are not a character boundary —
+    // `percent_decode("%aé")` aborted the process, because index 3 lands inside the two bytes of
+    // `é`. The input is a page-controlled field on the one query a web page is allowed to send, and
+    // a panic on the UI thread ends the browser: any site could have closed bru with one string.
+    // Measured 2026-08-09, standalone, before the fix. Indexing the byte array cannot panic on a
+    // boundary because a byte array has none.
     let bytes = src.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
+    let hex = |byte: u8| (byte as char).to_digit(16);
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&src[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((high * 16 + low) as u8);
                 i += 3;
                 continue;
             }
@@ -1093,6 +1104,8 @@ fn percent_decode(src: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
+    // Whatever the bytes turn out to be, this is where malformed UTF-8 stops: a page can send any
+    // sequence and gets replacement characters rather than an error path.
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1401,4 +1414,25 @@ mod tests {
         // reason it travels in a field of its own.
         assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
     }
+    /// A page cannot end the browser with a percent sign in front of a multi-byte character.
+    ///
+    /// **This aborted the process before 2026-08-09.** The decoder parsed `&src[i + 1..i + 3]` — a
+    /// slice of the `str` by byte index — and `%aé` puts index 3 inside the two bytes of `é`, which
+    /// is a panic, on the UI thread, from the one field a web page is allowed to put bytes in.
+    /// Every case below returns the input unchanged because none of them is a valid escape; what is
+    /// being asserted is that they *return*.
+    #[test]
+    fn a_malformed_escape_is_left_alone_rather_than_ending_the_process() {
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%A"), "%A");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%%41"), "%A");
+        // And a well-formed one still decodes, so the guard did not swallow the feature.
+        assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
+        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+    }
+
 }
