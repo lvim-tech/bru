@@ -49,6 +49,14 @@ pub fn on_process_message_received(
     if crate::scroll::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/adblock.rs -------------------------------------------------------------------------
+    // "This frame is at <url>; what should it hide?" — the cosmetic half of the filter lists, asked
+    // once per document at document-start. It is a process message rather than a `cefQuery` for the
+    // reason the router's own check gives: a query is the page speaking, and any page may send one.
+    if crate::adblock::on_cosmetic_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/adblock.rs ---------------------------------------------------------------------
     // --- src/editor.rs ----------------------------------------------------------------------
     // The answer to a question `editor.rs` asked the page — what the focused field holds. Same
     // shape as the scroll report above, and for the same reason: it is not a query the page could
@@ -1358,6 +1366,12 @@ pub fn renderer_on_process_message_received(
     if crate::scroll::renderer_on_query(frame.as_deref(), message.as_deref()) {
         return 1;
     }
+    // --- src/adblock.rs -------------------------------------------------------------------------
+    // The answer to the question above: the stylesheet this document should hide things with.
+    if crate::adblock::renderer_on_cosmetic_css(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // --- end src/adblock.rs ---------------------------------------------------------------------
     // --- src/editor.rs ----------------------------------------------------------------------
     // The renderer half of the same channel: evaluate what the browser process asked for and send
     // the result back. Only the browser process can address the renderer, so a page cannot ask.

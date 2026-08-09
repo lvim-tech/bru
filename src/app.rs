@@ -218,6 +218,13 @@ wrap_render_process_handler! {
             // first a window shows.
             crate::scrollbar::renderer_on_context_created(gm_frame.as_ref());
             crate::userstyles::renderer_on_context_created(gm_frame.as_ref());
+            // --- src/adblock.rs -----------------------------------------------------------------
+            // The cosmetic half of the filter lists, through the same door and last of the three:
+            // hiding an element must win over the site's own CSS, and the keeper appends, so the
+            // sheet installed last sits last. (`display:none!important` would win from anywhere;
+            // the order is so that it does not depend on that.)
+            crate::adblock::renderer_on_context_created(gm_frame.as_ref());
+            // --- end src/adblock.rs -------------------------------------------------------------
             // --- end src/userstyles.rs ---------------------------------------------------------
             // --- end src/greasemonkey.rs ------------------------------------------------------
         }

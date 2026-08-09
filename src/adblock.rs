@@ -107,8 +107,41 @@ pub fn lists_dir() -> Option<PathBuf> {
 ///
 /// qutebrowser calls its equivalent `adblock-cache.dat` and keeps it directly in the data directory;
 /// bru keeps it beside the lists it was built from, because the two are only meaningful together.
+///
+/// **The name carries what is in it, and that is the whole of the migration.** The cache used to be
+/// `cache.dat` and held network rules only. Nothing inside a serialized engine says which rule types
+/// built it, and [`is_cache_fresh`] compares timestamps — so a `cache.dat` newer than the lists
+/// would have been loaded happily on the day cosmetic filtering landed, and the new layer would
+/// have hidden nothing at all, silently, on every machine that had ever run `:adblock-update`. That
+/// is the exact failure this file's own comment calls "a stale ad blocker is exactly the thing
+/// nobody notices". A cache built the old way now simply is not this file, so it is not read.
 fn cache_path() -> Option<PathBuf> {
+    lists_dir().map(|dir| dir.join("cache.all.dat"))
+}
+
+/// The name the cache had before it held the cosmetic half. Read by nothing; removed once, so that
+/// a five-megabyte file nobody will ever open again does not sit in the user's data directory for
+/// ever.
+fn legacy_cache_path() -> Option<PathBuf> {
     lists_dir().map(|dir| dir.join("cache.dat"))
+}
+
+/// Drop the pre-cosmetic cache if it is still there. Called once, from [`load`].
+fn forget_legacy_cache() {
+    let Some(old) = legacy_cache_path() else {
+        return;
+    };
+    if !old.exists() {
+        return;
+    }
+    match std::fs::remove_file(&old) {
+        Ok(()) => eprintln!(
+            "bru[adblock]: removed {}, which held network rules only",
+            old.display()
+        ),
+        // Not being able to delete it costs nothing but the space: it is never read either way.
+        Err(e) => eprintln!("bru[adblock]: could not remove {}: {e}", old.display()),
+    }
 }
 
 /// Start loading the engine, once per process, off the UI thread.
@@ -166,6 +199,8 @@ fn load() {
         return;
     }
 
+    forget_legacy_cache();
+
     if let Some(cache) = cache_path().filter(|cache| is_cache_fresh(cache, &lists)) {
         let started = Instant::now();
         match std::fs::read(&cache) {
@@ -197,10 +232,28 @@ fn load() {
 /// Compile every `.txt` in the lists directory into one engine, and cache the result.
 fn compile(lists: &[PathBuf]) {
     let started = Instant::now();
-    // Network rules only. Cosmetic filtering is element hiding — a stylesheet injected into the
-    // page — and bru has no path for that yet, so parsing the cosmetic half would cost time and
-    // memory for rules nothing would ever ask about.
-    let options = ParseOptions { rule_types: RuleTypes::NetworkOnly, ..ParseOptions::default() };
+    // **Both halves of every list, since the cosmetic layer landed.** This said `NetworkOnly` and
+    // gave the reason: "bru has no path for that yet". It has one now — the renderer installs a
+    // stylesheet at `on_context_created`, the same door `userstyles.rs` and `scrollbar.rs` use, and
+    // [`cosmetic_css`] is what fills it.
+    //
+    // Say what the second half costs, measured on this machine over the two lists bru ships —
+    // EasyList and EasyPrivacy, 143,933 lines — on 2026-08-09:
+    //
+    // ```text
+    //               compile      cache.dat
+    //   NetworkOnly   134 ms      5,069,637 bytes
+    //   All           145 ms      6,372,973 bytes
+    // ```
+    //
+    // Eleven milliseconds and 1.3 MB. The compile happens once per list change, on a thread of its
+    // own, so those eleven milliseconds are not on any path a person waits at.
+    //
+    // **Nothing on the request path changed**, which is the number that would have mattered: the
+    // network matcher is the same matcher over the same rules, and the cosmetic rules sit in their
+    // own structure that only [`cosmetic_css`] reads, once per document rather than once per
+    // request.
+    let options = ParseOptions { rule_types: RuleTypes::All, ..ParseOptions::default() };
     let mut set = FilterSet::new(false);
     let mut lines = 0usize;
     for path in lists {
@@ -244,6 +297,187 @@ fn install(engine: Engine) {
     if let Ok(mut slot) = ENGINE.write() {
         *slot = Some(engine);
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// The cosmetic layer: the half of a filter list that hides what the network layer let through
+// -----------------------------------------------------------------------------------------------
+
+/// Renderer → browser: "this frame is at <url>; what should it hide?"
+const COSMETIC_ASK: &str = "bru.cosmetic.ask";
+
+/// Browser → renderer: the stylesheet, or an empty string for a page with nothing to hide.
+const COSMETIC_CSS: &str = "bru.cosmetic.css";
+
+/// **What this layer is for, and what the network layer cannot do.**
+///
+/// Cancelling a request stops the advert from loading. It does not stop the *hole* — the empty
+/// 300x250 box, the reserved column that shifts the text sideways, the cookie wall, the "turn off
+/// your ad blocker" sheet. None of those is a request; they are the page's own markup, and only
+/// hiding an element removes them. The rules are already in the two lists bru downloads; until now
+/// they were parsed away — see [`compile`].
+///
+/// **The rules this asks for are the host's own.** `url_cosmetic_resources` answers with the
+/// selectors written against *this hostname* (`example.com##.promo`), and deliberately not with the
+/// generic ones (`##.ad-banner`). There are hundreds of thousands of those and Brave's engine hands
+/// them over the other way round: the page reports the classes and ids it actually contains and
+/// asks `hidden_class_id_selectors` about those. That needs a `MutationObserver` in the page,
+/// because at [`renderer_on_context_created`] — which is document-start — the document is still
+/// empty and has no classes to report. **It is not implemented yet**, and this comment is the note
+/// saying which half is missing rather than a silence implying there is none.
+///
+/// **Scriptlets are not injected either, and cannot be yet.** `UrlSpecificResources::injected_script`
+/// is assembled by resolving `+js(...)` rules against a resource library — uBlock's `resources.json`
+/// — through `Engine::use_resources`. bru ships no such library, so the field comes back empty; the
+/// honest thing is to not read it rather than to read it and pretend.
+fn cosmetic_css(url: &str) -> String {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return String::new();
+    }
+    let Ok(guard) = ENGINE.read() else {
+        return String::new();
+    };
+    let Some(engine) = guard.as_ref() else {
+        return String::new();
+    };
+    let resources = engine.url_cosmetic_resources(url);
+    // `$generichide` is an exception rule a list writer put on a page that cosmetic filtering
+    // breaks. It only ever governs the generic half, which is the half not implemented above — so
+    // it changes nothing today, and reading it here is what makes that true rather than luck.
+    stylesheet(resources.hide_selectors.iter().map(String::as_str))
+}
+
+/// The selectors as one CSS rule, or the empty string when there are none.
+///
+/// Separated from the engine so the shape of the sheet is a test rather than a claim — nothing here
+/// touches CEF or the engine.
+///
+/// **A selector that could end the rule early is dropped.** The parser that produced these accepts
+/// only what it recognises as a selector, so a brace should never arrive; the guard costs one scan
+/// of a string bru is already copying, and what it prevents is one malformed list turning the whole
+/// sheet into whatever follows the brace. One list line must not be able to rewrite the others.
+fn stylesheet<'a>(selectors: impl Iterator<Item = &'a str>) -> String {
+    let mut kept: Vec<&str> = selectors
+        .filter(|selector| {
+            !selector.is_empty()
+                && !selector.contains(['{', '}', '\n', '\r'])
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    // Sorted so that the same page produces the same sheet twice — `hide_selectors` is a `HashSet`,
+    // whose order is its own business, and a sheet that differs between two loads of one page is a
+    // sheet nobody can diff when something goes wrong.
+    kept.sort_unstable();
+    let mut css = String::with_capacity(kept.iter().map(|s| s.len() + 1).sum::<usize>() + 32);
+    for (index, selector) in kept.iter().enumerate() {
+        if index > 0 {
+            css.push(',');
+        }
+        css.push_str(selector);
+    }
+    css.push_str("{display:none!important}");
+    css
+}
+
+/// Whether this frame is one the cosmetic layer speaks for: a real web page.
+///
+/// `bru://` is bru's own UI and no filter list has an opinion about it; `about:blank` and the like
+/// have no hostname for a rule to be written against.
+fn hideable(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Renderer side, at document start. Installs the keeper and asks the browser process what to hide.
+///
+/// **Why the question travels rather than the engine.** The engine is 6 MB of compiled rules in the
+/// browser process; there is one of it and there are as many renderers as Chromium decides to make.
+/// A round trip per document is the cheap direction.
+///
+/// The keeper is `userstyles.rs`'s, installed here too rather than depended upon: it refuses to
+/// install twice, and a layer that only works when another module happened to run first is a layer
+/// with a bug waiting in it. It is what makes the hiding survive a page that deletes the element —
+/// which is exactly what a page fighting an ad blocker does.
+pub fn renderer_on_context_created(frame: Option<&Frame>) {
+    let Some(frame) = frame else {
+        return;
+    };
+    if !hideable(&CefString::from(&frame.url()).to_string()) {
+        return;
+    }
+    crate::greasemonkey::evaluate(frame, crate::userstyles::KEEPER_JS, Some("bru://userstyle.js"));
+    let Some(mut message) = process_message_create(Some(&CefString::from(COSMETIC_ASK))) else {
+        return;
+    };
+    frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+}
+
+/// Browser side of [`COSMETIC_ASK`]. Answers true when the message was ours.
+///
+/// The URL is read from the **frame the message arrived on**, not from an argument the renderer
+/// filled in: the frame is the browser process's own record of where that frame is, and a renderer
+/// naming its own URL is a renderer that could name someone else's.
+pub fn on_cosmetic_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != COSMETIC_ASK {
+        return false;
+    }
+    let Some(frame) = frame else {
+        return true;
+    };
+    let url = CefString::from(&frame.url()).to_string();
+    let css = if hideable(&url) { cosmetic_css(&url) } else { String::new() };
+
+    if std::env::var_os("BRU_DEBUG_ADBLOCK").is_some() {
+        eprintln!("bru[adblock]: cosmetic for {url}: {} bytes of CSS", css.len());
+    }
+
+    let Some(mut reply) = process_message_create(Some(&CefString::from(COSMETIC_CSS))) else {
+        return true;
+    };
+    if let Some(arguments) = reply.argument_list() {
+        arguments.set_string(0, Some(&CefString::from(css.as_str())));
+    }
+    frame.send_process_message(ProcessId::RENDERER, Some(&mut reply));
+    true
+}
+
+/// Renderer side of [`COSMETIC_CSS`]: put the sheet in, or take it out again.
+///
+/// An empty sheet calls `off()` rather than setting nothing, so that `:adblock-toggle` followed by a
+/// reload leaves no stylesheet behind on a page that had one.
+pub fn renderer_on_cosmetic_css(frame: Option<&Frame>, message: Option<&ProcessMessage>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    if CefString::from(&message.name()).to_string() != COSMETIC_CSS {
+        return false;
+    }
+    let Some(frame) = frame else {
+        return true;
+    };
+    let css = message
+        .argument_list()
+        .map(|arguments| CefString::from(&arguments.string(0)).to_string())
+        .unwrap_or_default();
+
+    // **`any`, and never an end of the root.** "first" is the scrollbar's and "last" is the user's
+    // own CSS; a second keeper holding an end livelocks against the one already there — see
+    // `chrome/userstyle.js` for the two pages it was measured on. Hiding needs no position, because
+    // `display: none !important` outranks whatever sits after it.
+    let code = if css.is_empty() {
+        "window.bruKeep && window.bruKeep(\"bru-cosmetic\",\"any\").off();".to_string()
+    } else {
+        format!(
+            "window.bruKeep && window.bruKeep(\"bru-cosmetic\",\"any\").set(\"{}\");",
+            crate::ipc::json_escape(&css)
+        )
+    };
+    crate::greasemonkey::evaluate(frame, &code, None);
+    true
 }
 
 /// Every `.txt` in the lists directory, sorted so that a rebuild is reproducible.
@@ -835,4 +1069,104 @@ mod tests {
         .unwrap();
         assert!(restored.check_network_request(&request).should_block());
     }
+
+    // --- the cosmetic layer ---------------------------------------------------------------------
+
+    /// An engine over one list, built the way [`compile`] builds the real one — same
+    /// `ParseOptions`, so a test cannot pass under rules the browser does not run on.
+    fn engine_over(list: &str, rule_types: RuleTypes) -> Engine {
+        let mut set = FilterSet::new(false);
+        set.add_filter_list(
+            list.to_string(),
+            ParseOptions { rule_types, ..ParseOptions::default() },
+        );
+        Engine::new_with_filter_set(set)
+    }
+
+    /// **The line that turns the layer on, as a test.** `example.com##.promo` is a hostname cosmetic
+    /// rule — the shape EasyList writes thousands of. Parsed as `NetworkOnly`, which is what
+    /// `compile` did until 2026-08-09, it is thrown away and the page hides nothing; parsed as
+    /// `All` it comes back. Put `RuleTypes::NetworkOnly` back in `compile` and the second half of
+    /// this fails.
+    #[test]
+    fn a_hostname_hiding_rule_only_survives_when_the_cosmetic_half_is_parsed() {
+        const LIST: &str = "example.com##.promo";
+
+        let dropped = engine_over(LIST, RuleTypes::NetworkOnly);
+        assert!(
+            dropped.url_cosmetic_resources("https://example.com/").hide_selectors.is_empty(),
+            "NetworkOnly must throw the cosmetic half away — that was the old behaviour",
+        );
+
+        let kept = engine_over(LIST, RuleTypes::All);
+        let selectors = kept.url_cosmetic_resources("https://example.com/").hide_selectors;
+        assert!(selectors.contains(".promo"), "the rule for this host must come back: {selectors:?}");
+
+        // And it is *this host's* rule: another site gets nothing from it.
+        assert!(
+            kept.url_cosmetic_resources("https://other.example.org/").hide_selectors.is_empty(),
+            "a hostname rule must not leak onto a hostname it was not written for",
+        );
+    }
+
+    /// The sheet's shape, which is what the page actually receives.
+    #[test]
+    fn the_stylesheet_is_one_rule_over_sorted_selectors() {
+        assert_eq!(
+            stylesheet([".b", ".a"].into_iter()),
+            ".a,.b{display:none!important}",
+            "sorted, comma-joined, and hidden with a declaration a site's own CSS cannot outrank",
+        );
+        // Nothing to hide is no stylesheet at all, not an empty rule — `renderer_on_cosmetic_css`
+        // reads the empty string as "take the sheet out again".
+        assert_eq!(stylesheet(std::iter::empty()), "");
+        assert_eq!(stylesheet([""].into_iter()), "");
+    }
+
+    /// One list line must not be able to rewrite the rest of the sheet. The parser should never
+    /// hand a brace over; this is what makes "should never" not matter.
+    #[test]
+    fn a_selector_that_could_end_the_rule_early_is_dropped() {
+        assert_eq!(
+            stylesheet([".ok", ".evil}html{display:none"].into_iter()),
+            ".ok{display:none!important}",
+        );
+        assert_eq!(stylesheet([".a\nb"].into_iter()), "");
+    }
+
+    /// **Two keepers may not hold the same end of the root.** This is the livelock of 2026-08-09:
+    /// the cosmetic sheet was added as `"last"`, which `bru-userstyle` already holds, and each
+    /// observer appended its own element back over the other's for ever. youtube.com and
+    /// start.duckduckgo.com — the pages with a user stylesheet, so there was a second element to
+    /// fight — stopped painting entirely and their renderers stopped answering.
+    ///
+    /// Asserted over the source of both halves, because the bug is not in either one alone: it is
+    /// in two callers choosing the same position.
+    #[test]
+    fn the_cosmetic_sheet_does_not_hold_an_end_of_the_root() {
+        let this = include_str!("adblock.rs");
+        assert!(
+            this.contains("\\\"bru-cosmetic\\\",\\\"any\\\""),
+            "the cosmetic keeper must ask for `any`; `first` is the scrollbar's and `last` is the \
+             user's own CSS, and a second holder of either livelocks the renderer",
+        );
+        // And the keeper has to have that third position to give.
+        let keeper = crate::userstyles::KEEPER_JS;
+        assert!(
+            keeper.contains("where === \"last\"") && keeper.contains("styleElem.parentNode !== rootElem"),
+            "userstyle.js must branch on `last` explicitly and treat anything else as presence-only",
+        );
+    }
+
+    /// Only real web pages. bru's own UI is not something a filter list has an opinion about, and a
+    /// page with no hostname has no rule written against it.
+    #[test]
+    fn only_web_pages_are_hidden_on() {
+        assert!(hideable("https://example.com/"));
+        assert!(hideable("http://example.com/"));
+        assert!(!hideable("bru://chrome/settings"));
+        assert!(!hideable("about:blank"));
+        assert!(!hideable("file:///run/user/1000/test.html"));
+    }
 }
+
