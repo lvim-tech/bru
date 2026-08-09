@@ -226,8 +226,19 @@ impl BrowserSideHandler for BruQueryHandler {
             // changing a strip's height from a query handler since the command line was written.
             Some("divider") => {
                 let phase = json_field(request, "phase").unwrap_or_default();
-                // How far the hand has moved since the press, never where it is. Signed, and it must
-                // be: a drag goes up as often as down.
+                // **Where the boundary ended up, in the expanded strip's own pixels — not a delta.**
+                //
+                // This comment used to say the field was a signed distance the hand had moved, and
+                // it was, for the design that chased the pointer with a six-pixel strip. That design
+                // was replaced (CEF-NOTES trap 26): the strip now grows to cover the whole shared
+                // area for the duration of a drag and reports the line, which `divider.js` clamps to
+                // `[min, max]` before sending and `min` is the protected page height. So the value
+                // is never negative, and `json_number_field` — which cannot represent a negative,
+                // see its own note — is the right reader rather than an accident.
+                //
+                // Said out loud because the stale sentence promised a property the reader could not
+                // deliver, and the next person to add a genuinely signed field here would have
+                // trusted it.
                 let y = json_number_field(request, "y").unwrap_or(0) as i32;
                 let Some(id) = browser.as_ref().map(|browser| browser.identifier()) else {
                     fail(&callback, -10, "a divider event with no browser behind it");
@@ -1372,6 +1383,15 @@ fn json_field(src: &str, key: &str) -> Option<String> {
 /// because `offsetHeight` is. Quoting either in the chrome to fit [`json_field`] would be the tail
 /// wagging the dog, and reading one *with* `json_field` is a silent zero: it answers `None` for an
 /// unquoted value, which is how the completion panel spent an afternoon 24 pixels tall.
+/// A non-negative number out of a flat JSON object.
+///
+/// **It cannot represent a negative, and every caller must be a field that has none.** The digits
+/// are taken with `take_while(is_ascii_digit)`, so a leading `-` yields an empty string and the
+/// whole field reads `None` — which each caller turns into `0`. That is silent, and it is why this
+/// note exists: the four fields read through it are `px` (`offsetHeight`), `cursor`
+/// (`selectionStart`), `index` (an array index) and the divider's `y` (a boundary clamped to at
+/// least the protected page height), and none of the four can be below zero. A field that can needs
+/// a reader that says so rather than this one.
 fn json_number_field(src: &str, key: &str) -> Option<usize> {
     let needle = format!("\"{key}\"");
     let at = src.find(&needle)?;
@@ -1425,4 +1445,31 @@ pub fn json_escape(src: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reader's contract, pinned: it is for fields that cannot be negative.
+    ///
+    /// A `-40` does not parse as `-40` here, it parses as nothing — and every caller turns nothing
+    /// into `0`, silently. That is safe only because all four callers read a quantity with no
+    /// negative half, and this test is what fails the day somebody points it at a field that has
+    /// one. The divider's `y` used to be documented as signed and was not; see the comment there.
+    #[test]
+    fn the_number_reader_has_no_negative_half() {
+        assert_eq!(json_number_field("{\"y\":40}", "y"), Some(40));
+        assert_eq!(json_number_field("{\"y\": 40 }", "y"), Some(40));
+        assert_eq!(
+            json_number_field("{\"y\":-40}", "y"),
+            None,
+            "a negative must read as absent, not as some other number"
+        );
+        assert_eq!(json_number_field("{\"y\":\"40\"}", "y"), None);
+        assert_eq!(json_number_field("{\"x\":40}", "y"), None);
+        // A fractional value keeps its whole part, which is what the callers want from a coordinate
+        // a scaled display made fractional.
+        assert_eq!(json_number_field("{\"y\":40.5}", "y"), Some(40));
+    }
 }
