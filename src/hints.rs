@@ -988,7 +988,7 @@ fn show(browser: &mut Browser, code: &str) {
 // The labels' colours — bru's theme, carried into the page
 // ------------------------------------------------------------------------------------------------
 
-/// `{"fg":…,"bg":…,"border":…,"match":…}` for `chrome/hints.js`'s `show`, out of the theme's
+/// `{"fg":…,"bg":…,"match":…}` for `chrome/hints.js`'s `show`, out of the theme's
 /// `--hints-*` custom properties.
 ///
 /// The labels are drawn **in the page**, and a page cannot fetch `bru://chrome/theme.css`: the
@@ -1010,11 +1010,10 @@ fn label_style_json_from(css: &str) -> String {
         ("fg", "--hints-fg"),
         ("bg", "--hints-bg"),
         ("match", "--hints-match-fg"),
-        // qutebrowser's `hints.border` is `1px solid #E3BE23` and no generated theme sets it, so
-        // the outline takes the label's own foreground: in-theme by construction, and visible
-        // against the background whatever the palette does, because it is the colour the text on
-        // that background is already using.
-        ("border", "--hints-fg"),
+        // No `border`. qutebrowser draws `1px solid #E3BE23` around a label and bru did too, taking
+        // the label's own foreground for it; `chrome/hints.js` casts a shadow instead, because at
+        // 12px a line on the edge read as a smudge on it. The shadow needs no field of its own — it
+        // is mixed from `fg` in the page, which is the same colour this entry used to send twice.
     ] {
         if let Some(value) = resolve(&properties, property, 0).filter(|v| is_safe_colour(v)) {
             fields.push(format!("\"{field}\":\"{value}\""));
@@ -2335,12 +2334,12 @@ mod tests {
         let style = label_style_json_from(css);
         assert_eq!(
             style,
-            "{\"fg\":\"#232929\",\"bg\":\"#af9e6b\",\"match\":\"#535d4e\",\"border\":\"#232929\"}"
+            "{\"fg\":\"#232929\",\"bg\":\"#af9e6b\",\"match\":\"#535d4e\"}"
         );
 
         // The theme bru ships with has to work, or the default install draws qutebrowser's yellow.
         let shipped = label_style_json_from(include_str!("../chrome/theme.css"));
-        for field in ["fg", "bg", "match", "border"] {
+        for field in ["fg", "bg", "match"] {
             assert!(shipped.contains(&format!("\"{field}\":\"#")), "{field} missing from {shipped}");
         }
 

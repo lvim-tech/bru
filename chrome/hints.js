@@ -121,14 +121,33 @@ window.__bru_hints = (function () {
             "position: fixed;" +
             "z-index: 2147483647;" +
             "pointer-events: none;" +
-            "font: bold 12px/1.2 monospace;" +
+            // **`/1` and a trim, not `/1.2` and no padding.** A line box is tall enough for a
+            // descender and a label is all capitals, so the space that descender would have used is
+            // left under the letters and nothing balances it above: the letters sit against the top
+            // edge of the chip with a gap beneath them. `text-box: trim-both cap alphabetic` cuts
+            // the box down to the ink itself — cap height at the top, the baseline at the bottom —
+            // and then the padding below is the whole of the space on all four sides, so it is
+            // symmetric because it is one number.
+            "font: bold 12px/1 monospace;" +
+            "text-box: trim-both cap alphabetic;" +
             `color: ${style.fg};` +
             `background: ${style.bg};` +
             // qutebrowser's `hints.radius` is 3, which on a label this small rounds a corner by less
             // than the antialiasing does — it reads square. 4px is still a soft corner rather than a
             // pill, and it is visible.
             "border-radius: 4px;" +
-            "padding: 0 3px;" +
+            // **A shadow rather than an outline.** qutebrowser draws `1px solid #E3BE23` around a
+            // label; bru drew the same in the label's own ink, and at this size a line on the edge
+            // reads as a smudge on it. A shadow separates the chip from the page without adding
+            // anything to the chip itself — nothing is drawn *on* the label, so the two or three
+            // characters keep every pixel they had.
+            //
+            // The colour is the label's own ink at 45%, not black: a black shadow under a chip on a
+            // dark page is a darker patch of the same dark, and on the light themes the ink is not
+            // black to begin with. One offset pixel down and a two-pixel blur is the whole of it —
+            // enough to lift a 12px chip, small enough that it never reads as a second rectangle.
+            `box-shadow: 0 1px 2px color-mix(in srgb, ${style.fg} 45%, transparent);` +
+            "padding: 3px 4px;" +
             "white-space: nowrap;" +
             "text-transform: uppercase;";
     }
@@ -378,10 +397,16 @@ window.__bru_hints = (function () {
             // `#333631` against `#1f2529` — and then the label looks untouched while half of it has
             // already been typed. So the colour is only half of the signal: the matched characters
             // are also dimmed and struck through, which survives any palette.
+            // `text-transform: inherit` on both, and it is not decoration. `all: initial` is what
+            // keeps a page's own stylesheet out of a label, and it resets `text-transform` too — so
+            // the `uppercase` on the parent reached nothing, because every character of a label
+            // lives in one of these two spans. Measured 2026-08-09 on a probe page: the labels drew
+            // `a`, `ls`, `ld`, lower case, with the rule right there in the parent's cssText.
             node.childNodes[0].style.cssText =
-                `all: initial; color: ${style.match}; font: inherit; opacity: 0.55;` +
-                "text-decoration: line-through;";
-            node.childNodes[1].style.cssText = "all: initial; color: inherit; font: inherit;";
+                `all: initial; color: ${style.match}; font: inherit; text-transform: inherit;` +
+                " opacity: 0.55; text-decoration: line-through;";
+            node.childNodes[1].style.cssText =
+                "all: initial; color: inherit; font: inherit; text-transform: inherit;";
             node.childNodes[1].textContent = labels[i];
             root.appendChild(node);
             state.nodes.push(node);
