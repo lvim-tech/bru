@@ -137,14 +137,28 @@ pub fn on_before_browse(
     }
     let Some(host) = browser.host() else { return false };
     set_bypass(&host, wanted);
-    // See the module note: the value only reaches the *next* document, so the one being asked for
-    // has to be asked for again — unless asking again would not be the same navigation.
-    if !method.eq_ignore_ascii_case("GET") || !reissuable {
+    if !should_reissue(method, reissuable) {
         return false;
     }
     let mut task = Reload::new(id, url.to_string());
     post_task(ThreadId::UI, Some(&mut task));
     true
+}
+
+/// Whether a navigation may be asked for a second time, now that the flag has been changed.
+///
+/// **Split out so it can be tested without a browser**, the way `bypassed` already is. The decision
+/// itself is the module note's: the bypass value only reaches the *next* document, so the one being
+/// asked for has to be asked for again — and that is only honest for a navigation that re-issuing
+/// reproduces.
+///
+/// A POST is not one. Replaying it as a GET would drop the body, so a form submitted to a listed
+/// host would arrive as an empty request and the user would watch their form vanish; the page loads
+/// with its policy still honoured instead, which is the smaller wrong. A navigation Chromium says is
+/// not reissuable is the other: a step through history re-issued would push a new entry and lose the
+/// way forward.
+fn should_reissue(method: &str, reissuable: bool) -> bool {
+    method.eq_ignore_ascii_case("GET") && reissuable
 }
 
 /// The one DevTools call, both ways.
@@ -242,4 +256,22 @@ mod tests {
         assert!(!bypassed("bru://chrome/help", &list));
         assert!(!bypassed("about:blank", &list));
     }
+    /// A form POST to a listed host must not be replayed as a GET.
+    ///
+    /// The bypass only reaches the next document, so a transition re-asks for the navigation — and
+    /// re-asking is honest only when it reproduces what was asked. A POST re-issued is a GET with no
+    /// body: the form is gone. A navigation Chromium calls not-reissuable is a step through history,
+    /// which re-issued would push a new entry and lose the way forward. Both load with the old policy
+    /// still in force instead, which is the smaller wrong and is what the module note says.
+    ///
+    /// Verified by flipping the predicate to `true`: the POST and history rows fail.
+    #[test]
+    fn only_a_reissuable_get_is_asked_for_twice() {
+        assert!(should_reissue("GET", true));
+        assert!(should_reissue("get", true), "the method is compared without case");
+        assert!(!should_reissue("POST", true), "a POST re-issued loses its body");
+        assert!(!should_reissue("GET", false), "a history step re-issued loses the way forward");
+        assert!(!should_reissue("POST", false));
+    }
+
 }
