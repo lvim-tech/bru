@@ -59,11 +59,28 @@
             if (!styleElem) {
                 return;
             }
+            // **Only one keeper may hold each end, and "any" is what everything else uses.**
+            //
+            // Two keepers that both insist on being the last child *livelock*: each append fires
+            // the other's observer, which appends its own back, for ever. Measured 2026-08-09 on
+            // youtube.com and start.duckduckgo.com — the pages that have a user stylesheet, so the
+            // second "last" keeper had something to fight — when the cosmetic layer was added with
+            // `where === "last"`. The renderer pegged, nothing painted, and `--remote js` timed out
+            // after five seconds because the page never got to answer.
+            //
+            // So: "first" is the scrollbar's, "last" is the user's own CSS, and anything whose
+            // declarations already win — `display: none !important` — takes "any", which guarantees
+            // presence and says nothing about order. A third keeper wanting an end is a livelock
+            // waiting to happen; give it "any" or give one of the other two up.
             if (where === "first") {
                 if (styleElem !== rootElem.firstChild) {
                     rootElem.insertBefore(styleElem, rootElem.firstChild);
                 }
-            } else if (styleElem !== rootElem.lastChild) {
+            } else if (where === "last") {
+                if (styleElem !== rootElem.lastChild) {
+                    rootElem.appendChild(styleElem);
+                }
+            } else if (styleElem.parentNode !== rootElem) {
                 rootElem.appendChild(styleElem);
             }
         }

@@ -145,7 +145,7 @@ pub fn css_for(url: &str) -> String {
 
 /// The keeper that lives in the page. See `chrome/userstyle.js` for the three failures it exists to
 /// survive, and qutebrowser's `javascript/stylesheet.js`, which is where its shape comes from.
-const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
+pub(crate) const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
 
 /// Whether the styles are switched on. **Read in the renderer, so it cannot ask the settings
 /// store** — that lives in the browser process. The value is pushed here by `settings.rs` through
