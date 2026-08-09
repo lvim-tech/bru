@@ -103,9 +103,12 @@ window.__bru_hints = (function () {
     // 1px solid #E3BE23, hints.radius = 3, hints.padding = 0/3/0/3, colors.hints.match.fg = green.
     const DEFAULT_STYLE = {
         "fg": "#000",
-        "bg": "linear-gradient(rgba(255,247,133,0.9), rgba(255,197,66,0.9))",
-        "border": "#E3BE23",
-        "match": "#0f0",
+        // **A flat yellow, not qutebrowser's gradient.** The gradient was two yellows fading into
+        // an orange, which reads as a smudge at 12px and fights whatever is behind it; one colour
+        // is what a label is. Opaque, too — the 0.9 alpha let the page show through and turned
+        // every label a slightly different shade depending on what it sat on.
+        "bg": "#ffd21e",
+        "match": "#c02020",
     };
 
     // A label's style. The colours arrive from Rust, resolved out of `bru://chrome/theme.css`'s
@@ -118,10 +121,9 @@ window.__bru_hints = (function () {
             "position: fixed;" +
             "z-index: 2147483647;" +
             "pointer-events: none;" +
-            "font: bold 11px/1.2 monospace;" +
+            "font: bold 12px/1.2 monospace;" +
             `color: ${style.fg};` +
             `background: ${style.bg};` +
-            `border: 1px solid ${style.border};` +
             "border-radius: 3px;" +
             "padding: 0 3px;" +
             "white-space: nowrap;" +
@@ -368,8 +370,14 @@ window.__bru_hints = (function () {
                 `top: ${Math.round(Math.max(rect.top, 0))}px;`;
             node.appendChild(document.createElement("span"));  // matched
             node.appendChild(document.createElement("span"));  // rest
+            // **The typed prefix, and it has to differ by more than a colour.** A theme is free to
+            // set `--hints-match-fg` to something a shade from `--hints-fg` — this machine's does,
+            // `#333631` against `#1f2529` — and then the label looks untouched while half of it has
+            // already been typed. So the colour is only half of the signal: the matched characters
+            // are also dimmed and struck through, which survives any palette.
             node.childNodes[0].style.cssText =
-                `all: initial; color: ${style.match}; font: inherit;`;
+                `all: initial; color: ${style.match}; font: inherit; opacity: 0.55;` +
+                "text-decoration: line-through;";
             node.childNodes[1].style.cssText = "all: initial; color: inherit; font: inherit;";
             node.childNodes[1].textContent = labels[i];
             root.appendChild(node);
