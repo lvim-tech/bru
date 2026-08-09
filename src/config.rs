@@ -300,6 +300,20 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("insert", "<Shift-Ins>", "insert-text -- {primary}"),
     ("insert", "<Escape>", "mode-leave"),
     ("insert", "<Shift-Escape>", "fake-key <Escape>"),
+// --- src/passwords.rs -------------------------------------------------------
+    // **Not qutebrowser's, because qutebrowser has no command to bind here.** Its own answer to
+    // passwords is a userscript the user binds themselves; bru has `:password-fill` in the binary,
+    // and a command with no key is a command nobody finds.
+    //
+    // In **insert** mode, which is where following a hint into a field leaves you. The alternative
+    // was a normal-mode key and an `<Escape>` before it, and that Escape exists only to reach the
+    // key — the focus never needed it. `f`, the label, `<Ctrl-p>`, and the form is filled.
+    //
+    // What it costs is that the page never sees `<Ctrl-p>` while a field is focused, because a key
+    // bound in a mode is swallowed. In a text field that chord means nothing standard, which is why
+    // it is the one taken; `<Ctrl-e>` and `<Shift-Ins>` beside it were chosen the same way.
+    ("insert", "<Ctrl-p>", "password-fill"),
+// --- end src/passwords.rs ---------------------------------------------------
     // -- command -------------------------------------------------------------------------------
     ("command", "<Ctrl-P>", "command-history-prev"),
     ("command", "<Ctrl-N>", "command-history-next"),
@@ -1522,7 +1536,10 @@ mod tests {
         // inspector was cut to one key. A number that moves has to say why as plainly in both
         // directions.
         // 288 since `<Left>`/`<Right>` became the file prompt's way in and out of a directory.
-        assert_eq!(total, 288, "the default table is not the one transcribed from configdata.yml");
+        // **289** since `<Ctrl-p>` in insert mode, which is `:password-fill` — the first binding in
+        // this table that is not transcribed from `configdata.yml`, because the command it names is
+        // not qutebrowser's either.
+        assert_eq!(total, 289, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1537,7 +1554,9 @@ mod tests {
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
         // **177: 172 plus the five inspector keys that came back.**
         assert_eq!(bindings.len(Mode::Normal), 177);
-        assert_eq!(bindings.len(Mode::Insert), 4);
+        // **Five**, the fourth of qutebrowser's plus `<Ctrl-p>` for `:password-fill` — the one
+        // binding in this table that is bru's own, because the command it names is bru's own.
+        assert_eq!(bindings.len(Mode::Insert), 5);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
         assert_eq!(bindings.len(Mode::Passthrough), 1);
