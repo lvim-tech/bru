@@ -413,7 +413,7 @@ fn render_history(visits: &[data::Visit], counts: (usize, usize)) -> String {
         out.push_str(&format!(
             "<tr><td class=\"when\">{}</td><td class=\"what\"><a href=\"{}\">{}</a></td><td class=\"where\">{}</td></tr>\n",
             escape(&visit.time),
-            escape_attr(&visit.url),
+            safe_href(&visit.url),
             escape(if visit.title.is_empty() { &visit.url } else { &visit.title }),
             escape(&visit.url),
         ));
@@ -459,7 +459,7 @@ fn render_marks(quickmarks: &[data::Quickmark], bookmarks: &[data::Bookmark]) ->
             out.push_str(&format!(
                 "<tr><td class=\"when\">{}</td><td class=\"what\"><a href=\"{}\">{}</a></td><td class=\"where\"></td></tr>\n",
                 escape(&mark.name),
-                escape_attr(&mark.url),
+                safe_href(&mark.url),
                 escape(&mark.url),
             ));
         }
@@ -474,7 +474,7 @@ fn render_marks(quickmarks: &[data::Quickmark], bookmarks: &[data::Bookmark]) ->
         for mark in bookmarks {
             out.push_str(&format!(
                 "<tr><td class=\"when\"></td><td class=\"what\"><a href=\"{}\">{}</a></td><td class=\"where\">{}</td></tr>\n",
-                escape_attr(&mark.url),
+                safe_href(&mark.url),
                 escape(if mark.title.is_empty() { &mark.url } else { &mark.title }),
                 escape(&mark.url),
             ));
@@ -575,6 +575,36 @@ fn escape(s: &str) -> String {
 /// escaped anyway so the function is safe wherever it is used next.
 fn escape_attr(s: &str) -> String {
     escape(s).replace('\'', "&#39;")
+}
+
+/// A URL that is safe to *follow* from a `bru://` page, not merely safe to print.
+///
+/// **Escaping is not enough here, and the difference is code execution.** `escape_attr` stops a
+/// value breaking out of the attribute; it says nothing about what the browser does when the link
+/// is clicked. A `javascript:` URL in this slot runs in the `bru://` origin — the one origin
+/// `ipc.rs` trusts for `cefQuery`, which is `:spawn`, cookie deletion and navigation of any tab.
+///
+/// **Nothing can plant such a URL today, and that is the reason to write this rather than not
+/// to.** History refuses those schemes on the way *in* (`data::is_excluded`), but that function is
+/// about log size and says so in its own comment; quickmarks and bookmarks do not go through it at
+/// all and are safe only because their URL is always a committed address or something the user
+/// typed. Three unrelated accidents holding up code execution in the privileged origin is not a
+/// defence — it is a defence that the next importer, sync feature or `bookmark-add` taking a
+/// page-supplied value silently removes. This makes the page refuse at render time, where the
+/// consequence is, instead of trusting the store.
+///
+/// The row still *shows* the string in its text cells: printing a URL is harmless, following it is
+/// not, and a poisoned row that renders as `#` while displaying what it holds is a row the reader
+/// can see and delete.
+fn safe_href(url: &str) -> String {
+    // Leading whitespace and case are both ignored by the URL parser, so they are ignored here.
+    let lower = url.trim_start().to_ascii_lowercase();
+    const REFUSED: [&str; 5] = ["javascript:", "data:", "vbscript:", "blob:", "file:"];
+    if REFUSED.iter().any(|scheme| lower.starts_with(scheme)) {
+        "#".to_string()
+    } else {
+        escape_attr(url)
+    }
 }
 
 // --- the debug hook -----------------------------------------------------------------------------
@@ -687,6 +717,39 @@ mod tests {
             date: date.to_string(),
             time: time.to_string(),
         }
+    }
+
+    /// A row whose URL could run code must render as a link that goes nowhere.
+    ///
+    /// **The page refuses at render time rather than trusting the store**, and this is the whole of
+    /// why: escaping keeps the value inside the attribute, and a `javascript:` URL inside the
+    /// attribute is still a `javascript:` URL. Following one from `bru://chrome/history` runs it in
+    /// the origin `ipc.rs` trusts for `cefQuery` — `:spawn`, cookies, any tab.
+    ///
+    /// Nothing can plant such a row today. Bookmarks and quickmarks never pass through
+    /// `data::is_excluded`, though, so what stops it is the shape of their callers rather than a
+    /// check — and that is what this fixes.
+    #[test]
+    fn a_row_that_could_run_code_is_not_a_link_to_it() {
+        assert_eq!(safe_href("javascript:alert(1)"), "#");
+        // Case and leading space are ignored by the URL parser and so by this.
+        assert_eq!(safe_href("  JavaScript:alert(1)"), "#");
+        assert_eq!(safe_href("data:text/html,<script>x</script>"), "#");
+        // An ordinary URL is untouched but for its escaping.
+        assert!(safe_href("https://x/a\"b").starts_with("https://x/a&quot;b"));
+
+        let marks = [data::Bookmark {
+            url: "javascript:alert(document.title)".to_string(),
+            title: "innocent".to_string(),
+        }];
+        let html = render_marks(&[], &marks);
+        assert!(
+            !html.contains("href=\"javascript:"),
+            "a javascript: URL reached an href on a bru:// page"
+        );
+        assert!(html.contains("href=\"#\""), "the row should still render");
+        // The string is still *shown*, so the reader can see what is in their file and delete it.
+        assert!(html.contains("javascript:alert(document.title)"));
     }
 
     #[test]
