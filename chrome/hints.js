@@ -124,7 +124,10 @@ window.__bru_hints = (function () {
             "font: bold 12px/1.2 monospace;" +
             `color: ${style.fg};` +
             `background: ${style.bg};` +
-            "border-radius: 3px;" +
+            // qutebrowser's `hints.radius` is 3, which on a label this small rounds a corner by less
+            // than the antialiasing does — it reads square. 4px is still a soft corner rather than a
+            // pill, and it is visible.
+            "border-radius: 4px;" +
             "padding: 0 3px;" +
             "white-space: nowrap;" +
             "text-transform: uppercase;";
