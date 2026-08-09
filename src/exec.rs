@@ -690,6 +690,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             }
         }
         Command::DevTools(place) => crate::devtools::toggle(browser, *place),
+        Command::DevToolsClose => crate::devtools::close(browser),
         Command::DevToolsFocus => crate::devtools::focus(browser),
         // Through the three named entry points rather than through `show`, because those are what
         // every other workstream will call — `message::info("yanked")` reads as what it does.
@@ -1226,7 +1227,7 @@ pub fn is_live(command: &Command) -> bool {
         Command::ViewSource | Command::Print => true,
         // Every `devtools <position>` is live, and every one of them opens a window: CEF has no
         // docked inspector to give a BrowserView. See `devtools.rs`.
-        Command::DevTools(_) | Command::DevToolsFocus => true,
+        Command::DevTools(_) | Command::DevToolsClose | Command::DevToolsFocus => true,
         // No default binding names these; they are here so a workstream can say something and so
         // `:message-error x` can be typed. They cost the live count nothing either way.
         Command::Message { .. } => true,
@@ -1763,10 +1764,11 @@ mod tests {
         // `register:` (3991); 264 once macros brought the other two modes that read it.
         // 298 with src/prompt.rs, which brought `bindings.default.prompt`'s 26 rows and
         // `.yesno`'s 8 — the last two sections of `configdata.yml` bru had no mode for.
-        // 293 since the inspector kept `wi` and lost `wIh`, `wIj`, `wIk`, `wIl`, `wIw` and `wIf`:
-        // five of the six bound a docked position CEF cannot draw. 281 since the twelve `t**` rows
-        // went with the two settings they named. The only falls in this number.
-        assert_eq!(DEFAULT_BINDINGS.len(), 281);
+        // 293 since the inspector kept `wi` and lost six keys that bound a docked position CEF was
+        // thought not to draw; 281 since the twelve `t**` rows went with the two settings they
+        // named — the only two falls in this number. 286 since five of the inspector's keys came
+        // back, once the docked positions turned out to be drawable after all.
+        assert_eq!(DEFAULT_BINDINGS.len(), 286);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1819,13 +1821,15 @@ mod tests {
         // The denominator does not move — the row was always in the table.
         // --- end unhardcoded -------------------------------------------------------------
         //
-        // **281 since the inspector kept one key of seven.** The six that went — `wIh`, `wIj`,
-        // `wIk`, `wIl`, `wIw`, `wIf` — were all live, because `devtools` is implemented; what was
-        // wrong was the docked placement five of them named, which CEF cannot draw. Here the
-        // denominator moves with the numerator, since the rows left the table.
+        // **286 since five of the inspector's keys came back.** They had gone with the reading that
+        // CEF offers no docked inspector; that reading was wrong — it hands the view over and asks
+        // where to put it — so `wIj`, `wIl` and `wIw` name placements that draw, `wIc` names a close
+        // command bru added, and `wIf` is `devtools-focus`. `wIh` and `wIk` stay out: left and top
+        // are buildable now and have not been built. Here the denominator moves with the numerator,
+        // since the rows left and returned to the table.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 281, "the live-binding count moved");
+        assert_eq!(live, 286, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1857,10 +1861,9 @@ mod tests {
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        // 281 as it was, less the twelve `t**` rows that named two settings bru does not have. A
-        // key that says why it does nothing is still a key that does nothing, and the table now
-        // holds only keys that act.
-        assert_eq!(live, 281);
+        // Every one of them acts: the twelve that only explained themselves are gone, and the five
+        // inspector keys that came back name commands that all draw something.
+        assert_eq!(live, 286);
     }
 // --- end src/help.rs -------------------------------------------------------
 

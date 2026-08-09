@@ -445,9 +445,21 @@ pub enum Command {
     ViewSource,
     /// `print` — hand the page to Chromium's print dialog.
     Print,
-    /// `devtools [position]` — open the web inspector, or close it if it is open. Every position
-    /// opens a window; see `devtools.rs` for why CEF offers no docked one.
-    DevTools(crate::devtools::Place),
+    /// `devtools [position]` — open the web inspector, move it, or toggle it.
+    ///
+    /// **`None` means "toggle it wherever it is" and a position means "put it there".** They are not
+    /// the same command with a default: a bare `devtools` on an open panel hides it, and
+    /// `devtools right` on a panel open at the bottom *moves* it. Folding the two together is what
+    /// made the argument disappear — the toggle ran first and the position was never read.
+    DevTools(Option<crate::devtools::Place>),
+    /// `devtools-close` — close the inspector, whatever position it is in, and do nothing if none is
+    /// open.
+    ///
+    /// qutebrowser has no such command: there, `:devtools` is the only spelling and it toggles. bru
+    /// keeps the toggle and adds this because a toggle is the wrong shape for a key you press to
+    /// mean one thing — and because with three positions, "press the same key again" stopped being
+    /// obvious about *which* panel it closes.
+    DevToolsClose,
     /// `devtools-focus` — bring the inspector forward.
     DevToolsFocus,
     /// `message-info` / `message-warning` / `message-error <text>` — say something in the bar.
@@ -1725,9 +1737,15 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // pieces of arithmetic and are not built yet, so they say so rather than quietly doing
         // something else to a line copied out of a `config.py`.
         "devtools" => match args.arg(0) {
-            None | Some("bottom") => Command::DevTools(crate::devtools::Place::Bottom),
-            Some("right") => Command::DevTools(crate::devtools::Place::Right),
-            Some("window") => Command::DevTools(crate::devtools::Place::Window),
+            // **`None` is not `bottom`, and the difference is the whole of what a position means.**
+            // A bare `devtools` toggles whatever is there, wherever it is. A *named* position says
+            // where the inspector should be, so a panel already open at the bottom moves rather than
+            // hiding — which is what it did, silently, when the argument was folded into `Bottom`
+            // here and thrown away by the toggle.
+            None => Command::DevTools(None),
+            Some("bottom") => Command::DevTools(Some(crate::devtools::Place::Bottom)),
+            Some("right") => Command::DevTools(Some(crate::devtools::Place::Right)),
+            Some("window") => Command::DevTools(Some(crate::devtools::Place::Window)),
             Some(side @ ("left" | "top")) => {
                 return Err(bad(&format!(
                     "bru cannot dock the inspector {side} yet — `devtools bottom` docks it under \
@@ -1736,6 +1754,7 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
             Some(other) => return Err(bad(&format!("invalid position {other:?}"))),
         },
+        "devtools-close" => Command::DevToolsClose,
         "devtools-focus" => Command::DevToolsFocus,
 
         // maxsplit=0: the whole rest of the line is the text, spaces and all.

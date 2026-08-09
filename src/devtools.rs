@@ -43,7 +43,7 @@ pub fn trace(what: &str) {
 ///
 /// qutebrowser's is a toggle (`browsertab.py:946`, "Show/hide (and if needed, create) the web
 /// inspector for this tab"), so this is too.
-pub fn toggle(browser: &mut Browser, place: Place) {
+pub fn toggle(browser: &mut Browser, wanted: Option<Place>) {
     let Some(host) = browser.host() else {
         return;
     };
@@ -59,28 +59,82 @@ pub fn toggle(browser: &mut Browser, place: Place) {
     // this CEF supports, and there is no upstream example of a same-window docked inspector to
     // copy: cefclient gives every DevTools popup a window of its own.
     //
-    // So the toggle stops destroying anything. The inspector is hidden and shown, which is exactly
-    // what bru already does to tabs, and a `BoxLayout` skips an invisible child so the page gets
-    // the room back. The browser stays alive behind it — the same trade qutebrowser makes, whose
-    // inspector is a widget it hides — and it goes when its tab or its window goes, on CEF's own
-    // teardown path rather than on one bru drives.
+    // So nothing here destroys anything. The inspector is hidden and shown, which is exactly what
+    // bru already does to tabs, and a `BoxLayout` skips an invisible child so the page gets the room
+    // back. The browser stays alive behind it — the same trade qutebrowser makes, whose inspector is
+    // a widget it hides — and it goes when its tab or its window goes, on CEF's own teardown path.
     if let Some(state) = crate::state::BruState::instance() {
         let window = state
             .lock()
             .expect("state mutex poisoned")
             .window_of_browser(browser.identifier());
         if let Some(window) = window {
-            if let Some(shown) = flip(&state, window, browser.identifier()) {
-                trace(&format!("toggle: docked inspector now visible={shown}"));
-                return;
+            let docked = state
+                .lock()
+                .expect("state mutex poisoned")
+                .inspector_in(window)
+                .map(|(_, inspects)| inspects)
+                == Some(browser.identifier());
+            if docked {
+                match wanted {
+                    // **A named position moves it; a bare command toggles it.** This is the whole of
+                    // what the argument was for, and it used to be thrown away: `toggle` flipped
+                    // visibility and returned before looking at it, so `:devtools right` on a panel
+                    // open at the bottom hid the bottom one and reported nothing. A key that names a
+                    // position and does something else is the kind of key this project deletes.
+                    // **A window is the one place a docked panel cannot be moved to**, and the
+                    // message says why rather than suggesting something that does not help.
+                    //
+                    // CEF decides where a DevTools popup lives at the moment it creates it, so this
+                    // browser's home is settled. Changing it means destroying it and asking again —
+                    // and destroying a docked inspector is the measured SIGSEGV above. Nor does
+                    // `devtools-close` open the road: closing a docked panel *hides* it, for the
+                    // same reason, so the browser is still there and still docked. The first draft
+                    // of this message told the user to run `devtools-close` first, and then said the
+                    // same thing again when they had — a message that lies is worse than a refusal.
+                    //
+                    // What does free it is the panel's browser actually going, which happens when
+                    // its tab or its window closes. That is the honest answer and it is what this
+                    // says.
+                    Some(Place::Window) => {
+                        crate::message::error(
+                            "devtools window: this inspector is docked, and CEF fixed where it \
+                             lives when it made it. A window of its own needs a new inspector — \
+                             close the tab, or open one on another tab.",
+                        );
+                        return;
+                    }
+                    Some(place) if place != place_of(window) => {
+                        move_docked(&state, window, place);
+                        return;
+                    }
+                    // Already where it was asked to be: show it rather than toggling it away. A
+                    // position is a statement about where, not a request to flip.
+                    Some(_) => {
+                        show_docked(&state, window);
+                        return;
+                    }
+                    None => {
+                        if let Some(shown) = flip(&state, window, browser.identifier()) {
+                            trace(&format!("toggle: docked inspector now visible={shown}"));
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
     if host.has_dev_tools() != 0 {
-        // A windowed inspector, which CEF owns entirely: closing one has never been a problem.
+        // A windowed inspector, which CEF owns entirely: closing one has never been a problem, and
+        // it is also how a windowed panel becomes a docked one — CEF decides where a popup goes when
+        // it creates it, so the only way to change that is to let this one go and ask again.
         host.close_dev_tools();
-        return;
+        match wanted {
+            Some(Place::Window) | None => return,
+            Some(_) => {}
+        }
     }
+    let place = wanted.unwrap_or(Place::Bottom);
     // **Said before `show_dev_tools`, because the answer is wanted inside it.** CEF creates the
     // DevTools browser synchronously enough that `on_popup_browser_view_created` is reached from
     // this call, and that callback is handed the popup view and nothing else about why it exists —
@@ -95,6 +149,142 @@ pub fn toggle(browser: &mut Browser, place: Place) {
     // inspector opened anywhere.
     pending().lock().expect("devtools mutex poisoned").take();
     trace("toggle: pending cleared");
+}
+
+/// `devtools-close` — put the inspector away, wherever it is, and say nothing if there is none.
+///
+/// **Not `close_dev_tools` for a docked one**, for the reason `toggle` gives at length: that call on
+/// a panel inside a window is the SIGSEGV this whole design is arranged around. Closing a docked
+/// panel is hiding it; the browser behind it goes when its tab or its window does. A panel in its
+/// own window is CEF's entirely and closes the ordinary way.
+pub fn close(browser: &mut Browser) {
+    let Some(host) = browser.host() else {
+        return;
+    };
+    if let Some(state) = crate::state::BruState::instance() {
+        let window = state
+            .lock()
+            .expect("state mutex poisoned")
+            .window_of_browser(browser.identifier());
+        if let Some(window) = window {
+            let showing = {
+                let guard = state.lock().expect("state mutex poisoned");
+                guard
+                    .inspector_in(window)
+                    .filter(|(_, inspects)| *inspects == browser.identifier())
+                    .map(|(view, _)| View::from(&view).is_visible() != 0)
+            };
+            if let Some(visible) = showing {
+                if visible {
+                    flip(&state, window, browser.identifier());
+                }
+                trace("close: docked inspector hidden");
+                return;
+            }
+        }
+    }
+    if host.has_dev_tools() != 0 {
+        host.close_dev_tools();
+    }
+}
+
+/// Make sure the docked panel is on screen, without toggling it off if it already is.
+fn show_docked(state: &crate::tabs::SharedState, window_id: u32) {
+    let (view, divider, window) = {
+        let guard = state.lock().expect("state mutex poisoned");
+        let Some((view, _)) = guard.inspector_in(window_id) else {
+            return;
+        };
+        (view, guard.divider_in(window_id), guard.window_handle(window_id))
+    };
+    let Some(window) = window else {
+        return;
+    };
+    let child = View::from(&view);
+    if child.is_visible() != 0 {
+        return;
+    }
+    child.set_visible(1);
+    if let Some(divider) = divider.as_ref() {
+        View::from(divider).set_visible(1);
+    }
+    child.invalidate_layout();
+    View::from(&window).invalidate_layout();
+    window.layout();
+}
+
+/// Move a docked inspector from one container to the other — `bottom` to `right` and back.
+///
+/// **The browser is never touched, only its view is re-parented**, and that is the only way this can
+/// be done here: closing a docked inspector to reopen it elsewhere is the measured segfault, and CEF
+/// decides where a popup lives when it creates it, so there is nothing to ask a second time. Taking
+/// a live `BrowserView` out of one container and putting it in another is not new — `tabs::give`
+/// does exactly that to hand a tab to another window, and its comment says the browser follows its
+/// view.
+fn move_docked(state: &crate::tabs::SharedState, window_id: u32, place: Place) {
+    let (view, divider, window, layout, pages, pages_layout) = {
+        let guard = state.lock().expect("state mutex poisoned");
+        let Some((view, _)) = guard.inspector_in(window_id) else {
+            return;
+        };
+        let (pages, pages_layout) = guard.pages_of(window_id);
+        (
+            view,
+            guard.divider_in(window_id),
+            guard.window_handle(window_id),
+            guard.layout_handle(window_id),
+            pages,
+            pages_layout,
+        )
+    };
+    let (Some(window), Some(pages)) = (window, pages) else {
+        return;
+    };
+    let was = place_of(window_id);
+    // Out of the old container first. `remove_child_view` on a view whose browser is alive and well
+    // is the safe half of the pair; it is removal *during teardown* that is not.
+    let old: Panel = if was.is_side() {
+        pages.clone()
+    } else {
+        Panel::from(&window)
+    };
+    old.remove_child_view(Some(&mut View::from(&view)));
+    if let Some(divider) = divider.as_ref() {
+        old.remove_child_view(Some(&mut View::from(divider)));
+    }
+
+    // Recorded before the views go back in, so the delegates answer for the new axis on the very
+    // first layout rather than one pass later.
+    set_place(window_id, Some(place));
+    let (new, new_layout, index) = if place.is_side() {
+        (pages.clone(), pages_layout, pages.child_view_count() as i32)
+    } else {
+        (
+            Panel::from(&window),
+            layout,
+            crate::window::leading_strip_count() + 1,
+        )
+    };
+    if let Some(divider) = divider.as_ref() {
+        let mut strip = View::from(divider);
+        if let Some(layout) = new_layout.as_ref() {
+            layout.set_flex_for_view(Some(&mut strip), 0);
+        }
+        new.add_child_view_at(Some(&mut strip), index);
+    }
+    let mut child = View::from(&view);
+    if let Some(layout) = new_layout.as_ref() {
+        layout.set_flex_for_view(Some(&mut child), INSPECTOR_FLEX);
+    }
+    new.add_child_view_at(Some(&mut child), index + i32::from(divider.is_some()));
+    child.set_visible(1);
+    if let Some(divider) = divider.as_ref() {
+        View::from(divider).set_visible(1);
+    }
+    child.invalidate_layout();
+    View::from(&window).invalidate_layout();
+    window.layout();
+    trace(&format!("move: {was:?} -> {place:?}"));
 }
 
 /// Where an inspector goes. The command's own vocabulary, minus what CEF cannot draw.

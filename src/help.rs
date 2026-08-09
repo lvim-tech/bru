@@ -521,9 +521,12 @@ pub const COMMANDS: &[Doc] = &[
     Doc { names: &["print"], args: "", flags: &[],
         what: "Hand the page to Chromium's print dialog.", example: "print" },
     Doc { names: &["devtools"], args: "[position]", flags: &[],
-        what: "Open the web inspector, or close it. `bottom` docks it under the page, `right` \
-               beside it, `window` gives it a window of its own.",
+        what: "Open the web inspector, or toggle it when no position is named. `bottom` docks it \
+               under the page, `right` beside it, `window` gives it a window of its own — and a \
+               position on an open panel moves it there.",
         example: "devtools right" },
+    Doc { names: &["devtools-close"], args: "", flags: &[],
+        what: "Close the inspector, wherever it is.", example: "devtools-close" },
     Doc { names: &["devtools-focus"], args: "", flags: &[],
         what: "Bring the inspector forward.", example: "devtools-focus" },
     Doc { names: &["message-info"], args: "<text>", flags: &[],
@@ -1354,7 +1357,7 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 170, "the scrape found a different number of commands");
+        assert_eq!(source.len(), 171, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1519,6 +1522,7 @@ mod tests {
                 Command::ViewSource => "ViewSource",
                 Command::Print => "Print",
                 Command::DevTools(_) => "DevTools",
+                Command::DevToolsClose => "DevToolsClose",
                 Command::DevToolsFocus => "DevToolsFocus",
                 Command::Message { .. } => "Message",
                 Command::MacroRecord { .. } => "MacroRecord",
@@ -1612,7 +1616,7 @@ mod tests {
         "SelectionReverse", "SelectionFollow", "MoveTo", "CmdSetText", "CommandAccept", "Spawn",
         "EditText", "InsertText", "FakeKey", "Set", "ConfigCycle", "ConfigDictAdd",
         "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigListAdd",
-        "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind",
+        "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind", "DevToolsClose",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",
         "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",
         "AdblockUpdate", "AdblockToggle", "AdblockInfo", "GreasemonkeyReload", "ViewSource",
