@@ -127,6 +127,46 @@ wrap_app! {
             // covers the case where something other than Blink's heuristic reaches
             // `PageLoadTracker::OnSoftNavigation`; it is not what the fix rests on.
             add_to_switch(command_line, "disable-features", "SoftNavigationDetection");
+
+            // **WebAuthn's conditional UI eats the first Escape after a hint lands in a login
+            // field, in the browser process, before bru is ever given the key.** Reported by the
+            // user 2026-08-09 on `https://accounts.google.com/`: Escape took two presses to leave
+            // insert mode, and `BRU_DEBUG_KEYS=1` showed the first press's key-down never reached
+            // `on_pre_key_event` at all. That field is `<input autocomplete="username webauthn">`,
+            // and the page holds a `navigator.credentials.get({mediation:'conditional'})` open
+            // against it: Chromium anchors its passkey dropdown to such a field, and the popup
+            // controller registers a `KeyPressEventCallback` on the RenderWidgetHost.
+            // `RenderWidgetHostImpl::ForwardKeyboardEvent` runs those callbacks **before** the
+            // delegate's `PreHandleKeyboardEvent` — which is where CEF calls `on_pre_key_event` —
+            // so the first Escape closes a dropdown (drawn or not) and bru sees only the key-up.
+            //
+            // Measured 2026-08-09, scriptably, because `send_key_event` funnels into the same
+            // `ForwardKeyboardEvent`: with a capture-phase `keydown` listener on the page and
+            // `:fake-key <Escape>` after `:hint inputs --first`,
+            //
+            // ```text
+            // plain <input>                                    first Escape reaches the page
+            // accounts.google.com identifier field             first eaten, second reaches it
+            // local <input autocomplete="username webauthn">
+            //   + a pending conditional credentials.get        first eaten, second reaches it
+            // with --disable-blink-features=WebAuth, both      first Escape reaches the page
+            // ```
+            //
+            // The profile held **zero** autofill data throughout (`Web Data`'s `autofill` and
+            // `addresses` tables and `Login Data`'s `logins` all empty), which is why the four
+            // preferences `content.autofill` writes could not and did not fix it — the passkey
+            // dropdown is fed by the WebAuthn request, not by stored form data.
+            //
+            // `WebAuth` is the Blink runtime feature behind `PublicKeyCredential`; with it off the
+            // API is absent, the page's feature-detect fails, no conditional request ever opens,
+            // and nothing owns the keyboard but bru. There is no narrower switch left in Chromium
+            // 151 — `WebAuthenticationConditionalUI` shipped and was removed years ago (checked:
+            // absent from libcef's strings). What this costs is passkeys, which bru never had:
+            // CEF's Alloy-style views draw none of the WebAuthn UX, so the flow could only dead-end
+            // — and qutebrowser is the same, QtWebEngine's WebAuth UX being embedder-provided and
+            // qutebrowser 3.7.0 containing no webauthn code at all (grepped), which is exactly why
+            // the same page costs it only one Escape.
+            add_to_switch(command_line, "disable-blink-features", "WebAuth");
         }
 
         // --- M2 --------------------------------------------------------------------------------
