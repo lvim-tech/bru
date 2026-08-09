@@ -882,20 +882,66 @@ enum PrefKind {
     /// the first page load after it is typed is worse than one that does not work at all, and only
     /// a page's own behaviour catches it.
     AcceptLanguage,
+    /// **Chromium's own form-fill dropdowns, and it is four preferences rather than one** — the
+    /// addresses list, the cards list, and the password manager's two. They are one setting here
+    /// because they are one thing on the screen: a native popup under the field that bru cannot
+    /// see, cannot draw and cannot drive with its own bindings.
+    ///
+    /// Measured exists=1 settable=1 for all four, 2026-08-09, with
+    /// `--settings-probe='prefs:<name>'`.
+    ///
+    /// **What this setting is not, learned the expensive way.** It was written to end the
+    /// two-press Escape on `https://accounts.google.com/` (a hint into the email field, then
+    /// Escape doing nothing once), and the user tested it and it did not: all four preferences
+    /// verified `false` in the profile, first Escape still eaten. The measurement that settled
+    /// why is in `app.rs` beside `disable-blink-features=WebAuth` — that field carries
+    /// `autocomplete="username webauthn"`, and the dropdown holding the keyboard was the
+    /// **passkey** one, fed by the page's conditional WebAuthn request rather than by any stored
+    /// form data. The profile's `Web Data` and `Login Data` were empty throughout, so these four
+    /// preferences had nothing to disable.
+    ///
+    /// The setting stays on its own terms: once data *is* saved, the address, card and password
+    /// dropdowns take the keyboard through the same `KeyPressEventCallback` the passkey one used
+    /// — the mechanism is the popup controller's, not the passkey's — and a browser whose whole
+    /// premise is that the keyboard reaches bru ships them off.
+    Autofill,
 }
 
 impl PrefKind {
-    /// The dotted name bru writes.
+    /// The dotted name bru writes. For [`PrefKind::Autofill`] this is the first of [`names`], and
+    /// what messages are phrased in terms of.
+    ///
+    /// [`names`]: PrefKind::names
     fn name(self) -> &'static str {
         match self {
             PrefKind::DoNotTrack => "enable_do_not_track",
             PrefKind::HyperlinkAuditing => "enable_a_ping",
             PrefKind::AcceptLanguage => "intl.selected_languages",
+            PrefKind::Autofill => "autofill.profile_enabled",
+        }
+    }
+
+    /// Every preference this setting writes, in order. One for all but the autofill dropdown, which
+    /// is one switch over four — see [`PrefKind::Autofill`].
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            PrefKind::Autofill => &[
+                "autofill.profile_enabled",
+                "autofill.credit_card_enabled",
+                "credentials_enable_service",
+                "credentials_enable_autosignin",
+            ],
+            PrefKind::DoNotTrack => &["enable_do_not_track"],
+            PrefKind::HyperlinkAuditing => &["enable_a_ping"],
+            PrefKind::AcceptLanguage => &["intl.selected_languages"],
         }
     }
 
     /// The dotted name bru reads back, which is the same one for all but the language list — see
     /// [`PrefKind::AcceptLanguage`].
+    ///
+    /// The four of [`PrefKind::Autofill`] are always written together, so reading the first is
+    /// reading the setting; they can only disagree if something outside bru wrote one of them.
     fn read_name(self) -> &'static str {
         match self {
             PrefKind::AcceptLanguage => "intl.accept_languages",
@@ -1288,6 +1334,26 @@ pub const SETTINGS: &[Def] = &[
         default: Some("en-US,en"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Preference(PrefKind::AcceptLanguage),
+    },
+    Def {
+        // **qutebrowser has no name for this, because QtWebEngine has no such dropdown to name.**
+        // So the default is not copied from `configdata.yml`; it is chosen, and the reason is in
+        // [`PrefKind::Autofill`]: these dropdowns take the keyboard through the popup
+        // controller's key-press callback, in the browser process, before `on_pre_key_event` is
+        // called — the first Escape then closes a dropdown instead of leaving insert mode. A
+        // browser whose whole premise is that the keyboard reaches bru cannot ship a window that
+        // quietly takes it. (The Escape bug this was first written against turned out to be the
+        // *passkey* dropdown, which no preference governs — see [`PrefKind::Autofill`] and
+        // `app.rs` — but the mechanism is the same one, and saved data would reopen it here.)
+        //
+        // Off, therefore — which is also what qutebrowser does by having nothing. Anyone who wants
+        // Chromium's saved addresses and passwords back has `:set content.autofill true`, and it
+        // costs the first Escape in a field on the pages that have saved data.
+        name: "content.autofill",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Preference(PrefKind::Autofill),
     },
 // --- end content settings ----------------------------------------------------------------------
 // --- config commands ---------------------------------------------------------------------------
@@ -3959,7 +4025,12 @@ fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
             ));
         }
     }
-    let name = CefString::from(pref.name());
+    // Every name this setting stands for. One for all but the autofill dropdown, which is one
+    // switch over four — written in a loop rather than unrolled so that adding a fifth is adding a
+    // string, and inline rather than in a helper so that CEF's value type is never spelled out
+    // here. The first refusal stops the rest: a half-written switch is worth saying out loud.
+    for name in pref.names() {
+    let name_string = CefString::from(*name);
     // **Not `CefString::default()`, and this is trap 9 read from the other end.** `Default` for a
     // `CefStringData` is `Borrowed(None)`, and `From<&mut CefStringUtf16> for *mut
     // _cef_string_utf16_t` answers a **null pointer** for the borrowed form — so CEF is handed
@@ -3970,14 +4041,15 @@ fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
     // non-empty because `cef_string_utf8_to_utf16` of an empty string produces `None` and puts the
     // null pointer back.
     let mut error = CefString::from("-");
-    if context.set_preference(Some(&name), Some(&mut cef_value), Some(&mut error)) == 0 {
+    if context.set_preference(Some(&name_string), Some(&mut cef_value), Some(&mut error)) == 0 {
         let error = error.to_string();
         let error = if error == "-" { String::new() } else { error };
         return Err(if error.is_empty() {
-            format!("{}: Chromium refused the write and said nothing", pref.name())
+            format!("{name}: Chromium refused the write and said nothing")
         } else {
-            format!("{}: {error}", pref.name())
+            format!("{name}: {error}")
         });
+    }
     }
     Ok(())
 }
@@ -4455,7 +4527,12 @@ mod tests {
         // whose defaults are deliberately empty — see [`CSP_BYPASS`].
         // **Sixty-six**, +1 for `devtools.flex`, which is how tall the docked inspector is — a
         // share rather than a height, for the reason its own `Def` gives.
-        assert_eq!(SETTINGS.len(), 67);
+        // **Sixty-eight**, +1 for `content.autofill`. It is bru's first preference-backed setting
+        // that writes **more than one** Chromium name — four — and the first whose default is
+        // bru's own choice rather than qutebrowser's, because QtWebEngine has no such dropdown to
+        // have an opinion about. See [`PrefKind::Autofill`], including for the Escape bug it was
+        // first written against and measurably does not end.
+        assert_eq!(SETTINGS.len(), 68);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

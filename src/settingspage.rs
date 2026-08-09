@@ -448,7 +448,9 @@ mod tests {
         // three whose value lives in a Chromium *preference* — which is Chromium's copy too, so
         // "not read yet" is the honest cell for them before a reading. **This number conflicts with
         // the other two settings workstreams**; +15 is this one's.
-        assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 16);
+        // Seventeen, +1 for `content.autofill` — a fourth preference-backed setting, and the same
+        // reasoning puts it in this column: Chromium holds the value, so bru has not read it yet.
+        assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 17);
 // --- end content settings ------------------------------------------------------------------------
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
         // neither is ever one of them — the two above are the content settings.
