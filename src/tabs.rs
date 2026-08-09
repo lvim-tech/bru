@@ -19,6 +19,26 @@ use crate::window::BruBrowserViewDelegate;
 
 pub type SharedState = Arc<Mutex<BruState>>;
 
+/// One tab, as the strip draws it — the four fields a label can be built from, copied out of the
+/// state.
+///
+/// **A copy rather than a borrow, and that is the whole point.** See [`render_tabs`].
+pub struct TabRow {
+    pub title: String,
+    pub url: String,
+    pub pinned: bool,
+    pub muted: bool,
+    /// `{id}` in a title format is the browser's, and a tab that has not been created yet has none.
+    pub browser_id: Option<i32>,
+}
+
+/// A window's tabs, taken under the state lock and rendered without it.
+#[derive(Default)]
+pub struct TabsSnapshot {
+    rows: Vec<TabRow>,
+    active: usize,
+}
+
 pub struct Tab {
     pub(crate) view: BrowserView,
     /// Learned from `BrowserViewDelegate::on_browser_created`, not at creation: `browser_view_create`
@@ -115,79 +135,39 @@ impl BruState {
         Some(window)
     }
 
-    /// What the current window's tab strip renders, in strip order.
-    pub fn tabs_json(&self) -> String {
+    /// What the current window's tab strip renders, as data — **not** as the rendered JSON.
+    ///
+    /// See [`render_tabs`] for why the two are separate. In short: rendering can run a Lua function
+    /// per tab, these are `BruState` methods, and every caller holds the state lock across them.
+    pub fn tabs_snapshot(&self) -> TabsSnapshot {
         match self.current_window_id() {
-            Some(window) => self.tabs_json_in(window),
-            None => empty_tabs_json(),
+            Some(window) => self.tabs_snapshot_in(window),
+            None => TabsSnapshot::default(),
         }
     }
 
     /// The same for a named window. Two windows draw two strips, and a push into the wrong one is
     /// how a background window ends up listing the tabs of the one in front of it.
-    pub fn tabs_json_in(&self, window: u32) -> String {
+    pub fn tabs_snapshot_in(&self, window: u32) -> TabsSnapshot {
         let Some(slot) = self.slot(window) else {
-            return empty_tabs_json();
+            return TabsSnapshot::default();
         };
-        // --- tabs and statusbar ----------------------------------------------------------------
-        // Read once for the whole strip rather than once per tab: `text_of` takes the settings
-        // mutex, and a window with twenty tabs would take it eighty times for four answers that
-        // cannot change in between.
-        // --- setting functions -----------------------------------------------------------------
-        // **Read once, called per tab**, and the two halves of that sentence are two different
-        // costs. Reading takes the settings mutex — 43.7 ns — and neither answer can change between
-        // the first tab and the twentieth, which is why this line was already outside the loop. A
-        // *function* is the other thing: what it answers depends on the tab, so it has to run once
-        // per tab, and `Template` is the split that lets the store be read once and the function be
-        // called many times. The number that costs is in `.claude/PLUGINS.md` under P2.
-        //
-        // `text_or_default` is gone from this file rather than kept beside the new call: it would
-        // have called the function once, for the whole strip, with no tab in its hand — every tab
-        // drawn with the answer for a tab that does not exist.
-        let format = crate::settings::template_of("tabs.title.format");
-        let pinned_format = crate::settings::template_of("tabs.title.format_pinned");
-        // --- end setting functions ---------------------------------------------------------------
-        let count = slot.tabs.len();
-        // --- end tabs and statusbar ------------------------------------------------------------
-        let entries: Vec<String> = slot
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(index, tab)| {
-                // --- tabs and statusbar --------------------------------------------------------
-                // `label` is what the strip draws and `title`/`url` are what it draws it *from*;
-                // both are sent because the strip still needs the raw URL for the favicon key and
-                // the tooltip. `top.js` reads `label` and falls back to the old `title || url` when
-                // it is absent, so a strip that has not been reloaded after an upgrade still draws
-                // something.
-                // --- setting functions -------------------------------------------------------
-                let template = if tab.pinned { &pinned_format } else { &format };
-                let label = label_for(template, tab, index, slot.active, count);
-                // --- end setting functions ---------------------------------------------------
-                format!(
-                    "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
-                    crate::ipc::json_escape(&tab.title),
-                    crate::ipc::json_escape(&tab.url),
-                    crate::ipc::json_escape(&label),
-                    index == slot.active,
-                    tab.pinned,
-                    tab.muted,
-                )
-            })
-            .collect();
-        // --- tabs and statusbar ----------------------------------------------------------------
-        // The three presentation settings ride with the tabs rather than in the bar's payload: they
-        // are the tab strip's, the strip is pushed on its own, and a strip that had to wait for a
-        // bar push to learn its own alignment would be a strip that is right one push late.
-        format!(
-            "{{\"tabs\":[{}],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
-            entries.join(","),
-            crate::ipc::json_escape(&crate::settings::choice_of("tabs.favicons.show")),
-            crate::ipc::json_escape(&crate::settings::choice_of("tabs.title.alignment")),
-            crate::settings::is_on("tabs.tooltips"),
-        )
-        // --- end tabs and statusbar ------------------------------------------------------------
+        TabsSnapshot {
+            rows: slot
+                .tabs
+                .iter()
+                .map(|tab| TabRow {
+                    title: tab.title.clone(),
+                    url: tab.url.clone(),
+                    pinned: tab.pinned,
+                    muted: tab.muted,
+                    browser_id: tab.browser_id,
+                })
+                .collect(),
+            active: slot.active,
+        }
     }
+
 
     /// Whether the tab at `index` keeps its place — what `tab-close` and `tab-only` consult before
     /// they take a tab away.
@@ -466,9 +446,68 @@ pub fn new_tab(state: &SharedState, url: &str, background: bool) {
 /// settings arrived, and a fallback that kept the old two-key shape would leave a window with no
 /// tabs drawing its titles left-aligned no matter what `tabs.title.alignment` says — for exactly as
 /// long as it took the first tab to appear.
-fn empty_tabs_json() -> String {
+/// Turn a window's tabs into the JSON its strip draws — **outside the state lock**, because this
+/// can run a Lua function.
+///
+/// `tabs.title.format` may be a function, and it is called once per tab. It used to be called from
+/// a `BruState` method, which every caller reaches with the state mutex held: `push_tabs_everywhere`
+/// locks and maps every window through it, and so do `select_in`, `close_others`, `toggle_pin`,
+/// `move_current` and `new_tab_in`. Rust's `Mutex` is not reentrant, so any `bru.*` binding that
+/// took `BruState` synchronously would have hung the browser on the next strip rebuild.
+///
+/// **That is not hypothetical here.** Measured 2026-08-07: a `config.lua` whose `tabs.title.format`
+/// indexed a nil field printed its error inline, the error reached `ipc::push_bar`, which takes the
+/// same mutex to find the window in front, and the process sat there until `--close-after-ms`. The
+/// remedy then was to post that one message (`settings.rs`, the `FN_ERROR_SINK` comment). This is
+/// the same hazard from the other side, fixed by construction rather than one entry point at a time:
+/// the state hands over data, and everything that can call into Lua happens after the lock is gone.
+///
+/// It is also the shape `ipc::set_mode_for` already uses for the same reason, and the one
+/// `bar_json_for` uses for the bar.
+pub fn render_tabs(snapshot: &TabsSnapshot) -> String {
+    // --- tabs and statusbar ----------------------------------------------------------------
+    // Read once for the whole strip rather than once per tab: `text_of` takes the settings
+    // mutex, and a window with twenty tabs would take it eighty times for four answers that
+    // cannot change in between.
+    // --- setting functions -----------------------------------------------------------------
+    // **Read once, called per tab**, and the two halves of that sentence are two different
+    // costs. Reading takes the settings mutex — 43.7 ns — and neither answer can change between
+    // the first tab and the twentieth, which is why this line was already outside the loop. A
+    // *function* is the other thing: what it answers depends on the tab, so it has to run once
+    // per tab, and `Template` is the split that lets the store be read once and the function be
+    // called many times. The number that costs is in `.claude/PLUGINS.md` under P2.
+    let format = crate::settings::template_of("tabs.title.format");
+    let pinned_format = crate::settings::template_of("tabs.title.format_pinned");
+    // --- end setting functions ---------------------------------------------------------------
+    let count = snapshot.rows.len();
+    let entries: Vec<String> = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            // `label` is what the strip draws and `title`/`url` are what it draws it *from*; both
+            // are sent because the strip still needs the raw URL for the favicon key and the
+            // tooltip. `top.js` reads `label` and falls back to the old `title || url` when it is
+            // absent, so a strip that has not been reloaded after an upgrade still draws something.
+            let template = if tab.pinned { &pinned_format } else { &format };
+            let label = label_for(template, tab, index, snapshot.active, count);
+            format!(
+                "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
+                crate::ipc::json_escape(&tab.title),
+                crate::ipc::json_escape(&tab.url),
+                crate::ipc::json_escape(&label),
+                index == snapshot.active,
+                tab.pinned,
+                tab.muted,
+            )
+        })
+        .collect();
+    // The three presentation settings ride with the tabs rather than in the bar's payload: they are
+    // the tab strip's, the strip is pushed on its own, and a strip that had to wait for a bar push
+    // to learn its own alignment would be a strip that is right one push late.
     format!(
-        "{{\"tabs\":[],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
+        "{{\"tabs\":[{}],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
+        entries.join(","),
         crate::ipc::json_escape(&crate::settings::choice_of("tabs.favicons.show")),
         crate::ipc::json_escape(&crate::settings::choice_of("tabs.title.alignment")),
         crate::settings::is_on("tabs.tooltips"),
@@ -490,7 +529,7 @@ fn empty_tabs_json() -> String {
 /// second vocabulary.
 fn label_for(
     template: &Option<crate::settings::Template>,
-    tab: &Tab,
+    tab: &TabRow,
     index: usize,
     active: usize,
     count: usize,
@@ -562,7 +601,7 @@ fn label_for(
 /// | `{audio}` | `[M] ` when muted, empty otherwise |
 /// | `{host}`, `{protocol}`, `{current_url}` | pulled out of the tab's address |
 /// | `{private}` | always empty: every browser bru makes shares the one `RequestContext` |
-fn format_title(format: &str, tab: &Tab, index: usize, active: usize, count: usize) -> String {
+fn format_title(format: &str, tab: &TabRow, index: usize, active: usize, count: usize) -> String {
     format_fields(
         format,
         &tab.title,
@@ -638,18 +677,19 @@ pub fn push_tabs_everywhere() {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let per_window: Vec<(u32, String)> = {
+    let per_window: Vec<(u32, TabsSnapshot)> = {
         let Ok(state) = state.lock() else {
             return;
         };
         state
             .window_ids()
             .into_iter()
-            .map(|window| (window, state.tabs_json_in(window)))
+            .map(|window| (window, state.tabs_snapshot_in(window)))
             .collect()
     };
-    for (window, json) in per_window {
-        crate::ipc::set_tabs_for(window, json);
+    // Rendered after the lock is dropped: `render_tabs` can call a Lua title function.
+    for (window, snapshot) in per_window {
+        crate::ipc::set_tabs_for(window, render_tabs(&snapshot));
     }
 }
 
@@ -720,11 +760,11 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
     // not when its page eventually commits an address. `select_in` is what pushes for a foreground
     // tab and this branch pushed nothing at all, so until now the only thing that told the chrome
     // about an `:open -b` was `on_address_change` in `keys.rs`, one network round trip later.
-    let tabs = state
+    let snapshot = state
         .lock()
         .expect("state mutex poisoned")
-        .tabs_json_in(window_id);
-    crate::ipc::set_tabs_for(window_id, tabs);
+        .tabs_snapshot_in(window_id);
+    crate::ipc::set_tabs_for(window_id, render_tabs(&snapshot));
 }
 
 /// Puts every tab of one window into it. Called once per window, from `on_window_created`.
@@ -810,14 +850,15 @@ pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
     // handler fires on navigation, and switching tabs is not one. Without this the status line keeps
     // the URL of the tab you just left — measured after the stage-2 merge, with the bar reading
     // example.com over a vesti.bg page.
-    let (url, title, tabs) = {
+    let (url, title, snapshot) = {
         let state = state.lock().expect("state mutex poisoned");
         (
             state.tab_url_in(window_id, index).unwrap_or_default(),
             state.tab_title_in(window_id, index).unwrap_or_default(),
-            state.tabs_json_in(window_id),
+            state.tabs_snapshot_in(window_id),
         )
     };
+    let tabs = render_tabs(&snapshot);
 // --- plugin events ---------------------------------------------------------
     // `tab-switched`, before the bar is told — so that a handler asking bru what is showing gets the
     // tab it was just told about rather than the one being left. It carries the new tab's own url
@@ -909,11 +950,12 @@ pub fn close_others(state: &SharedState, force: bool) {
         (
             closed,
             state.pages(),
-            state.tabs_json(),
+            state.tabs_snapshot(),
             state.active_tab(),
             window_id,
         )
     };
+    let tabs = render_tabs(&tabs);
     if closed.is_empty() {
         return;
     }
@@ -935,13 +977,13 @@ pub fn close_others(state: &SharedState, force: bool) {
 /// close paths refusing to take the tab away without `-f`, and the `pinned` class on the strip,
 /// which `chrome/chrome.css` already had colours for.
 pub fn toggle_pin(state: &SharedState) {
-    let tabs = {
+    let snapshot = {
         let mut state = state.lock().expect("state mutex poisoned");
         let index = state.active_tab();
         state.toggle_tab_pinned(index);
-        state.tabs_json()
+        state.tabs_snapshot()
     };
-    crate::ipc::set_tabs(tabs);
+    crate::ipc::set_tabs(render_tabs(&snapshot));
 }
 
 /// `<Alt-m>` — mute or unmute the showing tab.
@@ -954,8 +996,9 @@ pub fn toggle_mute(state: &SharedState) {
         let index = state.active_tab();
         let muted = state.toggle_tab_muted(index);
         let browser = state.active_browser();
-        (muted, browser, state.tabs_json())
+        (muted, browser, state.tabs_snapshot())
     };
+    let tabs = render_tabs(&tabs);
     if let Some(host) = browser.and_then(|browser| browser.host()) {
         host.set_audio_muted(i32::from(muted));
     }
@@ -982,13 +1025,13 @@ pub fn apply_mute(state: &SharedState, index: usize) {
 
 /// Moves the showing tab to `to` in the strip — `gm`, `gJ`, `gK`.
 pub fn move_current(state: &SharedState, to: usize) {
-    let tabs = {
+    let snapshot = {
         let mut state = state.lock().expect("state mutex poisoned");
         let from = state.active_tab();
         state.move_tab(from, to);
-        state.tabs_json()
+        state.tabs_snapshot()
     };
-    crate::ipc::set_tabs(tabs);
+    crate::ipc::set_tabs(render_tabs(&snapshot));
 }
 
 /// Closes the showing tab. Closing the last one closes the window, which is what the plan settled
@@ -1170,11 +1213,11 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     if remaining > 0 {
         // The window it came from shows whatever took its place.
         select_in(state, from_window, old_active);
-        let tabs = state
+        let snapshot = state
             .lock()
             .expect("state mutex poisoned")
-            .tabs_json_in(from_window);
-        crate::ipc::set_tabs_for(from_window, tabs);
+            .tabs_snapshot_in(from_window);
+        crate::ipc::set_tabs_for(from_window, render_tabs(&snapshot));
     } else {
         // It gave away its last tab, so it goes — the same rule `close_current` follows. Only
         // reachable through `:tab-give <id>`; the detaching spelling refuses a single-tab window

@@ -593,12 +593,17 @@ wrap_display_handler! {
             // Which window the tab is in, so a page loading in a background window pushes into that
             // window's bar and strip instead of into whichever one is in front. `None` is not a tab
             // at all — a chrome strip reporting its own bru:// URL.
-            let (window, is_active, tabs) = {
+            // The snapshot is taken under the lock and rendered after it — `render_tabs` can run a
+            // Lua title function, which must never happen with `BruState` held. See its doc.
+            let (window, is_active, snapshot) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
                 let window = state.set_tab_url(id, url.clone());
-                let tabs = window.map(|w| state.tabs_json_in(w)).unwrap_or_default();
-                (window, state.is_active_browser(id), tabs)
+                let snapshot = window.map(|w| state.tabs_snapshot_in(w));
+                (window, state.is_active_browser(id), snapshot)
             };
+            let tabs = snapshot
+                .map(|snapshot| crate::tabs::render_tabs(&snapshot))
+                .unwrap_or_default();
             let Some(window) = window else {
                 return;
             };
@@ -621,12 +626,15 @@ wrap_display_handler! {
             let title = title.map(CefString::to_string).unwrap_or_default();
 
             // The window the tab is in — see `on_address_change` above.
-            let (window, is_active, tabs) = {
+            let (window, is_active, snapshot) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
                 let window = state.set_tab_title(id, title.clone());
-                let tabs = window.map(|w| state.tabs_json_in(w)).unwrap_or_default();
-                (window, state.is_active_browser(id), tabs)
+                let snapshot = window.map(|w| state.tabs_snapshot_in(w));
+                (window, state.is_active_browser(id), snapshot)
             };
+            let tabs = snapshot
+                .map(|snapshot| crate::tabs::render_tabs(&snapshot))
+                .unwrap_or_default();
             let Some(window) = window else {
                 return;
             };

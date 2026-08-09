@@ -3398,9 +3398,12 @@ fn report_fn_error(def: &'static Def, why: &str) {
     }
     eprintln!("bru: {text}");
     // **Posted rather than said here, and this was measured rather than reasoned about.** Said
-    // inline, the browser hung: `tabs_json_in` runs with `BruState`'s mutex held —
-    // `push_tabs_everywhere` takes it and maps every window through it — and `message::error`
+    // inline, the browser hung: the strip was rendered with `BruState`'s mutex held —
+    // `push_tabs_everywhere` took it and mapped every window through it — and `message::error`
     // reaches `ipc::push_bar`, which takes the same mutex to find out which window is in front.
+    // (The rendering has since moved out from under that lock — `tabs::render_tabs` — so this
+    // particular re-entry is gone; the posting stays, because the sink is reachable from other
+    // places that do hold it and because a message is not worth a lock either way.)
     // Seen 2026-08-07 with a `config.lua` whose `tabs.title.format` indexes a nil field: the error
     // printed once, on stderr, during the first window's creation, and nothing after it ever ran.
     // No tab opened, no probe fired, and the process sat there until `--close-after-ms`.
@@ -4237,18 +4240,24 @@ fn time_strip_rebuild(spec: &str) {
         eprintln!("settings-probe: strip: there is no browser state to rebuild a strip from");
         return;
     };
-    let guard = state.lock().expect("state mutex poisoned");
-    let tabs = guard.tab_count();
+    // **The snapshot is taken once, under the lock, and the lock is gone before a single rebuild.**
+    // That is not only the deadlock rule — it is what makes this probe measure the right thing: what
+    // costs per rebuild is reading the settings and calling the title function, not copying four
+    // fields per tab out of the state.
+    let (tabs, snapshot) = {
+        let guard = state.lock().expect("state mutex poisoned");
+        (guard.tab_count(), guard.tabs_snapshot())
+    };
 
     // Kept and summed so that the optimiser cannot decide the loop has no effect, and printed so
     // that a payload which came out empty cannot be read as a fast rebuild.
     let mut bytes = 0usize;
     for _ in 0..iterations.min(50) {
-        bytes += guard.tabs_json().len();
+        bytes += crate::tabs::render_tabs(&snapshot).len();
     }
     let start = std::time::Instant::now();
     for _ in 0..iterations {
-        bytes += guard.tabs_json().len();
+        bytes += crate::tabs::render_tabs(&snapshot).len();
     }
     let elapsed = start.elapsed();
 
@@ -4265,7 +4274,7 @@ fn time_strip_rebuild(spec: &str) {
     // The payload itself, once. A count of nanoseconds says nothing about whether the strip is
     // drawing what the config asked for, and a rebuild that produced the *default* label would be
     // both fast and wrong. This is the same string `push_tabs_everywhere` hands `chrome/top.js`.
-    eprintln!("settings-probe: strip: {}", guard.tabs_json());
+    eprintln!("settings-probe: strip: {}", crate::tabs::render_tabs(&snapshot));
 }
 // --- end setting functions -------------------------------------------------------------------------
 

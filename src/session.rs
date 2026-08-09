@@ -418,7 +418,8 @@ pub fn restore(state: &SharedState, session: &Session, clear: bool, history: boo
         crate::tabs::apply_mute(state, before + offset);
     }
 
-    let tabs = state.lock().expect("state mutex poisoned").tabs_json();
+    let snapshot = state.lock().expect("state mutex poisoned").tabs_snapshot();
+    let tabs = crate::tabs::render_tabs(&snapshot);
     crate::ipc::set_tabs(tabs);
 
     if opened > 0 {
