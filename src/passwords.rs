@@ -123,6 +123,16 @@ pub fn failure(entry: &str, status: Option<i32>, stderr: &[u8]) -> String {
     }
 }
 
+/// The user name an entry carries, which in a `pass` store is its last path segment.
+///
+/// `websites/abv.bg/biserstoilov@abv.bg` is an address, and that is not a coincidence: `pass`'s own
+/// convention — and `keyforge`'s, which wrote this store — is that the leaf names the account. It is
+/// **metadata, not a secret**: it is a filename, world-readable in the store, and bru's own history
+/// already knows the host it belongs to.
+pub fn user_of(entry: &str) -> &str {
+    entry.rsplit('/').next().unwrap_or(entry)
+}
+
 // -----------------------------------------------------------------------------------------------
 // Which entry belongs to which host
 // -----------------------------------------------------------------------------------------------
@@ -413,6 +423,29 @@ mod tests {
              the order is the same twice",
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The account name is the entry's leaf, which in a `pass` store written by `keyforge` is an
+    /// address — and it is metadata: a filename, not a secret.
+    #[test]
+    fn the_account_name_is_the_entrys_last_segment() {
+        assert_eq!(user_of("websites/abv.bg/biserstoilov@abv.bg"), "biserstoilov@abv.bg");
+        assert_eq!(user_of("router"), "router");
+        assert_eq!(user_of("a/b/c/me"), "me");
+    }
+
+    /// **The four words the renderer answers in.** `on_filled` matches on them, so a typo at either
+    /// end is a fill that reports nothing useful; both ends are pinned here.
+    #[test]
+    fn the_renderer_answers_in_four_words() {
+        for word in ["both", "password", "user", "nofield"] {
+            assert!(
+                FILL_JS.contains(&format!("'{word}'")),
+                "{word:?} is not one of the answers the script can give",
+            );
+        }
+        // And neither value is ever in the script: both arrive as arguments.
+        assert!(FILL_JS.starts_with("(function(secret,user)"));
     }
 
     /// **The navigate-away hole, as a test.** Take the host comparison out of `verdict` and the
@@ -707,6 +740,9 @@ wrap_task! {
             };
             if let Some(arguments) = message.argument_list() {
                 arguments.set_string(0, Some(&CefString::from(secret.as_str())));
+                // The account name, so that one command fills the pair a login form is. It is a
+                // path segment and not a secret — see `user_of`.
+                arguments.set_string(1, Some(&CefString::from(user_of(&pending.entry))));
             }
             frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
         }
@@ -729,10 +765,14 @@ pub fn on_filled(message: Option<&ProcessMessage>) -> bool {
         .and_then(|p| p.as_ref().map(|p| p.entry.clone()))
         .unwrap_or_default();
     match verdict.as_str() {
-        "ok" => crate::message::info(&format!("password-fill: filled {entry}")),
-        "notpassword" => crate::message::error(
-            "password-fill: the focused field is not a password field — follow a hint into one \
-             first",
+        "both" => crate::message::info(&format!("password-fill: filled {entry} — name and password")),
+        "password" => crate::message::info(&format!("password-fill: filled {entry} — password only")),
+        "user" => crate::message::info(&format!(
+            "password-fill: filled the name from {entry}, but this form has no password field"
+        )),
+        "nofield" => crate::message::error(
+            "password-fill: nothing is focused that can be typed into — follow a hint into the \
+             form first",
         ),
         _ => crate::message::error("password-fill: the page would not take it"),
     }
@@ -743,20 +783,51 @@ pub fn on_filled(message: Option<&ProcessMessage>) -> bool {
 // The renderer half: the only place that can tell a password field from a search box
 // -----------------------------------------------------------------------------------------------
 
-/// The function the fill calls. **A constant** — the secret is never part of this source; it is
-/// handed over as a V8 argument, so it never appears in any script bru builds.
+/// The function the fill calls. **A constant** — neither the secret nor the account name is ever
+/// part of this source; both are handed over as V8 arguments, so no script bru builds contains
+/// them.
 ///
-/// The native setter rather than `e.value = v`, because a framework that tracks its own inputs
-/// (React's value tracker) ignores a plain assignment and then submits the empty string it thinks
-/// is there. The two events afterwards are what such a framework listens for.
-const FILL_JS: &str = "(function(v){try{\
-var e=document.activeElement;\
-if(!e||e.tagName!=='INPUT'||e.type!=='password'){return 'notpassword';}\
-var d=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');\
-if(d&&d.set){d.set.call(e,v);}else{e.value=v;}\
-e.dispatchEvent(new Event('input',{bubbles:true}));\
-e.dispatchEvent(new Event('change',{bubbles:true}));\
-return 'ok';\
+/// # Why this looks for a *form* and not at the focused element
+///
+/// It began by filling whatever had the focus, once bru had checked through `Domnode` that it was
+/// an `INPUT_PASSWORD`. That check is the strongest one available and it was **defeated by the
+/// first real site it met.** Measured 2026-08-09 on `home.abv.bg`: the field with `id="password"`
+/// is `type="text"` until something is typed into it — the site swaps the type to keep its own
+/// placeholder visible — so at the moment of filling it honestly is not a password field, and bru
+/// honestly refused, five times in a row, while the user watched a login form it would not fill.
+///
+/// So the question moved from "is *this* a password field" to "**what pair does this form hold**",
+/// which is also what the user asked for: invoke it from the address field or from the password
+/// field, and both are filled.
+///
+/// **Say what that costs**, because it is a real weakening. The old rule could not be fooled: it
+/// asked Blink's form-control model. This one reads names and types out of the page, and a page
+/// writes both. What survives of the guarantee is that bru fills only inside the form the focused
+/// element belongs to, and only fields shaped like a login — a page cannot make bru type the
+/// password into a field the user is not standing in.
+const FILL_JS: &str = "(function(secret,user){try{\
+var here=document.activeElement;\
+if(!here||!here.form&&here.tagName!=='INPUT'&&here.tagName!=='TEXTAREA'){return 'nofield';}\
+var scope=here.form||document;\
+var inputs=[].slice.call(scope.querySelectorAll('input'));\
+function looks(e,re){return re.test(e.id||'')||re.test(e.name||'')||re.test(e.getAttribute('autocomplete')||'');}\
+var pw=null,i;\
+for(i=0;i<inputs.length;i++){if(inputs[i].type==='password'){pw=inputs[i];break;}}\
+if(!pw){for(i=0;i<inputs.length;i++){if(looks(inputs[i],/pass|parol|pwd/i)){pw=inputs[i];break;}}}\
+var id=null;\
+for(i=0;i<inputs.length;i++){var e=inputs[i];\
+ if(e===pw){continue;}\
+ if(e.type==='email'||looks(e,/user|mail|login|account|nick/i)){id=e;break;}}\
+if(!id){for(i=0;i<inputs.length;i++){var t=inputs[i];\
+ if(t!==pw&&(t.type==='text'||t.type==='email')&&t.offsetParent!==null){id=t;break;}}}\
+if(!pw&&!id){return 'nofield';}\
+var native=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');\
+function put(e,v){if(!e){return 0;}\
+ if(native&&native.set){native.set.call(e,v);}else{e.value=v;}\
+ e.dispatchEvent(new Event('input',{bubbles:true}));\
+ e.dispatchEvent(new Event('change',{bubbles:true}));return 1;}\
+var n=put(id,user)+put(pw,secret);\
+return n===2?'both':(pw?'password':'user');\
 }catch(x){return 'threw';}})";
 
 /// Renderer side of [`FILL`]. Answers true when the message was ours.
@@ -770,12 +841,17 @@ pub fn renderer_on_fill(frame: Option<&Frame>, message: Option<&ProcessMessage>)
         return false;
     }
     let Some(frame) = frame else { return true };
-    let secret = message
+    let (secret, user) = message
         .argument_list()
-        .map(|arguments| CefString::from(&arguments.string(0)).to_string())
+        .map(|arguments| {
+            (
+                CefString::from(&arguments.string(0)).to_string(),
+                CefString::from(&arguments.string(1)).to_string(),
+            )
+        })
         .unwrap_or_default();
 
-    let mut visitor = FocusedField::new(frame.clone(), secret);
+    let mut visitor = FocusedField::new(frame.clone(), secret, user);
     frame.visit_dom(Some(&mut visitor));
     true
 }
@@ -784,6 +860,7 @@ wrap_domvisitor! {
     struct FocusedField {
         frame: Frame,
         secret: String,
+        user: String,
     }
 
     impl Domvisitor {
@@ -792,15 +869,17 @@ wrap_domvisitor! {
             // page can shadow `document.activeElement`; it cannot shadow Blink's own form-control
             // model. `focus.rs` makes the same argument about `is_editable` and for the same
             // reason: one definition, not two that can disagree.
-            let is_password = document
+            // **Editable, not `INPUT_PASSWORD`** — the narrower question was defeated by a real
+            // site, and the user fills from the address field as often as from the password one.
+            // See `FILL_JS` for the measurement and for what the widening costs. What `Domnode`
+            // still guarantees, and JavaScript could not, is that the user is standing in a field
+            // at all: a page cannot make bru fill a form nobody is in.
+            let in_a_field = document
                 .and_then(|document| document.focused_node())
-                .map(|node| {
-                    node.is_form_control_element() != 0
-                        && node.form_control_element_type() == DomFormControlType::INPUT_PASSWORD
-                })
+                .map(|node| node.is_editable() != 0)
                 .unwrap_or(false);
 
-            let answer = if is_password { self.inject() } else { "notpassword".to_string() };
+            let answer = if in_a_field { self.inject() } else { "nofield".to_string() };
 
             let Some(mut reply) = process_message_create(Some(&CefString::from(FILLED))) else {
                 return;
@@ -834,9 +913,10 @@ impl FocusedField {
         let answer = if built != 0 {
             match value {
                 Some(function) => {
-                    let arguments = vec![v8_value_create_string(Some(&CefString::from(
-                        self.secret.as_str(),
-                    )))];
+                    let arguments = vec![
+                        v8_value_create_string(Some(&CefString::from(self.secret.as_str()))),
+                        v8_value_create_string(Some(&CefString::from(self.user.as_str()))),
+                    ];
                     match function.execute_function(None, Some(&arguments)) {
                         Some(result) => CefString::from(&result.string_value()).to_string(),
                         None => "threw".to_string(),

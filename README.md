@@ -775,8 +775,9 @@ so each is here only when something is actually asking for it. Only `fetch` is w
 
 ## Passwords
 
-`:password-fill` puts a password into the focused password field. bru stores nothing and generates
-nothing: it runs whatever your password manager's command is and reads the secret off its **stdout**.
+`:password-fill` fills a login form — the account name and the password together — from whatever
+password manager you use. bru stores nothing and generates nothing: it runs your manager's command
+and reads the secret off its **stdout**.
 
 ```lua
 bru.set("passwords.show", "pass show {}")     -- the default
@@ -801,9 +802,17 @@ path contains it: `websites/abv.bg/me` answers for `abv.bg` and for `www.abv.bg`
 credentials are issued per domain and used on subdomains. One match fills, several open the
 completion, none says so and names the host it looked for. `:password-fill <entry>` skips all of it.
 
-**Focus the field first** — follow a hint into it. bru refuses to fill anything that is not a
-password field, and it asks CEF's own form-control model rather than the page: a page can shadow
-`document.activeElement`, and it cannot shadow that.
+**Focus either field first** — follow a hint into the address field or into the password one, then
+`<Escape>` back to normal; the field keeps the focus. One command fills both: the password from the
+store, and the account name from the entry's last path segment, which in a `pass` store written by
+`keyforge` is the address (`websites/abv.bg/biserstoilov@abv.bg` → `biserstoilov@abv.bg`).
+
+bru fills only inside the form the focused element belongs to, so a page cannot make it type a
+password into a form nobody is standing in. It does **not** insist the focused field be
+`type=password`, and that is not laziness: measured 2026-08-09 on `home.abv.bg`, the field with
+`id="password"` is `type="text"` until something is typed into it — the site swaps the type to keep
+its own placeholder — so the strictest possible check refused a real login form five times in a
+row. The narrower rule was correct and useless.
 
 ### What is claimed, and what is not
 
