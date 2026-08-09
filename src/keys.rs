@@ -221,6 +221,18 @@ wrap_keyboard_handler! {
             }
             // --- end src/caret.rs -----------------------------------------------------------
 
+            // The press itself, which is the event every verdict is decided on and the one
+            // `swallow_rest_of_press` cannot print — it only ever sees the other three. Without
+            // this line a key that "does nothing" leaves no trace at all, and the only evidence is
+            // `pending` on the key-up, which reads the same whether the press was refused or never
+            // arrived. That ambiguity cost a full round of guessing on the Escape of 2026-08-09.
+            let mode_now = window.map(|window| {
+                self.state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .mode_in(window)
+            });
+
             let Some(outcome) = self
                 .state
                 .lock()
@@ -228,8 +240,19 @@ wrap_keyboard_handler! {
                 .handle_key(info)
             else {
                 // No bindings loaded: not the browser process, or before startup finished.
+                if std::env::var_os("BRU_DEBUG_KEYS").is_some() {
+                    eprintln!("bru[keys]: RAWKEYDOWN {info:?} mode={mode_now:?} -> no bindings");
+                }
                 return 0;
             };
+
+            if std::env::var_os("BRU_DEBUG_KEYS").is_some() {
+                eprintln!(
+                    "bru[keys]: RAWKEYDOWN {info:?} mode={mode_now:?} chrome={chrome_key} \
+                     -> {:?}",
+                    outcome.action,
+                );
+            }
 
             // The half-typed chain and count, the way qutebrowser's keystring widget shows them.
             crate::ipc::set_keystring(outcome.keystring.clone());
