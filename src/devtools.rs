@@ -39,11 +39,42 @@ pub fn trace(what: &str) {
     }
 }
 
+/// The browser these commands act on: **the tab that is showing, never the browser the key arrived
+/// at.**
+///
+/// A key can reach bru from any browser in the window that has focus, and after `:devtools` docks a
+/// panel the thing holding focus is often the divider strip beside it — a `bru://` page with a
+/// browser of its own. Measured 2026-08-09 by pressing `wi` and then `wIl`: the first arrived with
+/// the tab (browser 2), the second with the divider (browser 5). Every "is one already docked?"
+/// question compares against the browser being *inspected*, so it answered no, and `wIl` went down
+/// the **open** path — asking for an inspector of the divider, whose view carries a chrome delegate,
+/// so CEF gave it a window of its own. What the user saw was a new window where a move was asked
+/// for, and nothing in the trace looked wrong until the browser ids were read.
+///
+/// An inspector is a thing you open on a **page**, so that is what these resolve to. Trap 11 makes
+/// the same correction for scrolling, for the same reason: a key that lands on chrome still means
+/// the page.
+fn for_page(browser: &mut Browser) -> Option<Browser> {
+    let state = crate::state::BruState::instance()?;
+    let mut guard = state.lock().expect("state mutex poisoned");
+    // `window_of_browser` already answers for a chrome browser as well as a tab — the divider is
+    // one — so this finds the right window whichever of the two the key came from. The fallback is
+    // the current window, for a browser that belongs to no window at all.
+    let window = guard
+        .window_of_browser(browser.identifier())
+        .or_else(|| guard.current_window_id())?;
+    guard.active_browser_in(window)
+}
+
 /// `devtools [position]` — open the inspector, or close it if it is already open.
 ///
 /// qutebrowser's is a toggle (`browsertab.py:946`, "Show/hide (and if needed, create) the web
 /// inspector for this tab"), so this is too.
 pub fn toggle(browser: &mut Browser, wanted: Option<Place>) {
+    let Some(mut page) = for_page(browser) else {
+        return;
+    };
+    let browser = &mut page;
     let Some(host) = browser.host() else {
         return;
     };
@@ -158,6 +189,10 @@ pub fn toggle(browser: &mut Browser, wanted: Option<Place>) {
 /// panel is hiding it; the browser behind it goes when its tab or its window does. A panel in its
 /// own window is CEF's entirely and closes the ordinary way.
 pub fn close(browser: &mut Browser) {
+    let Some(mut page) = for_page(browser) else {
+        return;
+    };
+    let browser = &mut page;
     let Some(host) = browser.host() else {
         return;
     };
@@ -211,6 +246,28 @@ fn show_docked(state: &crate::tabs::SharedState, window_id: u32) {
     child.invalidate_layout();
     View::from(&window).invalidate_layout();
     window.layout();
+    focus_page(state, window_id);
+}
+
+/// Put the keyboard back on the page after the layout has moved.
+///
+/// **A docked inspector is a browser with no client, so a key pressed while it holds focus never
+/// reaches bru at all.** Measured 2026-08-09: `wi` docked at the bottom, `wIl` moved it to the right
+/// — and `wIj` after that did nothing whatsoever, no trace line, because re-parenting the views had
+/// left focus inside the panel. The command was never called; the key went into the DevTools
+/// front-end, which is exactly what having no client is *for* when you are typing in the console,
+/// and exactly wrong the instant the panel is placed rather than used.
+///
+/// So every placement ends with the page holding focus. The divider's drag already does this at
+/// `pointerup` for the same reason.
+fn focus_page(state: &crate::tabs::SharedState, window_id: u32) {
+    let page = state
+        .lock()
+        .expect("state mutex poisoned")
+        .active_view_in(window_id);
+    if let Some(page) = page {
+        View::from(&page).request_focus();
+    }
 }
 
 /// Move a docked inspector from one container to the other — `bottom` to `right` and back.
@@ -284,6 +341,7 @@ fn move_docked(state: &crate::tabs::SharedState, window_id: u32, place: Place) {
     child.invalidate_layout();
     View::from(&window).invalidate_layout();
     window.layout();
+    focus_page(state, window_id);
     trace(&format!("move: {was:?} -> {place:?}"));
 }
 
@@ -438,6 +496,10 @@ fn dock(
         "dock: added at {}, bounds {}x{}",
         index, bounds.width, bounds.height
     ));
+    // The page keeps the keyboard, so the next key still reaches bru — see `focus_page`. Typing
+    // *into* the panel is a click away, and that is `devtools-focus`'s job rather than an accident
+    // of where a view landed.
+    focus_page(state, window_id);
     true
 }
 
@@ -533,6 +595,7 @@ fn flip(state: &crate::tabs::SharedState, window_id: u32, inspects: i32) -> Opti
     child.invalidate_layout();
     View::from(&window).invalidate_layout();
     window.layout();
+    focus_page(state, window_id);
     Some(!showing)
 }
 
@@ -989,7 +1052,10 @@ pub fn docking() -> bool {
 /// `devtools-focus` on a tab whose inspector was never opened therefore opens it, which is the
 /// friendlier of the two readings of a binding whose whole purpose is to get you there.
 pub fn focus(browser: &mut Browser) {
-    let Some(host) = browser.host() else {
+    let Some(page) = for_page(browser) else {
+        return;
+    };
+    let Some(host) = page.host() else {
         return;
     };
     open(&host);
