@@ -1344,6 +1344,37 @@ mod tests {
     /// It does not survive a rename — renaming `screenshot` in the parser and here together passes,
     /// and so it should, but so does renaming it in both while every other mention of it stays. The
     /// colour test in `src/chrome.rs` says the same thing about itself, and it is the honest limit
+    /// **The README counts what this binary has, or the build fails.**
+    ///
+    /// `:help` is generated and cannot drift; the README is written by hand and did. Before
+    /// 2026-08-09 it advertised "288 default bindings, 166 commands, 67 settings" at a browser with
+    /// 173 and 68 — nobody noticed, because nothing was checking. The three numbers are the
+    /// headline claim of the file, so they are the three this pins; a command added without a line
+    /// in the README now fails here rather than in a reader's expectations.
+    #[test]
+    fn the_readme_counts_what_this_binary_has() {
+        let readme = include_str!("../README.md");
+        let expected = format!(
+            "**{} default bindings, {} commands, {} settings.**",
+            crate::config::Bindings::defaults().all().len(),
+            COMMANDS.iter().map(|doc| doc.names.len()).sum::<usize>(),
+            crate::settings::SETTINGS.len(),
+        );
+        assert!(
+            readme.contains(&expected),
+            "the README does not say {expected:?} — raise its numbers with the code",
+        );
+
+        // And every command has to be *named* somewhere in it, not merely counted. The tables are
+        // generated from `COMMANDS`, so this is the check that they were regenerated.
+        let undocumented: Vec<&str> = COMMANDS
+            .iter()
+            .flat_map(|doc| doc.names.iter().copied())
+            .filter(|name| !readme.contains(&format!("`{name}`")))
+            .collect();
+        assert!(undocumented.is_empty(), "the README names none of these: {undocumented:?}");
+    }
+
     /// of reading source as text.
     #[test]
     fn every_command_bru_understands_has_a_row() {
