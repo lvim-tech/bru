@@ -164,15 +164,28 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "gU", "navigate up -t"),
     ("normal", "<Ctrl-A>", "navigate increment"),
     ("normal", "<Ctrl-X>", "navigate decrement"),
-    // **One key for the inspector, where qutebrowser has seven.** Its `wIh`, `wIj`, `wIk` and `wIl`
-    // dock the inspector to a side and `wIw` gives it a window; CEF has no docked inspector to
-    // offer, so all five opened the same window and four of them promised a placement that could
-    // not happen — see `devtools.rs`, which carries the quote from the C API. `wIf`
-    // (`devtools-focus`) went with them: it differs from `wi` only in refusing to close what is
-    // already open, which is not worth a second key on a toggle. Both commands are still there and
-    // still take their arguments, so a line copied out of a `config.py` keeps working; what is
-    // gone is bru pretending in its own defaults that the position means something.
+    // **Six keys for the inspector, where qutebrowser has seven, and the missing one is missing on
+    // purpose.**
+    //
+    // There was one key here for a while. All seven went when it turned out CEF handed bru no docked
+    // inspector at all: five of them named a placement that could not happen, and a key that
+    // promises a position and opens a window is a key that lies. That reading was wrong — the
+    // inspector *is* handed over as a view and bru had only to place it (CEF-NOTES traps 24–26) — so
+    // `bottom`, `right` and `window` all draw now, and the keys that name them can come back.
+    //
+    // `wIh` (left) and `wIk` (top) do **not** come back. They are the same two pieces of arithmetic
+    // as the two that work — an insertion index and a sign — and the nested panel makes them
+    // possible, but neither has been built or run, and this table does not bind what has not been
+    // tried.
+    //
+    // `wIc` is bru's own: qutebrowser has no close command, so it has no key for one. The letter was
+    // free in this family and reads as what it does.
     ("normal", "wi", "devtools"),
+    ("normal", "wIj", "devtools bottom"),
+    ("normal", "wIl", "devtools right"),
+    ("normal", "wIw", "devtools window"),
+    ("normal", "wIc", "devtools-close"),
+    ("normal", "wIf", "devtools-focus"),
     ("normal", "gd", "download"),
     ("normal", "ad", "download-cancel"),
     ("normal", "cd", "download-clear"),
@@ -1329,13 +1342,14 @@ mod tests {
         // **299, not 298.** qutebrowser's table is 298; the extra one is bru's own `ts`
         // (`styles-toggle`), which qutebrowser has no command for. A number that grows is a number
         // that has to say which of the two it is counting.
-        // **281 since the twelve `t**` rows went** — six for `content.plugins` and six for
-        // `content.cookies.accept`, two settings bru does not have and will not, so the keys said
-        // why they did nothing rather than doing anything. A key that only explains itself is a key
-        // that does nothing, and the table now holds only keys that act. (293 before those; 299
-        // before the inspector kept one key of seven.) A number that shrinks has to say why as
-        // plainly as one that grows.
-        assert_eq!(total, 281, "the default table is not the one transcribed from configdata.yml");
+        // **286 since the inspector got five of its keys back** — `wIj`, `wIl`, `wIw`, `wIc` and
+        // `wIf`, once `bottom`, `right` and `window` all drew and there was a close command to bind.
+        // Before that: 281, after the twelve `t**` rows went — six for `content.plugins` and six for
+        // `content.cookies.accept`, two settings bru does not have and will not, so those keys said
+        // why they did nothing rather than doing anything. 293 before those; 299 before the
+        // inspector was cut to one key. A number that moves has to say why as plainly in both
+        // directions.
+        assert_eq!(total, 286, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1348,8 +1362,8 @@ mod tests {
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
         // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
-        // **172: 184 less the twelve `t**` rows, which named two settings bru does not have.**
-        assert_eq!(bindings.len(Mode::Normal), 172);
+        // **177: 172 plus the five inspector keys that came back.**
+        assert_eq!(bindings.len(Mode::Normal), 177);
         assert_eq!(bindings.len(Mode::Insert), 4);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
@@ -1647,7 +1661,7 @@ mod tests {
             "a syntax error means nothing in the file ran, so J is still the default"
         );
         assert_eq!(config.bindings.command_for(Mode::Normal, "j"), Some("scroll down"));
-        assert_eq!(config.bindings.len(Mode::Normal), 172);
+        assert_eq!(config.bindings.len(Mode::Normal), 177);
     }
 
     #[test]
