@@ -67,6 +67,24 @@
     }
 
     window.bru = {
+        // --- src/prompt.rs ------------------------------------------------
+        // **Rust asks this document, because the input it asks about is in
+        // this document.** `ipc::ask_prompt` runs `window.bru.promptAccept()`
+        // in the panel's frame — and this object had only `render`, so the
+        // guard `window.bru.promptAccept && …` was false and `<Return>` did
+        // nothing at all: no save, no close, no error. The wrapper existed in
+        // `bottom.js`, where `#prompt` used to live before it and the
+        // completion table were given a view of their own.
+        //
+        // Forwarded rather than implemented here for the reason bottom.js gave
+        // when it held it: `prompt.js` owns that input, and this file does not
+        // know which of a login's two fields has the focus.
+        promptAccept: function () {
+            if (window.bruPrompt) {
+                window.bruPrompt.promptAccept();
+            }
+        },
+        // --- end src/prompt.rs --------------------------------------------
         render: function (state) {
             state = state || {};
             if (window.bruCompletion) {

@@ -276,9 +276,26 @@ wrap_keyboard_handler! {
                             || crate::prompt::takes_typing(window))
                     // --- end src/prompt.rs ------------------------------------------------------
                 });
-                let forward = in_command_mode
-                    && crate::ipc::is_bottom_chrome_browser(browser_id)
-                    && crate::cmdline::types_into_cmdline(&info);
+                // **Which document holds the field decides which browser may have the letter.**
+                // `#cmdline` is in `bottom.html` and `#prompt` is in `panel.html` — they were one
+                // view until the completion table and the prompt were given their own, and this
+                // check was not moved with them. So a file prompt drew a caret, focused its input,
+                // and never received a character: every key was swallowed here because the panel is
+                // not the bottom strip.
+                let types_here = window.is_some_and(|window| {
+                    let mode = self
+                        .state
+                        .lock()
+                        .expect("state mutex poisoned")
+                        .mode_in(window);
+                    if mode == crate::modes::Mode::Prompt {
+                        crate::ipc::is_panel_chrome_browser(browser_id)
+                    } else {
+                        crate::ipc::is_bottom_chrome_browser(browser_id)
+                    }
+                });
+                let forward =
+                    in_command_mode && types_here && crate::cmdline::types_into_cmdline(&info);
                 if std::env::var_os("BRU_DEBUG_KEYS").is_some() {
                     eprintln!(
                         "bru[keys]: {info:?} on chrome browser {browser_id} -> {}",

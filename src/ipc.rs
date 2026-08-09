@@ -1129,6 +1129,19 @@ pub fn panel_chrome_browser_for(window: u32) -> Option<Browser> {
     panel_frame_for(window).and_then(|frame| frame.browser())
 }
 
+/// Give the panel keyboard focus, so the prompt's own `<input>` receives what is typed.
+///
+/// The sibling of [`focus_bottom_chrome`], and the two are not interchangeable: `#cmdline` is in
+/// `bottom.html` and `#prompt` is in `panel.html`. Focusing the wrong one delivers every key to a
+/// document with no field in it, which looks exactly like a browser that has stopped responding.
+pub fn focus_panel_chrome(window: u32) {
+    if let Some(browser) = panel_chrome_browser_for(window) {
+        if let Some(host) = browser.host() {
+            host.set_focus(1);
+        }
+    }
+}
+
 fn bottom_frame_for(window: u32) -> Option<Frame> {
     let chrome = chrome().lock().ok()?;
     chrome
@@ -1165,6 +1178,28 @@ pub fn is_bottom_chrome_browser(identifier: i32) -> bool {
         entry
             .frames
             .bottom
+            .as_ref()
+            .and_then(|frame| frame.browser())
+            .map(|browser| browser.identifier() == identifier)
+            .unwrap_or(false)
+    })
+}
+
+/// Whether `identifier` is a window's **panel** browser — the view holding the completion table and
+/// the prompt's own `<input>`.
+///
+/// The sibling of [`is_bottom_chrome_browser`], and the two answer for two different documents:
+/// `#cmdline` is in `bottom.html`, `#prompt` is in `panel.html`. Asking the wrong one is how every
+/// key typed at a file prompt came to be swallowed — the key path forwarded letters only to the
+/// bar, which no longer holds the field they were meant for.
+pub fn is_panel_chrome_browser(identifier: i32) -> bool {
+    let Ok(chrome) = chrome().lock() else {
+        return false;
+    };
+    chrome.iter().any(|entry| {
+        entry
+            .frames
+            .panel
             .as_ref()
             .and_then(|frame| frame.browser())
             .map(|browser| browser.identifier() == identifier)
