@@ -28,6 +28,19 @@ struct Docked {
     /// The inspector's *own* browser, learned from the view the moment it is docked. It is what
     /// `on_before_close` sees when the panel is closed by its own button rather than by `:devtools`.
     browser_id: Option<i32>,
+    /// The strip above it that resizes it, made with it and going with it.
+    ///
+    /// Held here rather than beside it so the two cannot drift: every place that shows, hides or
+    /// removes the inspector has the divider in the same hand, and there is no window state in
+    /// which one exists without the other.
+    divider: Option<BrowserView>,
+    /// The inspector's height when the pointer went down on the divider, in DIP.
+    ///
+    /// The drag reports how far the pointer has moved **from where it started**, so the height it
+    /// asks for is this number minus that distance — which is why the start has to be kept. `None`
+    /// when no drag is in progress; a `drag` phase that arrives without a `start` is ignored rather
+    /// than guessed at.
+    drag_from: Option<i32>,
 }
 // --- end src/devtools.rs -------------------------------------------------------------------------
 
@@ -293,10 +306,17 @@ impl BruState {
 
     /// Remember the inspector now under this window's pages. Replaces whatever was there, which is
     /// what a second `:devtools` in a window with one already docked means.
-    pub fn set_inspector(&mut self, id: u32, view: BrowserView, inspects: i32) {
+    pub fn set_inspector(
+        &mut self,
+        id: u32,
+        view: BrowserView,
+        inspects: i32,
+        divider: Option<BrowserView>,
+    ) {
         let browser_id = view.browser().map(|browser| browser.identifier());
         if let Some(slot) = self.slot_mut(id) {
-            slot.devtools = Some(Docked { view, inspects, browser_id });
+            slot.devtools =
+                Some(Docked { view, inspects, browser_id, divider, drag_from: None });
         }
     }
 
@@ -312,6 +332,45 @@ impl BruState {
         self.slot_mut(id)
             .and_then(|slot| slot.devtools.take())
             .map(|docked| docked.view)
+    }
+
+    /// The divider strip above this window's docked inspector, if one is docked.
+    pub fn divider_in(&self, id: u32) -> Option<BrowserView> {
+        self.slot(id)
+            .and_then(|slot| slot.devtools.as_ref())
+            .and_then(|docked| docked.divider.clone())
+    }
+
+    /// Which window's divider strip is drawn by `identifier`, if any.
+    ///
+    /// A drag arrives as a query from the divider's own browser and has to name a window before it
+    /// can name a height. Asked by `devtools::on_divider_query`.
+    pub fn window_of_divider(&self, identifier: i32) -> Option<u32> {
+        self.windows
+            .iter()
+            .find(|slot| {
+                slot.devtools
+                    .as_ref()
+                    .and_then(|docked| docked.divider.as_ref())
+                    .and_then(|view| view.browser())
+                    .map(|browser| browser.identifier())
+                    == Some(identifier)
+            })
+            .map(|slot| slot.id)
+    }
+
+    /// Remember the height a drag started from, or forget it when the drag ends.
+    pub fn set_drag_from(&mut self, id: u32, height: Option<i32>) {
+        if let Some(docked) = self.slot_mut(id).and_then(|slot| slot.devtools.as_mut()) {
+            docked.drag_from = height;
+        }
+    }
+
+    /// The height the drag in progress started from, if one is in progress.
+    pub fn drag_from(&self, id: u32) -> Option<i32> {
+        self.slot(id)
+            .and_then(|slot| slot.devtools.as_ref())
+            .and_then(|docked| docked.drag_from)
     }
 
     /// Which window holds an inspector whose own browser is `identifier`, if any. What
@@ -565,6 +624,19 @@ impl BruState {
             .and_then(|tab| tab.browser_id)?;
         self.browser_with_id(id)
     }
+
+    // --- src/devtools.rs ------------------------------------------------------------------------
+    /// The `BrowserView` of the tab showing in a named window.
+    ///
+    /// Two things a drag needs and cannot get from the browser: how tall the page is right now,
+    /// which is half of what the divider is allowed to divide, and something to hand the keyboard
+    /// back to when the button comes up.
+    pub fn active_view_in(&self, window: u32) -> Option<BrowserView> {
+        self.slot(window)
+            .and_then(|slot| slot.tabs.get(slot.active))
+            .map(|tab| tab.view.clone())
+    }
+    // --- end src/devtools.rs --------------------------------------------------------------------
 
     /// Any live browser by identifier. `active_browser` is the common case; saving a session needs
     /// every tab's browser, because a navigation list can only be read from the browser that holds

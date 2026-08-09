@@ -57,6 +57,109 @@ body[data-view="panel"] {
     display: block;
 }
 
+/* The inspector's divider ---------------------------------------- src/devtools.rs
+ *
+ * Six pixels between the pages and the docked inspector, and every one of them
+ * is a grab target — which is why there is nothing in here to click instead.
+ * The height is not set here: the view is six pixels tall because its delegate
+ * says so, and a height in CSS would be a second opinion that cannot win.
+ *
+ * `ns-resize` is the cursor Chromium draws for a horizontal splitter, and it is
+ * what the page asks for; whether the compositor shows it over a CEF view on
+ * Wayland is not something CSS decides. If it does not, the strip still drags.
+ *
+ * `--completion-border` rather than a colour of its own: it is the same line the
+ * completion table draws between itself and the bar, doing the same job of
+ * separating two areas that both have content. */
+body[data-view="divider"] {
+    height: 100%;
+    cursor: ns-resize;
+    background: var(--bg);
+    /* Every pixel of this document is a grab target, so nothing in it may take a
+     * selection or start a native drag on the way past. */
+    user-select: none;
+    -webkit-user-drag: none;
+    overflow: hidden;
+}
+
+/* The line, at rest: the whole of a twelve-pixel strip is background and this is
+ * the two pixels in the middle of it that read as an edge. Fixed rather than
+ * flowed, so the same element can be moved by `top` while the view is expanded
+ * without the layout underneath it changing meaning. */
+body[data-view="divider"] #split {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: 5px;
+    height: 2px;
+    background: var(--completion-border);
+}
+
+/* The two fields of the preview. Nothing at rest — a twelve-pixel strip has no
+ * room for them and nothing to say — and the whole picture while dragging. */
+body[data-view="divider"] #above,
+body[data-view="divider"] #below {
+    display: none;
+}
+
+/* Dragging: the view now covers everything the page and the inspector shared, and
+ * this document draws what the split will be. A schematic, deliberately: a
+ * preview that tried to look like the content would be a picture of something
+ * that is not there.
+ *
+ * **The two fields must not be the same colour**, which is the whole reason they
+ * are named separately here. The first version used --completion-category-bg for
+ * the lower one and that token is defined as `var(--bg)` — the same colour as the
+ * upper one — so the preview drew a single flat area with a label at each end and
+ * read as "everything disappeared". --completion-odd-bg is the completion table's
+ * own alternating row, which exists precisely to be distinguishable from --bg. */
+body[data-view="divider"].dragging #above,
+body[data-view="divider"].dragging #below {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    align-items: center;
+    justify-content: center;
+    gap: 0.6em;
+    color: var(--ui-fg-dim);
+    font-family: var(--chrome-font-family);
+    font-size: var(--chrome-font-size);
+    overflow: hidden;
+}
+
+body[data-view="divider"].dragging #above {
+    top: 0;
+    background: var(--bg);
+}
+
+body[data-view="divider"].dragging #below {
+    bottom: 0;
+    background: var(--completion-odd-bg);
+}
+
+/* The height each field will have, beside its name. The number is the point of a
+ * preview: it is what `:set devtools.height?` will answer after the release. */
+body[data-view="divider"] .px {
+    color: var(--completion-category-fg);
+}
+
+/* The boundary, while dragging: a foreground colour rather than a background one,
+ * because it is the thing being moved and it has to read against both fields. */
+/* The boundary, while dragging. **As thick as the strip really is**, set from
+ * JavaScript out of the number Rust sends, with the visible line down its middle:
+ * a preview whose band is thinner than the strip it previews is a preview that
+ * shows the wrong split. Transparent either side of the line, so the two fields
+ * meet it exactly. */
+body[data-view="divider"].dragging #split {
+    background: linear-gradient(
+        to bottom,
+        var(--bg) 0 5px,
+        var(--ui-fg) 5px 7px,
+        var(--bg) 7px 100%
+    );
+}
+
 /* Scrollbars --------------------------------------------------- src/scrollbar.rs
  *
  * Every scrollbar on a bru:// page, including the one down the side of

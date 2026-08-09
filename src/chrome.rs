@@ -48,6 +48,10 @@ const DEFAULT_THEME_CSS: &str = include_str!("../chrome/theme.css");
 const PANEL_HTML: &[u8] = include_bytes!("../chrome/panel.html");
 const PANEL_JS: &[u8] = include_bytes!("../chrome/panel.js");
 // --- end src/window.rs: the panel --------------------------------------------------------------
+// --- src/devtools.rs ---------------------------------------------------------------------------
+const DIVIDER_HTML: &[u8] = include_bytes!("../chrome/divider.html");
+const DIVIDER_JS: &[u8] = include_bytes!("../chrome/divider.js");
+// --- end src/devtools.rs -----------------------------------------------------------------------
 
 /// Called from `App::on_register_custom_schemes`, which runs in **every** process — browser,
 /// renderer, GPU, zygote. A renderer that never heard of `bru://` treats it as an opaque origin and
@@ -138,6 +142,10 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/panel.html" => Some(("text/html", PANEL_HTML.to_vec())),
         "/panel.js" => Some(("text/javascript", PANEL_JS.to_vec())),
 // --- end src/window.rs: the panel ------------------------------------------
+// --- src/devtools.rs -------------------------------------------------------
+        "/divider.html" => Some(("text/html", DIVIDER_HTML.to_vec())),
+        "/divider.js" => Some(("text/javascript", DIVIDER_JS.to_vec())),
+// --- end src/devtools.rs ---------------------------------------------------
         "/theme.css" => Some(("text/css", theme_css())),
 // --- src/chrome.rs: themes -------------------------------------------------
         // **The vocabulary a theme has to speak, as a file.** 141 declarations, of which

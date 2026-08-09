@@ -162,6 +162,19 @@ fn dock(
         return false;
     };
     trace(&format!("dock: window found, {tabs} tabs"));
+    // **The divider is made before the inspector is placed, and inserted above it.** Both go in at
+    // the same index in turn — the divider first, then the inspector at one past it — so the pair
+    // arrives in the layout in the order they are drawn, and there is no moment at which a docked
+    // inspector has no strip to resize it.
+    let divider = crate::window::divider_view(state, window_id);
+    let index = crate::window::leading_strip_count() + tabs as i32;
+    if let Some(divider) = divider.as_ref() {
+        let mut strip = View::from(divider);
+        if let Some(layout) = layout.as_ref() {
+            layout.set_flex_for_view(Some(&mut strip), 0);
+        }
+        window.add_child_view_at(Some(&mut strip), index);
+    }
     let mut child = View::from(view);
     trace(&format!("dock: layout handle present={}", layout.is_some()));
     // **Flex before the child is placed**, which is what `on_window_created` does for the three
@@ -172,7 +185,7 @@ fn dock(
     }
     window.add_child_view_at(
         Some(&mut child),
-        crate::window::leading_strip_count() + tabs as i32,
+        index + i32::from(divider.is_some()),
     );
     if let Some(layout) = layout.as_ref() {
         // **Flex 0, exactly as the chrome strips have it**, which is what makes `devtools.height`
@@ -184,10 +197,12 @@ fn dock(
         // a child that has not said 0 is a child that can be handed a share of the leftover.
         layout.set_flex_for_view(Some(&mut child.clone()), INSPECTOR_FLEX);
     }
-    state
-        .lock()
-        .expect("state mutex poisoned")
-        .set_inspector(window_id, view.clone(), inspects);
+    state.lock().expect("state mutex poisoned").set_inspector(
+        window_id,
+        view.clone(),
+        inspects,
+        divider,
+    );
     // **`invalidate_layout` on the child and on the window, in that order** — the recipe
     // `prompt.rs::resize_bar` already uses to change a strip's height while the window is up. A
     // bare `window.layout()` lays out with sizes that were cached before this child existed.
@@ -206,9 +221,7 @@ fn dock(
     let bounds = View::from(view).bounds();
     trace(&format!(
         "dock: added at {}, bounds {}x{}",
-        crate::window::leading_strip_count() + tabs as i32,
-        bounds.width,
-        bounds.height
+        index, bounds.width, bounds.height
     ));
     true
 }
@@ -222,9 +235,11 @@ fn dock(
 /// times out of three. A view whose browser Chromium is still tearing down is not a view to take
 /// out of a layout by hand; `on_browser_destroyed` is CEF saying it is finished with it.
 pub fn undock(state: &crate::tabs::SharedState, window_id: u32) {
-    let (window, view) = {
+    let (window, view, divider) = {
         let mut state = state.lock().expect("state mutex poisoned");
-        (state.window_handle(window_id), state.take_inspector(window_id))
+        // Read before the take: `take_inspector` drops the record the divider is held in.
+        let divider = state.divider_in(window_id);
+        (state.window_handle(window_id), state.take_inspector(window_id), divider)
     };
     let (Some(window), Some(view)) = (window, view) else {
         return;
@@ -235,20 +250,27 @@ pub fn undock(state: &crate::tabs::SharedState, window_id: u32) {
     // ruled out the clean-shutdown explanation. One turn of the UI loop later the teardown has
     // finished and the same three calls are safe. The view is refcounted and the task holds a
     // clone, so it cannot be freed underneath the task.
-    let mut task = Undock::new(window, view);
+    let mut task = Undock::new(window, view, divider);
     post_task(ThreadId::UI, Some(&mut task));
 }
 
+// The divider goes out with the inspector, in the same posted turn: a strip left behind would be
+// six pixels of chrome between the page and the status bar with nothing under it to resize. No doc
+// comments on these fields — `wrap_task!` takes none.
 wrap_task! {
     struct Undock {
         window: Window,
         view: BrowserView,
+        divider: Option<BrowserView>,
     }
 
     impl Task {
         fn execute(&self) {
             trace("undock: removing the view");
             self.window.remove_child_view(Some(&mut View::from(&self.view)));
+            if let Some(divider) = self.divider.as_ref() {
+                self.window.remove_child_view(Some(&mut View::from(divider)));
+            }
             View::from(&self.window).invalidate_layout();
             self.window.layout();
         }
@@ -260,17 +282,21 @@ wrap_task! {
 /// Answers the new visibility, or `None` when this window has no inspector for that browser — which
 /// is the signal to open one.
 fn flip(state: &crate::tabs::SharedState, window_id: u32, inspects: i32) -> Option<bool> {
-    let (view, window) = {
+    let (view, divider, window) = {
         let state = state.lock().expect("state mutex poisoned");
         let (view, for_browser) = state.inspector_in(window_id)?;
         if for_browser != inspects {
             return None;
         }
-        (view, state.window_handle(window_id)?)
+        (view, state.divider_in(window_id), state.window_handle(window_id)?)
     };
     let child = View::from(&view);
     let showing = child.is_visible() != 0;
     child.set_visible(i32::from(!showing));
+    // The strip goes with the panel it resizes, both ways.
+    if let Some(divider) = divider.as_ref() {
+        View::from(divider).set_visible(i32::from(!showing));
+    }
     child.invalidate_layout();
     View::from(&window).invalidate_layout();
     window.layout();
@@ -283,14 +309,22 @@ fn flip(state: &crate::tabs::SharedState, window_id: u32, inspects: i32) -> Opti
 /// a page it knows nothing about. Called from `tabs::select`, after the tab views themselves have
 /// been shown and hidden.
 pub fn follow_tab(state: &crate::tabs::SharedState, window_id: u32, showing: Option<i32>) {
-    let (view, inspects) = {
+    let (view, inspects, divider) = {
         let state = state.lock().expect("state mutex poisoned");
         match state.inspector_in(window_id) {
-            Some((view, inspects)) => (view, inspects),
+            Some((view, inspects)) => (view, inspects, state.divider_in(window_id)),
             None => return,
         }
     };
-    View::from(&view).set_visible(i32::from(showing == Some(inspects)));
+    // **Whether the panel is on screen is not the same question as whether it was open.** A panel
+    // hidden by `:devtools` and a panel hidden by leaving its tab both answer 0 here; coming back to
+    // the tab shows it again either way, which is the one place this differs from qutebrowser, whose
+    // inspector remembers a closed state per tab. Left as it is: the toggle is per window here.
+    let on_screen = i32::from(showing == Some(inspects));
+    View::from(&view).set_visible(on_screen);
+    if let Some(divider) = divider.as_ref() {
+        View::from(divider).set_visible(on_screen);
+    }
 }
 
 /// Lay out again every window that has an inspector docked, so a new `devtools.height` is on screen.
@@ -358,6 +392,264 @@ const INSPECTOR_FLEX: i32 = 0;
 pub fn height() -> i32 {
     crate::settings::int_of("devtools.height") as i32
 }
+
+/// The smallest a drag may leave the inspector. The same 80 the setting's range refuses to go under,
+/// because a drag and a `:set` are the same number arriving by different roads.
+const MIN_INSPECTOR: i32 = 80;
+/// The smallest a drag may leave the **page**, which is the thing worth protecting: an inspector
+/// dragged to the top of the window would hide what it is inspecting. 150 DIP is qutebrowser's
+/// `_PROTECTED_MAIN_SIZE` (`miscwidgets.py:303`), doing the same job for its splitter.
+const PROTECTED_PAGE: i32 = 150;
+
+/// The height a drag is holding, per window, while the button is down.
+///
+/// **Not the setting, and deliberately.** A drag asks for a new height sixty times a second; writing
+/// each one into the settings store would run the whole `:set` path — validation, the apply arm,
+/// every listener — per frame, and would leave the store holding numbers the user never chose if the
+/// drag were cancelled. The store is written once, at `end`, and until then this is what the
+/// delegate answers with.
+///
+/// A plain `Mutex<Vec<_>>` read from inside `preferred_size`, exactly as `window.rs`'s `STRIPS` is:
+/// the lock is never held across a CEF call, so a layout pass asking for it cannot meet a caller
+/// holding it.
+static DRAGGING: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// What the inspector in `window` should be right now: the drag's height if one is in progress,
+/// the setting otherwise. This is what the delegate answers.
+pub fn height_for(window: u32) -> i32 {
+    DRAGGING
+        .lock()
+        .ok()
+        .and_then(|live| {
+            live.iter()
+                .find(|(id, _)| *id == window)
+                .map(|(_, height)| *height)
+        })
+        .unwrap_or_else(height)
+}
+
+fn set_dragging(window: u32, height: Option<i32>) {
+    let Ok(mut live) = DRAGGING.lock() else {
+        return;
+    };
+    live.retain(|(id, _)| *id != window);
+    if let Some(height) = height {
+        live.push((window, height));
+    }
+}
+
+/// How tall the divider view itself is: six pixels of chrome, or the whole area during a drag.
+///
+/// **The expansion is the drag.** A page is only told where the pointer is while the pointer is over
+/// it, and a pointer that leaves a strip upward is not reported at all — CEF-NOTES trap 26, 410
+/// events, not one of them upward. Chasing the pointer with a small strip therefore works in exactly
+/// one direction. Surrounding it works in both: on `pointerdown` the strip becomes the whole area
+/// the page and the inspector share, they are hidden behind it, and the pointer has nowhere to go
+/// that is not this view.
+static EXPANDED: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// What the divider's delegate answers. Read from inside a layout pass, so the lock is taken and
+/// dropped without a CEF call in between, exactly as `height_for` is.
+pub fn divider_height_for(window: u32) -> i32 {
+    EXPANDED
+        .lock()
+        .ok()
+        .and_then(|live| {
+            live.iter()
+                .find(|(id, _)| *id == window)
+                .map(|(_, height)| *height)
+        })
+        .unwrap_or(crate::window::DIVIDER_HEIGHT)
+}
+
+fn set_expanded(window: u32, height: Option<i32>) {
+    let Ok(mut live) = EXPANDED.lock() else {
+        return;
+    };
+    live.retain(|(id, _)| *id != window);
+    if let Some(height) = height {
+        live.push((window, height));
+    }
+}
+
+/// A press or a release on a window's divider. Nothing arrives in between.
+///
+/// Called from `ipc.rs` with the divider's own browser, which is what names the window — the strip
+/// has no idea which one it is in and does not need to. Answers `None` when the query cannot be
+/// placed at all, which the caller reports back to the page as a failure; otherwise the JSON the
+/// page is owed.
+///
+/// **The panel does not move while the button is down, and that is not a compromise.** The page has
+/// the whole area to draw in, so it draws the split where the pointer is at its own refresh rate,
+/// with no query per frame and no relayout per frame; Rust hears the number once, on release. What
+/// the page needs to do that is the geometry it is given here at `start`.
+///
+/// `y` is the boundary the page ended on, in its own expanded coordinates. Meaningless at `start`.
+pub fn on_divider_query(
+    state: &crate::tabs::SharedState,
+    browser_id: i32,
+    phase: &str,
+    y: i32,
+) -> Option<String> {
+    let window_id = state
+        .lock()
+        .expect("state mutex poisoned")
+        .window_of_divider(browser_id)?;
+
+    match phase {
+        "start" => {
+            let (page, inspector) = shared_views(state, window_id)?;
+            let page_height = View::from(&page).bounds().height;
+            let inspector_height = View::from(&inspector).bounds().height;
+            let total = page_height + crate::window::DIVIDER_HEIGHT + inspector_height;
+            // Hidden first, expanded second: a `BoxLayout` skips an invisible child, so the room
+            // the two of them were holding is free by the time the divider asks for it.
+            View::from(&page).set_visible(0);
+            View::from(&inspector).set_visible(0);
+            set_expanded(window_id, Some(total));
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_drag_from(window_id, Some(inspector_height));
+            relayout_window(state, window_id);
+            trace(&format!(
+                "divider: expanded to {total}, boundary at {page_height}"
+            ));
+            // Where the line is now, and how far it may travel. The page clamps against these
+            // itself so that what it draws is what it will get — a preview that shows a split the
+            // release would refuse is a preview that lies.
+            // `strip` so the page can do the same arithmetic Rust does at the release. Without it
+            // the preview promised eight pixels more inspector than the release gave, because the
+            // page had guessed the strip's thickness from how thick it drew the line.
+            Some(format!(
+                "{{\"top\":{page_height},\"min\":{},\"max\":{},\"strip\":{},\"total\":{total}}}",
+                PROTECTED_PAGE,
+                (total - crate::window::DIVIDER_HEIGHT - MIN_INSPECTOR).max(PROTECTED_PAGE),
+                crate::window::DIVIDER_HEIGHT
+            ))
+        }
+        "end" => {
+            let started_at = state
+                .lock()
+                .expect("state mutex poisoned")
+                .drag_from(window_id);
+            let total = divider_height_for(window_id);
+            // Back to a strip before anything else, so that a failure below leaves a window with a
+            // page in it rather than one holding a twelve-hundred-pixel divider.
+            set_expanded(window_id, None);
+            if let Some((page, inspector)) = shared_views(state, window_id) {
+                View::from(&page).set_visible(1);
+                View::from(&inspector).set_visible(1);
+            }
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_drag_from(window_id, None);
+
+            // The boundary the page ended on, read as a height: everything below the line, less the
+            // strip itself. A release with no movement answers the height it started at.
+            let wanted = clamp_height(
+                state,
+                window_id,
+                total - crate::window::DIVIDER_HEIGHT - y,
+            );
+            let held = match started_at {
+                Some(was) if y <= 0 => was,
+                _ => wanted,
+            };
+            set_dragging(window_id, Some(held));
+            relayout_window(state, window_id);
+            // **The store is written after the layout, not before.** `run_set` runs the apply arm,
+            // which relayouts every window with an inspector; doing that first would lay this one
+            // out while it was still expanded.
+            if held != height() {
+                // `run_set` and not some quieter writer: a dragged height is a `:set devtools.height`
+                // that happened to be typed with a mouse, and it should validate, apply and be
+                // visible in `:set devtools.height?` and in `config-diff` exactly like the typed one.
+                // `print` is false — the drag is its own feedback, and a message per release would be
+                // noise.
+                crate::settings::run_set(
+                    Some("devtools.height"),
+                    Some(&held.to_string()),
+                    None,
+                    false,
+                );
+            }
+            set_dragging(window_id, None);
+            // The keyboard goes back to the page. Without this the next `j` is typed into the
+            // divider — a document with nothing to scroll and nothing to type into.
+            if let Some(page) = state
+                .lock()
+                .expect("state mutex poisoned")
+                .active_view_in(window_id)
+            {
+                View::from(&page).request_focus();
+            }
+            trace(&format!("divider: drag ended at {held}"));
+            Some(String::new())
+        }
+        // A phase this does not act on. Traced rather than failed — the page says nothing else
+        // today, and a phase bru has not heard of is worth seeing in the log rather than swallowing.
+        other => {
+            trace(&format!("divider: {other}"));
+            Some(String::new())
+        }
+    }
+}
+
+/// The two views a drag divides between: the tab on screen and the inspector under it.
+fn shared_views(
+    state: &crate::tabs::SharedState,
+    window_id: u32,
+) -> Option<(BrowserView, BrowserView)> {
+    let state = state.lock().expect("state mutex poisoned");
+    Some((
+        state.active_view_in(window_id)?,
+        state.inspector_in(window_id).map(|(view, _)| view)?,
+    ))
+}
+
+/// Lay the window out with whatever the delegates now answer.
+fn relayout_window(state: &crate::tabs::SharedState, window_id: u32) {
+    let (window, divider) = {
+        let state = state.lock().expect("state mutex poisoned");
+        (state.window_handle(window_id), state.divider_in(window_id))
+    };
+    let Some(window) = window else {
+        return;
+    };
+    if let Some(divider) = divider {
+        View::from(&divider).invalidate_layout();
+    }
+    View::from(&window).invalidate_layout();
+    window.layout();
+}
+
+/// Keep a dragged height inside what the window can actually show.
+///
+/// The floor is [`MIN_INSPECTOR`]; the ceiling is everything the page and the inspector share, less
+/// [`PROTECTED_PAGE`]. That total is measured rather than computed from the window: the two views
+/// are the only children whose height a drag moves, so their current heights added are exactly the
+/// room there is, whatever chrome the user has turned on above and below them.
+fn clamp_height(state: &crate::tabs::SharedState, window_id: u32, wanted: i32) -> i32 {
+    let (page, inspector) = {
+        let state = state.lock().expect("state mutex poisoned");
+        (
+            state.active_view_in(window_id),
+            state.inspector_in(window_id).map(|(view, _)| view),
+        )
+    };
+    let shared = match (page, inspector) {
+        (Some(page), Some(inspector)) => {
+            View::from(&page).bounds().height + View::from(&inspector).bounds().height
+        }
+        // No page to protect — a window mid-teardown. The floor still applies.
+        _ => return wanted.max(MIN_INSPECTOR),
+    };
+    let ceiling = (shared - PROTECTED_PAGE).max(MIN_INSPECTOR);
+    wanted.clamp(MIN_INSPECTOR, ceiling)
+}
+
 
 /// Whether the inspector about to be created is one bru is going to place itself.
 ///

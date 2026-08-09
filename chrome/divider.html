@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>bru divider</title>
+        <link rel="stylesheet" href="chrome.css" />
+        <link rel="stylesheet" href="theme.css" />
+        <link rel="stylesheet" href="user.css" />
+    </head>
+    <!-- THE DIVIDER IS A PAGE BECAUSE A VIEW CANNOT BE ONE.
+         src/devtools.rs
+
+         CEF's Views toolkit has no splitter, and no delegate in it is ever handed
+         a pointer event: `cef_view_delegate_t` has preferred/minimum/maximum size,
+         height-for-width, the parent and child hooks, focus, blur and theme —
+         nothing pointer-shaped, on any delegate. So a strip that can be grabbed
+         has to be something that receives mouse events, and the only such thing
+         in a bru window is a page.
+
+         Six pixels of nothing, then, between the pages and the inspector, whose
+         whole job is to turn a drag into a number Rust can put in
+         `devtools.height`. It carries no text and no controls: a control here
+         would be a button in the one place where every pixel is a grab target. -->
+    <body data-view="divider">
+        <!-- Three elements, and only the middle one is ever seen at rest: the
+             line IS the strip when the view is twelve pixels tall. While the view
+             is expanded the two fields either side of it become the preview, so
+             the boundary the eye follows is the same element in both states —
+             moved by `top` rather than swapped, and there is nothing to keep in
+             step. -->
+        <div id="above"><span>page</span><span class="px"></span></div>
+        <div id="split"></div>
+        <div id="below"><span>inspector</span><span class="px"></span></div>
+        <script src="divider.js"></script>
+    </body>
+</html>

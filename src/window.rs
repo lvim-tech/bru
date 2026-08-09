@@ -41,6 +41,26 @@ pub const KIND_BAR: i32 = 1;
 /// status line would be a block floating on the page with nothing under it.
 pub const KIND_PANEL: i32 = 2;
 // --- end src/window.rs: the panel ---------------------------------------------------------------
+// --- src/devtools.rs ----------------------------------------------------------------------------
+/// The strip between the pages and the docked inspector, and the only chrome view that is not made
+/// with the window: it exists exactly as long as an inspector is docked. See [`divider_view`].
+pub const KIND_DIVIDER: i32 = 3;
+/// Twelve logical pixels, of which the eye sees two.
+///
+/// **The other ten are the drag's headroom, and the drag does not work without them.** A pointer
+/// that leaves the strip stops being reported: measured 2026-08-09, positions floor at the strip's
+/// top edge, so a hand moving upward faster than the strip can follow reports no movement at all and
+/// the panel never catches up — it could be shrunk and not grown. Downward there is room to spare,
+/// which is why only one direction was broken. With the line drawn in the middle, each frame has
+/// half the strip's height to play with in either direction and the strip re-centres under the
+/// pointer as it follows.
+///
+/// Pointer lock would have removed the need for any of this — it reports movement rather than
+/// position — but this CEF refuses it: `UnknownError`, Chromium's own catch-all, from
+/// `requestPointerLock` on a chrome page. See `chrome/divider.js`.
+pub const DIVIDER_HEIGHT: i32 = 12;
+const DIVIDER_URL: &str = "bru://chrome/divider.html";
+// --- end src/devtools.rs ------------------------------------------------------------------------
 
 /// Chrome strip heights, in logical pixels.
 const TOP_HEIGHT: i32 = 40;
@@ -624,6 +644,39 @@ fn reorder(handle: &Window, top: &BrowserView, bottom: &BrowserView, want: Layou
     }
 }
 
+// --- src/devtools.rs ----------------------------------------------------------------------------
+/// Make the divider strip for `window`, ready to be put above a docked inspector.
+///
+/// **The one chrome view made after its window.** The other three are built in [`create`] because a
+/// window always has them; this one exists only while an inspector is docked, and making it with
+/// every window would be a browser per window for a panel most windows never open.
+///
+/// It is `BruChromeViewDelegate` like the rest — a fixed height and flex 0 is exactly what a strip
+/// is — and its `on_browser_created` registers the browser as chrome, which is what stops `j` in the
+/// divider being read as a scroll of the page above it (CEF-NOTES trap 11).
+///
+/// Creates no browser by itself: `add_child_view` does that, synchronously (CEF-NOTES). So this may
+/// not be called from inside a query handler — see trap 12 — and `devtools::dock`, its only caller,
+/// runs on a CEF callback.
+pub fn divider_view(state: &SharedState, window_id: u32) -> Option<BrowserView> {
+    let mut settings = BrowserSettings::default();
+    if let Some(colour) = crate::chrome::chrome_background() {
+        settings.background_color = colour;
+    }
+    let mut client = state.lock().expect("state mutex poisoned").client();
+    let mut delegate =
+        BruChromeViewDelegate::new(state.clone(), window_id, DIVIDER_HEIGHT, KIND_DIVIDER);
+    browser_view_create(
+        client.as_mut(),
+        Some(&CefString::from(DIVIDER_URL)),
+        Some(&settings),
+        None,
+        None,
+        Some(&mut delegate),
+    )
+}
+// --- end src/devtools.rs ------------------------------------------------------------------------
+
 /// Whether a strip is currently hidden, for the preferred height its delegate answers with.
 fn strip_hidden(window: u32, kind: i32) -> bool {
     STRIPS
@@ -639,6 +692,14 @@ fn strip_hidden(window: u32, kind: i32) -> bool {
                     // would be a block floating on the page with nothing under it.
                     if kind == KIND_TABS {
                         !applied.tabs_visible
+                    // --- src/devtools.rs ---------------------------------------------------
+                    // The divider goes with the inspector and with nothing else. `statusbar.show`
+                    // says whether bru draws a status line, which is no statement about a strip
+                    // that only exists while a panel is docked — and hiding the divider while the
+                    // panel it resizes stayed would leave a panel nothing can move.
+                    } else if kind == KIND_DIVIDER {
+                        false
+                    // --- end src/devtools.rs -----------------------------------------------
                     } else {
                         !applied.status_visible
                     }
@@ -1098,7 +1159,9 @@ wrap_browser_view_delegate! {
             // this delegate answered was classified as "no answer" and never read. The strips hold
             // their 40 and 24 through every layout because they answer a nonzero width — 1280, at
             // line 1194 — and that number was the whole difference. Same number here, same reason.
-            let height = crate::devtools::height();
+            // `height_for`, not `height`: while the divider is being dragged the number comes from
+            // the drag rather than from the setting, and the setting is written once at the end.
+            let height = crate::devtools::height_for(self.window_id);
             crate::devtools::trace(&format!("inspector preferred_size -> {height}"));
             Size { width: 1280, height }
         }
@@ -1188,6 +1251,17 @@ wrap_browser_view_delegate! {
             if strip_hidden(self.window_id, self.kind) {
                 return Size { width: 1280, height: 0 };
             }
+// --- src/devtools.rs -----------------------------------------------------------------------
+            // Six pixels of chrome, or the whole area the page and the inspector share — see
+            // `devtools::divider_height_for`, which explains why a drag has to surround the pointer
+            // rather than chase it.
+            if self.kind == KIND_DIVIDER {
+                return Size {
+                    width: 1280,
+                    height: crate::devtools::divider_height_for(self.window_id),
+                };
+            }
+// --- end src/devtools.rs -------------------------------------------------------------------
 // --- end tabs and statusbar ----------------------------------------------------------------
             Size { width: 1280, height: self.height + extra }
 // --- end src/completers.rs -----------------------------------------------------------------

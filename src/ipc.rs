@@ -216,6 +216,36 @@ impl BrowserSideHandler for BruQueryHandler {
                 return true;
             }
             // --- end the panel's height -------------------------------------------------------
+            // --- src/devtools.rs: the divider -------------------------------------------------
+            // A press, a move or a release on the six pixels between the pages and the docked
+            // inspector. All three arrive here because CEF's Views delegates are never handed a
+            // pointer event — see `chrome/divider.js` for why the strip is a page at all.
+            //
+            // Relayouting from inside a query handler is what trap 12 does **not** forbid: it names
+            // creating browsers and starting navigations, and `prompt.rs::resize_bar` has been
+            // changing a strip's height from a query handler since the command line was written.
+            Some("divider") => {
+                let phase = json_field(request, "phase").unwrap_or_default();
+                // How far the hand has moved since the press, never where it is. Signed, and it must
+                // be: a drag goes up as often as down.
+                let y = json_number_field(request, "y").unwrap_or(0) as i32;
+                let Some(id) = browser.as_ref().map(|browser| browser.identifier()) else {
+                    fail(&callback, -10, "a divider event with no browser behind it");
+                    return true;
+                };
+                let Some(state) = crate::state::BruState::instance() else {
+                    fail(&callback, -10, "a divider event before there is any state");
+                    return true;
+                };
+                match crate::devtools::on_divider_query(&state, id, &phase, y) {
+                    // The press is answered with the geometry the page draws its preview from; the
+                    // release is answered with nothing, because there is nothing left to say.
+                    Some(answer) => succeed(&callback, &answer),
+                    None => fail(&callback, -10, "a divider event bru could not place"),
+                }
+                return true;
+            }
+            // --- end src/devtools.rs: the divider ---------------------------------------------
             Some("ready") => {
                 let view = json_field(request, "view").unwrap_or_default();
                 let Some(frame) = frame else {
