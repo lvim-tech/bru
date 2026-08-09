@@ -90,6 +90,21 @@ fn main() -> Result<(), &'static str> {
             }
         };
     }
+    // **A second bru hands its page to the first and exits**, which is what every other browser
+    // does and what `xdg-open`, a `.desktop` entry and `BROWSER=bru` all assume. Before this, a
+    // second start ran a whole second browser — `remote.rs` called that "the honest behaviour",
+    // and it is honest for a browser somebody starts on purpose and wrong for a link somebody
+    // clicked. The escape hatch is spelled out rather than implied: `--new-instance`, or a
+    // `--socket=` of one's own, which is what the tests and a scratch browser already use.
+    //
+    // It runs here, before CEF is initialised, so a handed-over link costs a socket write and an
+    // exit rather than a browser's worth of startup.
+    if let Some(line) = handover(&raw) {
+        if remote::send(&line).is_ok() {
+            return Ok(());
+        }
+        // Nothing was listening, or it would not take it. Be the browser.
+    }
     // --- end src/remote.rs ----------------------------------------------------------------------
 
     let args = args::Args::new();
@@ -203,4 +218,97 @@ fn main() -> Result<(), &'static str> {
         profile.release();
     }
     Ok(())
+}
+// --- src/remote.rs ------------------------------------------------------------------------------
+/// The command a second bru sends to the first, or `None` when this bru must be a browser itself.
+///
+/// **The subprocess check is first and is not optional.** CEF starts renderers, GPU and zygote
+/// processes by re-executing this binary with `--type=`, and their command lines are full of
+/// Chromium's own arguments. A zygote that handed a "page" to the running browser and exited would
+/// take the browser it belongs to down with it.
+///
+/// `--new-instance` is the way to say no, and `--socket=` is the other: a browser on a socket of its
+/// own is asking for a browser of its own, and nothing is listening there to hand anything to.
+///
+/// With no page named, the handover is `open -w` — a new window in the browser that is running,
+/// which is what clicking a browser's icon does everywhere else. Doing nothing would leave a person
+/// clicking an icon and watching nothing happen.
+fn handover(args: &[String]) -> Option<String> {
+    for arg in args {
+        if arg == "--type" || arg.starts_with("--type=") {
+            return None;
+        }
+        if arg == "--new-instance" || arg == "--remote" {
+            return None;
+        }
+    }
+
+    // `--url=` means the same thing here as it does to `app.rs`, and wins for the same reason.
+    if let Some(url) = args.iter().find_map(|arg| arg.strip_prefix("--url=")) {
+        let url = url.trim();
+        if !url.is_empty() {
+            return Some(format!("open -t {url}"));
+        }
+    }
+
+    // The first bare argument, skipping this binary's own name.
+    match args
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-') && !arg.trim().is_empty())
+    {
+        Some(url) => Some(format!("open -t {}", url.trim())),
+        None => Some("open -w".to_string()),
+    }
+}
+// --- end src/remote.rs --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::handover;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("bru".to_string())
+            .chain(rest.iter().map(|arg| arg.to_string()))
+            .collect()
+    }
+
+    /// What a clicked link, a menu entry and `xdg-open` each produce.
+    #[test]
+    fn a_second_bru_hands_its_page_over() {
+        assert_eq!(
+            handover(&argv(&["https://example.com/"])).as_deref(),
+            Some("open -t https://example.com/"),
+        );
+        assert_eq!(
+            handover(&argv(&["--url=https://example.com/"])).as_deref(),
+            Some("open -t https://example.com/"),
+        );
+        // Clicking the icon with a browser already running opens a window in it, which is what
+        // every other browser does. Nothing at all would look like a broken launcher.
+        assert_eq!(handover(&argv(&[])).as_deref(), Some("open -w"));
+    }
+
+    /// **The check that keeps this from killing the browser it belongs to.** CEF re-executes this
+    /// binary for every renderer, GPU and zygote process, with `--type=` and a command line of
+    /// Chromium's own. One of those handing a page over and exiting would take the tab with it.
+    #[test]
+    fn a_subprocess_never_hands_anything_over() {
+        assert_eq!(handover(&argv(&["--type=renderer"])), None);
+        assert_eq!(handover(&argv(&["--type=zygote", "https://example.com/"])), None);
+        assert_eq!(handover(&argv(&["--type"])), None);
+    }
+
+    /// Two ways to ask for a browser of your own, and both are spelled out rather than implied.
+    #[test]
+    fn asking_for_a_browser_of_your_own_is_honoured() {
+        assert_eq!(handover(&argv(&["--new-instance"])), None);
+        assert_eq!(handover(&argv(&["--new-instance", "https://example.com/"])), None);
+        // `--remote` is the other client entirely, and `main` has already answered it by here.
+        assert_eq!(handover(&argv(&["--remote", "tabs"])), None);
+        // `--socket=` needs no arm: nothing is listening on a socket of one's own, so the send
+        // fails and this bru becomes the browser. That is asserted by the shape of `main`, not
+        // here, and it is why a scratch browser still works.
+        assert!(handover(&argv(&["--socket=/run/user/1000/x.sock"])).is_some());
+    }
 }
