@@ -32,6 +32,36 @@ fn data_uri(content: &str, mime_type: &str) -> CefString {
     CefString::from(format!("data:{mime_type};base64,{escaped}").as_str())
 }
 
+/// Which page the first window shows: `--url=`, else the first bare argument, else the start page.
+///
+/// **A bare argument is how every other browser is handed a URL**, and until 2026-08-09 bru read
+/// none. `firefox https://x` works, `xdg-open` works that way, a `.desktop` entry's `%U` arrives
+/// that way, and `BROWSER=bru` is called that way. bru read only `--url=`, so all of them opened
+/// the *start page* instead of the link — a wrong answer rather than a refusal, which is the shape
+/// this codebase refuses everywhere else. Two wrapper scripts in `~/bin` existed mostly to
+/// translate, and that is the smell that says the gap was bru's.
+///
+/// **`--url=` still wins.** It is what `:open -w` and the debug hooks pass, it cannot be confused
+/// with anything, and a switch that already means this must not change meaning because a positional
+/// arrived beside it.
+///
+/// **Only the browser process may read a bare argument**, and the caller is the one place that is
+/// guaranteed: CEF gives every subprocess a `--type=` switch (`main.rs:100` sorts them on it) and
+/// fills their command lines with arguments of Chromium's own. Reading positionals there would be
+/// bru answering for text that was never addressed to it.
+fn first_page(switched: &str, positional: &[String], start_page: &str) -> String {
+    if !switched.is_empty() {
+        return switched.to_string();
+    }
+    // The first one only. A browser handed three URLs opens three tabs, and bru's first window
+    // shows one page; the rest are a separate job — see `--open` — and quietly dropping them here
+    // would be the same silent half-answer this function exists to end.
+    match positional.iter().find(|argument| !argument.trim().is_empty()) {
+        Some(url) => url.trim().to_string(),
+        None => start_page.to_string(),
+    }
+}
+
 /// Add one name to a comma-separated Chromium switch, keeping whatever is already there.
 ///
 /// **Never `append_switch_with_value` on its own.** Chromium reads a single value for each of these,
@@ -442,10 +472,13 @@ wrap_browser_process_handler! {
 
             // M9, DECISIONS item 7: the start page comes from config.lua when it sets one. It can
             // only be asked for after the block above, which is what installs it.
-            let url = CefString::from(&command_line.switch_value(Some(&CefString::from("url"))))
+            let switched = CefString::from(&command_line.switch_value(Some(&CefString::from("url"))))
                 .to_string();
+            let mut positional = CefStringList::new();
+            command_line.arguments(Some(&mut positional));
+            let positional: Vec<String> = positional.into_iter().collect();
             let start_page = crate::open::start_page();
-            let url = CefString::from(if url.is_empty() { start_page.as_str() } else { url.as_str() });
+            let url = CefString::from(first_page(&switched, &positional, &start_page).as_str());
 
             // The first window, made by the same function `:open -w` uses — see `window::create`.
             // `FirstTab::Startup` is the one thing about it that is special: `--restore` may fill it
@@ -680,5 +713,53 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> {
             self.state.lock().expect("state mutex poisoned").client()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_page;
+
+    /// **The gap this closed, as a table.** Reported by the user 2026-08-09 while writing a
+    /// `.desktop` entry: `Exec=bru %U` opened the start page instead of the link that was clicked.
+    /// bru read the page to show from `--url=` alone, and a desktop entry — like `xdg-open`, like
+    /// `BROWSER=bru`, like every other browser's command line — hands it over as a bare argument.
+    ///
+    /// Give `first_page` back its old behaviour by returning `start_page` whenever `switched` is
+    /// empty and the first case below fails.
+    #[test]
+    fn a_bare_argument_is_the_page_to_open() {
+        let start = "https://start.example/";
+
+        assert_eq!(
+            first_page("", &["https://example.com/".to_string()], start),
+            "https://example.com/",
+            "a bare argument is how every other browser is handed a URL",
+        );
+
+        // `--url=` still wins: it is what `:open -w` and the debug hooks pass, and a switch that
+        // already means this must not change meaning because a positional arrived beside it.
+        assert_eq!(
+            first_page("https://switched/", &["https://bare/".to_string()], start),
+            "https://switched/",
+        );
+
+        // Nothing said: the start page, which is what a browser opened from a menu shows.
+        assert_eq!(first_page("", &[], start), start);
+    }
+
+    /// The first *usable* one. CEF hands over whatever survived its own parsing, and an empty or
+    /// blank argument is not an address — answering with it would open a blank page and call that
+    /// the user's request.
+    #[test]
+    fn a_blank_argument_is_not_an_address() {
+        let start = "https://start.example/";
+        assert_eq!(first_page("", &[String::new()], start), start);
+        assert_eq!(first_page("", &["   ".to_string()], start), start);
+        assert_eq!(
+            first_page("", &["  ".to_string(), " https://real/ ".to_string()], start),
+            "https://real/",
+            "and it is trimmed, because a shell can hand over a padded argument",
+        );
     }
 }
