@@ -32,12 +32,101 @@ use std::time::Instant;
 use adblock::Engine;
 use adblock::lists::{FilterSet, ParseOptions, RuleTypes};
 use adblock::request::Request as AdRequest;
+// **`ResourceType` is not imported, and must not be.** `use cef::*` above brings CEF's own
+// `ResourceType` — the one this file already matches `MAIN_FRAME` and `STYLESHEET` on — into scope,
+// and the adblock crate has an unrelated enum of the same name. Naming the scriptlet one in full at
+// its three uses is what keeps the request path's spelling untouched.
+use adblock::resources::{PermissionMask, Resource};
 
 /// qutebrowser's `content.blocking.adblock.lists` default (configdata.yml:886-889).
 pub const DEFAULT_LISTS: [&str; 2] = [
     "https://easylist.to/easylist/easylist.txt",
     "https://easylist.to/easylist/easyprivacy.txt",
 ];
+
+// -----------------------------------------------------------------------------------------------
+// Scriptlets: the third mechanism, and the one that reaches inside a video
+// -----------------------------------------------------------------------------------------------
+
+/// The permission a filter list must carry before a `trusted-` scriptlet written in it will run.
+///
+/// **Only a file the user wrote by hand gets it**, and the check is the *path* rather than a flag:
+/// [`trusted_filters_path`] is in `~/.config/bru/`, which is the directory a person edits, and every
+/// downloaded list is in `~/.local/share/bru/adblock/`, which is where things bru fetched go. There
+/// is deliberately no setting that marks a subscription trusted — that is the setting whose whole
+/// purpose would be to let somebody be talked into ticking it.
+///
+/// What the permission buys is real: a `trusted-` scriptlet can rewrite **any** network response the
+/// page receives, not only an advertisement. uBlock draws the same line in the same place, granting
+/// it to "My filters" and to no subscribed list, including its own.
+const TRUSTED: PermissionMask = PermissionMask::from_bits(1);
+
+/// bru's scriptlet library, as the engine wants it.
+///
+/// A filter list's `##+js(name, arg, …)` rule names one of these; the engine substitutes the
+/// arguments into `{{1}}`, `{{2}}`, … and hands the result back as `injected_script`, which the
+/// renderer runs at document-start. Without this the field is always empty — which is exactly what
+/// bru shipped until 2026-08-09, and why YouTube's advertisement survived both other layers.
+///
+/// **It is a handful and not uBlock's two hundred.** Each one is code bru executes in every page a
+/// rule names, so each is here because something bru's user actually subscribes to needs it, and
+/// each was read before it was shipped. The names and aliases are uBlock's, because the rules that
+/// call them are written against uBlock's.
+fn resources() -> Vec<Resource> {
+    vec![
+        Resource {
+            name: "set-constant.js".to_string(),
+            // **`set.js`, not `set`.** A rule writes `+js(set, …)` and the engine canonicalises the
+            // name by appending `.js` before it looks anything up — `with_js_extension`. An alias
+            // spelled the way the rule spells it therefore matches nothing, silently: measured
+            // 2026-08-09, four `set` rules resolved to **zero** scriptlets while the two whose name
+            // already ended in `.js` resolved fine, and the only symptom was that YouTube still
+            // played its advertisement.
+            aliases: vec!["set.js".to_string()],
+            kind: adblock::resources::ResourceType::Template,
+            content: base64_of(include_str!("../chrome/scriptlets/set-constant.js")),
+            dependencies: Vec::new(),
+            permission: PermissionMask::default(),
+        },
+        Resource {
+            name: "trusted-replace-fetch-response.js".to_string(),
+            aliases: vec!["trusted-replace-fetch-response".to_string()],
+            kind: adblock::resources::ResourceType::Template,
+            content: base64_of(include_str!(
+                "../chrome/scriptlets/trusted-replace-fetch-response.js"
+            )),
+            dependencies: Vec::new(),
+            permission: TRUSTED,
+        },
+    ]
+}
+
+/// `Resource::content` is base64, and this is the whole of what bru needs of it — a dependency for
+/// one encode of two files at startup would be a dependency for nothing.
+fn base64_of(text: &str) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// `~/.config/bru/filters.txt` — the user's own filter rules, and the only list bru trusts.
+///
+/// In the **config** directory rather than beside the downloaded lists, and that is the whole
+/// mechanism: it is hand-written, so it is the user's, so it may say things a stranger's list may
+/// not. bru never creates it and never writes to it, exactly as it never writes `config.lua`.
+pub fn trusted_filters_path() -> Option<PathBuf> {
+    crate::config::config_path()?.parent().map(|dir| dir.join("filters.txt"))
+}
 
 /// The compiled engine, or `None` until one has been loaded — and `None` forever if there are no
 /// lists, which is the state of a fresh `~/.local/share/bru`.
@@ -201,7 +290,16 @@ fn load() {
 
     forget_legacy_cache();
 
-    if let Some(cache) = cache_path().filter(|cache| is_cache_fresh(cache, &lists)) {
+    // **The user's own file is watched too, or editing it would change nothing until a list was
+    // re-downloaded.** `is_cache_fresh` compares timestamps, and `filters.txt` is the one input
+    // that changes without `:adblock-update` being run — it is edited by hand, which is the whole
+    // point of it.
+    let mut watched = lists.clone();
+    if let Some(own) = trusted_filters_path().filter(|path| path.exists()) {
+        watched.push(own);
+    }
+
+    if let Some(cache) = cache_path().filter(|cache| is_cache_fresh(cache, &watched)) {
         let started = Instant::now();
         match std::fs::read(&cache) {
             Ok(bytes) => {
@@ -265,6 +363,20 @@ fn compile(lists: &[PathBuf]) {
             Err(e) => eprintln!("bru[adblock]: {} unreadable: {e}", path.display()),
         }
     }
+
+    // The user's own rules, and the one list that carries [`TRUSTED`]. Added last so that reading
+    // the count above still describes what was downloaded.
+    if let Some(path) = trusted_filters_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let own = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('!')).count();
+            lines += text.lines().count();
+            set.add_filter_list(
+                text,
+                ParseOptions { permissions: TRUSTED, ..options },
+            );
+            eprintln!("bru[adblock]: {own} rule(s) of your own from {}", path.display());
+        }
+    }
     let read_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let compiled_at = Instant::now();
@@ -293,7 +405,11 @@ fn compile(lists: &[PathBuf]) {
     );
 }
 
-fn install(engine: Engine) {
+fn install(mut engine: Engine) {
+    // **Every path installs the library, including the cached one.** The cache holds the compiled
+    // rules; the scriptlets are bru's own code and travel with the binary, so a build that adds one
+    // must not need the cache thrown away to have it.
+    engine.use_resources(resources());
     if let Ok(mut slot) = ENGINE.write() {
         *slot = Some(engine);
     }
@@ -326,25 +442,30 @@ const COSMETIC_CSS: &str = "bru.cosmetic.css";
 /// empty and has no classes to report. **It is not implemented yet**, and this comment is the note
 /// saying which half is missing rather than a silence implying there is none.
 ///
-/// **Scriptlets are not injected either, and cannot be yet.** `UrlSpecificResources::injected_script`
-/// is assembled by resolving `+js(...)` rules against a resource library — uBlock's `resources.json`
-/// — through `Engine::use_resources`. bru ships no such library, so the field comes back empty; the
-/// honest thing is to not read it rather than to read it and pretend.
-fn cosmetic_css(url: &str) -> String {
+/// **The scriptlet comes back with it, which is the third mechanism.** `injected_script` is
+/// assembled by resolving each `##+js(name, …)` rule against [`resources`]; it was always empty
+/// before bru had a library to resolve against, and reading it was pointless. It is the only one of
+/// the three layers that can reach an advertisement *inside* a video: that one arrives over the
+/// same connection as the video and is announced in the player's own response, so there is no
+/// request to cancel and no element to hide — only the response to edit before the player reads it.
+fn cosmetic_for(url: &str) -> (String, String) {
     if !ENABLED.load(Ordering::Relaxed) {
-        return String::new();
+        return (String::new(), String::new());
     }
     let Ok(guard) = ENGINE.read() else {
-        return String::new();
+        return (String::new(), String::new());
     };
     let Some(engine) = guard.as_ref() else {
-        return String::new();
+        return (String::new(), String::new());
     };
     let resources = engine.url_cosmetic_resources(url);
     // `$generichide` is an exception rule a list writer put on a page that cosmetic filtering
     // breaks. It only ever governs the generic half, which is the half not implemented above — so
     // it changes nothing today, and reading it here is what makes that true rather than luck.
-    stylesheet(resources.hide_selectors.iter().map(String::as_str))
+    (
+        stylesheet(resources.hide_selectors.iter().map(String::as_str)),
+        resources.injected_script,
+    )
 }
 
 /// The selectors as one CSS rule, or the empty string when there are none.
@@ -429,10 +550,18 @@ pub fn on_cosmetic_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) 
         return true;
     };
     let url = CefString::from(&frame.url()).to_string();
-    let css = if hideable(&url) { cosmetic_css(&url) } else { String::new() };
+    let (css, script) = if hideable(&url) {
+        cosmetic_for(&url)
+    } else {
+        (String::new(), String::new())
+    };
 
     if std::env::var_os("BRU_DEBUG_ADBLOCK").is_some() {
-        eprintln!("bru[adblock]: cosmetic for {url}: {} bytes of CSS", css.len());
+        eprintln!(
+            "bru[adblock]: cosmetic for {url}: {} bytes of CSS, {} of scriptlet",
+            css.len(),
+            script.len()
+        );
     }
 
     let Some(mut reply) = process_message_create(Some(&CefString::from(COSMETIC_CSS))) else {
@@ -440,6 +569,7 @@ pub fn on_cosmetic_ask(frame: Option<&Frame>, message: Option<&ProcessMessage>) 
     };
     if let Some(arguments) = reply.argument_list() {
         arguments.set_string(0, Some(&CefString::from(css.as_str())));
+        arguments.set_string(1, Some(&CefString::from(script.as_str())));
     }
     frame.send_process_message(ProcessId::RENDERER, Some(&mut reply));
     true
@@ -459,10 +589,35 @@ pub fn renderer_on_cosmetic_css(frame: Option<&Frame>, message: Option<&ProcessM
     let Some(frame) = frame else {
         return true;
     };
-    let css = message
+    let (css, script) = message
         .argument_list()
-        .map(|arguments| CefString::from(&arguments.string(0)).to_string())
+        .map(|arguments| {
+            (
+                CefString::from(&arguments.string(0)).to_string(),
+                CefString::from(&arguments.string(1)).to_string(),
+            )
+        })
         .unwrap_or_default();
+
+    // **The scriptlet first, and as its own script.** It is the only one of the two that races the
+    // page — it has to have run before the page's own code reads the object it edits — while a
+    // stylesheet arriving a millisecond later changes nothing anybody sees. Running it separately
+    // also keeps a throw inside one rule from taking the stylesheet down with it.
+    //
+    // **The ask round trip wins that race, and by how much is measured, not hoped.** The question
+    // leaves at `on_context_created` and this answer is a posted task, so on paper the page's own
+    // inline script could run first. Measured 2026-08-09 on `youtube.com/watch`, instrumented
+    // inside the scriptlet: it ran at 166 ms in page time on a cold load and 212 ms on a reload,
+    // and the page assigned `ytInitialPlayerResponse` at 1,258 ms and 1,421 ms — over a second of
+    // margin both times, because the answer crosses two processes on one machine while the
+    // assignment sits behind 1.5 MB of HTML that YouTube serves uncached even on reload
+    // (`transferSize` 1,537,456). If a page ever turns up whose first script beats this answer,
+    // the payload will have to be *pushed* — computed in `on_before_browse`, stashed in the
+    // renderer, injected synchronously at `on_context_created` — rather than asked for; it was
+    // not built now because no page that loses the race could be produced to fail against it.
+    if !script.is_empty() {
+        crate::greasemonkey::evaluate(frame, &script, Some("bru://scriptlet.js"));
+    }
 
     // **`any`, and never an end of the root.** "first" is the scrollbar's and "last" is the user's
     // own CSS; a second keeper holding an end livelocks against the one already there — see
@@ -1158,6 +1313,85 @@ mod tests {
         );
     }
 
+    // --- the scriptlets -------------------------------------------------------------------------
+
+    /// **The alias must carry the `.js`.** A rule writes `+js(set, …)` and the engine appends
+    /// `.js` before looking the name up, so an alias spelled `set` matches nothing, silently —
+    /// four rules resolved to zero scriptlets on 2026-08-09 and the only symptom was the
+    /// advertisement they were written to remove. Change the alias in [`resources`] back to
+    /// `set` and this fails.
+    #[test]
+    fn a_set_rule_resolves_through_the_alias_the_engine_canonicalises() {
+        let mut engine = engine_over(
+            "www.youtube.com##+js(set, ytInitialPlayerResponse.adPlacements, undefined)",
+            RuleTypes::All,
+        );
+        engine.use_resources(resources());
+        let script =
+            engine.url_cosmetic_resources("https://www.youtube.com/watch?v=x").injected_script;
+        assert!(
+            script.contains("function bruSetConstant("),
+            "the library function must travel with the invocation: {script:?}",
+        );
+        assert!(
+            script.contains("bruSetConstant(\"ytInitialPlayerResponse.adPlacements\", \"undefined\")"),
+            "the rule's arguments must arrive as a function call, quoted by the engine: {script:?}",
+        );
+    }
+
+    /// **Trust comes from how the list was parsed, and from nowhere else.** The same rule text
+    /// resolves to the trusted scriptlet when parsed with [`TRUSTED`] — `filters.txt`'s path —
+    /// and to nothing when parsed the way every downloaded list is.
+    #[test]
+    fn a_trusted_scriptlet_answers_only_a_trusted_list() {
+        const RULE: &str = "www.youtube.com##+js(trusted-replace-fetch-response, \
+                            /\"(adPlacements|adSlots|playerAds)\"/, '\"no_ads\"', get_watch)";
+
+        let mut untrusted = engine_over(RULE, RuleTypes::All);
+        untrusted.use_resources(resources());
+        let script =
+            untrusted.url_cosmetic_resources("https://www.youtube.com/watch?v=x").injected_script;
+        assert!(
+            !script.contains("bruTrustedReplaceFetchResponse"),
+            "a downloaded list must not be able to rewrite responses: {script:?}",
+        );
+
+        let mut set = FilterSet::new(false);
+        set.add_filter_list(
+            RULE.to_string(),
+            ParseOptions { rule_types: RuleTypes::All, permissions: TRUSTED, ..ParseOptions::default() },
+        );
+        let mut trusted = Engine::new_with_filter_set(set);
+        trusted.use_resources(resources());
+        let script =
+            trusted.url_cosmetic_resources("https://www.youtube.com/watch?v=x").injected_script;
+        assert!(
+            script.contains("bruTrustedReplaceFetchResponse("),
+            "the user's own file must resolve the same rule: {script:?}",
+        );
+    }
+
+    /// **Each scriptlet file must *begin* with `function <name>(`.** `extract_function_name` is
+    /// anchored at the start of the file; a comment above the function demotes the resource to a
+    /// text template, whose substitution cannot carry arguments with quotes in them — that is the
+    /// syntax error that once killed the whole injected script, silently. The prose lives inside
+    /// the bodies for exactly this reason.
+    #[test]
+    fn the_scriptlet_files_begin_with_the_function_the_engine_extracts() {
+        for (text, name) in [
+            (include_str!("../chrome/scriptlets/set-constant.js"), "bruSetConstant"),
+            (
+                include_str!("../chrome/scriptlets/trusted-replace-fetch-response.js"),
+                "bruTrustedReplaceFetchResponse",
+            ),
+        ] {
+            assert!(
+                text.starts_with(&format!("function {name}(")),
+                "{name}: the engine reads the callable name off the first characters of the file",
+            );
+        }
+    }
+
     /// Only real web pages. bru's own UI is not something a filter list has an opinion about, and a
     /// page with no hostname has no rule written against it.
     #[test]
@@ -1169,4 +1403,5 @@ mod tests {
         assert!(!hideable("file:///run/user/1000/test.html"));
     }
 }
+
 

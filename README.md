@@ -692,7 +692,7 @@ one vocabulary, three doors. Arguments in `<>` are required and `[]` optional.
 
 Brave's own ad-blocking engine, linked directly rather than through a binding — the same engine
 qutebrowser reaches through `python-adblock`, with no FFI and no interpreter between a request and
-the decision about it. It works in two layers.
+the decision about it. It works in three layers.
 
 **The network layer** decides before a request is initiated: nothing goes on the wire, no
 connection, no DNS lookup, no cookie. It answers in `get_resource_request_handler` rather than in
@@ -732,14 +732,45 @@ Add your own and fetch them:
 | `content.blocking.adblock.lists` | which lists `:adblock-update` fetches |
 | `content.autofill` | Chromium's own form-fill dropdowns. **Off**, because they are native windows that take the keyboard — the first `<Escape>` in a login field goes to closing one instead of leaving insert mode |
 
+**The scriptlet layer** is the third, and it exists for the one advertisement the other two cannot
+touch: the one *inside* a video. That one arrives over the same connection as the video, from the
+same hosts, so there is no request to cancel; and it is not an element, so there is nothing to hide.
+It is announced as a field in the player's own response, and the only way to remove it is to edit
+that response before the player reads it. A `##+js(name, args…)` rule names one of the scriptlets
+bru ships — they are compiled into the binary from `chrome/scriptlets/`, not loaded from disk — and
+the engine hands back the code to run at document-start.
+
+### Your own rules, and the only list bru trusts
+
+```
+~/.config/bru/filters.txt
+```
+
+uBlock Origin's syntax, read at startup, and rebuilt when it changes. **Trust comes from where the
+file is, not from a setting.** It sits in the directory you hand-write, so a `trusted-` rule in it —
+one that may rewrite *any* network response the page receives, not merely an advertisement — is
+allowed to run. Nothing bru downloads is ever trusted, and there is deliberately no switch to make
+it so, because that switch's only purpose would be to let somebody be talked into ticking it. uBlock
+draws the line in the same place: "My filters" may, and no subscribed list may, including its own.
+
+Removing YouTube's in-video advertisement takes both kinds, because the response arrives two ways:
+
+```
+! opening a video directly — the response is embedded in the page
+www.youtube.com##+js(set, ytInitialPlayerResponse.playerAds, undefined)
+www.youtube.com##+js(set, ytInitialPlayerResponse.adPlacements, undefined)
+
+! clicking one from the feed — no page loads; YouTube fetches a new response
+www.youtube.com##+js(trusted-replace-fetch-response, /"(adPlacements|adSlots|playerAds)"/, '"no_ads"', get_watch)
+```
+
 **What is not implemented, said plainly.** Cosmetic rules keyed by class or id (`##.ad-banner`) need
 the page to report the classes it contains and ask again, which needs a `MutationObserver`; today
 only the rules a list writes against the hostname, and the generic ones that are not class- or
-id-keyed, are applied. **Scriptlets** (`+js(...)`) are not injected at all: they are resolved
-against a resource library — uBlock's `resources.json` — which bru does not ship, so the engine
-returns an empty script and bru does not read it rather than pretend. That is also why YouTube's
-pre-roll advert is not blocked: it arrives from the same hosts as the video and is announced inside
-the player's own response, so there is no request to cancel — only a scriptlet can edit it out.
+id-keyed, are applied. Of uBlock's roughly two hundred scriptlets bru ships **two** — `set-constant`
+and `trusted-replace-fetch-response` — because each one is code bru runs in every page a rule names,
+so each is here only when something is actually asking for it. Only `fetch` is wrapped, not
+`XMLHttpRequest`: measured 2026-08-09, YouTube uses XHR for logging alone.
 
 ## Lua
 
@@ -889,8 +920,9 @@ What you keep in that directory is only what you have changed:
 
 ```
 ~/.config/bru/
-    config.lua      your overrides
-    theme.css       the generated theme
+    config.lua            your overrides
+    filters.txt           your own ad-block rules — the only ones bru trusts
+    theme.css             the generated theme
     styles/<host>/*.css   per-site CSS
 ```
 
