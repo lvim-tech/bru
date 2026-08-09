@@ -597,13 +597,52 @@ fn escape_attr(s: &str) -> String {
 /// not, and a poisoned row that renders as `#` while displaying what it holds is a row the reader
 /// can see and delete.
 fn safe_href(url: &str) -> String {
-    // Leading whitespace and case are both ignored by the URL parser, so they are ignored here.
-    let lower = url.trim_start().to_ascii_lowercase();
-    const REFUSED: [&str; 5] = ["javascript:", "data:", "vbscript:", "blob:", "file:"];
-    if REFUSED.iter().any(|scheme| lower.starts_with(scheme)) {
-        "#".to_string()
-    } else {
-        escape_attr(url)
+    // **Normalise the way the parser will, then allow rather than refuse.**
+    //
+    // The first version of this refused a denylist of schemes after `trim_start` and
+    // `to_ascii_lowercase`, and its comment said "leading whitespace and case are both ignored by
+    // the URL parser, so they are ignored here". That was true and it was not all of it. The parser
+    // also removes **every ASCII tab, LF and CR anywhere in the string**, and trims leading C0
+    // controls that are not whitespace — so `java<TAB>script:alert(1)` and a `javascript:` behind a
+    // leading U+0001 were live `javascript:` URLs that did not begin with `javascript:` as a Rust
+    // string and walked straight through. Measured standalone 2026-08-09, before this rewrite.
+    // Embedding a tab in a scheme is the textbook bypass of exactly this kind of filter, and a
+    // partial filter is worse than none because it reads as handled.
+    //
+    // So: strip what the parser strips, read the scheme, and **allow** the handful that cannot run
+    // anything. A denylist has to anticipate every spelling of danger; an allowlist cannot be
+    // widened by a spelling nobody thought of, which is the only property worth having here.
+    //
+    // Whether Chromium follows `java<TAB>script:` in an `href` as `javascript:` is spec-backed and
+    // **not measured here** — the experiment is a `bru://` page carrying that href, clicked. The
+    // Rust-side half, that these strings used to come back unrefused, is measured.
+    let stripped: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let head = stripped.trim_start_matches(|c: char| c <= ' ');
+    // A scheme is a letter followed by letters, digits, `+`, `-` or `.`. Anything else before the
+    // first colon is not a scheme at all — `example.com/a:b` is a relative reference, and reading
+    // its first half as a scheme would refuse a link that runs nothing.
+    let scheme = head.split_once(':').and_then(|(candidate, _)| {
+        let mut chars = candidate.chars();
+        if !chars.next()?.is_ascii_alphabetic() {
+            return None;
+        }
+        chars
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .then(|| candidate.to_ascii_lowercase())
+    });
+    const SAFE: [&str; 5] = ["http", "https", "ftp", "mailto", "bru"];
+    match scheme {
+        // No scheme: a relative reference, which resolves against this `bru://` page and runs
+        // nothing.
+        None => escape_attr(url),
+        Some(scheme) if SAFE.contains(&scheme.as_str()) => escape_attr(url),
+        // Everything else, named or not. The row still prints the string in its text cells, so a
+        // bookmark to a scheme bru does not list is visible and can be copied — it just is not a
+        // link this page will follow.
+        Some(_) => "#".to_string(),
     }
 }
 
@@ -735,8 +774,34 @@ mod tests {
         // Case and leading space are ignored by the URL parser and so by this.
         assert_eq!(safe_href("  JavaScript:alert(1)"), "#");
         assert_eq!(safe_href("data:text/html,<script>x</script>"), "#");
+
+        // **The bypasses the first version of this let through**, each measured against it on
+        // 2026-08-09 and each a live `javascript:` URL once the parser has stripped what it strips.
+        assert_eq!(safe_href("java\tscript:alert(1)"), "#", "an embedded tab");
+        assert_eq!(safe_href("java\nscript:alert(1)"), "#", "an embedded newline");
+        assert_eq!(safe_href("java\rscript:alert(1)"), "#", "an embedded carriage return");
+        assert_eq!(safe_href("\u{01}javascript:alert(1)"), "#", "a leading C0 control");
+        assert_eq!(safe_href("\u{0c}javascript:alert(1)"), "#", "a leading form feed");
+        // A scheme nobody put on either list: an allowlist refuses it, a denylist would not.
+        assert_eq!(safe_href("vbscript\t:x"), "#");
+        assert_eq!(safe_href("wyciwyg://x"), "#");
+
+        // **A control character *inside* a scheme is not the same as one before it**, and this
+        // asserts the difference rather than assuming it. The parser removes tab, LF and CR
+        // anywhere and trims the other C0 controls only from the front, so `jAvAsCrIpT\u{02}:` is
+        // not a scheme at all and the whole string reads as a relative reference — which resolves
+        // against this `bru://` page and runs nothing. Refusing it would refuse something harmless;
+        // this assertion exists because the first draft of it claimed the opposite and was wrong.
+        assert!(safe_href("jAvAsCrIpT\u{02}:x").starts_with("jAvAsCrIpT"));
+
         // An ordinary URL is untouched but for its escaping.
         assert!(safe_href("https://x/a\"b").starts_with("https://x/a&quot;b"));
+        assert!(safe_href("http://x/").starts_with("http://x/"));
+        assert!(safe_href("mailto:a@b").starts_with("mailto:a@b"));
+        // A relative reference has no scheme to run, and a colon after a slash is not one: refusing
+        // these would break links that do nothing dangerous.
+        assert!(safe_href("/a/b").starts_with("/a/b"));
+        assert!(safe_href("example.com/a:b").starts_with("example.com/a:b"));
 
         let marks = [data::Bookmark {
             url: "javascript:alert(document.title)".to_string(),
