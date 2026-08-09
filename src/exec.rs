@@ -1399,7 +1399,47 @@ fn zoom_percent(browser: &mut Browser) -> u32 {
     let Some(host) = browser.host() else {
         return ZOOM_DEFAULT;
     };
-    (1.2f64.powf(host.zoom_level()) * 100.0).round() as u32
+    (zoom_factor(&host) * 100.0).round() as u32
+}
+
+/// The same reading as a multiplier rather than a percentage. Kept beside `zoom_percent` and used
+/// by it, because the two must not come to disagree about what a level means.
+fn zoom_factor(host: &BrowserHost) -> f64 {
+    1.2f64.powf(host.zoom_level())
+}
+
+/// A point the page measured, in the coordinates `send_mouse_*_event` takes.
+///
+/// **The page and CEF do not use the same pixel, and they are the same size only at 100%.**
+/// `getBoundingClientRect` and `elementFromPoint` answer in CSS pixels; a mouse event is in view
+/// coordinates. Page zoom is exactly the ratio between them, so a CSS point sent unconverted
+/// arrives at `css / zoom` — right at 100%, and further off the further the zoom is from it.
+///
+/// **The bug this ends.** Measured 2026-08-09 on a 30px-tall `<input>` spanning y 127.5–157.6 at
+/// `:zoom 90`: the page gave the click point (63, 143), bru sent it as it stood, and the
+/// `mousedown` arrived at (70, 158) — one pixel below the field, on the `<body>`. The field never
+/// took the focus, so `focus.rs` saw `editable=false` and *left* insert mode instead of entering
+/// it, and `f` onto a text field ended in normal mode with nothing looking wrong. Hinting a link
+/// missed the same way; a link is short too. At 100% the identical follow lands exactly, which is
+/// why hinting worked until the first `:zoom` and not afterwards.
+///
+/// Every caller is a place bru clicks where the *page* said to: `hints.rs`, `utilcmds.rs`'s
+/// `:click`, and `caret.rs` following the selection. `scroll.rs` is not one — its wheel goes to a
+/// fixed (10, 10), which is inside the page at any zoom.
+pub fn view_point(browser: &mut Browser, x: i32, y: i32) -> (i32, i32) {
+    let Some(host) = browser.host() else {
+        return (x, y);
+    };
+    to_view(x, y, zoom_factor(&host))
+}
+
+/// The arithmetic of [`view_point`], separated from the host read so the measured case can be a
+/// test rather than a paragraph — nothing here touches CEF.
+fn to_view(x: i32, y: i32, factor: f64) -> (i32, i32) {
+    (
+        (x as f64 * factor).round() as i32,
+        (y as f64 * factor).round() as i32,
+    )
 }
 
 fn set_zoom_percent(browser: &mut Browser, percent: u32) {
@@ -2473,5 +2513,61 @@ mod tests {
         assert_eq!(commands::parse("zoom 150%").unwrap(), Command::Zoom { level: Some(150) });
         assert_eq!(commands::parse("zoom 150").unwrap(), Command::Zoom { level: Some(150) });
         assert!(commands::parse("zoom huge").is_err());
+    }
+
+    /// The measurement that found the bug, as a test. `file:///run/user/1000/short.html` at
+    /// `:zoom 90`, 2026-08-09: a 30px-tall `<input>` spanning **y 127.49 to 157.63**, for which
+    /// `chrome/hints.js` gave the click point (63, 143) — comfortably inside.
+    ///
+    /// Sent unconverted, the `mousedown` arrived at (70, 158): past the bottom edge, on the
+    /// `<body>`, with `document.activeElement` left as `BODY`. That is the whole bug — the field
+    /// never took the focus, `focus.rs` read `editable=false` and left insert mode rather than
+    /// entering it, and `f` onto a text field ended in normal mode.
+    ///
+    /// So the assertion is about where the click **lands**, which is `sent / factor`, and not about
+    /// the number sent. Remove the conversion from `view_point` and the second half fails.
+    #[test]
+    fn a_hint_followed_at_ninety_percent_lands_inside_the_field_it_aimed_at() {
+        const TOP: f64 = 127.49;
+        const BOTTOM: f64 = 157.63;
+        const FACTOR: f64 = 0.9;
+        const AIMED_AT: (i32, i32) = (63, 143);
+
+        let landing = |sent: i32| sent as f64 / FACTOR;
+
+        let (_, sent_y) = to_view(AIMED_AT.0, AIMED_AT.1, FACTOR);
+        let landed = landing(sent_y);
+        assert!(
+            landed > TOP && landed < BOTTOM,
+            "converted, the click lands at {landed:.1}, which must be inside {TOP}..{BOTTOM}",
+        );
+
+        // What bru did before: the CSS point sent as it stood.
+        let landed_before = landing(AIMED_AT.1);
+        assert!(
+            landed_before > BOTTOM,
+            "unconverted it landed at {landed_before:.1}, below the field's {BOTTOM} — if this \
+             passes, the measurement that motivated the fix has been mistranscribed",
+        );
+    }
+
+    /// **Why it worked until the first `:zoom`.** At 100% the two pixels are the same size, so the
+    /// conversion is the identity — which is also what says this fix cannot have moved a click that
+    /// was already landing.
+    #[test]
+    fn at_one_hundred_percent_the_point_is_unchanged() {
+        for point in [(0, 0), (63, 143), (807, 553), (1919, 1079)] {
+            assert_eq!(to_view(point.0, point.1, 1.0), point);
+        }
+    }
+
+    /// Zooming in overshoots exactly as zooming out undershoots, and the factor is the one
+    /// `zoom_percent` reports — a level of 0 is 100%, and 1.2 per step is Chromium's own.
+    #[test]
+    fn the_factor_is_the_one_the_zoom_command_reads() {
+        // `:zoom 200` sets the level to ln(2)/ln(1.2); the factor that comes back is 2.
+        let factor = 1.2f64.powf((200.0f64 / 100.0).ln() / 1.2f64.ln());
+        assert!((factor - 2.0).abs() < 1e-9, "{factor} should be 2.0");
+        assert_eq!(to_view(100, 200, factor), (200, 400));
     }
 }

@@ -1033,7 +1033,9 @@ fn on_follow(browser: &mut Browser, tab: bool, data: &str, url: &str) {
     };
     eprintln!("bru[caret]: following the selected link at {x},{y}");
     // A real click, for the same reason `src/hints.rs` uses one: a synthetic `element.click()` skips
-    // hover, focus and every handler that checks `isTrusted`.
+    // hover, focus and every handler that checks `isTrusted`. The page reported the caret's box in
+    // CSS pixels, so it needs the same conversion the hint's click does — `exec::view_point`.
+    let (x, y) = crate::exec::view_point(browser, x, y);
     let Some(host) = browser.host() else {
         return;
     };
