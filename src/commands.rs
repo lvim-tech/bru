@@ -383,6 +383,13 @@ pub enum Command {
     /// The value is optional because `<Return>` means "what is in the line edit", or for a yes/no
     /// question with a default, that default (`YesNoPrompt.accept`, prompt.py:971-983).
     PromptAccept { value: Option<String>, save: bool },
+    /// `prompt-dir <in|out>` — walk a filename prompt's listing, `<Right>` and `<Left>`.
+    ///
+    /// bru's own; qutebrowser has no such command, because its file prompt is a widget with a mouse
+    /// on it. Here the three questions a picker asks are three keys: which row is under the cursor
+    /// (`prompt-item-focus`), which directory you are in (this), and where the file goes
+    /// (`prompt-accept`).
+    PromptDir { into: bool },
     /// `prompt-item-focus <next|prev>` — `<Tab>`, `<Shift-Tab>`, `<Up>`, `<Down>` in `prompt`.
     /// Walks the file list of a filename prompt, and the two fields of a login.
     PromptItemFocus { which: FocusWhich },
@@ -1644,6 +1651,12 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         "prompt-accept" => Command::PromptAccept {
             value: args.arg(0).map(str::to_string),
             save: args.has("save"),
+        },
+        "prompt-dir" => match args.arg(0) {
+            Some("in") => Command::PromptDir { into: true },
+            Some("out") => Command::PromptDir { into: false },
+            Some(other) => return Err(bad(&format!("invalid direction {other:?} — in or out"))),
+            None => return Err(bad("needs a direction — in or out")),
         },
         "prompt-item-focus" => {
             let Some(which) = args.arg(0) else {

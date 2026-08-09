@@ -141,6 +141,17 @@ impl CmdLine {
         self.rev += 1;
     }
 
+    /// The same, with the caret put somewhere other than the end.
+    ///
+    /// One caller: the file prompt, which parks the caret where the file's name begins so that
+    /// typing lands in front of it — a search — and the name stays visible and editable behind it.
+    pub fn set_text_with_cursor(&mut self, text: &str, cursor: usize) {
+        self.chars = text.chars().collect();
+        self.cursor = cursor.min(self.chars.len());
+        self.rev += 1;
+    }
+
+
     /// Empty the line and stop any history walk. `Command.on_mode_left`.
     pub fn clear(&mut self) {
         self.chars.clear();

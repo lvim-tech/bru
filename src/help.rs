@@ -470,6 +470,10 @@ pub const COMMANDS: &[Doc] = &[
     Doc { names: &["prompt-accept"], args: "[value]", flags: &["--save"],
         what: "Answer the question that is open; --save remembers the answer for this site.",
         example: "prompt-accept" },
+    Doc { names: &["prompt-dir"], args: "<in|out>", flags: &[],
+        what: "Walk a file prompt's listing — `<Right>` goes into the highlighted folder, \
+               `<Left>` goes up one.",
+        example: "prompt-dir out" },
     Doc { names: &["prompt-item-focus"], args: "<next|prev>", flags: &[],
         what: "Move through a question's file list, or between a login's two fields.",
         example: "prompt-item-focus next" },
@@ -1357,7 +1361,7 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 171, "the scrape found a different number of commands");
+        assert_eq!(source.len(), 172, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1506,6 +1510,7 @@ mod tests {
                 Command::CompletionItemYank { .. } => "CompletionItemYank",
                 Command::PromptAccept { .. } => "PromptAccept",
                 Command::PromptItemFocus { .. } => "PromptItemFocus",
+                Command::PromptDir { .. } => "PromptDir",
                 Command::PromptOpenDownload { .. } => "PromptOpenDownload",
                 Command::PromptYank { .. } => "PromptYank",
                 Command::PromptFileselectExternal => "PromptFileselectExternal",
@@ -1618,7 +1623,7 @@ mod tests {
         "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigListAdd",
         "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind", "DevToolsClose",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",
-        "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",
+        "PromptDir", "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",
         "AdblockUpdate", "AdblockToggle", "AdblockInfo", "GreasemonkeyReload", "ViewSource",
         "Print", "DevTools", "DevToolsFocus", "Message", "MacroRecord", "MacroRun", "Save",
         "CmdRepeatLast", "SettingsPage", "TabSelect", "TabTake", "WindowOnly", "Screenshot",

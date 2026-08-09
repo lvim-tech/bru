@@ -931,11 +931,12 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
 // --- end lua runtime ---------------------------------------------------------------------------
 
 // --- src/prompt.rs -------------------------------------------------------------------------
-        // The five `prompt-*` commands, all of which act on the question open in the window the
+        // The six `prompt-*` commands, all of which act on the question open in the window the
         // key was pressed in. They take no browser: a prompt belongs to a window, and the browser
         // that raised it may be a background tab.
         Command::PromptAccept { .. }
         | Command::PromptItemFocus { .. }
+        | Command::PromptDir { .. }
         | Command::PromptOpenDownload { .. }
         | Command::PromptYank { .. }
         | Command::PromptFileselectExternal => {
@@ -1133,6 +1134,7 @@ pub fn is_live(command: &Command) -> bool {
         // fifteen prompt bindings are `rl-*` rows that reach `cmdline.rs` by name, and
         // `Command::Unimplemented` at the bottom of this match is what asks about those.
         Command::PromptAccept { .. }
+        | Command::PromptDir { .. }
         | Command::PromptItemFocus { .. }
         | Command::PromptOpenDownload { .. }
         | Command::PromptYank { .. }
@@ -1768,7 +1770,7 @@ mod tests {
         // thought not to draw; 281 since the twelve `t**` rows went with the two settings they
         // named — the only two falls in this number. 286 since five of the inspector's keys came
         // back, once the docked positions turned out to be drawable after all.
-        assert_eq!(DEFAULT_BINDINGS.len(), 286);
+        assert_eq!(DEFAULT_BINDINGS.len(), 288);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1829,7 +1831,7 @@ mod tests {
         // since the rows left and returned to the table.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 286, "the live-binding count moved");
+        assert_eq!(live, 288, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1863,7 +1865,7 @@ mod tests {
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
         // Every one of them acts: the twelve that only explained themselves are gone, and the five
         // inspector keys that came back name commands that all draw something.
-        assert_eq!(live, 286);
+        assert_eq!(live, 288);
     }
 // --- end src/help.rs -------------------------------------------------------
 

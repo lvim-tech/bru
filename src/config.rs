@@ -344,10 +344,19 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("prompt", "<Return>", "prompt-accept"),
     ("prompt", "<Ctrl-X>", "prompt-open-download"),
     ("prompt", "<Ctrl-P>", "prompt-open-download --pdfjs"),
-    ("prompt", "<Shift-Tab>", "prompt-item-focus prev"),
     ("prompt", "<Up>", "prompt-item-focus prev"),
-    ("prompt", "<Tab>", "prompt-item-focus next"),
     ("prompt", "<Down>", "prompt-item-focus next"),
+    // **Tab walks the tree; the arrows walk the line and the list.** `<Tab>` completes what has
+    // been typed to the name the highlighted row really has and steps into it, which is the shell's
+    // own bargain and the reason `neov` can find `nvim`. `<Shift-Tab>` steps back out.
+    ("prompt", "<Tab>", "prompt-dir in"),
+    ("prompt", "<Shift-Tab>", "prompt-dir out"),
+    // Left and right move through the *text*, so the name being saved under can be edited like any
+    // other line. They were briefly the way in and out of a folder, and that cost the ability to
+    // put the caret anywhere — one key cannot be both a step through a path and a step through a
+    // word.
+    ("prompt", "<Right>", "rl-forward-char"),
+    ("prompt", "<Left>", "rl-backward-char"),
     ("prompt", "<Alt-Y>", "prompt-yank"),
     ("prompt", "<Alt-Shift-Y>", "prompt-yank --sel"),
     ("prompt", "<Alt-E>", "prompt-fileselect-external"),
@@ -1349,7 +1358,8 @@ mod tests {
         // why they did nothing rather than doing anything. 293 before those; 299 before the
         // inspector was cut to one key. A number that moves has to say why as plainly in both
         // directions.
-        assert_eq!(total, 286, "the default table is not the one transcribed from configdata.yml");
+        // 288 since `<Left>`/`<Right>` became the file prompt's way in and out of a directory.
+        assert_eq!(total, 288, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1379,7 +1389,7 @@ mod tests {
         // The two sections that were left out until there were modes to hang them on. `yesno` is
         // where the collision check earns its keep twice over: `y`/`Y` and `n`/`N` are the same
         // two keys with and without Shift, so eight rows collapse to six if the Shift bit is lost.
-        assert_eq!(bindings.len(Mode::Prompt), 26);
+        assert_eq!(bindings.len(Mode::Prompt), 28);
         assert_eq!(bindings.len(Mode::YesNo), 8);
 // --- end src/prompt.rs ---------------------------------------------------------------------
     }

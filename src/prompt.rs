@@ -268,6 +268,18 @@ struct Open {
     items: Vec<String>,
     items_dir: PathBuf,
     selected: Option<usize>,
+    /// The name the file will be saved under, carried from folder to folder.
+    ///
+    /// **One field cannot be both a name and a search box, and this is how it is both.** The line
+    /// shows `…/folder/report.pdf`, so what the file will be called is visible the whole time; and
+    /// the tail of the line narrows the listing, so typing searches. Those two would fight — an
+    /// untouched `report.pdf` matches no folder and would filter everything away — except that a
+    /// tail *equal to this* is treated as no query at all. Edit one letter of it and it becomes a
+    /// query; `<Tab>` then puts the real folder in the line and this name back on the end.
+    ///
+    /// Set when the question opens and again on every step through the tree, so it is always the
+    /// name the user last settled on rather than the one the download arrived with.
+    name: String,
     /// The key hints, resolved against the live binding table **once**, when the question opened.
     ///
     /// Not on every push: `Bindings` is behind `BruState` and reading it means cloning the whole
@@ -349,13 +361,25 @@ pub fn ask(window: u32, question: Question) {
 /// The editing state a question starts in.
 fn open_of(question: Question) -> Open {
     let mut line = CmdLine::new();
-    line.set_text(&question.default);
+    // The caret opens where the file's name begins: typing then lands *in front* of the name and is
+    // a search, while the name stays visible and can be reached with the arrows to be edited.
+    let starts_at = question
+        .default
+        .rfind('/')
+        .map(|at| question.default[..=at].chars().count())
+        .unwrap_or(0);
+    if question.kind == Kind::Download {
+        line.set_text_with_cursor(&question.default, starts_at);
+    } else {
+        line.set_text(&question.default);
+    }
     let (items_dir, items) = if question.kind == Kind::Download {
         list_dir(&question.default)
     } else {
         (PathBuf::new(), Vec::new())
     };
     let keys = key_hints(&question);
+    let name = file_name_of(&question.default);
     Open {
         question,
         line,
@@ -364,8 +388,41 @@ fn open_of(question: Question) -> Open {
         items,
         items_dir,
         selected: None,
+        name,
         keys,
     }
+}
+
+/// Split a filename prompt's line into the directory, the query typed in front of the name, and the
+/// name itself.
+///
+/// **Keyed on the remembered name, not on where the caret is.** An earlier version cut the line at
+/// the caret and called everything before it a query — and a caret that had wandered into the name
+/// for any other reason then ate real letters out of it: `download.html` came back as `ownload.html`
+/// and the prompt looked broken in a way that had nothing to do with what the user had done.
+///
+/// A suffix cannot do that. If the tail still ends with the name, whatever precedes it is a query;
+/// if it does not, the name itself has been edited and *is* the new name. Nothing is ever removed
+/// from the middle.
+fn split_line<'a>(text: &'a str, name: &str) -> (String, String, String) {
+    let cut = text.rfind('/').map(|at| at + 1).unwrap_or(0);
+    let (dir, tail) = text.split_at(cut);
+    if !name.is_empty() && tail.ends_with(name) {
+        let query = &tail[..tail.len() - name.len()];
+        (dir.to_string(), query.to_string(), name.to_string())
+    } else {
+        // The name has been typed over. There is no query, and the tail is what the file will be
+        // called — see `on_text_changed`, which is where that is remembered.
+        (dir.to_string(), String::new(), tail.to_string())
+    }
+}
+
+/// The last component of a path, or an empty string when it has none.
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// Put a window into the mode the open question is answered in, and draw it.
@@ -404,7 +461,17 @@ fn enter_mode(window: u32) {
         // Nothing has to give the focus back: `keys.rs` aims every key that lands on a chrome
         // strip at the showing tab anyway (trap 11), so the strip keeping it after the answer
         // costs nothing.
-        crate::ipc::focus_bottom_chrome(window);
+        //
+        // **The panel, not the bottom strip.** This said `focus_bottom_chrome` and had done since
+        // before the completion table and the prompt were moved into a view of their own — so the
+        // keys were being delivered to `bottom.html`, which has no `#prompt` in it and says so in a
+        // comment. The `<input>` the prompt builds is in `panel.html`, and `prompt.js` calling
+        // `input.focus()` inside that document means nothing while the document's *browser* has no
+        // keyboard focus. What that looked like: a file prompt with no caret that swallowed every
+        // key, `<Return>` included, so the only way out was `<Escape>`.
+        //
+        // Two levels are needed and this is the CEF one; the DOM one the chrome does itself.
+        crate::ipc::focus_panel_chrome(window);
     } else {
         // The window was already in the other prompt mode, which `ModeManager::enter` refuses. That
         // cannot happen from `ask` — a window with an open prompt queues instead — but it can from
@@ -704,29 +771,56 @@ const TEXT_ROWS: i32 = 3;
 /// **Built here and never by the chrome.** The rows are a promise about what the keyboard will do;
 /// a page that could add one could promise anything.
 fn key_hints(q: &Question) -> Vec<(String, &'static str)> {
-    let mut cmds: Vec<(&str, &'static str)> = Vec::new();
+    /// One hint's command, or the two that belong together.
+    ///
+    /// The arrows come in pairs and a row that showed only one of them would be a row that lies by
+    /// omission — `<Down>` alone says nothing about how to go back up.
+    enum Keys {
+        One(&'static str),
+        Pair(&'static str, &'static str),
+    }
+    use Keys::{One, Pair};
+
+    let mut cmds: Vec<(Keys, &'static str)> = Vec::new();
     match q.kind {
-        Kind::Alert => cmds.push(("prompt-accept", "Hide")),
+        Kind::Alert => cmds.push((One("prompt-accept"), "Hide")),
         Kind::YesNo => {
-            cmds.push(("prompt-accept yes", "Yes"));
-            cmds.push(("prompt-accept no", "No"));
+            cmds.push((One("prompt-accept yes"), "Yes"));
+            cmds.push((One("prompt-accept no"), "No"));
             if q.default_yes.is_some() {
-                cmds.push(("prompt-accept", "Use the default"));
+                cmds.push((One("prompt-accept"), "Use the default"));
             }
-            cmds.push(("mode-leave", "Abort"));
-            cmds.push(("prompt-yank", "Yank URL"));
+            cmds.push((One("mode-leave"), "Abort"));
+            cmds.push((One("prompt-yank"), "Yank URL"));
         }
         Kind::Download => {
-            cmds.push(("prompt-accept", "Accept"));
-            cmds.push(("mode-leave", "Abort"));
-            cmds.push(("rl-filename-rubout", "Go to parent directory"));
-            cmds.push(("prompt-open-download", "Open download"));
-            cmds.push(("prompt-yank", "Yank URL"));
-            cmds.push(("prompt-fileselect-external", "Launch external file selector"));
+            // **Four lines, and they are the whole of the picker.** Which row (the up and down
+            // arrows), which directory (left and right), where the file goes, and out.
+            //
+            // The others are still bound and deliberately not listed: `prompt-open-download`,
+            // `prompt-yank` and `prompt-fileselect-external` are things you go looking for, and
+            // `rl-filename-rubout` is an editing key that used to be advertised as the way to the
+            // parent — which is why `<Ctrl+Shift+W>` was the only route anybody found. A hint list
+            // that names everything names nothing; these four are what the prompt is *for*.
+            //
+            // The keys themselves are read from the bindings, so a `config.lua` that rebinds one is
+            // described correctly rather than from memory.
+            // **Named with their arguments, because that is what is bound.** `binding_in` matches
+            // the command string exactly, and the table holds `prompt-item-focus next`, not
+            // `prompt-item-focus` — so the bare name found nothing and the row read
+            // `unbound (prompt-item-focus)`. Both halves of each pair are asked for and shown
+            // together, which is also the truer hint: these keys come in pairs.
+            cmds.push((
+                Pair("prompt-item-focus prev", "prompt-item-focus next"),
+                "Move through the listing",
+            ));
+            cmds.push((Pair("prompt-dir in", "prompt-dir out"), "Into the folder, or back out"));
+            cmds.push((One("prompt-accept"), "Save in this folder"));
+            cmds.push((One("mode-leave"), "Abort"));
         }
         Kind::Text | Kind::UserPwd => {
-            cmds.push(("prompt-accept", "Accept"));
-            cmds.push(("mode-leave", "Abort"));
+            cmds.push((One("prompt-accept"), "Accept"));
+            cmds.push((One("mode-leave"), "Abort"));
         }
     }
     let mode = q.kind.mode();
@@ -737,7 +831,19 @@ fn key_hints(q: &Question) -> Vec<(String, &'static str)> {
         .map(|bindings| bindings.all())
         .unwrap_or_default();
     cmds.into_iter()
-        .map(|(cmd, what)| (binding_in(&table, mode, cmd), what))
+        .map(|(keys, what)| match keys {
+            One(cmd) => (binding_in(&table, mode, cmd), what),
+            // `<Left>/<Right>`, in the order they read: out first, then in, so the pair matches the
+            // sentence beside it.
+            Pair(first, second) => (
+                format!(
+                    "{}/{}",
+                    binding_in(&table, mode, first),
+                    binding_in(&table, mode, second)
+                ),
+                what,
+            ),
+        })
         .collect()
 }
 
@@ -753,7 +859,15 @@ fn binding_in(table: &[(Mode, String, String)], mode: Mode, cmd: &str) -> String
         .filter(|(bound_mode, _, bound)| *bound_mode == mode && bound == cmd)
         .map(|(_, keys, _)| keys)
         .collect();
-    for preferred in ["<Return>", "<Escape>"] {
+    // **Which spelling to show when a command answers to several.** `<Return>` and `<Escape>` are
+    // qutebrowser's own preference and stay first. The arrows are bru's, and they are here because
+    // the table lists `<Shift-Tab>` before `<Up>`, so the hint read `<Shift+Tab>/<Down>` — one row
+    // naming two different families for what is one pair of keys. The arrows are what the prompt
+    // teaches, so they are what it shows; `<Tab>` still works and is simply not the label.
+    //
+    // Each is chosen only if the command is actually bound to it, so this changes nothing for a
+    // command that answers to one key.
+    for preferred in ["<Return>", "<Escape>", "<Up>", "<Down>", "<Left>", "<Right>"] {
         if let Some(key) = found.iter().find(|key| key.eq_ignore_ascii_case(preferred)) {
             return (*key).clone();
         }
@@ -811,12 +925,76 @@ pub fn takes_typing(window: u32) -> bool {
 
 /// What the chrome says its input holds, from `{"type":"prompt-text"}`. The mirror, exactly like
 /// the command line's: one IPC hop behind, and never what an answer is built from.
-pub fn on_text_changed(window: u32, text: &str, cursor: Option<usize>) {
+/// Whether a question with a text field is open in `window`.
+///
+/// Asked by `completers::apply_height`, which is the moment the panel stops being invisible — and
+/// an invisible view cannot hold the keyboard, so that is the moment the prompt's `<input>` can
+/// actually be given it.
+pub fn wants_the_keyboard(window: u32) -> bool {
     with_window(window, |entry| {
-        if let Some(open) = entry.open.as_mut() {
-            open.field().sync(text, cursor);
+        entry
+            .open
+            .as_ref()
+            .is_some_and(|open| open.question.kind.has_input())
+    })
+    .unwrap_or(false)
+}
+
+pub fn on_text_changed(window: u32, text: &str, cursor: Option<usize>) {
+    let relisted = with_window(window, |entry| {
+        let Some(open) = entry.open.as_mut() else {
+            return false;
+        };
+        open.field().sync(text, cursor);
+        // **A filename prompt's listing follows what is typed**, which is what makes it searchable
+        // rather than only walkable. The letters land in the chrome's own `<input>` and arrive here
+        // as a mirror, and this used to stop at the mirror: the text moved, the listing did not, so
+        // typing `Fo` in a folder of thirty names still showed thirty names.
+        //
+        // `list_dir` reads the last path component as a filter — see it for why a filter matching
+        // nothing shows everything rather than nothing.
+        if open.question.kind != Kind::Download || open.on_password {
+            return false;
         }
-    });
+        // **The highlight follows what is typed.** `list_and_pick` says which row answers the
+        // query best, and that is where the cursor goes — so `<Tab>` always completes to something
+        // the user can see is selected, rather than to whatever happened to be first.
+        // **Try the tail as a search before calling it a name, and that order is the whole fix.**
+        //
+        // With the name still on the line the split is unambiguous: what precedes it was typed to
+        // find something. Delete the name, or type over it, and there is nothing to precede — and
+        // this used to take the tail as a new name without ever asking the folder about it. So `co`
+        // in a folder holding `completion` filtered nothing, highlighted nothing, and `<Tab>`
+        // completed the folder and left `co` sitting behind it. Photographed 2026-08-09.
+        //
+        // Nobody types at a picker hoping to match nothing, so a tail that matches is a search and
+        // a tail that matches nothing is a name.
+        let cut = text.rfind('/').map(|at| at + 1).unwrap_or(0);
+        let (folder, tail) = text.split_at(cut);
+        let query = if !open.name.is_empty() && tail.ends_with(&open.name) {
+            tail[..tail.len() - open.name.len()].to_string()
+        } else {
+            let (_, _, matched) = list_and_pick(&format!("{folder}{tail}"), "");
+            if matched.is_some() {
+                // A search. Whatever the name was, it stays — including empty, which
+                // `accept_open` fills in from the download itself.
+                tail.to_string()
+            } else {
+                // A name, and it sticks from here on.
+                open.name = tail.to_string();
+                String::new()
+            }
+        };
+        let (dir, items, best) = list_and_pick(&format!("{folder}{query}"), "");
+        open.items_dir = dir;
+        open.items = items;
+        open.selected = best;
+        true
+    })
+    .unwrap_or(false);
+    if relisted {
+        crate::ipc::push_bar();
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -831,6 +1009,7 @@ pub fn run_command(command: &Command) -> bool {
             command,
             Command::PromptAccept { .. }
                 | Command::PromptItemFocus { .. }
+                | Command::PromptDir { .. }
                 | Command::PromptOpenDownload { .. }
                 | Command::PromptYank { .. }
                 | Command::PromptFileselectExternal
@@ -843,6 +1022,10 @@ pub fn run_command(command: &Command) -> bool {
         }
         Command::PromptItemFocus { which } => {
             item_focus(window, *which);
+            true
+        }
+        Command::PromptDir { into } => {
+            dir_step(window, *into);
             true
         }
         Command::PromptOpenDownload { cmdline, pdfjs } => {
@@ -1026,7 +1209,15 @@ fn accept_open(
             value.map(str::to_string).unwrap_or_else(|| open.line.text()),
         )),
         Kind::Download => {
-            let text = value.map(str::to_string).unwrap_or_else(|| open.line.text());
+            // The query goes here as it goes everywhere: what stands in front of the name was typed
+            // to *find* something, and a file called `nvreport.pdf` is nobody's intention.
+            let text = match value {
+                Some(value) => value.to_string(),
+                None => {
+                    let (folder, _, name) = split_line(&open.line.text(), &open.name);
+                    format!("{folder}{name}")
+                }
+            };
             let path = expand_path(&text);
             if path.as_os_str().is_empty() {
                 return Err(Some("invalid filename".to_string()));
@@ -1103,14 +1294,15 @@ fn item_focus(window: u32, which: FocusWhich) {
                     (_, Some(at)) if at == last => 0,
                     (_, Some(at)) => at + 1,
                 });
-                // Selecting a row puts it in the line, the way `_insert_path` does — the point of
-                // `<Tab>` is completion, not a torch shone along a list.
-                if let Some(at) = open.selected {
-                    // Against the directory the listing is **of**, never against the line: the
-                    // line already holds whatever the previous `<Tab>` put there.
-                    let joined = join_dir(&open.items_dir, &open.items[at]);
-                    open.line.set_text(&joined);
-                }
+                // **The line is not touched.** It holds the directory being browsed, and that is
+                // what `<Return>` saves into; moving the highlight is looking, not choosing. Going
+                // in and out is `<Right>`/`<Left>` — see [`dir_step`], which is the only thing that
+                // rewrites the line and the listing together.
+                //
+                // It used to write the highlighted path into the line on every step, which made
+                // three different keys mean three different kinds of "where": the line said one
+                // thing, the listing showed another, and `..` appeared to do nothing because only
+                // the invisible half had moved.
                 true
             }
             _ => false,
@@ -1288,38 +1480,180 @@ fn expand_path(text: &str) -> PathBuf {
 /// The directories under whatever `text` names, sorted, with `..` first — `_set_fileview_root`
 /// plus `DownloadFilenamePrompt`'s `QDir.Filter.AllDirs` (`prompt.py:863-864`). Directories only:
 /// the thing being chosen is where a file goes, and the file's own name is typed.
+/// The listing alone, with the tail taken as a plain query.
+///
+/// The callers that use this hand it a path ending in a separator, so there is no tail to speak of;
+/// `""` is the honest answer to "what name has been settled on" rather than a guess at one.
 fn list_dir(text: &str) -> (PathBuf, Vec<String>) {
+    let (dir, items, _) = list_and_pick(text, "");
+    (dir, items)
+}
+
+/// The listing, and which row the typed text points at.
+///
+/// **What is typed after the last separator is a query, and the answer to it is a real name.** Type
+/// `nv` and the rows narrow to what contains it; the best of them is highlighted, and `<Tab>` writes
+/// *that* name into the line in place of what was typed. So `neov` can find `nvim` and still put
+/// `nvim` on the line — a picker that completes to what exists rather than to what was guessed.
+///
+/// Matching is two-tiered, best first: names that **start with** the query, then names that merely
+/// **contain** it. Both are case-insensitive. A query that matches nothing narrows nothing — the
+/// whole directory stays on offer, because a listing that empties itself the moment you mistype is
+/// a listing you cannot recover from without deleting what you wrote.
+fn list_and_pick(text: &str, settled: &str) -> (PathBuf, Vec<String>, Option<usize>) {
     let path = expand_path(text);
-    let dir = if path.is_dir() {
-        path
+    let (dir, query) = if text.ends_with('/') {
+        (path, String::new())
+    } else if !settled.is_empty() && text.ends_with(settled) {
+        // **The name as it stands is not a search.** The line carries what the file will be called,
+        // so an untouched `report.pdf` would otherwise be a query matching no folder — and the
+        // listing would be filtered by something the user never typed. Change one letter of it and
+        // it becomes a query like any other.
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                (parent.to_path_buf(), String::new())
+            }
+            _ => return (PathBuf::new(), Vec::new(), None),
+        }
     } else {
         match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => return (PathBuf::new(), Vec::new()),
+            Some(parent) if !parent.as_os_str().is_empty() => (
+                parent.to_path_buf(),
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default(),
+            ),
+            _ => return (PathBuf::new(), Vec::new(), None),
         }
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return (dir, Vec::new());
+        return (dir, Vec::new(), None);
     };
-    let mut out: Vec<String> = entries
+    let mut names: Vec<String> = entries
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| !name.starts_with('.'))
+        // **Hidden folders are hidden until they are asked for.** A listing full of `.cache` and
+        // `.local` is a listing nobody reads, and `~/.config` is somewhere people really do save
+        // things — so the dot has to be typed, exactly as it is in a shell.
+        .filter(|name| !name.starts_with('.') || query.starts_with('.'))
         .collect();
-    out.sort();
-    out.insert(0, "..".to_string());
-    (dir, out)
+    names.sort();
+
+    let (mut shown, best) = if query.is_empty() {
+        (names, None)
+    } else {
+        let starts: Vec<String> = names
+            .iter()
+            .filter(|name| name.to_ascii_lowercase().starts_with(&query))
+            .cloned()
+            .collect();
+        let holds: Vec<String> = names
+            .iter()
+            .filter(|name| name.to_ascii_lowercase().contains(&query))
+            .filter(|name| !starts.contains(name))
+            .cloned()
+            .collect();
+        if starts.is_empty() && holds.is_empty() {
+            (names, None)
+        } else {
+            let best = if starts.is_empty() { None } else { Some(0usize) };
+            let mut shown = starts;
+            shown.extend(holds);
+            // With nothing starting with the query, the closest thing is the first that holds it.
+            (shown, Some(best.unwrap_or(0)))
+        }
+    };
+    // `..` is always first and is never a match: it is the way out, not a name.
+    shown.insert(0, "..".to_string());
+    (dir, shown, best.map(|at| at + 1))
 }
 
+/// `prompt-dir in|out` — walk the listing of a filename prompt, `<Right>` and `<Left>`.
+///
+/// **The three keys mean three different things and none of them overlaps.** `<Up>`/`<Down>` move
+/// the highlight, this moves *where you are*, and `<Return>` saves into where you are. That split is
+/// what the first attempt got wrong: `<Tab>` did all three at once, so the line, the listing and the
+/// highlight could each be describing a different directory.
+///
+/// `in` with nothing highlighted does nothing rather than guessing at the first row: a key that
+/// moves you somewhere you did not point at is worse than a key that waits.
+fn dir_step(window: u32, into: bool) {
+    let moved = with_window(window, |entry| {
+        let Some(open) = entry.open.as_mut() else {
+            return false;
+        };
+        if open.question.kind != Kind::Download {
+            return false;
+        }
+        let item = if into {
+            match open.selected {
+                Some(at) => open.items.get(at).cloned(),
+                None => return false,
+            }
+        } else {
+            Some("..".to_string())
+        };
+        let Some(item) = item else {
+            return false;
+        };
+        // **What goes on the line is the real name, not what was typed.** That is the whole point
+        // of completing: `neov` finds `nvim` and the line ends up saying `nvim`, because the folder
+        // is called what it is called and a path built from a guess is a path that does not exist.
+        // `join_dir` takes the item from the listing, which is the name on disk.
+        //
+        // The line ends at the separator with no file name on it. `accept_open` puts the download's
+        // own name back at the moment of saving — it has done so since long before this — so the
+        // name is never lost, and while browsing the line says only where you are.
+        // The name comes along. It is whatever the line last settled on — the one the download
+        // arrived with, or the one the user typed over it — so walking the tree never quietly
+        // changes what the file will be called.
+        let there = join_dir(&open.items_dir, &item);
+        let settled = open.name.clone();
+        let line = format!("{there}{settled}");
+        // The caret lands in front of the name again, so the next thing typed is the next search.
+        open.line
+            .set_text_with_cursor(&line, there.chars().count());
+        // Listed from the directory, never from the line: the line now ends in a file name, and
+        // `list_dir` would read that as "a file in the parent" and show the wrong folder.
+        let (dir, items) = list_dir(&there);
+        open.items_dir = dir;
+        open.items = items;
+        // Nothing highlighted in the new listing: arriving somewhere is not the same as pointing at
+        // something in it, and `<Return>` here means "this directory", which is now the new one.
+        open.selected = None;
+        true
+    })
+    .unwrap_or(false);
+    if moved {
+        crate::ipc::push_bar();
+    }
+}
+
+
 /// Where selecting `item` takes the line. `..` goes up; anything else goes down.
+///
+/// **The root is where this used to accumulate.** `/` has no parent, so `..` answered `/` and the
+/// trailing slash was appended anyway: `/` became `//`, `//` became `///`, and every further step
+/// added one. It was harmless only while nothing could walk upward repeatedly — the listing did not
+/// follow a selection, so the root was unreachable — and the moment stepping was added it showed up
+/// as a path of slashes and a browser that stopped answering. There was even a test asserting
+/// `join_dir("/", "..") == "//"`, which recorded the behaviour rather than questioning it.
+///
+/// So the slash is added only when there is not one already. At the root, going up is standing
+/// still, which is what a root is.
 fn join_dir(dir: &Path, item: &str) -> String {
     let joined = if item == ".." {
         dir.parent().map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf())
     } else {
         dir.join(item)
     };
-    format!("{}/", joined.display())
+    let text = joined.display().to_string();
+    if text.ends_with('/') {
+        text
+    } else {
+        format!("{text}/")
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -1840,7 +2174,10 @@ mod tests {
         // in the line. This is the assertion the bug would have failed.
         assert_eq!(join_dir(dir, "music"), "/home/someone/Downloads/music/");
         // `..` at the root has nowhere to go and stays put rather than producing an empty path.
-        assert_eq!(join_dir(Path::new("/"), ".."), "//");
+        // The root has no parent, and going up from it must not grow a second slash — see
+        // `join_dir`, where repeating this built `///…` and hung the prompt.
+        assert_eq!(join_dir(Path::new("/"), ".."), "/");
+        assert_eq!(join_dir(Path::new("/"), "etc"), "/etc/");
     }
 
     /// Accepting a *directory* keeps the name the download came with. Without it `<Tab>` to a
@@ -1989,4 +2326,134 @@ mod tests {
             "the command history is command mode's, and prompt mode must not bind it"
         );
     }
+    /// Typing narrows the listing, and typing something with no match does not blind you.
+    ///
+    /// The line normally ends in the download's own file name, so a filter that emptied the list on
+    /// no match would show nothing the moment the prompt opened — which is why the fallback is the
+    /// whole directory rather than an empty one.
+    #[test]
+    fn a_half_typed_name_narrows_the_listing_and_a_wrong_one_does_not_empty_it() {
+        let root = std::env::temp_dir().join(format!("bru-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha", "album", "beta"] {
+            std::fs::create_dir_all(root.join(name)).expect("a test directory");
+        }
+        let dir = format!("{}/", root.display());
+
+        // The directory itself: everything, with `..` first.
+        let (_, all) = list_dir(&dir);
+        assert_eq!(all, vec!["..", "album", "alpha", "beta"]);
+
+        // A tail narrows it, without case mattering.
+        let (_, some) = list_dir(&format!("{dir}al"));
+        assert_eq!(some, vec!["..", "album", "alpha"]);
+        let (_, upper) = list_dir(&format!("{dir}AL"));
+        assert_eq!(upper, vec!["..", "album", "alpha"]);
+        let (_, one) = list_dir(&format!("{dir}bet"));
+        assert_eq!(one, vec!["..", "beta"]);
+
+        // A tail that matches nothing — the file's own name is one — shows the folder rather than
+        // an empty list.
+        let (_, none) = list_dir(&format!("{dir}report.pdf"));
+        assert_eq!(none, vec!["..", "album", "alpha", "beta"]);
+
+        // **The best match is pointed at, and it is a real name.** `nv` finds `nvim`-shaped rows
+        // and the highlight lands on the first that *starts* with it; a query that only appears in
+        // the middle is still offered, after those. `<Tab>` writes whichever is highlighted, which
+        // is why the highlight has to be right rather than merely somewhere.
+        let (_, rows, best) = list_and_pick(&format!("{dir}al"), "");
+        assert_eq!(rows, vec!["..", "album", "alpha"]);
+        assert_eq!(best, Some(1), "the first row that starts with the query");
+        assert_eq!(rows[best.unwrap()], "album");
+
+        // Contained but not at the start: offered, and pointed at, because it is the only answer.
+        let (_, held, held_best) = list_and_pick(&format!("{dir}lph"), "");
+        assert_eq!(held, vec!["..", "alpha"]);
+        assert_eq!(held_best, Some(1));
+
+        // No match at all: the folder stays whole and nothing is pointed at, so `<Tab>` has nothing
+        // to complete to rather than completing to a row nobody chose.
+        let (_, whole, none) = list_and_pick(&format!("{dir}zzz"), "");
+        assert_eq!(whole, vec!["..", "album", "alpha", "beta"]);
+        assert_eq!(none, None);
+
+        // **A hidden folder appears once the dot is typed, and not before.** A listing full of
+        // `.cache` is a listing nobody reads; a `~/.config` nobody can reach is worse.
+        std::fs::create_dir_all(root.join(".hidden")).expect("a hidden test directory");
+        let (_, plain, _) = list_and_pick(&dir, "");
+        assert_eq!(plain, vec!["..", "album", "alpha", "beta"]);
+        let (_, dotted, dot_best) = list_and_pick(&format!("{dir}.h"), "");
+        assert_eq!(dotted, vec!["..", ".hidden"]);
+        assert_eq!(dot_best, Some(1));
+
+        // **The name the file will be saved under is not a query.** It sits on the line the whole
+        // time so it can be seen and edited, and an untouched one must not filter the folder away.
+        let (_, kept, kept_best) = list_and_pick(&format!("{dir}report.pdf"), "report.pdf");
+        assert_eq!(kept, vec!["..", "album", "alpha", "beta"]);
+        assert_eq!(kept_best, None);
+        // Edit one letter of it and it is a query like any other — here, one that matches nothing.
+        let (_, edited, _) = list_and_pick(&format!("{dir}report.pd"), "report.pdf");
+        assert_eq!(edited, vec!["..", "album", "alpha", "beta"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha", "album", "beta"] {
+            std::fs::create_dir_all(root.join(name)).expect("a test directory");
+        }
+        let dir = format!("{}/", root.display());
+
+        // The directory itself: everything, with `..` first.
+        let (_, all) = list_dir(&dir);
+        assert_eq!(all, vec!["..", "album", "alpha", "beta"]);
+
+        // A tail narrows it, without case mattering.
+        let (_, some) = list_dir(&format!("{dir}al"));
+        assert_eq!(some, vec!["..", "album", "alpha"]);
+        let (_, upper) = list_dir(&format!("{dir}AL"));
+        assert_eq!(upper, vec!["..", "album", "alpha"]);
+        let (_, one) = list_dir(&format!("{dir}bet"));
+        assert_eq!(one, vec!["..", "beta"]);
+
+        // A tail that matches nothing — the file's own name is one — shows the folder rather than
+        // an empty list.
+        let (_, none) = list_dir(&format!("{dir}report.pdf"));
+        assert_eq!(none, vec!["..", "album", "alpha", "beta"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// The line splits into folder, query and name — and a wandering caret cannot eat the name.
+    ///
+    /// The split is keyed on the remembered name as a **suffix**, which is what makes it safe: an
+    /// earlier version cut at the caret and turned `download.html` into `ownload.html` when the
+    /// caret happened to sit one letter in. Nothing here removes anything from the middle.
+    #[test]
+    fn the_query_is_what_stands_in_front_of_the_name() {
+        // Nothing typed: no query, the name is the name.
+        assert_eq!(
+            split_line("/home/x/Downloads/report.pdf", "report.pdf"),
+            ("/home/x/Downloads/".into(), "".into(), "report.pdf".into())
+        );
+        // Two letters typed in front of it: those are the query, the name is untouched.
+        assert_eq!(
+            split_line("/home/x/Downloads/nvreport.pdf", "report.pdf"),
+            ("/home/x/Downloads/".into(), "nv".into(), "report.pdf".into())
+        );
+        // The name typed over: no query, and the tail is the new name.
+        assert_eq!(
+            split_line("/home/x/Downloads/notes.txt", "report.pdf"),
+            ("/home/x/Downloads/".into(), "".into(), "notes.txt".into())
+        );
+        // A bare directory: nothing after the separator at all.
+        assert_eq!(
+            split_line("/home/x/Downloads/", "report.pdf"),
+            ("/home/x/Downloads/".into(), "".into(), "".into())
+        );
+        // And the case that broke the caret version: a name that contains its own tail.
+        assert_eq!(
+            split_line("/x/download.html", "download.html"),
+            ("/x/".into(), "".into(), "download.html".into())
+        );
+    }
+
 }
