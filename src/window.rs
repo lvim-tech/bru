@@ -283,6 +283,11 @@ pub fn set_prompt_height(window: u32, height: i32) -> i32 {
     set_height_in(&PROMPT_HEIGHTS, window, height)
 }
 
+/// What the prompt block last asked for. **Nothing reads this to size the panel any more** — see the
+/// delegate's `preferred_size`, which takes the page's own measurement of both blocks. It is kept as
+/// the record `prompt::resize_bar` compares against so that a redraw which moves nothing costs no
+/// relayout.
+#[allow(dead_code)]
 fn prompt_height(window: u32) -> i32 {
     height_in(&PROMPT_HEIGHTS, window)
 }
@@ -1303,10 +1308,19 @@ wrap_browser_view_delegate! {
             // This strip's own window, not whichever one is current: a layout pass runs for the
             // window being relayouted, and reading a shared value would make window 0's bar as tall
             // as window 1's table.
-            // Two slots, added: the completion table's and — src/prompt.rs — the prompt block's.
-            // Either can be zero and both can be open at once; see `PROMPT_HEIGHTS`.
+            // **One number, and it is the one the page measured.** `chrome/panel.js` reports
+            // `prompt.offsetHeight + completion.offsetHeight` — both blocks, after it has drawn them
+            // — and that arrives here through `completers::apply_height`. This used to add
+            // `prompt_height` on top, a second figure Rust computed from a row count, so the prompt
+            // block was counted twice: the view came out as tall as its content plus the prompt
+            // again, and the extra showed as a band of empty panel under the key hints.
+            //
+            // Photographed 2026-08-09 on a `Save file to` prompt: roughly 250 px of content in
+            // roughly 490 px of panel. The measurement wins for the reason the strip's own comment
+            // already gives — a height reported after the draw cannot disagree with what was drawn,
+            // and a height guessed before it can.
             let extra = if self.kind == KIND_PANEL {
-                completion_height(self.window_id) + prompt_height(self.window_id)
+                completion_height(self.window_id)
             } else {
                 0
             };
