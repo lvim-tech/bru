@@ -361,19 +361,7 @@ impl ModeManager {
 
         let mut left = None;
         if self.mode != Mode::Normal {
-            // **Hint mode counts as normal for this guard, and it has to.**
-            //
-            // `only_if_normal` is what stops a page's own focus event pulling the user out of
-            // passthrough or out of a half-typed command line — a page does not get to move bru's
-            // mode. Hint mode is not that: it is a mode bru itself is about to leave, and following
-            // a hint onto an input *is* the gesture that should enter insert.
-            //
-            // The report from the renderer arrives asynchronously, so it lands either side of the
-            // session ending — and when it landed first, this refused it and `f` onto a text field
-            // left the caret in the page with bru still in normal mode. Nothing looked wrong; the
-            // field simply did not take the next letter.
-            let from_a_hint = self.mode == Mode::Hint && mode == Mode::Insert;
-            if only_if_normal && !from_a_hint {
+            if only_if_normal {
                 return Transition::IGNORED;
             }
             left = Some(self.mode);
