@@ -1639,30 +1639,30 @@ fn finish(state: &SharedState, window: u32, browser: &mut Browser, rapid: bool) 
 /// A move first, because hover state is what a page's own handlers look at and a press with no
 /// preceding move arrives at an element that was never entered. Then press and release, one click.
 fn click(browser: &mut Browser, x: i32, y: i32) {
-    let Some(host) = browser.host() else {
-        return;
-    };
-    let event = MouseEvent { x, y, modifiers: 0 };
-    host.send_mouse_move_event(Some(&event), 0);
-    host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 0, 1);
-    host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 1, 1);
+    // The page measured this point in CSS pixels and a mouse event is in view coordinates; page
+    // zoom is the ratio. See `exec::view_point` for the follow that missed a 30px field by a pixel.
+    let (x, y) = crate::exec::view_point(browser, x, y);
     // --- src/focus.rs ---------------------------------------------------------------------
-    // A hint followed onto a text field must end in insert mode, and `focus.rs` cannot always
-    // learn that from the focus changing: when the field the hint landed on **already had the
-    // focus**, nothing changes and no callback fires. Measured 2026-08-07 on
-    // `https://start.duckduckgo.com/`, whose own script focuses its search box: `hint inputs`
-    // then `a` clicked at (729, 539), no focus change was reported, and the mode stayed normal.
+    // The whole click lives in `focus.rs` now, in three ordered pieces:
     //
-    // So the click says so itself. This is the only place in bru that knows a real click has just
-    // been sent at a point on the page; `focus.rs` asks the renderer what has the focus now and
-    // treats the answer as the user's doing, because it was.
-    crate::focus::after_click(browser);
+    // - It **arms the caret move first** and waits for the renderer to say so, which is what puts
+    //   the caret after a field's existing text with no painted frame in between — see
+    //   `focus::click_through` for the 6-of-10 race a fire-and-forget arm measurably loses.
+    // - The events themselves are the move-press-release this function used to send.
+    // - Then `focus::after_click` asks what the click landed on, because a hint onto a field that
+    //   **already had the focus** changes no focus and fires no callback. Measured 2026-08-07 on
+    //   `https://start.duckduckgo.com/`, whose own script focuses its search box: `hint inputs`
+    //   then `a` clicked at (729, 539), no focus change was reported, and the mode stayed normal.
+    //   The click has to say so itself, and since the Escape of 2026-08-09 it is the only way a
+    //   web page's field enters insert mode at all.
+    crate::focus::click_through(browser, x, y);
     // --- end src/focus.rs -----------------------------------------------------------------
 }
 
 /// `;h` — the move without the press. `mouse_leave = 0` means the pointer is entering, which is
 /// what raises `mouseover`/`:hover` on the element and everything nested under it.
 fn hover(browser: &mut Browser, x: i32, y: i32) {
+    let (x, y) = crate::exec::view_point(browser, x, y);
     let Some(host) = browser.host() else {
         return;
     };

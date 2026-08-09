@@ -558,17 +558,16 @@ fn find_element_script(filter: ElementFilter, value: &str, select_first: bool) -
 /// A real click, the way `hints.rs` sends one: a move first, because hover state is what a page's
 /// own handlers look at, then press and release.
 fn click(browser: &mut Browser, x: i32, y: i32) {
-    let Some(host) = browser.host() else {
-        return;
-    };
-    let event = MouseEvent { x, y, modifiers: 0 };
-    host.send_mouse_move_event(Some(&event), 0);
-    host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 0, 1);
-    host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, 1, 1);
-    crate::focus::after_click(browser);
+    // CSS pixels from the page's `getBoundingClientRect` into view coordinates — `exec::view_point`.
+    let (x, y) = crate::exec::view_point(browser, x, y);
+    // The same three ordered pieces as `hints::click`: arm the caret move in the page, wait for
+    // the renderer's echo, then move-press-release and ask what the click landed on. See
+    // `focus::click_through` for the ordering and the measured race behind it.
+    crate::focus::click_through(browser, x, y);
 }
 
 fn hover(browser: &mut Browser, x: i32, y: i32) {
+    let (x, y) = crate::exec::view_point(browser, x, y);
     if let Some(host) = browser.host() {
         host.send_mouse_move_event(Some(&MouseEvent { x, y, modifiers: 0 }), 0);
     }

@@ -83,6 +83,12 @@ pub fn on_process_message_received(
     if crate::focus::on_report(browser.as_deref(), message.as_deref()) {
         return 1;
     }
+    // The renderer's "the caret move is armed" echo, which is what releases a hint's click — the
+    // ordering that keeps the caret from visibly jumping to the end of a field. Claimed here for
+    // the same reason as the report above.
+    if crate::focus::on_armed(browser.as_deref(), message.as_deref()) {
+        return 1;
+    }
     // --- end src/focus.rs ---------------------------------------------------------------------
     browser_router().on_process_message_received(
         browser.cloned(),
@@ -1368,6 +1374,11 @@ pub fn renderer_on_process_message_received(
     // "bru has just clicked — what has the focus now?" Only the browser process can address this
     // renderer, so a page cannot ask it, and it never reaches the router's `bru://`-only check.
     if crate::focus::renderer_on_ask(frame.as_deref(), message.as_deref()) {
+        return 1;
+    }
+    // "bru is about to click — arm the caret move and say so." The other half of the same click,
+    // and the half whose echo is what lets the mouse events leave the browser process at all.
+    if crate::focus::renderer_on_arm(frame.as_deref(), message.as_deref()) {
         return 1;
     }
     // --- end src/focus.rs ---------------------------------------------------------------------
