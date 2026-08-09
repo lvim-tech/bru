@@ -531,9 +531,9 @@ pub const COMMANDS: &[Doc] = &[
     Doc { names: &["print"], args: "", flags: &[],
         what: "Hand the page to Chromium's print dialog.", example: "print" },
     Doc { names: &["devtools"], args: "[position]", flags: &[],
-        what: "Open the web inspector, or close it. Every position opens a window — CEF has no \
-               docked inspector to give a view.",
-        example: "devtools" },
+        what: "Open the web inspector, or close it. `bottom` docks it under the page, `right` \
+               beside it, `window` gives it a window of its own.",
+        example: "devtools right" },
     Doc { names: &["devtools-focus"], args: "", flags: &[],
         what: "Bring the inspector forward.", example: "devtools-focus" },
     Doc { names: &["message-info"], args: "<text>", flags: &[],

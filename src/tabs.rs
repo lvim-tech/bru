@@ -662,13 +662,10 @@ pub fn push_tabs_everywhere() {
 /// safe to call from a posted UI task and **not** from inside a message-router query handler — it
 /// creates a browser (CEF-NOTES trap 12).
 pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bool) {
-    let (client, window, layout) = {
+    let (client, pages, layout) = {
         let state = state.lock().expect("state mutex poisoned");
-        (
-            state.client(),
-            state.window_handle(window_id),
-            state.layout_handle(window_id),
-        )
+        let (pages, layout) = state.pages_of(window_id);
+        (state.client(), pages, layout)
     };
     let Some(mut client) = client else {
         return;
@@ -710,8 +707,8 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
 
     // At startup the first tab is made before there is a window to put it in; `attach_all_in` picks
     // it up once the window exists.
-    if let Some(window) = window {
-        attach(&window, layout.as_ref(), &view, index);
+    if let Some(pages) = pages {
+        attach(&pages, layout.as_ref(), &view, index);
     }
 
     if !background {
@@ -732,37 +729,30 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
 
 /// Puts every tab of one window into it. Called once per window, from `on_window_created`.
 pub fn attach_all_in(state: &SharedState, window_id: u32) {
-    let (views, window, layout) = {
+    let (views, pages, layout) = {
         let state = state.lock().expect("state mutex poisoned");
-        (
-            state.tab_views_in(window_id),
-            state.window_handle(window_id),
-            state.layout_handle(window_id),
-        )
+        let (pages, layout) = state.pages_of(window_id);
+        (state.tab_views_in(window_id), pages, layout)
     };
-    let Some(window) = window else {
+    let Some(pages) = pages else {
         return;
     };
     for (index, view) in views.iter().enumerate() {
-        attach(&window, layout.as_ref(), view, index);
+        attach(&pages, layout.as_ref(), view, index);
     }
 }
 
-/// Child order in each window is: tab strip, one view per tab of *that window*, status bar.
-/// Offsetting by one keeps the strip on top and the bar at the bottom whatever happens to the tabs
-/// in between. Every window has its own strip as child 0, so the `+ 1` still holds once there is
-/// more than one — the index is into that window's tabs, not into a global list.
-fn attach(window: &Window, layout: Option<&BoxLayout>, view: &BrowserView, index: usize) {
+/// Put one tab's view in its window's pages panel, at its own index among the tabs.
+///
+/// **No strip offset any more, and that is the point of the panel.** The tab views used to be
+/// direct children of the window, sitting between however many chrome strips were above the pages
+/// and however many below, so every one of them had to be placed at `index +
+/// window::leading_strip_count()`. They are children of the pages panel now, whose only other
+/// children are what `devtools.position right` puts beside them — so the index into that window's
+/// tabs is the index into the panel, and the strips are somebody else's arithmetic.
+fn attach(pages: &Panel, layout: Option<&BoxLayout>, view: &BrowserView, index: usize) {
     let mut view = View::from(view);
-    // --- tabs and statusbar --------------------------------------------------------------------
-    // The `+ 1` was "the tab strip is child 0". It is now "however many strips are above the
-    // pages", which is 0, 1 or 2 depending on `tabs.position` and `statusbar.position` — see
-    // `window::leading_strip_count`, which is the one place that ordering is decided.
-    window.add_child_view_at(
-        Some(&mut view),
-        index as i32 + crate::window::leading_strip_count(),
-    );
-    // --- end tabs and statusbar ----------------------------------------------------------------
+    pages.add_child_view_at(Some(&mut view), index as i32);
     if let Some(layout) = layout {
         layout.set_flex_for_view(Some(&mut view), 1);
     }
@@ -910,7 +900,7 @@ fn step(active: usize, count: usize, by: isize) -> usize {
 ///
 /// Pinned tabs stay unless `force` — see [`BruState::take_other_tabs`].
 pub fn close_others(state: &SharedState, force: bool) {
-    let (closed, window, tabs, active, window_id) = {
+    let (closed, pages, tabs, active, window_id) = {
         let mut state = state.lock().expect("state mutex poisoned");
         let Some(window_id) = state.current_window_id() else {
             return;
@@ -918,7 +908,7 @@ pub fn close_others(state: &SharedState, force: bool) {
         let closed = state.take_other_tabs(force);
         (
             closed,
-            state.window(),
+            state.pages(),
             state.tabs_json(),
             state.active_tab(),
             window_id,
@@ -928,8 +918,8 @@ pub fn close_others(state: &SharedState, force: bool) {
         return;
     }
     for view in &closed {
-        if let Some(window) = &window {
-            window.remove_child_view(Some(&mut View::from(view)));
+        if let Some(pages) = &pages {
+            pages.remove_child_view(Some(&mut View::from(view)));
         }
     }
     drop(closed);
@@ -1005,7 +995,7 @@ pub fn move_current(state: &SharedState, to: usize) {
 /// on — qutebrowser's `tabs.last_close` default keeps a blank tab instead, and that is
 /// DECISIONS.md item 6, still open.
 pub fn close_current(state: &SharedState, force: bool) {
-    let (closed, remaining, window, active, window_id, closing) = {
+    let (closed, remaining, pages, window, active, window_id, closing) = {
         let mut state = state.lock().expect("state mutex poisoned");
         // A pinned tab is not closed by a bare `d`. qutebrowser prompts here
         // (`tabbedbrowser.py:431`); bru has no yes/no mode, so it says why and does nothing, and
@@ -1036,6 +1026,7 @@ pub fn close_current(state: &SharedState, force: bool) {
         (
             closed,
             state.tab_count(),
+            state.pages(),
             state.window(),
             state.active_tab(),
             window_id,
@@ -1053,8 +1044,8 @@ pub fn close_current(state: &SharedState, force: bool) {
     // and the process quit. Calling it *after* `remove_child_view` is worse still: CEF then CHECKs
     // in `CefBrowserPlatformDelegateViews::CloseHostWindow` on the widget the view no longer has,
     // and the process aborts with SIGTRAP.
-    if let Some(window) = &window {
-        window.remove_child_view(Some(&mut View::from(&closed)));
+    if let Some(pages) = &pages {
+        pages.remove_child_view(Some(&mut View::from(&closed)));
     }
     drop(closed);
 
@@ -1139,12 +1130,12 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     // Out of bru's book-keeping first, and out of the old window's children second. The `Tab` is
     // ours for the whole of the rest of this function, so the view's last reference is never
     // dropped and the browser is never closed.
-    let (tab, old_window, remaining, old_active) = {
+    let (tab, old_pages, remaining, old_active) = {
         let mut state = state.lock().expect("state mutex poisoned");
         let tab = state.detach_active_tab_in(from_window);
         (
             tab,
-            state.window_handle(from_window),
+            state.pages_of(from_window).0,
             state.tab_count_in(from_window),
             state.active_tab_in(from_window),
         )
@@ -1153,19 +1144,16 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
         return;
     };
 
-    if let Some(old_window) = &old_window {
-        old_window.remove_child_view(Some(&mut View::from(&tab.view)));
+    if let Some(old_pages) = &old_pages {
+        old_pages.remove_child_view(Some(&mut View::from(&tab.view)));
     }
 
     let view = tab.view.clone();
-    let (index, new_window, layout) = {
+    let (index, new_pages, layout) = {
         let mut state = state.lock().expect("state mutex poisoned");
         let index = state.attach_tab_in(target, tab);
-        (
-            index,
-            state.window_handle(target),
-            state.layout_handle(target),
-        )
+        let (pages, layout) = state.pages_of(target);
+        (index, pages, layout)
     };
     let Some(index) = index else {
         return;
@@ -1174,8 +1162,8 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     // Adding a browser view that already has a browser does *not* create a second one — the browser
     // follows its view to the new window. Nothing else in bru re-parents a view, so this is the one
     // `add_child_view_at` whose browser already exists.
-    if let Some(new_window) = &new_window {
-        attach(new_window, layout.as_ref(), &view, index);
+    if let Some(pages) = &new_pages {
+        attach(pages, layout.as_ref(), &view, index);
     }
 
     select_in(state, target, index);

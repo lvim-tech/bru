@@ -102,8 +102,19 @@ pub fn toggle(browser: &mut Browser, place: Place) {
 pub enum Place {
     /// Under the pages of the window it was opened from, above the status strips.
     Bottom,
+    /// Beside the pages, in the panel that holds them. `left` and `top` are the same two pieces of
+    /// arithmetic — an insertion index and a sign — and are not built.
+    Right,
     /// A window of its own — CEF's default, and what returning 0 from the view hook means.
     Window,
+}
+
+impl Place {
+    /// Whether this placement divides the window's width rather than its height. The one question
+    /// the layout, the delegate and the divider each have to ask, so it is asked in one place.
+    pub fn is_side(self) -> bool {
+        matches!(self, Place::Right)
+    }
 }
 
 /// What `toggle` leaves for `on_popup_browser_view_created` to read.
@@ -134,7 +145,7 @@ pub fn on_popup_view(state: &crate::tabs::SharedState, window_id: u32, view: &Br
         trace("on_popup_view: pending says window");
         return false;
     }
-    dock(state, window_id, view, pending.inspects)
+    dock(state, window_id, view, pending.inspects, pending.place)
 }
 
 /// Put the inspector under the pages of its window.
@@ -148,53 +159,67 @@ fn dock(
     window_id: u32,
     view: &BrowserView,
     inspects: i32,
+    place: Place,
 ) -> bool {
-    let (window, layout, tabs) = {
+    // **Recorded before the view is placed**, because placing it is what makes CEF ask the delegate
+    // for a size, and the delegate answers a width or a height depending on this.
+    set_place(window_id, Some(place));
+    let (window, layout, pages, pages_layout) = {
         let state = state.lock().expect("state mutex poisoned");
+        let (pages, pages_layout) = state.pages_of(window_id);
         (
             state.window_handle(window_id),
             state.layout_handle(window_id),
-            state.tab_count_in(window_id),
+            pages,
+            pages_layout,
         )
     };
     let Some(window) = window else {
         trace("dock: no window handle");
         return false;
     };
-    trace(&format!("dock: window found, {tabs} tabs"));
-    // **The divider is made before the inspector is placed, and inserted above it.** Both go in at
-    // the same index in turn — the divider first, then the inspector at one past it — so the pair
-    // arrives in the layout in the order they are drawn, and there is no moment at which a docked
-    // inspector has no strip to resize it.
+    // **Two containers, one arrangement.** `bottom` divides the window's height, so the inspector is
+    // a child of the window's vertical layout, just past the pages panel. `right` divides the pages
+    // panel's width, so it is a child of that panel instead, just past the tab views. Everything
+    // else — the divider going in first, the flex, the relayout — is the same either way, which is
+    // why this is one function with a container in a variable rather than two.
+    let side = place.is_side();
     let divider = crate::window::divider_view(state, window_id);
-    let index = crate::window::leading_strip_count() + tabs as i32;
+    let (holder, holder_layout, index) = if side {
+        let Some(pages) = pages.as_ref() else {
+            trace("dock: no pages panel");
+            return false;
+        };
+        (pages.clone(), pages_layout, pages.child_view_count() as i32)
+    } else {
+        // The window's children are the leading strips, the pages panel, then the trailing strips —
+        // one child for the pages however many tabs there are, which is what the panel changed.
+        // A `Window` **is** a `Panel` in CEF's hierarchy, so both branches hand back the same type
+        // and the placement below is written once.
+        (
+            Panel::from(&window),
+            layout,
+            crate::window::leading_strip_count() + 1,
+        )
+    };
+    trace(&format!("dock: {} at index {index}", if side { "right" } else { "bottom" }));
     if let Some(divider) = divider.as_ref() {
         let mut strip = View::from(divider);
-        if let Some(layout) = layout.as_ref() {
+        if let Some(layout) = holder_layout.as_ref() {
             layout.set_flex_for_view(Some(&mut strip), 0);
         }
-        window.add_child_view_at(Some(&mut strip), index);
+        holder.add_child_view_at(Some(&mut strip), index);
     }
     let mut child = View::from(view);
-    trace(&format!("dock: layout handle present={}", layout.is_some()));
-    // **Flex before the child is placed**, which is what `on_window_created` does for the three
-    // strips and says why: the layout keeps its own record of a view's flex and does not need the
-    // view to be a child yet.
-    if let Some(layout) = layout.as_ref() {
+    // **Flex 0, exactly as the chrome strips have it**, which is what makes the setting the size
+    // rather than a suggestion: a flex-0 child of a BoxLayout is laid out at its preferred size, and
+    // the inspector's delegate answers that from `devtools.height` or `devtools.width`. The pages
+    // keep flex 1 and absorb what is left.
+    if let Some(layout) = holder_layout.as_ref() {
         layout.set_flex_for_view(Some(&mut child), INSPECTOR_FLEX);
     }
-    window.add_child_view_at(
-        Some(&mut child),
-        index + i32::from(divider.is_some()),
-    );
-    if let Some(layout) = layout.as_ref() {
-        // **Flex 0, exactly as the chrome strips have it**, which is what makes `devtools.height`
-        // the height rather than a suggestion: a flex-0 child of a BoxLayout is laid out at its
-        // preferred size, and the inspector's delegate answers that with the setting. The pages
-        // keep flex 1 and absorb what is left.
-        //
-        // Said out loud rather than left to the default, for the reason the panel's own note gives:
-        // a child that has not said 0 is a child that can be handed a share of the leftover.
+    holder.add_child_view_at(Some(&mut child), index + i32::from(divider.is_some()));
+    if let Some(layout) = holder_layout.as_ref() {
         layout.set_flex_for_view(Some(&mut child.clone()), INSPECTOR_FLEX);
     }
     state.lock().expect("state mutex poisoned").set_inspector(
@@ -235,13 +260,30 @@ fn dock(
 /// times out of three. A view whose browser Chromium is still tearing down is not a view to take
 /// out of a layout by hand; `on_browser_destroyed` is CEF saying it is finished with it.
 pub fn undock(state: &crate::tabs::SharedState, window_id: u32) {
+    // **Out of whatever it was put into.** A `bottom` inspector is a child of the window and a
+    // `right` one of the pages panel; removing from the wrong one is a no-op that leaves a live view
+    // holding a share of the layout for ever.
+    let holder = if place_of(window_id).is_side() {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .pages_of(window_id)
+            .0
+    } else {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .window_handle(window_id)
+            .map(|window| Panel::from(&window))
+    };
     let (window, view, divider) = {
         let mut state = state.lock().expect("state mutex poisoned");
         // Read before the take: `take_inspector` drops the record the divider is held in.
         let divider = state.divider_in(window_id);
         (state.window_handle(window_id), state.take_inspector(window_id), divider)
     };
-    let (Some(window), Some(view)) = (window, view) else {
+    set_place(window_id, None);
+    let (Some(window), Some(view), Some(holder)) = (window, view, holder) else {
         return;
     };
     // **Posted, not done here.** `on_browser_destroyed` is inside Chromium's teardown of the
@@ -250,7 +292,7 @@ pub fn undock(state: &crate::tabs::SharedState, window_id: u32) {
     // ruled out the clean-shutdown explanation. One turn of the UI loop later the teardown has
     // finished and the same three calls are safe. The view is refcounted and the task holds a
     // clone, so it cannot be freed underneath the task.
-    let mut task = Undock::new(window, view, divider);
+    let mut task = Undock::new(window, holder, view, divider);
     post_task(ThreadId::UI, Some(&mut task));
 }
 
@@ -260,6 +302,7 @@ pub fn undock(state: &crate::tabs::SharedState, window_id: u32) {
 wrap_task! {
     struct Undock {
         window: Window,
+        holder: Panel,
         view: BrowserView,
         divider: Option<BrowserView>,
     }
@@ -267,9 +310,9 @@ wrap_task! {
     impl Task {
         fn execute(&self) {
             trace("undock: removing the view");
-            self.window.remove_child_view(Some(&mut View::from(&self.view)));
+            self.holder.remove_child_view(Some(&mut View::from(&self.view)));
             if let Some(divider) = self.divider.as_ref() {
-                self.window.remove_child_view(Some(&mut View::from(divider)));
+                self.holder.remove_child_view(Some(&mut View::from(divider)));
             }
             View::from(&self.window).invalidate_layout();
             self.window.layout();
@@ -414,6 +457,68 @@ const PROTECTED_PAGE: i32 = 150;
 /// holding it.
 static DRAGGING: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
 
+/// Where each window's docked inspector is, so the delegates can answer the right axis.
+///
+/// Kept beside the layout rather than in the window's state because it is read from inside
+/// `preferred_size`, and that is a place where taking the state mutex would meet whatever caller
+/// asked for the layout. The same reasoning as `DRAGGING` above and `window.rs`'s `STRIPS`.
+static PLACES: std::sync::Mutex<Vec<(u32, Place)>> = std::sync::Mutex::new(Vec::new());
+
+/// Where the inspector docked in `window` is. `Bottom` when nothing is docked, which is the answer
+/// that makes a delegate asked out of turn behave as it always did.
+pub fn place_of(window: u32) -> Place {
+    PLACES
+        .lock()
+        .ok()
+        .and_then(|live| {
+            live.iter()
+                .find(|(id, _)| *id == window)
+                .map(|(_, place)| *place)
+        })
+        .unwrap_or(Place::Bottom)
+}
+
+fn set_place(window: u32, place: Option<Place>) {
+    let Ok(mut live) = PLACES.lock() else {
+        return;
+    };
+    live.retain(|(id, _)| *id != window);
+    if let Some(place) = place {
+        live.push((window, place));
+    }
+}
+
+/// How wide a side-docked inspector is, from `devtools.width`.
+pub fn width() -> i32 {
+    crate::settings::int_of("devtools.width") as i32
+}
+
+/// What a side-docked inspector's width should be right now — the drag's if one is running.
+pub fn width_for(window: u32) -> i32 {
+    DRAGGING
+        .lock()
+        .ok()
+        .and_then(|live| {
+            live.iter()
+                .find(|(id, _)| *id == window)
+                .map(|(_, size)| *size)
+        })
+        .unwrap_or_else(width)
+}
+
+/// The size a docked inspector's delegate answers, whichever axis it divides.
+///
+/// **Both numbers are non-empty, always.** A zero on either axis is a size CEF discards unread —
+/// CEF-NOTES trap 25 — so the axis this placement does not decide is given a plausible number rather
+/// than a zero, and the layout stretches it on the cross axis anyway.
+pub fn inspector_size(window: u32) -> Size {
+    if place_of(window).is_side() {
+        Size { width: width_for(window), height: 300 }
+    } else {
+        Size { width: 1280, height: height_for(window) }
+    }
+}
+
 /// What the inspector in `window` should be right now: the drag's height if one is in progress,
 /// the setting otherwise. This is what the delegate answers.
 pub fn height_for(window: u32) -> i32 {
@@ -448,8 +553,20 @@ fn set_dragging(window: u32, height: Option<i32>) {
 /// that is not this view.
 static EXPANDED: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
 
-/// What the divider's delegate answers. Read from inside a layout pass, so the lock is taken and
-/// dropped without a CEF call in between, exactly as `height_for` is.
+/// The size the divider's delegate answers: a thin strip across the split, or the whole shared area
+/// while a drag is running. Which axis is which follows the placement.
+pub fn divider_size(window: u32) -> Size {
+    let across = divider_height_for(window);
+    if place_of(window).is_side() {
+        Size { width: across, height: 300 }
+    } else {
+        Size { width: 1280, height: across }
+    }
+}
+
+/// What the divider spans across the split — its thickness at rest, the whole shared area during a
+/// drag. Read from inside a layout pass, so the lock is taken and dropped without a CEF call in
+/// between, exactly as `height_for` is.
 pub fn divider_height_for(window: u32) -> i32 {
     EXPANDED
         .lock()
@@ -499,8 +616,15 @@ pub fn on_divider_query(
     match phase {
         "start" => {
             let (page, inspector) = shared_views(state, window_id)?;
-            let page_height = View::from(&page).bounds().height;
-            let inspector_height = View::from(&inspector).bounds().height;
+            // The axis the placement divides. Everything below is written once and reads the same
+            // number out of a different field.
+            let side = place_of(window_id).is_side();
+            let along = |view: &BrowserView| {
+                let b = View::from(view).bounds();
+                if side { b.width } else { b.height }
+            };
+            let page_height = along(&page);
+            let inspector_height = along(&inspector);
             let total = page_height + crate::window::DIVIDER_HEIGHT + inspector_height;
             // Hidden first, expanded second: a `BoxLayout` skips an invisible child, so the room
             // the two of them were holding is free by the time the divider asks for it.
@@ -522,10 +646,11 @@ pub fn on_divider_query(
             // the preview promised eight pixels more inspector than the release gave, because the
             // page had guessed the strip's thickness from how thick it drew the line.
             Some(format!(
-                "{{\"top\":{page_height},\"min\":{},\"max\":{},\"strip\":{},\"total\":{total}}}",
+                "{{\"top\":{page_height},\"min\":{},\"max\":{},\"strip\":{},\"total\":{total},\"axis\":\"{}\"}}",
                 PROTECTED_PAGE,
                 (total - crate::window::DIVIDER_HEIGHT - MIN_INSPECTOR).max(PROTECTED_PAGE),
-                crate::window::DIVIDER_HEIGHT
+                crate::window::DIVIDER_HEIGHT,
+                if side { "x" } else { "y" }
             ))
         }
         "end" => {
@@ -639,10 +764,13 @@ fn clamp_height(state: &crate::tabs::SharedState, window_id: u32, wanted: i32) -
             state.inspector_in(window_id).map(|(view, _)| view),
         )
     };
+    let side = place_of(window_id).is_side();
+    let along = |view: &BrowserView| {
+        let b = View::from(view).bounds();
+        if side { b.width } else { b.height }
+    };
     let shared = match (page, inspector) {
-        (Some(page), Some(inspector)) => {
-            View::from(&page).bounds().height + View::from(&inspector).bounds().height
-        }
+        (Some(page), Some(inspector)) => along(&page) + along(&inspector),
         // No page to protect — a window mid-teardown. The floor still applies.
         _ => return wanted.max(MIN_INSPECTOR),
     };
@@ -658,7 +786,7 @@ fn clamp_height(state: &crate::tabs::SharedState, window_id: u32, wanted: i32) -
 pub fn docking() -> bool {
     let answer = matches!(
         pending().lock().expect("devtools mutex poisoned").as_ref(),
-        Some(Pending { place: Place::Bottom, .. })
+        Some(Pending { place: Place::Bottom | Place::Right, .. })
     );
     trace(&format!("docking() -> {answer}"));
     answer

@@ -1743,17 +1743,17 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         // **Two placements, not qutebrowser's five, and the other three are refused rather than
         // silently treated as one of these.** `bottom` docks the inspector under the pages;
         // `window` gives it a window of its own, which is what CEF does when bru declines to place
-        // it. `top`, `left` and `right` are qutebrowser's and bru cannot draw them yet — left and
-        // right need a horizontal box nested in the window's vertical one, the same unbuilt piece
-        // `tabs.position left` waits on. Answering with the reason is what stops a line copied out
-        // of a `config.py` quietly doing something else.
+        // it. `right` puts it beside the page in the pages panel; `left` and `top` are the same two
+        // pieces of arithmetic and are not built yet, so they say so rather than quietly doing
+        // something else to a line copied out of a `config.py`.
         "devtools" => match args.arg(0) {
             None | Some("bottom") => Command::DevTools(crate::devtools::Place::Bottom),
+            Some("right") => Command::DevTools(crate::devtools::Place::Right),
             Some("window") => Command::DevTools(crate::devtools::Place::Window),
-            Some(side @ ("left" | "right" | "top")) => {
+            Some(side @ ("left" | "top")) => {
                 return Err(bad(&format!(
                     "bru cannot dock the inspector {side} yet — `devtools bottom` docks it under \
-                     the page, `devtools window` gives it a window"
+                     the page, `devtools right` beside it, `devtools window` gives it a window"
                 )))
             }
             Some(other) => return Err(bad(&format!("invalid position {other:?}"))),

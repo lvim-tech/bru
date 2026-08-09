@@ -61,10 +61,15 @@
     // however far the line was down the window; subtracting the grab keeps the
     // line under the same part of the strip it was taken by.
     var grab = 0;
+    var grabX = 0;
     // How thick the strip really is, from Rust at the press. Not guessed from
     // how thick the line is drawn: the two were four and twelve, and the preview
     // promised eight pixels of inspector that the release did not give.
     var strip = 0;
+    // "x" when the inspector is docked beside the page, "y" when it is under it.
+    // Rust says which at the press; this page has no way of knowing and no business
+    // guessing.
+    var axis = "y";
     var frame = null;
 
     var split = document.getElementById("split");
@@ -78,14 +83,23 @@
         if (line === null || !split) {
             return;
         }
-        split.style.top = line + "px";
-        // The two fields meet at the line. Their edges are set here rather than
-        // in CSS because only this file knows where the line is.
-        if (above) {
-            above.style.height = line + "px";
-        }
-        if (below) {
-            below.style.top = line + strip + "px";
+        // One boundary, laid out along whichever axis this dock divides.
+        if (axis === "x") {
+            split.style.left = line + "px";
+            if (above) {
+                above.style.width = line + "px";
+            }
+            if (below) {
+                below.style.left = line + strip + "px";
+            }
+        } else {
+            split.style.top = line + "px";
+            if (above) {
+                above.style.height = line + "px";
+            }
+            if (below) {
+                below.style.top = line + strip + "px";
+            }
         }
         // The numbers the release will produce, from the total Rust measured
         // rather than from `innerHeight`. The two differ by a pixel on a scaled
@@ -104,7 +118,10 @@
             return;
         }
         pointerId = event.pointerId;
+        // Along the axis this dock divides — but the axis is not known until Rust
+        // answers the press, so both are kept and the right one is used.
         grab = event.clientY;
+        grabX = event.clientX;
         // Capture is still worth taking. It is not what makes the drag work any
         // more — the expansion is — but a release that happens over a scrollbar
         // or outside the window still has to arrive here to end the drag.
@@ -124,7 +141,13 @@
             }
             line = limits.top;
             strip = limits.strip;
-            split.style.height = strip + "px";
+            axis = limits.axis === "x" ? "x" : "y";
+            document.body.classList.toggle("sideways", axis === "x");
+            if (axis === "x") {
+                split.style.width = strip + "px";
+            } else {
+                split.style.height = strip + "px";
+            }
             document.body.classList.add("dragging");
             draw();
         });
@@ -141,7 +164,9 @@
         // scaled display, and a fraction is not a height: it would reach Rust as
         // a number the settings store has to refuse or truncate, and it would
         // draw the preview at a boundary the release could not reproduce.
-        var wanted = Math.round(event.clientY - grab);
+        var wanted = Math.round(
+            axis === "x" ? event.clientX - grabX : event.clientY - grab
+        );
         if (wanted < limits.min) {
             wanted = limits.min;
         }

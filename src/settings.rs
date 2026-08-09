@@ -382,6 +382,10 @@ pub static ADBLOCK_LISTS: ListShape = ListShape {
 /// How much of the page area a docked inspector takes, as a flex share against the pages' own 1.
 static DEVTOOLS_HEIGHT: IntShape =
     IntShape { min: 80, max: 4000, unit: "pixels", sentinel: "" };
+/// The same range for the other axis. One shape would have done; two names is what makes a range
+/// error say which setting it is about.
+static DEVTOOLS_WIDTH: IntShape =
+    IntShape { min: 80, max: 4000, unit: "pixels", sentinel: "" };
 // --- end src/devtools.rs -----------------------------------------------------------------------
 
 /// The sites whose Content Security Policy bru turns off. See [`crate::csp`] for what that costs.
@@ -1316,6 +1320,20 @@ pub const SETTINGS: &[Def] = &[
         name: "devtools.height",
         kind: Kind::Int(&DEVTOOLS_HEIGHT),
         default: Some("400"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Devtools,
+    },
+    Def {
+        // How wide the inspector is when it is docked beside the page rather than under it —
+        // `:devtools right`. Its own setting rather than one number for both, because the two are
+        // read in different windows shapes and a user who has tuned one has said nothing about the
+        // other: a panel 400 tall under a page is comfortable, 400 wide beside it is narrow.
+        //
+        // 500 rather than 400, which is roughly where the DevTools front-end stops folding its own
+        // panes into one column.
+        name: "devtools.width",
+        kind: Kind::Int(&DEVTOOLS_WIDTH),
+        default: Some("500"),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Devtools,
     },
@@ -4647,7 +4665,7 @@ mod tests {
         // whose defaults are deliberately empty — see [`CSP_BYPASS`].
         // **Sixty-six**, +1 for `devtools.flex`, which is how tall the docked inspector is — a
         // share rather than a height, for the reason its own `Def` gives.
-        assert_eq!(SETTINGS.len(), 66);
+        assert_eq!(SETTINGS.len(), 67);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

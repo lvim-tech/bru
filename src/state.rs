@@ -53,6 +53,13 @@ pub struct WindowState {
     /// The window's vertical box layout, kept so a tab opened later can be given flex 1 like the
     /// ones that were there when the window was built.
     layout: Option<BoxLayout>,
+    // --- src/devtools.rs: the pages panel --------------------------------------------------------
+    /// The panel holding this window's tab views, and its horizontal layout. See [`set_pages_for`].
+    ///
+    /// [`set_pages_for`]: BruState::set_pages_for
+    pages: Option<Panel>,
+    pages_layout: Option<BoxLayout>,
+    // --- end src/devtools.rs: the pages panel ----------------------------------------------------
     /// Identifiers of the browsers behind *this* window's two chrome strips. Keys that reach those
     /// must not be read as page movements — `j` in the command line is a letter, not a scroll — and
     /// they must be aimed at the tab showing in the window they arrived at, not in whichever window
@@ -220,6 +227,8 @@ impl BruState {
             id,
             window: None,
             layout: None,
+            pages: None,
+            pages_layout: None,
             chrome_browsers: Vec::new(),
             tabs: Vec::new(),
             active: 0,
@@ -295,6 +304,31 @@ impl BruState {
     pub fn layout_handle(&self, id: u32) -> Option<BoxLayout> {
         self.slot(id).and_then(|slot| slot.layout.clone())
     }
+
+    // --- src/devtools.rs: the pages panel --------------------------------------------------------
+    /// The panel the tab views live in, and its own horizontal layout.
+    ///
+    /// **Every window has one, whether or not anything is docked beside the pages.** It could have
+    /// been made only when `devtools.position right` was first used, and that would have meant
+    /// re-parenting every live tab view at that moment — the one operation this codebase has
+    /// measured as fatal in a neighbouring case (`tabs.rs`, closing a tab). Made with the window
+    /// instead, once, and never moved.
+    pub fn set_pages_for(&mut self, id: u32, panel: Panel, layout: Option<BoxLayout>) {
+        if let Some(slot) = self.slot_mut(id) {
+            slot.pages = Some(panel);
+            slot.pages_layout = layout;
+        }
+    }
+
+    /// Where a tab view is added, and what gives it its flex. Both `None` before
+    /// `on_window_created` has run, which is the window that has no pages yet.
+    pub fn pages_of(&self, id: u32) -> (Option<Panel>, Option<BoxLayout>) {
+        match self.slot(id) {
+            Some(slot) => (slot.pages.clone(), slot.pages_layout.clone()),
+            None => (None, None),
+        }
+    }
+    // --- end src/devtools.rs: the pages panel ----------------------------------------------------
 
     // --- src/devtools.rs --------------------------------------------------------------------
     /// The browser behind one tab of a window, which is what an inspector is matched against.
@@ -392,6 +426,13 @@ impl BruState {
     pub fn window(&self) -> Option<Window> {
         self.current_slot().and_then(|slot| slot.window.clone())
     }
+
+    // --- src/devtools.rs: the pages panel --------------------------------------------------------
+    /// The current window's pages panel — where a tab view is taken *out* of when it is closed.
+    pub fn pages(&self) -> Option<Panel> {
+        self.current_slot().and_then(|slot| slot.pages.clone())
+    }
+    // --- end src/devtools.rs: the pages panel ----------------------------------------------------
 
     /// Every open window's handle — what `:quit` closes and what a shutdown walks.
     pub fn window_handles(&self) -> Vec<Window> {

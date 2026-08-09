@@ -644,6 +644,26 @@ fn reorder(handle: &Window, top: &BrowserView, bottom: &BrowserView, want: Layou
     }
 }
 
+// --- src/devtools.rs: the pages panel ------------------------------------------------------------
+// The container the tab views live in. Its only job is to have a horizontal layout.
+//
+// **The size it answers matters and the numbers in it do not.** It has to be non-empty, because CEF
+// discards an empty one unread and falls back to the view's current size — the whole of CEF-NOTES
+// trap 25. Beyond that it is a basis for flex 1 to grow from, and every real dimension comes from
+// the window.
+wrap_panel_delegate! {
+    struct BruPagesPanelDelegate {}
+
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: 1280, height: 300 }
+        }
+    }
+
+    impl PanelDelegate {}
+}
+// --- end src/devtools.rs: the pages panel --------------------------------------------------------
+
 // --- src/devtools.rs ----------------------------------------------------------------------------
 /// Make the divider strip for `window`, ready to be put above a docked inspector.
 ///
@@ -880,6 +900,33 @@ wrap_window_delegate! {
             let places = places();
             let mut leading: Vec<View> = Vec::new();
             let mut trailing: Vec<View> = Vec::new();
+            // --- src/devtools.rs: the pages panel -------------------------------------------
+            // **The tab views do not go in the window any more; they go in here.** A vertical box
+            // layout can only stack, so an inspector beside the pages needs a container of its own
+            // with a horizontal layout in it — and that container has to exist before the first tab
+            // is attached, because re-parenting live tab views later is the operation `tabs.rs` has
+            // measured as fatal in the neighbouring case.
+            //
+            // A `Panel` from `panel_create` was once recorded as measuring "0 tall however it is
+            // asked". That record was taken while every delegate here answered a zero width, which
+            // CEF discards unread (CEF-NOTES trap 25) — so the panel was never being asked at all.
+            // Probed again 2026-08-09 with a non-empty size: **1942x300 requested and given**, its
+            // inner horizontal layout live, and a browser view inside it laid out. The cost of the
+            // old reading was `devtools.position right` being refused for a year.
+            let mut pages_delegate = BruPagesPanelDelegate::new();
+            let pages = panel_create(Some(&mut pages_delegate));
+            let pages_layout = pages.as_ref().and_then(|pages| {
+                // STRETCH on the cross axis, or a tab view is laid out at its own preferred height
+                // in the middle of the panel — measured in the probe as a child 12px tall in a
+                // 300px panel.
+                let inner = BoxLayoutSettings {
+                    horizontal: 1,
+                    cross_axis_alignment: AxisAlignment::STRETCH,
+                    ..Default::default()
+                };
+                pages.set_to_box_layout(Some(&inner))
+            });
+            // --- end src/devtools.rs: the pages panel ---------------------------------------
             // --- src/window.rs: the panel ---------------------------------------------------
             // **The panel goes between the bar and the pages, on whichever side the bar is.** It
             // opens *towards* the page — that is where the room is — so with the bar at the bottom
@@ -904,12 +951,31 @@ wrap_window_delegate! {
             }
             // --- end tabs and statusbar ----------------------------------------------------
 
+            // --- src/devtools.rs: the pages panel -------------------------------------------
+            // After the leading strips and before the trailing ones, which is exactly where the
+            // tab views used to be added one by one.
+            if let Some(pages) = pages.as_ref() {
+                window.add_child_view(Some(&mut View::from(pages)));
+                // **Flex 1, and set after the panel is a child.** Said before it was added — the way
+                // the strips say theirs — the layout kept no record of it and the panel came up at
+                // its preferred 300 with the rest of the window left empty below the status bar.
+                // The strips get away with it because they ask for the height they want; this one
+                // has to be told to grow.
+                if let Some(layout) = layout.as_ref() {
+                    layout.set_flex_for_view(Some(&mut View::from(pages)), 1);
+                }
+            }
+            // --- end src/devtools.rs: the pages panel ---------------------------------------
+
             // Nothing else is ever handed the window or its layout; keep both where a tab opened
             // later can find them. The lock is let go before any tab is placed — see tabs.rs.
-            self.state
-                .lock()
-                .expect("state mutex poisoned")
-                .set_window_for(self.window_id, window.clone(), layout);
+            {
+                let mut guard = self.state.lock().expect("state mutex poisoned");
+                guard.set_window_for(self.window_id, window.clone(), layout);
+                if let Some(pages) = pages.clone() {
+                    guard.set_pages_for(self.window_id, pages, pages_layout);
+                }
+            }
 
             // Tabs that already exist in *this* window: at startup, the one the command line asked
             // for, created before there was a window to put it in; at runtime, whatever `create`
@@ -1159,11 +1225,15 @@ wrap_browser_view_delegate! {
             // this delegate answered was classified as "no answer" and never read. The strips hold
             // their 40 and 24 through every layout because they answer a nonzero width — 1280, at
             // line 1194 — and that number was the whole difference. Same number here, same reason.
-            // `height_for`, not `height`: while the divider is being dragged the number comes from
-            // the drag rather than from the setting, and the setting is written once at the end.
-            let height = crate::devtools::height_for(self.window_id);
-            crate::devtools::trace(&format!("inspector preferred_size -> {height}"));
-            Size { width: 1280, height }
+            // Asked of `devtools.rs`, not computed here: which axis this number lands on depends on
+            // where the inspector is docked, and while a drag is running it comes from the drag
+            // rather than from the setting. Both answers are non-empty on both axes — see trap 25.
+            let size = crate::devtools::inspector_size(self.window_id);
+            crate::devtools::trace(&format!(
+                "inspector preferred_size -> {}x{}",
+                size.width, size.height
+            ));
+            size
         }
 
         // No `minimum_size`, no `maximum_size`. They were written to pin a height the layout kept
@@ -1256,10 +1326,7 @@ wrap_browser_view_delegate! {
             // `devtools::divider_height_for`, which explains why a drag has to surround the pointer
             // rather than chase it.
             if self.kind == KIND_DIVIDER {
-                return Size {
-                    width: 1280,
-                    height: crate::devtools::divider_height_for(self.window_id),
-                };
+                return crate::devtools::divider_size(self.window_id);
             }
 // --- end src/devtools.rs -------------------------------------------------------------------
 // --- end tabs and statusbar ----------------------------------------------------------------

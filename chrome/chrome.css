@@ -160,6 +160,48 @@ body[data-view="divider"].dragging #split {
     );
 }
 
+/* The same, turned ninety degrees, for `devtools right`: the strip runs down the
+ * window and the two fields are left and right of it. Only the axis changes —
+ * every colour, every number and the drag itself are the ones above. */
+body[data-view="divider"].sideways {
+    cursor: ew-resize;
+}
+
+body[data-view="divider"].sideways #split {
+    top: 0;
+    bottom: 0;
+    left: 5px;
+    right: auto;
+    height: auto;
+    width: 2px;
+}
+
+body[data-view="divider"].sideways.dragging #split {
+    background: linear-gradient(
+        to right,
+        var(--bg) 0 5px,
+        var(--ui-fg) 5px 7px,
+        var(--bg) 7px 100%
+    );
+}
+
+body[data-view="divider"].sideways.dragging #above,
+body[data-view="divider"].sideways.dragging #below {
+    top: 0;
+    bottom: 0;
+    left: auto;
+    right: auto;
+    flex-direction: column;
+}
+
+body[data-view="divider"].sideways.dragging #above {
+    left: 0;
+}
+
+body[data-view="divider"].sideways.dragging #below {
+    right: 0;
+}
+
 /* Scrollbars --------------------------------------------------- src/scrollbar.rs
  *
  * Every scrollbar on a bru:// page, including the one down the side of
