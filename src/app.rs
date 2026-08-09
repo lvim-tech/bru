@@ -488,6 +488,12 @@ wrap_browser_process_handler! {
                 crate::window::FirstTab::Startup(&url.to_string()),
             );
 
+            // --- src/lifetime.rs ----------------------------------------------------------------
+            // After the window, not before: a handler that asks what is open should be answered by
+            // a browser that has something open.
+            crate::lifetime::on_started();
+            // --- end src/lifetime.rs ------------------------------------------------------------
+
             // Debug hook, off unless asked for. See state::schedule_close.
             let close_after =
                 CefString::from(&command_line.switch_value(Some(&CefString::from("close-after-ms"))))

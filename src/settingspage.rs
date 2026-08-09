@@ -450,6 +450,8 @@ mod tests {
         // the other two settings workstreams**; +15 is this one's.
         // Seventeen, +1 for `content.autofill` — a fourth preference-backed setting, and the same
         // reasoning puts it in this column: Chromium holds the value, so bru has not read it yet.
+        // Eighteen, +1 for `auto_save.session`. It is `Backing::Read` — bru's own store answers it —
+        // so it is *not* in this column; the count moves because the page has one more row that is.
         assert_eq!(html.matches("<td class=\"state\">not read yet</td>").count(), 17);
 // --- end content settings ------------------------------------------------------------------------
         // `start_page` and `statusbar.mode.style` are answered in Rust and need no reading, so
@@ -464,7 +466,9 @@ mod tests {
         // `tabs.background`, `tabs.wrap` and `tabs.tooltips` from the strips, then
         // `url.open_base_url`, `hints.scatter` and `downloads.location.prompt` from the constants
         // that became settings, then `scrollbar.style` and `scrollbar.page_overrides`.
-        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 2);
+        // **+1 `false`**: `auto_save.session`, which bru answers itself and ships off — the
+        // session is saved on every exit only when somebody asks for it.
+        assert_eq!(html.matches("<td class=\"state\">false</td>").count(), 3);
         // --- lua runtime ---------------------------------------------------------------------
         // **+1 `true`**: `plugins.enabled`, which bru answers itself and ships on. This number
         // moves with every bru-backed boolean, and 11 is what it was before this branch.

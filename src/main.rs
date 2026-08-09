@@ -34,6 +34,8 @@ mod hints;
 mod history;
 mod ipc;
 mod keys;
+// The two moments that are not about any page: the browser started, and it is going away.
+mod lifetime;
 mod load;
 // The second file allowed to mention `mlua`: the shared state, the plugin registry over it, the
 // handles a function-valued setting holds, and the `bru.on` that `events.rs` registers through.

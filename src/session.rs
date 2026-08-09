@@ -646,6 +646,28 @@ pub fn restore_at_startup(state: &SharedState) -> bool {
     };
     let name = CefString::from(&command_line.switch_value(Some(&CefString::from("restore"))))
         .to_string();
+    // **`auto_save.session` is the other way to ask**, and it asks for the same session by the
+    // same name — the one `:quit --save` writes and `--restore=default` reads. A switch on the
+    // command line still wins: it names a session on purpose, and a setting must not overrule
+    // something typed.
+    //
+    // Only when no page was named. Handed a URL — by a `.desktop` entry, by `xdg-open`, by
+    // `--url=` — the user asked for *that* page, and burying it under a restored session would be
+    // answering a question nobody asked.
+    let name = if name.is_empty() {
+        let asked_for_a_page = command_line.has_switch(Some(&CefString::from("url"))) == 1
+            || {
+                let mut bare = CefStringList::new();
+                command_line.arguments(Some(&mut bare));
+                bare.into_iter().any(|argument| !argument.trim().is_empty())
+            };
+        if asked_for_a_page || !crate::settings::is_on("auto_save.session") {
+            return false;
+        }
+        DEFAULT_NAME.to_string()
+    } else {
+        name
+    };
     if name.is_empty() {
         return false;
     }

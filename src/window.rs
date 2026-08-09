@@ -1082,6 +1082,14 @@ wrap_window_delegate! {
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
+            // --- src/lifetime.rs ------------------------------------------------------------
+            // **The window manager's close button reaches an exit through here, and this is the
+            // last moment anything is readable.** CEF asks whether the window may close, so
+            // nothing has been torn down yet; by `on_before_close` the browsers' navigation lists
+            // no longer read back, which is the fact that moved `:quit --save` into the command
+            // in the first place. `on_quitting` runs once however many windows pass through.
+            crate::lifetime::on_quitting(&self.state);
+            // --- end src/lifetime.rs --------------------------------------------------------
             // Ask every browser first: each may need to run beforeunload handlers. try_close_browser
             // both answers and starts the close, so all three have to be asked — short-circuiting on
             // the first 0 would leave the others open.

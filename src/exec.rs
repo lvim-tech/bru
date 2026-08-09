@@ -360,7 +360,15 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             // `:quit --save` (qutebrowser's `wq` alias) writes the open tabs before the window
             // goes. It has to happen here rather than in `on_before_close`: by the time that runs
             // the browsers are being torn down and their navigation lists no longer read back.
-            if *save {
+            // The exit is announced before anything is written, and `lifetime` is what decides
+            // whether `auto_save.session` writes as well. It runs once however many roads reach
+            // it — see that module's header for why the window manager's close button needed one.
+            let announced = crate::lifetime::is_quitting();
+            crate::lifetime::on_quitting(state);
+            // `--save` on top of the setting would write the same session twice. `announced` is
+            // false in the ordinary case, so the flag costs nothing and only speaks up when the
+            // setting has already done the job.
+            if *save && !crate::settings::is_on("auto_save.session") && !announced {
                 match crate::session::save(state, crate::session::DEFAULT_NAME) {
                     Ok(path) => eprintln!("bru: saved session to {}", path.display()),
                     Err(e) => eprintln!("bru: could not save the session: {e}"),

@@ -107,13 +107,24 @@ pub enum Event {
     DownloadFinished,
     /// `:config-source` finished reading a file.
     ConfigSourced,
+    /// The browser is up: the first window exists and its first tab has been asked for.
+    /// `app.rs::on_context_initialized`. Fires once per process, and never in a second bru that
+    /// handed its page to the first and exited.
+    Started,
+    /// The browser is going away, and **everything is still alive when this fires**. That is the
+    /// whole value of it: by the time CEF's `on_before_close` runs, the browsers are being torn
+    /// down and their navigation lists no longer read back, so a handler that wanted to save what
+    /// was open would find nothing to save. `lifetime::on_quitting` is the one place it fires
+    /// from, and both roads to an exit — `:quit` and the window manager's close button — go
+    /// through it, once.
+    Quit,
 }
 
 impl Event {
     /// Every event, in the order they are documented. The index into [`ARMED`] is the position in
     /// this array, so nothing may be inserted in the middle without the counts moving with it —
     /// which is why [`Event::index`] is written as a `match` and not as a search of this.
-    pub const ALL: [Event; 8] = [
+    pub const ALL: [Event; 10] = [
         Event::PageLoaded,
         Event::UrlChanged,
         Event::TabOpened,
@@ -122,6 +133,8 @@ impl Event {
         Event::ModeChanged,
         Event::DownloadFinished,
         Event::ConfigSourced,
+        Event::Started,
+        Event::Quit,
     ];
 
     /// The name `bru.on` takes.
@@ -141,6 +154,8 @@ impl Event {
             Event::ModeChanged => "mode-changed",
             Event::DownloadFinished => "download-finished",
             Event::ConfigSourced => "config-sourced",
+            Event::Started => "started",
+            Event::Quit => "quit",
         }
     }
 
@@ -160,6 +175,8 @@ impl Event {
             Event::ModeChanged => 5,
             Event::DownloadFinished => 6,
             Event::ConfigSourced => 7,
+            Event::Started => 8,
+            Event::Quit => 9,
         }
     }
 }

@@ -1336,6 +1336,30 @@ pub const SETTINGS: &[Def] = &[
         backing: Backing::Preference(PrefKind::AcceptLanguage),
     },
     Def {
+        // qutebrowser's own name, its own type and its own default (`configdata.yml:449-457`),
+        // and its own description reads like the request that asked for it: "Always restore open
+        // sites when qutebrowser is reopened. Without this option set, `:wq` (`:quit --save`)
+        // needs to be used."
+        //
+        // **One setting, not two, and that is qutebrowser's shape rather than a shortcut.** Saving
+        // without restoring writes a file nobody reads; restoring without saving restores whatever
+        // was last written by hand. The pair is the feature.
+        //
+        // It writes and reads the session named `session::DEFAULT_NAME`, which is the one
+        // `:quit --save` already writes and `--restore=default` already reads. A second name for
+        // the same idea — qutebrowser keeps a separate `_autosave` — would mean two sessions that
+        // are each sometimes the right one.
+        //
+        // `Backing::Read`: nothing is pushed anywhere. `lifetime::on_quitting` asks at the moment
+        // the browser is going away and `session::restore_at_startup` asks once at startup, so a
+        // `:set` takes effect on the very next quit with nothing to rebuild.
+        name: "auto_save.session",
+        kind: Kind::Bool,
+        default: Some("false"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    Def {
         // **qutebrowser has no name for this, because QtWebEngine has no such dropdown to name.**
         // So the default is not copied from `configdata.yml`; it is chosen, and the reason is in
         // [`PrefKind::Autofill`]: these dropdowns take the keyboard through the popup
@@ -4597,7 +4621,11 @@ mod tests {
         // bru's own choice rather than qutebrowser's, because QtWebEngine has no such dropdown to
         // have an opinion about. See [`PrefKind::Autofill`], including for the Escape bug it was
         // first written against and measurably does not end.
-        assert_eq!(SETTINGS.len(), 68);
+        // **Sixty-nine**, +1 for `auto_save.session` — qutebrowser's own name, type and default
+        // (`configdata.yml:449`). One setting for both halves, because saving without restoring
+        // writes a file nobody reads and restoring without saving restores whatever was last
+        // written by hand; the pair is the feature. See `lifetime.rs` for where it is read.
+        assert_eq!(SETTINGS.len(), 69);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {
