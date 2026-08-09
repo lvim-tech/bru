@@ -414,6 +414,64 @@ window.__bru_hints = (function () {
 
         state.root = root;
         document.documentElement.appendChild(root);
+        unstack(state.nodes);
+    }
+
+    // **Labels that would sit on top of each other, moved apart.**
+    //
+    // A label is drawn at its element's top-left corner, which is right until two elements have
+    // corners a few pixels apart — a mail list's sender, subject and date, a toolbar of icons — and
+    // then one chip covers another and the covered one cannot be read or typed. qutebrowser lives
+    // with this; measured on abv.bg's inbox, ten rows produced four unreadable pairs.
+    //
+    // Greedy and in label order, so the first label of a row keeps the corner it belongs to and the
+    // ones that arrive later give way. Down first, because a label displaced downward is still
+    // beside its element in the direction reading goes; then up, then to either side. A label with
+    // nowhere free stays where it was: covering something is better than pointing at nothing.
+    //
+    // **Every read happens before every write.** Reading a box after moving one flushes layout for
+    // each label in turn — measured 1000 labels that way and the page stopped for the best part of a
+    // second. The boxes are collected in one pass, the offsets computed with arithmetic, and the
+    // styles written in a second pass, which is one layout for the whole set.
+    function unstack(nodes) {
+        const boxes = [];
+        for (const node of nodes) {
+            const box = node.getBoundingClientRect();
+            boxes.push({ "x": box.left, "y": box.top, "w": box.width, "h": box.height });
+        }
+
+        const GAP = 1;
+        const hits = (a, b) =>
+            a.x < b.x + b.w + GAP && b.x < a.x + a.w + GAP &&
+            a.y < b.y + b.h + GAP && b.y < a.y + a.h + GAP;
+
+        const placed = [];
+        for (let i = 0; i < boxes.length; ++i) {
+            const box = boxes[i];
+            const step = box.h + GAP;
+            const tries = [
+                [0, 0], [0, step], [0, -step], [box.w + GAP, 0], [-box.w - GAP, 0],
+                [0, step * 2], [box.w + GAP, step], [-box.w - GAP, step],
+            ];
+            let dx = 0;
+            let dy = 0;
+            for (const [ox, oy] of tries) {
+                const at = { "x": box.x + ox, "y": box.y + oy, "w": box.w, "h": box.h };
+                if (at.x < 0 || at.y < 0) {
+                    continue;
+                }
+                if (!placed.some((other) => hits(at, other))) {
+                    dx = ox;
+                    dy = oy;
+                    break;
+                }
+            }
+            placed.push({ "x": box.x + dx, "y": box.y + dy, "w": box.w, "h": box.h });
+            if (dx !== 0 || dy !== 0) {
+                nodes[i].style.setProperty("left", `${Math.round(box.x + dx)}px`, "important");
+                nodes[i].style.setProperty("top", `${Math.round(box.y + dy)}px`, "important");
+            }
+        }
     }
 
     // Rust has matched `matched_len` characters and says these element indices are still in play.
