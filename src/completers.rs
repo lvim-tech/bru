@@ -643,18 +643,6 @@ fn in_force(store: &crate::settings::Settings, def: &crate::settings::Def) -> St
     }
 }
 
-/// The first sentence of a refusal, which is as much of one as a completion row can hold.
-///
-/// The whole reason is prose — `content.plugins`'s is 90 words — and it is printed in full on
-/// `bru://chrome/settings` and by `:set` itself when the name is typed. What a row here has to do
-/// is stop the reader typing the rest of the name, and the first sentence does that.
-fn first_sentence(why: &str) -> String {
-    match why.split_once(". ") {
-        Some((first, _)) => format!("{first}."),
-        None => why.to_string(),
-    }
-}
-
 /// `:set <option> <value>` — what the value may be.
 ///
 /// `configmodel.value` (`configmodel.py:66-94`), which is two categories and not one: what the
