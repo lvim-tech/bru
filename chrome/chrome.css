@@ -297,10 +297,15 @@ body[data-view="top"] {
     display: flex;
     height: 100%;
     align-items: stretch;
-    /* Breathing room at the window's edge. qutebrowser's strip runs edge to
-       edge because Qt draws the tab shapes themselves; here a tab is a plain
-       box, and a box touching the frame reads as unfinished. */
-    padding: 4px var(--pad-x) 0;
+    /* **Edge to edge, which is qutebrowser's answer after all.** This was 4px of
+       inset at the top and `--pad-x` at the sides, on the argument that a plain
+       box touching the frame reads as unfinished — Qt draws qutebrowser's tabs as
+       shapes and can afford to run them to the edge. Looked at rather than
+       reasoned about, the inset is what read as unfinished: a strip of bar
+       showing above and to the left of the first tab, which the eye takes for a
+       gap in the strip rather than for margin around it. The 2px between tabs
+       stays; that one separates two tabs from each other and is doing a job. */
+    padding: 0;
     gap: 2px;
     box-sizing: border-box;
 }
