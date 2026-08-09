@@ -317,7 +317,6 @@ pub enum Command {
     /// would reproduce it.
     ///
     /// qutebrowser opens `qute://configdiff`; bru prints, and prints `config.lua`'s language rather
-    /// than a table. That is the same decision as [`Command::ConfigWritePy`]'s refusal seen from the
     /// other side: what a reader of either command wants is the lines to put in the file that is
     /// theirs, and the only difference between the two commands is who writes the file.
     ConfigDiff,
@@ -342,25 +341,6 @@ pub enum Command {
     /// What happens after the editor exits is `ConfigSource`'s question, and the answer is the same
     /// as qutebrowser's: re-read it, unless `--no-source`.
     ConfigEdit { no_source: bool },
-    /// `config-write-py` — **refused**, and it is the one command of this group that is.
-    ///
-    /// qutebrowser writes the running configuration to a `config.py`. Split that into its two
-    /// halves and bru can do one of them and must not do the other:
-    ///
-    /// - *Turn the running state into the text of a config file* — bru does this, as
-    ///   [`Command::ConfigDiff`], in Lua rather than Python because that is what bru's config file
-    ///   is written in.
-    /// - *Write that text to `~/.config/bru/config.lua`* — bru must never. DESIGN.md gives that
-    ///   file to configer and gives bru only the defaults; a bru that generated it would make it
-    ///   neither hand-written nor configer's, and the next `configer` run would fight it.
-    ///
-    /// Writing it *somewhere else* was considered and is not a rescue: the value of the command is
-    /// that the file it writes is the one that gets read, and a `config.lua` in `/tmp` is
-    /// `:config-diff` with a `>` in front of it. So the name is bound to a refusal that names
-    /// `:config-diff`, rather than left to the dispatcher's "not implemented yet" — which would be
-    /// a promise. The `-py` in the name is a second, smaller reason: bru's configuration language
-    /// is Lua, and there is no Python anywhere in this project to write.
-    ConfigWritePy,
     /// `bind [--mode <mode>] [--default] [<key> [<command>]]` — `configcommands.py:120-169`.
     ///
     /// Four shapes: no key opens the page that lists every binding (`bru://chrome/help`, where
@@ -376,7 +356,6 @@ pub enum Command {
     /// existed and works only at startup; this is the same edit made to a browser that is already
     /// up, which means the trie the key path matches against as well as the table
     /// `bru://chrome/help`, `hints.rs` and `prompt.rs` read back. Nothing is written to disk —
-    /// qutebrowser's `save_yaml=True` has no counterpart here, for `ConfigWritePy`'s reason.
     Bind {
         mode: String,
         keys: Option<String>,
@@ -1619,7 +1598,6 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
         },
         // Refused, and the arm in `exec.rs` says why. It takes qutebrowser's three flags without
         // reading them: a user who types `--force` is owed the refusal, not "unknown flag --force".
-        "config-write-py" => Command::ConfigWritePy,
         "unbind" => parse_unbind(&tokens[1..])?,
 // --- end config commands -----------------------------------------------------------------------
 
@@ -3682,10 +3660,8 @@ mod tests {
         assert_eq!(parse("config-clear").unwrap(), Command::ConfigClear { save: false });
         assert_eq!(parse("config-clear --save").unwrap(), Command::ConfigClear { save: true });
         assert_eq!(parse("config-diff").unwrap(), Command::ConfigDiff);
-        assert_eq!(parse("config-write-py").unwrap(), Command::ConfigWritePy);
         // qutebrowser's three flags are swallowed rather than refused: someone who typed
         // `--force` is owed the refusal, not "unknown flag".
-        assert_eq!(parse("config-write-py --force --defaults").unwrap(), Command::ConfigWritePy);
 
         assert_eq!(
             parse("config-list-add content.blocking.adblock.lists https://x/list.txt").unwrap(),
@@ -3727,12 +3703,10 @@ mod tests {
             parse("config-edit --no-source").unwrap(),
             Command::ConfigEdit { no_source: true }
         );
-        // Every one of them acts when typed, `config-write-py` included — what it does is explain.
         for text in [
             "config-unset content.images",
             "config-clear",
             "config-diff",
-            "config-write-py",
             "config-list-add content.blocking.adblock.lists https://x/l.txt",
             "config-list-remove content.blocking.adblock.lists https://x/l.txt",
             "config-source",

@@ -1,10 +1,9 @@
-//! `bru://chrome/settings` — every setting bru has, every setting it refuses, and what Chromium is
-//! actually enforcing.
+//! `bru://chrome/settings` — every setting bru has, and what Chromium is actually enforcing.
 //!
 //! This is what a bare `:set` opens, which is what `Ss` is bound to: qutebrowser sends it to
 //! `qute://settings` (`configcommands.py:95-99`) and bru sends it here.
 //!
-//! Built at request time from [`crate::settings::SETTINGS`] and [`crate::settings::REFUSED`], for
+//! Built at request time from [`crate::settings::SETTINGS`], for
 //! the reason `src/help.rs` and `src/history.rs` are: a page written separately from the table it
 //! describes drifts, and a settings page that disagrees with the browser is worse than none. Adding
 //! a setting to `settings.rs` adds a row here with no edit to this file, and deleting one deletes
@@ -51,7 +50,7 @@ use std::time::Instant;
 
 use cef::*;
 
-use crate::settings::{Kind, Scopes, REFUSED, SETTINGS};
+use crate::settings::{Kind, Scopes, SETTINGS};
 
 /// The URL whose content settings the page reports, when there is no page to ask about.
 ///
@@ -129,14 +128,13 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
     );
 
     out.push_str(&format!(
-        "<h1>bru</h1>\n<p class=\"summary\">{} settings, {} refused. bru writes no configuration \
+        "<h1>bru</h1>\n<p class=\"summary\">{} settings. bru writes no configuration \
          file: <code>:set</code> changes the running browser and nothing on disk. The last column \
          is what <em>Chromium</em> answered for <code>{}</code> {}, not what bru's own store holds \
          — a store that agrees with itself proves nothing. It is read on the UI thread and this \
          page is built on the IO thread, which is why it carries an age. A rule written with \
          <code>-u</code> for some other host does not show here.</p>\n",
         SETTINGS.len(),
-        REFUSED.len(),
         escape(probe),
         match snapshot {
             Some(snapshot) => format!("{} ms ago", snapshot.at.elapsed().as_millis()),
@@ -161,15 +159,6 @@ pub fn page(snapshot: Option<&Snapshot>) -> String {
     }
     out.push_str("</table>\n");
 
-    out.push_str("<h2>refused</h2>\n<table>\n");
-    for (name, why) in REFUSED {
-        out.push_str(&format!(
-            "<tr class=\"todo\"><td class=\"keys\">{}</td><td class=\"cmd\">{}</td>\
-             <td class=\"state\">not a setting</td></tr>\n",
-            escape(name),
-            escape(why),
-        ));
-    }
     out.push_str("</table>\n</main>\n");
     out
 }
@@ -333,7 +322,7 @@ fn scope(scopes: Scopes) -> &'static str {
 }
 
 /// The same escape `src/help.rs` has, and here for the same reason: every cell above is built out
-/// of a string from `settings.rs`, and [`REFUSED`]'s reasons are prose that already contains `<`
+/// of a string from `settings.rs`, and those are prose that may already contain `<`
 /// and `>` in `cef_content_setting_types_t`-shaped names.
 ///
 /// It is duplicated rather than shared because `help.rs` belongs to another workstream and a
@@ -404,16 +393,11 @@ mod tests {
         let taken = snapshot("https://example.com/");
         let html = page(Some(&taken));
         let rows = html.matches("<tr class=").count();
-        assert_eq!(rows, SETTINGS.len() + REFUSED.len());
+        assert_eq!(rows, SETTINGS.len());
         for def in SETTINGS {
             assert!(html.contains(def.name), "{} is missing", def.name);
         }
-        for (name, _) in REFUSED {
-            assert!(html.contains(name), "{name} is missing");
-        }
-        // The refusal's *reason* is the point of listing it — a name with no reason beside it is
-        // the "someone forgot" the whole list exists to deny.
-        assert!(html.contains("Chromium 151 has nothing behind this name"));
+
     }
 
 // --- config commands -------------------------------------------------------------------------
@@ -544,7 +528,7 @@ mod tests {
     fn a_dictionary_setting_shows_a_line_per_pair() {
         let html = page(Some(&snapshot("https://example.com/")));
         // Still one row per setting — the pairs are inside the row, not extra rows.
-        assert_eq!(html.matches("<tr class=").count(), SETTINGS.len() + REFUSED.len());
+        assert_eq!(html.matches("<tr class=").count(), SETTINGS.len());
         // Nine engines and twelve labels, each as `<code>key</code> value`.
         for (name, template) in crate::open::DEFAULT_ENGINES {
             assert!(
@@ -569,19 +553,12 @@ mod tests {
         assert!(html.contains("default 14 entries"));
     }
 
-    /// `REFUSED`'s reasons are prose with angle brackets in them, and `settings.rs` is not this
-    /// module's to police. Nothing it holds may reach the page as markup.
+    /// Nothing from the settings table may reach the page as markup.
     #[test]
     fn nothing_from_the_settings_table_can_escape_its_cell() {
         let html = page(Some(&snapshot("<script>alert(1)</script>")));
         assert!(!html.contains("<script>alert(1)"), "the probe URL is text");
         assert!(html.contains("&lt;script&gt;alert(1)"));
-        // Every reason arrives through `escape`. None of the two currently written happens to
-        // contain markup, so this only bites when one does — which is the point of asserting the
-        // escaped form rather than the absence of the raw one.
-        for (_, why) in REFUSED {
-            assert!(html.contains(&escape(why)));
-        }
         assert_eq!(escape("a & b"), "a &amp; b");
         assert_eq!(escape("\"x\""), "&quot;x&quot;");
     }

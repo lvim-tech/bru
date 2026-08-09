@@ -16,7 +16,7 @@
 //!
 //! **A setting bru cannot honour is not a setting.** Every name in [`SETTINGS`] moves something
 //! observable; the ones qutebrowser's default bindings name and bru refuses are listed in
-//! [`REFUSED`], with the reason, so that `:set content.plugins false` answers with why there is
+//! nothing at all, so that `:set content.plugins false` answers that bru does not know the name
 //! nothing behind the name instead of quietly agreeing.
 //!
 //! The store itself is plain Rust and has no CEF in it — it is built and tested without a browser.
@@ -1857,200 +1857,6 @@ pub const SETTINGS: &[Def] = &[
     // --- end src/chrome.rs: fonts ----------------------------------------------------------------
 ];
 
-/// The settings qutebrowser's default bindings name that bru refuses, and why.
-///
-/// They are here rather than absent from the file so that the reason survives: someone who reads
-/// `config-cycle … content.plugins` in the binding table and wonders why it is inert finds the
-/// answer next to the ones that work, instead of concluding it was forgotten. `bru://chrome/help`
-/// prints these strings against the twelve rows — see [`refusal_in`] — so a refusal is a sentence
-/// the user can read rather than a row that says "not yet" about something that never will be.
-///
-/// Refusing them is the point. `tph` would otherwise toggle a value nothing reads, print it, reload
-/// the page, and leave the user certain that plugins are off.
-///
-/// **Both were re-measured 2026-08-06 against CEF 151 rather than reasoned about**, with
-/// `--settings-probe='prefs:…'` and `--settings-probe='cookies:…'` — see [`dump_preferences`] and
-/// [`probe_third_party_cookies`], which exist so that the next CEF can be asked the same questions
-/// in one command.
-pub const REFUSED: &[(&str, &str)] = &[
-    (
-        "content.plugins",
-        "Chromium 151 has nothing behind this name. cef_browser_settings_t has no plugin field \
-         at all, cef_content_setting_types_t's only plugin entry is DEPRECATED_PPAPI_BROKER, and \
-         the settable preferences in the family are plugins.always_open_pdf_externally — \"open \
-         PDFs in another application\" — and webkit.webprefs.plugins_enabled, which in Chromium \
-         151 governs the built-in PDF viewer and MimeHandlerView and nothing else. Measured \
-         2026-08-06, and the second preference re-measured 2026-08-07, which corrected this line: \
-         it used to say always_open_pdf_externally was the only one. Neither is \"enable plugins\" \
-         and neither can be scoped to a URL, which is how all six default bindings spell it. \
-         NPAPI and PPAPI are gone, so these six keys are not waiting for work; there is no work \
-         that would make them act.",
-    ),
-    (
-        "content.cookies.accept",
-        "its three values are all / no-3rdparty / never, and no-3rdparty cannot be written per \
-         URL. It needs a rule with a wildcard requesting pattern under a fixed top-level one, and \
-         set_content_setting derives both patterns from URLs. Measured 2026-08-06: \
-         set_content_setting(requesting=none, top_level=https://example.com/, COOKIES, BLOCK) \
-         changed nothing — every read-back, third-party and first-party alike, still answered \
-         allow — while the same call with the URLs the other way round answered block. Chromium \
-         does have a global switch, the preference profile.cookie_controls_mode, and CEF reports \
-         it settable; but all twelve default bindings pass -u <pattern>, and a per-site key that \
-         quietly changed the whole browser would be worse than one that does nothing. A \
-         three-value cycle that is wrong on one press in three is worse than a key that says it \
-         does nothing.",
-    ),
-    // --- tabs and statusbar --------------------------------------------------------------------
-    // The `tabs.*` and `statusbar.*` names bru does not implement and will not until something
-    // changes. Names that are simply not built yet are **not** here: `:set` answers those with
-    // "unknown setting", which is the truth, and a reason is only worth keeping when it is a reason
-    // rather than a date.
-    (
-        "tabs.last_close",
-        "what happens when the last tab closes is DECISIONS.md item 6, and it is still open — the \
-         user has not chosen between bru's current behaviour (the window closes) and qutebrowser's \
-         default (`ignore`, which keeps the window with a blank tab). Shipping the setting would \
-         settle an open question by picking a default for it, which is the one thing an agent may \
-         not do here.",
-    ),
-    (
-        "tabs.title.elide",
-        "CSS can only elide at the end. `#tabs .title` is `text-overflow: ellipsis`, which is this \
-         setting's `right`; `left` and `center` would mean bru measuring the rendered width of each \
-         title and cutting the string itself, and the strip is handed titles as JSON and never \
-         learns how wide a tab came out. Chromium has no `text-overflow: ellipsis center`.",
-    ),
-    (
-        "tabs.padding",
-        "it is a four-number Padding, and bru has no numeric setting kind — no Kind::Int, and no \
-         dict value that is a pixel count. Spelling four integers as text so that the name could \
-         exist would be the shape this file's second rule refuses.",
-    ),
-    (
-        "statusbar.padding",
-        "the same four-number Padding as tabs.padding, and the same missing numeric kind.",
-    ),
-    (
-        "tabs.indicator.width",
-        "a pixel count, and bru has no Kind::Int. The stripe itself is real — `#tabs .tab::before` \
-         draws it and the theme colours it — so this is a missing kind rather than a missing \
-         feature, and it is one line the day bru has one.",
-    ),
-    (
-        "tabs.favicons.scale",
-        "a float, and bru has no float kind either. `tabs.favicons.show` is the half of this that \
-         needs no number and it is implemented.",
-    ),
-    (
-        "tabs.show_switching_delay",
-        "milliseconds, and bru has no Kind::Int. `tabs.show switching` is built and uses \
-         qutebrowser's own default of 800 ms; a delay spelled as text would be a number parsed \
-         twice and validated nowhere.",
-    ),
-    (
-        "tabs.mousewheel_switching",
-        "bru's tab strip takes no wheel events at all. The one pointer input it accepts is a left \
-         click, forwarded from `chrome/top.js` as a `tab-select` query; a wheel over the strip \
-         scrolls nothing because the strip's document is exactly as tall as the strip.",
-    ),
-    (
-        "tabs.close_mouse_button",
-        "the strip listens for one thing, `click`, and CEF gives a chrome page no middle- or \
-         right-button channel bru has wired. Closing a tab with the mouse is not a behaviour bru \
-         has, so this would be a setting that chooses between three ways of doing nothing.",
-    ),
-    (
-        "tabs.close_mouse_button_on_bar",
-        "it names what the button of tabs.close_mouse_button does on the empty part of the strip, \
-         and that button does not exist here — see tabs.close_mouse_button.",
-    ),
-    (
-        "tabs.tabs_are_windows",
-        "DESIGN.md settles the shape as \"one window, many tabs, switched in place\", and it is not \
-         reopenable. bru does have more than one window — `:open -w`, `gD`, `U` — but a mode where \
-         every tab is a window would make the tab strip, `tabs.position` and `tabs.show` draw \
-         nothing.",
-    ),
-    // --- end tabs and statusbar ----------------------------------------------------------------
-// --- content settings ----------------------------------------------------------------------------
-    // **These strings are read by a person on `bru://chrome/settings`, so they name nothing but
-    // bru and CEF.** `help.rs::the_page_measures_bru_against_nothing` enforces that for the page it
-    // owns; the rule is the user's and it is the same rule here, whether or not a key is bound to
-    // one of these names today. Where a setting came from belongs in the comments above and in the
-    // commit message, not in the answer someone gets when they type it.
-    (
-        "content.desktop_capture",
-        "the rule exists and reading it kills the browser. CEF 151 has \
-         CEF_CONTENT_SETTING_TYPE_DISPLAY_CAPTURE and cef-rs exposes it, but \
-         RequestContext::get_content_setting on it does not fail and does not answer wrongly — the \
-         browser process takes SIGTRAP and exits 133 with nothing on stderr. Measured 2026-08-07 \
-         under gdb: HostContentSettingsMap::GetContentSetting immediate-crashes \
-         (base/immediate_crash.h:180), reached from CefRequestContextImpl::GetContentSetting \
-         (request_context_impl.cc:600). Every other type bru drives was swept the same way, one \
-         browser process each, and this is the only one that does it. It costs more than one \
-         setting: this page reads every setting it lists, so a row here would take the browser \
-         down whenever the page was opened.",
-    ),
-    (
-        "content.media.audio_video_capture",
-        "Chromium keeps the microphone and the camera in two separate rules and has no third for \
-         the pair — MEDIASTREAM_MIC and MEDIASTREAM_CAMERA are the whole of it in \
-         cef_content_setting_types_t. This name could only be implemented by writing both, and it \
-         would then silently overwrite content.media.audio_capture and content.media.video_capture \
-         beside it, and be overwritten by them in turn. Both halves are implemented; set them in \
-         one line and nothing is lost.",
-    ),
-    (
-        "content.local_storage",
-        "Chromium has no localStorage rule of its own. Measured 2026-08-07: no LOCAL_STORAGE in \
-         cef_content_setting_types_t, and webkit.webprefs.local_storage_enabled answers exists=0 \
-         settable=0, while cef_browser_settings_t::local_storage is read once when a browser is \
-         created and so cannot change a tab that is already open. What is left is COOKIES, which \
-         is the site's whole data store — a setting named local_storage that also threw away the \
-         site's cookies would be a switch wired to two things and labelled with one of them.",
-    ),
-    (
-        "content.canvas_reading",
-        "nothing in CEF 151 has it. There is no entry in cef_content_setting_types_t, no field in \
-         cef_browser_settings_t, and no preference: measured 2026-08-07 with \
-         --settings-probe='prefs:canvas', which matched none. Refusing canvas readback in Chromium \
-         is a decision taken when Blink is built, not one a running browser can take.",
-    ),
-    (
-        "content.webgl",
-        "the only spelling CEF 151 offers is cef_browser_settings_t::webgl, which is read once when \
-         a browser is created. It is not a content setting — there is no WEBGL in \
-         cef_content_setting_types_t — and not a preference either: webkit.webprefs.webgl1_enabled \
-         and webkit.webprefs.webgl2_enabled both answer exists=0 settable=0, measured 2026-08-07. \
-         So it could not be given a URL pattern, which is how every per-site key in bru is written, \
-         and could not change a tab that is already open. A setting that needed a new tab to take \
-         effect and could not be scoped would be two surprises rather than one option.",
-    ),
-    (
-        "content.default_encoding",
-        "cef_browser_settings_t::default_encoding, with content.webgl's objection: read once when \
-         a browser is created, with no content setting and no preference behind it — \
-         webkit.webprefs.default_encoding answers exists=0 settable=0, measured 2026-08-07. \
-         Chromium determines a page's encoding from its bytes and its headers, so the field is a \
-         fallback for documents that declare nothing, and bru cannot scope it or change it live.",
-    ),
-    (
-        "content.xss_auditing",
-        "the XSS Auditor was taken out of Chromium at M78 and CEF 151 is M151. There is no content \
-         setting, no preference, and not even the command-line switch it used to answer to: \
-         measured 2026-08-07, `strings libcef.so` contains no xss-auditor at all. There is nothing \
-         behind the name to switch on or off.",
-    ),
-    (
-        "content.pdfjs",
-        "it asks for a different PDF viewer, which is a feature rather than a setting. Chromium's \
-         viewer is built in, and the one preference CEF exposes beside it is \
-         plugins.always_open_pdf_externally (exists=1 settable=1, measured 2026-08-07), which \
-         means \"hand the file to another program\" — the opposite question. Honouring this name \
-         would mean bru shipping and serving a JavaScript PDF viewer of its own.",
-    ),
-// --- end content settings ------------------------------------------------------------------------
-];
 
 /// **What `:set` prints for a dictionary**, and the answer to "a dict is not one line".
 ///
@@ -2269,18 +2075,6 @@ pub fn widgets_json() -> String {
 }
 // --- end tabs and statusbar --------------------------------------------------------------------
 
-/// The reason a command string names a refused setting, for `bru://chrome/help`'s third state.
-///
-/// `commands.rs` refuses to build a `ConfigCycle` for a setting this file does not have, so the
-/// twelve `t**` rows arrive as `Command::Unimplemented` carrying their whole text — which is where
-/// the setting's name still is. See `exec::refusal`, the one caller.
-pub fn refusal_in(text: &str) -> Option<&'static str> {
-    REFUSED
-        .iter()
-        .find(|(name, _)| text.contains(name))
-        .map(|(_, why)| *why)
-}
-
 /// The definition for `name`, if bru has one.
 pub fn def(name: &str) -> Option<&'static Def> {
     SETTINGS.iter().find(|def| def.name == name)
@@ -2327,13 +2121,9 @@ pub fn fn_setting_names() -> String {
 }
 // --- end setting functions -------------------------------------------------------------------------
 
-/// The error a refused setting gets: it names the setting and says why, which is the whole reason
-/// [`REFUSED`] exists.
+/// The error an unknown setting gets: the name, and what bru does know.
 fn unknown(name: &str) -> String {
-    match REFUSED.iter().find(|(refused, _)| *refused == name) {
-        Some((_, why)) => format!("bru does not implement {name}: {why}"),
-        None => format!("unknown setting {name:?}; bru knows {}", known_names()),
-    }
+    format!("unknown setting {name:?}; bru knows {}", known_names())
 }
 
 impl Def {
@@ -4620,15 +4410,6 @@ mod tests {
 
     #[test]
     fn every_setting_bru_names_has_something_behind_it() {
-        // The table and the refusal list must not overlap: a name cannot both be implemented and be
-        // documented as refused, and this is the assertion that notices when one is implemented and
-        // the other is not deleted.
-        for (refused, _) in REFUSED {
-            assert!(
-                def(refused).is_none(),
-                "{refused} is in REFUSED and in SETTINGS"
-            );
-        }
         // Every default parses as its own kind — a table row that lies about its default would make
         // `config-cycle` start from a value the setting cannot hold.
         for def in SETTINGS {
@@ -4785,38 +4566,6 @@ mod tests {
         }
     }
 
-    /// Every `tabs.*` and `statusbar.*` name bru refuses says why, and none of them is also
-    /// implemented — the same pair of rules the file's first test applies to the whole table, aimed
-    /// at the twelve names this workstream added a reason for.
-    #[test]
-    fn the_refused_strip_settings_name_a_reason_rather_than_a_date() {
-        let mut settings = Settings::default();
-        for name in [
-            "tabs.last_close",
-            "tabs.title.elide",
-            "tabs.padding",
-            "statusbar.padding",
-            "tabs.indicator.width",
-            "tabs.favicons.scale",
-            "tabs.show_switching_delay",
-            "tabs.mousewheel_switching",
-            "tabs.close_mouse_button",
-            "tabs.close_mouse_button_on_bar",
-            "tabs.tabs_are_windows",
-        ] {
-            let error = settings.set_scoped(name, "1", None).unwrap_err();
-            assert!(
-                error.starts_with(&format!("bru does not implement {name}: ")),
-                "{name}: {error}"
-            );
-            // "not yet", "later", "TODO" — a date rather than a reason. The whole point of REFUSED
-            // is that the sentence still means something in a year.
-            let why = error.to_lowercase();
-            for excuse in ["not yet", "todo", "coming", "for now"] {
-                assert!(!why.contains(excuse), "{name} is refused with an excuse: {error}");
-            }
-        }
-    }
     // --- end tabs and statusbar ----------------------------------------------------------------
 
 // --- content settings ----------------------------------------------------------------------------
@@ -4921,20 +4670,10 @@ mod tests {
 // --- end content settings ------------------------------------------------------------------------
 
     #[test]
-    fn a_refused_setting_says_why_rather_than_pretending() {
+    fn a_name_bru_does_not_have_is_answered_with_the_list() {
         let mut settings = Settings::default();
-        let error = settings
-            .set_scoped("content.plugins", "true", None)
-            .expect_err("content.plugins is refused");
-        assert!(error.contains("Chromium 151 has nothing behind this name"), "{error}");
-
-        let error = settings
-            .set_scoped("content.cookies.accept", "never", None)
-            .expect_err("content.cookies.accept is refused");
-        assert!(error.contains("no-3rdparty"), "{error}");
-
-        // Something nobody has ever heard of gets the list instead.
         let error = settings.set_scoped("content.nonsense", "1", None).unwrap_err();
+        assert!(error.contains("unknown setting"), "{error}");
         assert!(error.contains("content.javascript.enabled"), "{error}");
     }
 

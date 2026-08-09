@@ -90,8 +90,6 @@ enum State {
     Live,
     /// Bound, parsed, and waiting for a milestone.
     NotYet,
-    /// Bound, parsed, and waiting for nothing — with the reason.
-    Refused(&'static str),
 }
 
 impl State {
@@ -104,11 +102,9 @@ impl State {
             return State::NotYet;
         };
         if crate::exec::is_live(&command) {
-            return State::Live;
-        }
-        match crate::exec::refusal(&command) {
-            Some(why) => State::Refused(why),
-            None => State::NotYet,
+            State::Live
+        } else {
+            State::NotYet
         }
     }
 
@@ -117,7 +113,6 @@ impl State {
         match self {
             State::Live => "live",
             State::NotYet => "todo",
-            State::Refused(_) => "refused",
         }
     }
 
@@ -126,7 +121,6 @@ impl State {
         match self {
             State::Live => "",
             State::NotYet => "not yet",
-            State::Refused(_) => "refused",
         }
     }
 }
@@ -454,10 +448,6 @@ pub const COMMANDS: &[Doc] = &[
         what: "Open config.lua in $EDITOR and re-read it afterwards. bru creates neither the file \
                nor its directory.",
         example: "config-edit" },
-    Doc { names: &["config-write-py"], args: "", flags: &[],
-        what: "Refused. Writing config.lua is not bru's to do; :config-diff prints the same text \
-               for you to put there yourself.",
-        example: "config-write-py" },
     Doc { names: &["bind"], args: "[key] [command]", flags: &["-m/--mode", "-d/--default"],
         what: "Bind a key in the running browser, print what one is bound to, put bru's own \
                binding back with --default, or with no key open this page. Nothing is written to \
@@ -775,15 +765,10 @@ fn reached(bindings: &Bindings) -> BTreeMap<String, Reached> {
 pub fn page(bindings: &Bindings) -> String {
     let rows = bindings.all();
 
-    // No total: the summary counts what acts and what is refused, and does not divide one by the
-    // other or by anything else.
-    let (live, refused) = rows.iter().fold((0usize, 0usize), |(live, refused), (_, _, cmd)| {
-        match State::of(cmd) {
-            State::Live => (live + 1, refused),
-            State::Refused(_) => (live, refused + 1),
-            State::NotYet => (live, refused),
-        }
-    });
+    let live = rows
+        .iter()
+        .filter(|(_, _, cmd)| matches!(State::of(cmd), State::Live))
+        .count();
 
     let mut out = String::with_capacity(64 * 1024);
     out.push_str(
@@ -819,7 +804,7 @@ pub fn page(bindings: &Bindings) -> String {
         .count();
     out.push_str(&format!(
         "<h1>bru</h1>\n<p class=\"summary\">{live} keys do something. \
-         {refused} say why they do not. {} commands can be typed. {bound} answer to a key.</p>\n",
+         {} commands can be typed. {bound} answer to a key.</p>\n",
         COMMANDS.len(),
     ));
 
@@ -831,15 +816,8 @@ pub fn page(bindings: &Bindings) -> String {
         out.push_str(&format!("<h2>{}</h2>\n<table>\n", escape(mode.name())));
         for (_, keys, cmd) in in_mode {
             let state = State::of(cmd);
-            // The reason goes inside the command cell rather than into a row of its own: one `<tr>`
-            // per binding is what `every_binding_appears` counts, and what keeps the striping from
-            // pairing a row with its own explanation.
-            let why = match state {
-                State::Refused(why) => format!("<span class=\"why\">{}</span>", escape(why)),
-                _ => String::new(),
-            };
             out.push_str(&format!(
-                "<tr class=\"{}\"><td class=\"keys\">{}</td><td class=\"cmd\">{}{why}</td><td class=\"state\">{}</td></tr>\n",
+                "<tr class=\"{}\"><td class=\"keys\">{}</td><td class=\"cmd\">{}</td><td class=\"state\">{}</td></tr>\n",
                 state.class(),
                 escape(keys),
                 escape(cmd),
@@ -862,10 +840,6 @@ pub fn page(bindings: &Bindings) -> String {
     );
     for doc in COMMANDS {
         let state = State::of(doc.example);
-        let why = match state {
-            State::Refused(why) => format!("<span class=\"why\">{}</span>", escape(why)),
-            _ => String::new(),
-        };
         let aliases = doc.names[1..]
             .iter()
             .map(|alias| format!("<span class=\"alias\">{}</span>", escape(alias)))
@@ -889,7 +863,7 @@ pub fn page(bindings: &Bindings) -> String {
         }
         out.push_str(&format!(
             "<tr data-row=\"command\" class=\"{}\"><td class=\"name\">{}{aliases}</td>\
-             <td class=\"cmd\"><code class=\"sig\">{}</code><span class=\"what\">{}</span>{why}</td>\
+             <td class=\"cmd\"><code class=\"sig\">{}</code><span class=\"what\">{}</span></td>\
              <td class=\"bound\">{keys}</td><td class=\"state\">{}</td></tr>\n",
             state.class(),
             escape(doc.names[0]),
@@ -1015,7 +989,6 @@ fn describe(doc: &Doc, state: State) -> String {
     match state {
         State::Live => doc.what.to_string(),
         State::NotYet => format!("not yet: {}", doc.what),
-        State::Refused(why) => format!("refused: {why}"),
     }
 }
 
@@ -1159,117 +1132,6 @@ mod tests {
         assert!(html.contains(
             r#"<tr class="todo"><td class="keys">ZW</td><td class="cmd">debug-dump-page /tmp/x</td><td class="state">not yet</td></tr>"#
         ));
-    }
-
-    /// The third state, and the thirteen rows that are in it.
-    ///
-    /// "not yet" against a key nothing can ever implement invites the same investigation every few
-    /// months; three of them have been paid for already. These rows say **refused** and carry the
-    /// reason the module that measured it wrote.
-    #[test]
-    fn a_binding_nothing_can_implement_says_refused_and_why() {
-        let html = page(&bindings());
-
-        // The twelve `t**` rows: six `content.plugins`, six `content.cookies.accept`.
-        let twelve: Vec<&str> = crate::config::DEFAULT_BINDINGS
-            .iter()
-            .filter(|(mode, keys, _)| *mode == "normal" && keys.starts_with('t') && keys.len() == 3)
-            .filter(|(_, _, cmd)| {
-                cmd.contains("content.plugins") || cmd.contains("content.cookies.accept")
-            })
-            .map(|(_, keys, _)| *keys)
-            .collect();
-        assert_eq!(twelve.len(), 12, "the t** rows moved: {twelve:?}");
-        for keys in &twelve {
-            let row = format!(r#"<td class="keys">{keys}</td>"#);
-            let at = html.find(&row).unwrap_or_else(|| panic!("no row for {keys}"));
-            let row = &html[..at];
-            assert!(row.ends_with(r#"<tr class="refused">"#), "{keys} is not marked refused");
-        }
-        assert!(html.contains("NPAPI and PPAPI are gone"), "the plugins reason is not on the page");
-        assert!(html.contains("no-3rdparty cannot be written per URL"), "the cookies reason is not");
-
-// --- unhardcoded -----------------------------------------------------------------------
-        // **`<Return>` in hint mode was the thirteenth and is not refused any more.**
-        // `hints.auto_follow` is a setting now, `never` is a value it takes, and that is the state
-        // the key exists for — so the row is live and the page must not still be telling the user
-        // it can never work. The reason string went with it.
-        assert!(!html.contains(r#"<tr class="refused"><td class="keys">&lt;Return&gt;</td><td class="cmd">hint-follow"#));
-        assert!(!html.contains("there is never a hint waiting to be followed"));
-
-        // Twelve rows, and the summary says so rather than only the table.
-        assert_eq!(html.matches(r#"<tr class="refused">"#).count(), 12);
-        assert!(html.contains("12 say why they do not"), "the summary undercounts");
-// --- end unhardcoded -------------------------------------------------------------------
-        // And it states counts rather than a fraction of anything — the user asked for that
-        // 2026-08-07, and a helpful-looking "x of y" is exactly what crept back last time.
-        assert!(!html.contains(" of 264"), "the summary is measuring against a total again");
-
-        // A refused row is not a "not yet" row, or the third state is decoration.
-        assert!(!html.contains(r#"<td class="cmd">hint-follow</td><td class="state">not yet</td>"#));
-
-// --- src/utilcmds.rs -------------------------------------------------------
-        // A command carried by `:later`, `:repeat` or `:run-with-count` keeps its own state, which
-        // for a refused one is the reason and not "not yet". Only reachable from a `config.lua`;
-        // the default table binds none of the three.
-        assert!(matches!(
-            State::of("later 1s config-cycle -p -u *://x/* content.plugins"),
-            State::Refused(_)
-        ));
-        assert_eq!(State::of("repeat 2 scroll down"), State::Live);
-        assert_eq!(State::of("repeat 2 debug-dump-page /tmp/x"), State::NotYet);
-// --- end src/utilcmds.rs ---------------------------------------------------
-
-        // The twelve are chains — `config-cycle … ;; reload` — and the reason must come from the
-        // half that is refused whichever half is written first. Asking `exec::refusal` for the
-        // reversed spelling is what proves it does not depend on the order, which it did until a
-        // deliberate break walked it past the `config-cycle` and into `reload`.
-        let forwards = "config-cycle -p -u *://x/* content.plugins ;; reload";
-        let backwards = "reload ;; config-cycle -p -u *://x/* content.plugins";
-        assert!(matches!(State::of(forwards), State::Refused(_)));
-        assert_eq!(State::of(forwards), State::of(backwards));
-    }
-
-    /// A reason is prose written by a person and lands inside a table cell. It goes through the
-    /// same escape as everything else, and the page carries the escaped form.
-    #[test]
-    fn a_refusal_reason_cannot_escape_its_cell() {
-        let b = bindings();
-        let html = page(&b);
-// --- tabs and statusbar ----------------------------------------------------
-        // Only the refusals a binding names reach this page, and that is what the page is: one row
-        // per binding, with the reason inside the row. `REFUSED` used to hold exactly the two the
-        // twelve `t**` bindings name, so walking all of it was walking those two; it now also holds
-        // `tabs.*` and `statusbar.*` names, which no default binding types, and those are printed by
-        // `bru://chrome/settings` instead — `settingspage.rs::every_refused_reason_is_escaped` is
-        // this same assertion over the page that does show them.
-        //
-        // Which ones those are is asked of the bindings rather than listed here, so that a binding
-        // added or taken away moves this check with it instead of leaving a hard-coded two.
-        let commands = b.all();
-        let named: Vec<&(&str, &str)> = crate::settings::REFUSED
-            .iter()
-            .filter(|(name, _)| commands.iter().any(|(_, _, cmd)| cmd.contains(name)))
-            .collect();
-        assert!(
-            named.len() >= 2,
-            "the two content settings the t** bindings name must still reach the page"
-        );
-        for (_, why) in named {
-// --- end tabs and statusbar ------------------------------------------------
-            assert!(html.contains(&escape(why)), "the escaped reason is not on the page");
-            // The plugins reason contains ASCII quotes, so this is not a vacuous check: the raw
-            // string must *not* be there.
-            if escape(why) != *why {
-                assert!(!html.contains(*why), "an unescaped reason reached the page");
-            }
-        }
-        assert_ne!(
-            escape(crate::settings::REFUSED[0].1),
-            crate::settings::REFUSED[0].1,
-            "if no reason needs escaping this test asserts nothing"
-        );
-        assert_eq!(escape("a <b> & \"c\""), "a &lt;b&gt; &amp; &quot;c&quot;");
     }
 
     /// A `config.lua` that rebinds a key must change the page, or it is documentation of something
@@ -1492,7 +1354,7 @@ mod tests {
         // for the scrape to find. That is the honest shape and it is why `Plugin` is exempt in
         // `every_command_variant_is_reachable_by_name`.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(source.len(), 171, "the scrape found a different number of commands");
+        assert_eq!(source.len(), 170, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1533,25 +1395,9 @@ mod tests {
             assert!(parsed.is_ok(), "{}: {:?} does not parse: {parsed:?}", doc.names[0], doc.example);
             match State::of(doc.example) {
                 State::Live => {}
-                State::Refused(why) => assert!(!why.is_empty(), "{}: refused with no reason", doc.names[0]),
-                State::NotYet => panic!("{}: neither acts nor says why not", doc.names[0]),
+                State::NotYet => panic!("{}: does not act", doc.names[0]),
             }
         }
-        // **None**, and the empty vector is the assertion rather than the absence of one.
-        //
-        // `hint-follow` was the one, refused because a hint session followed its match the instant
-        // it was unambiguous and there was nothing left for `<Return>` to confirm. `hints.auto_follow`
-        // is what gave it a job: set to `never`, the session stays open on an exact match and waits.
-        // So the row went live by a setting arriving, not by anyone rewriting the command — which is
-        // the shape to expect here, and the reason this list is asserted whole instead of by count.
-        assert_eq!(
-            COMMANDS
-                .iter()
-                .filter(|doc| matches!(State::of(doc.example), State::Refused(_)))
-                .map(|doc| doc.names[0])
-                .collect::<Vec<_>>(),
-            Vec::<&str>::new()
-        );
     }
 
     /// **The `Command` enum, covered with no `_` arm** — the trick `exec::run` uses, aimed at this
@@ -1650,7 +1496,6 @@ mod tests {
                 Command::ConfigListRemove { .. } => "ConfigListRemove",
                 Command::ConfigSource { .. } => "ConfigSource",
                 Command::ConfigEdit { .. } => "ConfigEdit",
-                Command::ConfigWritePy => "ConfigWritePy",
                 Command::Bind { .. } => "Bind",
                 Command::Unbind { .. } => "Unbind",
                 Command::CompletionItemFocus { .. } => "CompletionItemFocus",
@@ -1767,7 +1612,7 @@ mod tests {
         "SelectionReverse", "SelectionFollow", "MoveTo", "CmdSetText", "CommandAccept", "Spawn",
         "EditText", "InsertText", "FakeKey", "Set", "ConfigCycle", "ConfigDictAdd",
         "ConfigDictRemove", "ConfigUnset", "ConfigClear", "ConfigDiff", "ConfigListAdd",
-        "ConfigListRemove", "ConfigSource", "ConfigEdit", "ConfigWritePy", "Bind", "Unbind",
+        "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",
         "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",
         "AdblockUpdate", "AdblockToggle", "AdblockInfo", "GreasemonkeyReload", "ViewSource",

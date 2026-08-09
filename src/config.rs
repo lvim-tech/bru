@@ -222,24 +222,12 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "tSH", "config-cycle -p -u *://*.{url:host}/* content.javascript.enabled ;; reload"),
     ("normal", "tsu", "config-cycle -p -t -u {url} content.javascript.enabled ;; reload"),
     ("normal", "tSu", "config-cycle -p -u {url} content.javascript.enabled ;; reload"),
-    ("normal", "tph", "config-cycle -p -t -u *://{url:host}/* content.plugins ;; reload"),
-    ("normal", "tPh", "config-cycle -p -u *://{url:host}/* content.plugins ;; reload"),
-    ("normal", "tpH", "config-cycle -p -t -u *://*.{url:host}/* content.plugins ;; reload"),
-    ("normal", "tPH", "config-cycle -p -u *://*.{url:host}/* content.plugins ;; reload"),
-    ("normal", "tpu", "config-cycle -p -t -u {url} content.plugins ;; reload"),
-    ("normal", "tPu", "config-cycle -p -u {url} content.plugins ;; reload"),
     ("normal", "tih", "config-cycle -p -t -u *://{url:host}/* content.images ;; reload"),
     ("normal", "tIh", "config-cycle -p -u *://{url:host}/* content.images ;; reload"),
     ("normal", "tiH", "config-cycle -p -t -u *://*.{url:host}/* content.images ;; reload"),
     ("normal", "tIH", "config-cycle -p -u *://*.{url:host}/* content.images ;; reload"),
     ("normal", "tiu", "config-cycle -p -t -u {url} content.images ;; reload"),
     ("normal", "tIu", "config-cycle -p -u {url} content.images ;; reload"),
-    ("normal", "tch", "config-cycle -p -t -u *://{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
-    ("normal", "tCh", "config-cycle -p -u *://{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
-    ("normal", "tcH", "config-cycle -p -t -u *://*.{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
-    ("normal", "tCH", "config-cycle -p -u *://*.{url:host}/* content.cookies.accept all no-3rdparty never ;; reload"),
-    ("normal", "tcu", "config-cycle -p -t -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
-    ("normal", "tCu", "config-cycle -p -u {url} content.cookies.accept all no-3rdparty never ;; reload"),
 // --- src/caret.rs --------------------------------------------------------------------------
     // -- caret ---------------------------------------------------------------------------------
     // configdata.yml:3961–3989, transcribed in its own order.
@@ -519,9 +507,7 @@ impl Bindings {
     /// it would change how partial matches resolve.
     pub fn into_tries(self) -> HashMap<Mode, BindingTrie<Command>> {
         let mut tries: HashMap<Mode, BindingTrie<Command>> = HashMap::new();
-        // Two counts, because there are two things a key that does not act can be waiting for, and
-        // one line that conflated them said something false for a whole stage.
-        let (mut waiting, mut refused) = (0usize, 0usize);
+        let mut waiting = 0usize;
 
         let mut modes: Vec<_> = self.per_mode.into_iter().collect();
         modes.sort_by_key(|(mode, _)| *mode);
@@ -542,11 +528,7 @@ impl Bindings {
                         // asks the dispatcher — reported 13, and the same mistake once undercounted
                         // the live-binding total by 17 for a whole stage.
                         if !crate::exec::is_live(&parsed) {
-                            if crate::exec::refusal(&parsed).is_some() {
-                                refused += 1;
-                            } else {
-                                waiting += 1;
-                            }
+                            waiting += 1;
                         }
                         trie.insert(&sequence, parsed);
                     }
@@ -562,12 +544,6 @@ impl Bindings {
             eprintln!(
                 "bru: {waiting} bindings name commands that are not implemented yet; \
                  pressing them will say so rather than do nothing silently"
-            );
-        }
-        if refused > 0 {
-            eprintln!(
-                "bru: {refused} bindings name something CEF 151 cannot do at all; they are not \
-                 waiting for a milestone, and `bru://chrome/help` gives the reason for each"
             );
         }
         tries
@@ -1353,10 +1329,13 @@ mod tests {
         // **299, not 298.** qutebrowser's table is 298; the extra one is bru's own `ts`
         // (`styles-toggle`), which qutebrowser has no command for. A number that grows is a number
         // that has to say which of the two it is counting.
-        // **293 since the inspector lost six of its seven keys** — `wIh`, `wIj`, `wIk`, `wIl`,
-        // `wIw` and `wIf`. Five of them bound a docked position CEF cannot draw. A number that
-        // shrinks has to say why as plainly as one that grows.
-        assert_eq!(total, 293, "the default table is not the one transcribed from configdata.yml");
+        // **281 since the twelve `t**` rows went** — six for `content.plugins` and six for
+        // `content.cookies.accept`, two settings bru does not have and will not, so the keys said
+        // why they did nothing rather than doing anything. A key that only explains itself is a key
+        // that does nothing, and the table now holds only keys that act. (293 before those; 299
+        // before the inspector kept one key of seven.) A number that shrinks has to say why as
+        // plainly as one that grows.
+        assert_eq!(total, 281, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1369,8 +1348,8 @@ mod tests {
         // mode is where that matters most: `v` and `<Space>` are both `selection-toggle`, and `V`,
         // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
-        // **184, six fewer than the 190 this counted until the inspector kept one key of seven.**
-        assert_eq!(bindings.len(Mode::Normal), 184);
+        // **172: 184 less the twelve `t**` rows, which named two settings bru does not have.**
+        assert_eq!(bindings.len(Mode::Normal), 172);
         assert_eq!(bindings.len(Mode::Insert), 4);
         assert_eq!(bindings.len(Mode::Hint), 5);
         assert_eq!(bindings.len(Mode::Command), 32);
@@ -1668,7 +1647,7 @@ mod tests {
             "a syntax error means nothing in the file ran, so J is still the default"
         );
         assert_eq!(config.bindings.command_for(Mode::Normal, "j"), Some("scroll down"));
-        assert_eq!(config.bindings.len(Mode::Normal), 184);
+        assert_eq!(config.bindings.len(Mode::Normal), 172);
     }
 
     #[test]

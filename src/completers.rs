@@ -777,16 +777,8 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
                 .collect()
         }
         // --- end src/chrome.rs: themes ---------------------------------------------------------
-        // **Two categories, because a refused setting is not a setting.** The names in
-        // `settings::REFUSED` are ones bru will not implement and has a measured reason for; `:set`
-        // answers one with that reason instead of a value. Leaving them out of the completion would
-        // make `:set content.pl<Tab>` answer with silence, which reads as "bru forgot" — and the
-        // reason is the one thing the reader of a name that does nothing needs. Leaving them in the
-        // *same* category would be worse: it would offer them as things to set.
-        //
-        // This is the same rule the command model follows one screen up, applied to the other
-        // table: what bru knows a name for is offered, and a name that does nothing says so where
-        // it is offered.
+        // One category: what bru has. Names it does not have are not offered, and `:set` answers
+        // one with "unknown setting" and the list of what it knows.
         Which::Setting(only) => {
             let store = crate::settings::snapshot();
             let rows: Vec<Vec<String>> = crate::settings::SETTINGS
@@ -805,26 +797,6 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
                 completion::list_category_max("Settings", OPTION_WIDTHS, rows, pattern, usize::MAX)
             {
                 out.push(cat);
-            }
-            // Only where every setting is on offer: `:config-dict-add` takes a dictionary, and none
-            // of the refused names is one, so listing them under it would be listing them as
-            // dictionaries.
-            if only == Only::Any {
-                let rows: Vec<Vec<String>> = crate::settings::REFUSED
-                    .iter()
-                    .map(|(name, why)| {
-                        vec![name.to_string(), first_sentence(why), "refused".to_string()]
-                    })
-                    .collect();
-                if let Some(cat) = completion::list_category_max(
-                    "Refused",
-                    OPTION_WIDTHS,
-                    rows,
-                    pattern,
-                    usize::MAX,
-                ) {
-                    out.push(cat);
-                }
             }
             out
         }
@@ -1770,7 +1742,7 @@ mod tests {
         // this one exists so that a table which silently stopped growing is noticed.
         let names: usize = crate::help::COMMANDS.iter().map(|doc| doc.names.len()).sum();
         assert_eq!(cats[0].items.len(), names);
-        assert_eq!(names, 171);
+        assert_eq!(names, 170);
 
         let row = |name: &str| {
             cats[0]
@@ -1856,7 +1828,7 @@ mod tests {
     fn the_whole_command_list_does_not_ask_for_an_absurd_bar() {
         let cats = build_which(Which::Commands, "");
         let rows: i32 = cats.iter().map(|cat| cat.items.len() as i32).sum();
-        assert_eq!(rows, 171);
+        assert_eq!(rows, 170);
         // `resize_bar`'s arithmetic, which is `chrome.css:186-191`'s: 20px per row and per header,
         // capped at --completion-max-h and one pixel for the border. 166 rows want 3,340px and get
         // 301, because past the cap the table scrolls inside itself.
@@ -1940,12 +1912,8 @@ mod tests {
     #[test]
     fn the_option_model_lists_every_setting_with_what_it_takes_and_what_it_is() {
         let cats = build_which(Which::Setting(Only::Any), "");
-        assert_eq!(
-            cats.iter().map(|cat| cat.name).collect::<Vec<_>>(),
-            ["Settings", "Refused"]
-        );
+        assert_eq!(cats.iter().map(|cat| cat.name).collect::<Vec<_>>(), ["Settings"]);
         assert_eq!(cats[0].items.len(), crate::settings::SETTINGS.len());
-        assert_eq!(cats[1].items.len(), crate::settings::REFUSED.len());
 
         let row = |name: &str| {
             cats[0]
@@ -1970,11 +1938,6 @@ mod tests {
         // A setting that can only be written per URL still shows what is in force where no rule has
         // been written, which is bru's own default.
         assert_eq!(row("content.javascript.enabled")[2], "true");
-
-        // A refused name is offered with its reason and never as something to set.
-        let refused = &cats[1].items.iter().find(|i| i.cols[0] == "content.plugins").unwrap().cols;
-        assert_eq!(refused[1], "Chromium 151 has nothing behind this name.");
-        assert_eq!(refused[2], "refused");
     }
 
     #[test]
@@ -1982,8 +1945,6 @@ mod tests {
         let dicts = build_which(Which::Setting(Only::Dicts), "");
         let names: Vec<&str> = dicts[0].items.iter().map(|i| i.cols[0].as_str()).collect();
         assert_eq!(names, ["statusbar.mode.labels", "url.searchengines"]);
-        // No Refused category here: none of the refused names is a dictionary, so offering them
-        // under `:config-dict-add` would be offering them as dictionaries.
         assert_eq!(dicts.len(), 1);
 
         let lists = build_which(Which::Setting(Only::Lists), "");

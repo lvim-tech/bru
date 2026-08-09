@@ -612,14 +612,6 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             crate::config::run_source(filename.as_deref(), *clear)
         }
         Command::ConfigEdit { no_source } => crate::config::run_edit(*no_source),
-        // **Refused**, with the reason, rather than left to say "not implemented yet" — see
-        // `Command::ConfigWritePy`, which carries it. It acts: it explains, and names the command
-        // that does the half bru can do.
-        Command::ConfigWritePy => crate::message::error(
-            "config-write-py: bru never writes ~/.config/bru/config.lua — that file is \
-             hand-written and belongs to configer, and bru holds only the defaults it is layered \
-             on. `:config-diff` prints the Lua this browser would need, for you to paste there.",
-        ),
         // `:bind` with no key is the page listing every binding — `qute://bindings` in qutebrowser,
         // and here the page bru already generates from the table it is running on. It is done in
         // this file because navigating is this file's job; the other three shapes are `config.rs`'s.
@@ -1048,14 +1040,8 @@ pub fn is_live(command: &Command) -> bool {
 // --- end src/settings.rs ---------------------------------------------------
 
 // --- config commands ---------------------------------------------------------------------------
-        // All ten act, and none of them is bound by default, so the live-binding count is
+        // All nine act, and none of them is bound by default, so the live-binding count is
         // untouched by the whole group — checked in `the_config_commands_raise_no_binding`.
-        //
-        // `config-write-py` is live and **refused** at the same time, which no other command in bru
-        // is, and it is deliberate: `exec::refusal` is for a *binding* that will never act, and
-        // nothing binds this. What it does when typed is explain itself, which is doing something.
-        // Claiming it inert would send it to the dispatcher's "not implemented yet", which is the
-        // one answer that is false.
         Command::ConfigUnset { .. }
         | Command::ConfigClear { .. }
         | Command::ConfigDiff
@@ -1063,7 +1049,6 @@ pub fn is_live(command: &Command) -> bool {
         | Command::ConfigListRemove { .. }
         | Command::ConfigSource { .. }
         | Command::ConfigEdit { .. }
-        | Command::ConfigWritePy
         | Command::Bind { .. }
         | Command::Unbind { .. } => true,
 // --- end config commands -----------------------------------------------------------------------
@@ -1255,50 +1240,6 @@ pub fn is_live(command: &Command) -> bool {
 }
 
 // --- src/help.rs -----------------------------------------------------------
-/// Why a bound command will **never** act, or `None` if it might.
-///
-/// [`is_live`] answers "does pressing this do something today". This answers "and is that ever
-/// going to change", and it exists because the answer is no for thirteen of the 298 default
-/// bindings. A row that says "not yet" about a key nothing can implement is a lie of a different
-/// kind from a row that says it about a key waiting for a milestone: it invites the same
-/// investigation every few months, and the second one costs as much as the first.
-///
-/// The strings live with the module that measured them, not here — `settings::REFUSED`. This is
-/// only the dispatch, and `help.rs` is the only caller. It is deliberately *not* consulted by `is_live`: a refused command is inert, and both
-/// halves of the count would otherwise depend on one function.
-pub fn refusal(command: &Command) -> Option<&'static str> {
-    debug_assert!(!is_live(command), "a live command cannot also be refused");
-    match command {
-        // The twelve `t**` rows, all of them `config-cycle … content.plugins` or
-        // `… content.cookies.accept`. `commands.rs` will not build a `ConfigCycle` for a setting
-        // `settings.rs` does not have, so they arrive here as `Unimplemented` carrying the text
-        // the setting's name is still in.
-        Command::Unimplemented(text) => crate::settings::refusal_in(text),
-        // All twelve are `config-cycle … ;; reload`, so they arrive as a chain and never as the
-        // bare command. `is_live` on a chain is "every part acts", so one refused part is enough
-        // to refuse the whole row — and it is the part the reader pressed the key for.
-        //
-        // The live parts are filtered out before the recursion rather than skipped inside it, and
-        // that is not tidiness: without it the `debug_assert` above fires on `reload`. It did —
-        // `every_binding_appears` aborted with "a live command cannot also be refused" the moment
-        // `settings::refusal_in` was stubbed out and `find_map` walked past the `config-cycle` to
-        // the second half of the chain. A `config.lua` writing `reload ;; config-cycle …` would
-        // have reached it with nothing stubbed at all.
-        Command::Chain(parts) => parts.iter().filter(|part| !is_live(part)).find_map(refusal),
-// --- src/utilcmds.rs -------------------------------------------------------
-        // The three that carry a command are exactly a chain one link long, so they answer the same
-        // way: `:later 1s config-cycle … content.plugins` is refused for the reason the carried
-        // command is refused for, and not "not yet". No default binding is any of these — the
-        // reader who reaches this line wrote it in `config.lua`, which is precisely the case the
-        // three-state page exists for.
-        Command::Later { command, .. }
-        | Command::Repeat { command, .. }
-        | Command::RunWithCount { command, .. } => refusal(command),
-// --- end src/utilcmds.rs ---------------------------------------------------
-        _ => None,
-    }
-}
-// --- end src/help.rs -------------------------------------------------------
 
 /// `:back`/`:forward`, with a count and with `-t`/`-b`/`-w`.
 ///
@@ -1823,8 +1764,9 @@ mod tests {
         // 298 with src/prompt.rs, which brought `bindings.default.prompt`'s 26 rows and
         // `.yesno`'s 8 — the last two sections of `configdata.yml` bru had no mode for.
         // 293 since the inspector kept `wi` and lost `wIh`, `wIj`, `wIk`, `wIl`, `wIw` and `wIf`:
-        // five of the six bound a docked position CEF cannot draw. The only fall in this number.
-        assert_eq!(DEFAULT_BINDINGS.len(), 293);
+        // five of the six bound a docked position CEF cannot draw. 281 since the twelve `t**` rows
+        // went with the two settings they named. The only falls in this number.
+        assert_eq!(DEFAULT_BINDINGS.len(), 281);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1905,38 +1847,20 @@ mod tests {
     /// asserts the emptiness rather than deleting the state.
     #[test]
     fn nothing_bound_by_default_is_merely_waiting() {
-        let (mut live, mut refused, mut waiting) = (0usize, Vec::new(), Vec::new());
+        let (mut live, mut waiting) = (0usize, Vec::new());
         for (mode, keys, cmd) in DEFAULT_BINDINGS {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             if is_live(&parsed) {
                 live += 1;
-            } else if refusal(&parsed).is_some() {
-                refused.push((*mode, *keys));
             } else {
                 waiting.push((*mode, *keys, *cmd));
             }
         }
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
-        // 281: the six inspector keys that went were all live, since `devtools` is implemented —
-        // what was wrong with them was the placement they promised, not the command behind them.
+        // 281 as it was, less the twelve `t**` rows that named two settings bru does not have. A
+        // key that says why it does nothing is still a key that does nothing, and the table now
+        // holds only keys that act.
         assert_eq!(live, 281);
-        assert_eq!(
-            refused,
-            [
-                ("normal", "tph"), ("normal", "tPh"), ("normal", "tpH"),
-                ("normal", "tPH"), ("normal", "tpu"), ("normal", "tPu"),
-                ("normal", "tch"), ("normal", "tCh"), ("normal", "tcH"),
-                ("normal", "tCH"), ("normal", "tcu"), ("normal", "tCu"),
-            ]
-        );
-        // A live command is never also refused — `refusal` debug-asserts it, and this walks the
-        // whole table past that assertion rather than trusting one call.
-        for (_, _, cmd) in DEFAULT_BINDINGS {
-            let parsed = commands::parse(cmd).expect("a default binding must parse");
-            if !is_live(&parsed) {
-                let _ = refusal(&parsed);
-            }
-        }
     }
 // --- end src/help.rs -------------------------------------------------------
 
@@ -2229,14 +2153,6 @@ mod tests {
             // content.images, the same six
             "tih", "tIh", "tiH", "tIH", "tiu", "tIu",
         ];
-        let still_inert = [
-            // content.plugins — Chromium 151 has no such content setting
-            "tph", "tPh", "tpH", "tPH", "tpu", "tPu",
-            // content.cookies.accept — no-3rdparty is not expressible through set_content_setting
-            "tch", "tCh", "tcH", "tCH", "tcu", "tCu",
-        ];
-        // `Ss` — a bare `set` — was in the list above until `bru://chrome/settings` existed to
-        // open. It is counted here so the arithmetic at the bottom still describes 25 bindings.
         let live_now_too = ["Ss"];
         let command_for = |keys: &str| {
             DEFAULT_BINDINGS
@@ -2251,15 +2167,7 @@ mod tests {
             let parsed = commands::parse(cmd).expect("a default binding must parse");
             assert!(is_live(&parsed), "{keys} -> {cmd:?} is still inert");
         }
-        for keys in still_inert {
-            let cmd = command_for(keys);
-            let parsed = commands::parse(cmd).expect("a default binding must parse");
-            assert!(
-                !is_live(&parsed),
-                "{keys} -> {cmd:?} claims to work; if that is true, say which setting it moves"
-            );
-        }
-        assert_eq!(live_now.len() + live_now_too.len() + still_inert.len(), 25);
+        assert_eq!(live_now.len() + live_now_too.len(), 13);
     }
 
     /// `:set` answers for an option bru refuses; `config-cycle` on the same option does not.
