@@ -28,6 +28,7 @@ pub struct TabRow {
     pub url: String,
     pub pinned: bool,
     pub muted: bool,
+    pub loading: bool,
     /// `{id}` in a title format is the browser's, and a tab that has not been created yet has none.
     pub browser_id: Option<i32>,
 }
@@ -54,6 +55,13 @@ pub struct Tab {
     /// the strip is rendered from this struct and a tab's browser may not exist yet, and because a
     /// restored session has to re-apply it to a browser that has not been made.
     pub(crate) muted: bool,
+    /// Whether the page is fetching, from `LoadHandler::on_loading_state_change`.
+    ///
+    /// **Kept per tab rather than asked of CEF at render time**, and for the reason every other
+    /// field here is: the strip is drawn from this struct, a background tab's browser may be gone
+    /// or not yet made, and `render_tabs` runs without the CEF handles anyway. A tab that has never
+    /// loaded anything is not loading, which is what `false` says.
+    pub(crate) loading: bool,
 }
 
 /// The plain state operations. None of these touch CEF.
@@ -135,6 +143,22 @@ impl BruState {
         Some(window)
     }
 
+    /// Records whether a tab is fetching. Answers the window **only when the answer changed**, so
+    /// the caller can push a strip for a change and stay silent otherwise.
+    ///
+    /// CEF calls `on_loading_state_change` for every browser, the two chrome strips included, and
+    /// it repeats the state it is already in. Pushing a strip each time would redraw the whole row
+    /// of tabs several times per page for no visible difference; `None` here is what stops it.
+    pub fn set_tab_loading(&mut self, identifier: i32, loading: bool) -> Option<u32> {
+        let (window, index) = self.locate_tab(identifier)?;
+        let tab = &mut self.slot_mut(window)?.tabs[index];
+        if tab.loading == loading {
+            return None;
+        }
+        tab.loading = loading;
+        Some(window)
+    }
+
     /// What the current window's tab strip renders, as data — **not** as the rendered JSON.
     ///
     /// See [`render_tabs`] for why the two are separate. In short: rendering can run a Lua function
@@ -161,6 +185,7 @@ impl BruState {
                     url: tab.url.clone(),
                     pinned: tab.pinned,
                     muted: tab.muted,
+                    loading: tab.loading,
                     browser_id: tab.browser_id,
                 })
                 .collect(),
@@ -384,6 +409,7 @@ impl BruState {
             url: String::new(),
             pinned: false,
             muted: false,
+            loading: false,
         });
         Some(slot.tabs.len() - 1)
     }
@@ -492,13 +518,14 @@ pub fn render_tabs(snapshot: &TabsSnapshot) -> String {
             let template = if tab.pinned { &pinned_format } else { &format };
             let label = label_for(template, tab, index, snapshot.active, count);
             format!(
-                "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{}}}",
+                "{{\"title\":\"{}\",\"url\":\"{}\",\"label\":\"{}\",\"active\":{},\"pinned\":{},\"muted\":{},\"loading\":{}}}",
                 crate::ipc::json_escape(&tab.title),
                 crate::ipc::json_escape(&tab.url),
                 crate::ipc::json_escape(&label),
                 index == snapshot.active,
                 tab.pinned,
                 tab.muted,
+                tab.loading,
             )
         })
         .collect();

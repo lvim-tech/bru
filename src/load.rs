@@ -28,6 +28,41 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        // --- src/tabs.rs: the loading stripe ------------------------------------------------
+        // **The tab strip's left-edge indicator, and the only hook that can drive it.**
+        // `on_load_start` fires when a document begins and `on_load_end` when one finishes, but a
+        // page is more than its main document: those two bracket the HTML, not the load, and a
+        // stripe driven by them turns green while the page is still fetching. This is Chromium's
+        // own answer to "is that tab busy" — the bit that spins the throbber in Chrome.
+        //
+        // **No main-frame guard, and no active-tab guard**, which is the opposite of everything
+        // below. There is no frame to test: the state is the browser's. And a background tab
+        // loading is the case an indicator exists for — guarding on the showing tab would draw the
+        // stripe only where the status bar already says the same thing.
+        //
+        // **The work is posted, not done here, and that is a deadlock and not a preference.**
+        // `tabs::new_tab_in` holds the state lock across `browser_view_create`, and creating a
+        // browser calls this handler back on the same thread before it returns. Locking here
+        // deadlocked bru on the second tab it opened: measured 2026-08-09, the window kept
+        // accepting `--remote` commands and executed none of them, because the UI thread was
+        // waiting for a mutex the UI thread was holding. Posting moves the update to after the
+        // current stack unwinds, which is when the lock is free.
+        fn on_loading_state_change(
+            &self,
+            browser: Option<&mut Browser>,
+            is_loading: ::std::os::raw::c_int,
+            _can_go_back: ::std::os::raw::c_int,
+            _can_go_forward: ::std::os::raw::c_int,
+        ) {
+            let Some(browser) = browser else {
+                return;
+            };
+            let mut task = MarkLoading::new(browser.identifier(), is_loading != 0);
+            post_task(ThreadId::UI, Some(&mut task));
+        }
+        // --- end src/tabs.rs: the loading stripe --------------------------------------------
+
+
         fn on_load_start(
             &self,
             browser: Option<&mut Browser>,
@@ -147,3 +182,32 @@ fn trace(browser_id: i32) {
         eprintln!("bru[load]: main frame of the showing tab (browser {browser_id}) started loading");
     }
 }
+
+// --- src/tabs.rs: the loading stripe ------------------------------------------------------------
+// (`wrap_task!` takes no doc comment on the struct it declares — CEF-NOTES.md trap 8.)
+wrap_task! {
+    struct MarkLoading {
+        id: i32,
+        loading: bool,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            // `set_tab_loading` answers `None` when the state is the one already recorded — CEF
+            // repeats itself, and calls this for the two chrome strips, which are not tabs. Without
+            // that test the whole strip would be re-rendered several times per navigation for a
+            // picture that did not change.
+            let changed = state
+                .lock()
+                .ok()
+                .and_then(|mut state| state.set_tab_loading(self.id, self.loading));
+            if changed.is_some() {
+                crate::tabs::push_tabs_everywhere();
+            }
+        }
+    }
+}
+// --- end src/tabs.rs: the loading stripe --------------------------------------------------------
