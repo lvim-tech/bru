@@ -1341,6 +1341,19 @@ pub fn defaults_lua() -> Vec<String> {
 /// one that names their real configuration is the one worth naming in the refusal, because
 /// `:config-write ~/.config/bru/config.lua` is the plausible typo, not a wild path.
 pub fn run_write(filename: &str, defaults: bool, force: bool) {
+    // **A flag written after the file is part of the file, and here that is silent.** `maxsplit0`
+    // stops reading flags at the first word that is not one, so that a path may contain spaces —
+    // `config-source` is parsed the same way. For a command that *reads* a file the mistake shows
+    // up as "does not exist"; this one creates what it is given, and measured 2026-08-09
+    // `:config-write /run/user/1000/x.lua --force` wrote a file named `x.lua --force` and reported
+    // success. So the shape that cannot be right is refused, and the message is the correct order
+    // rather than a complaint.
+    if let Some(flag) = filename.split_whitespace().find(|word| word.starts_with("--")) {
+        crate::message::error(&format!(
+            "config-write: {flag} has to come before the file — :config-write {flag} <file>"
+        ));
+        return;
+    }
     let path = PathBuf::from(shellexpand(filename));
     let lines = if defaults { defaults_lua() } else { diff_lua() };
 
@@ -1393,40 +1406,54 @@ fn shellexpand(path: &str) -> String {
 pub fn page(defaults: bool) -> String {
     let lines = if defaults { defaults_lua() } else { diff_lua() };
     let mut out = String::with_capacity(16 * 1024);
+    // **Absolute, where every other page's are relative, and the difference is this page's fault.**
+    // `bru://chrome/help` resolves `chrome.css` against `bru://chrome/` and finds it. This page has
+    // a second view one path segment deeper, so `bru://chrome/config/defaults` resolves the same
+    // relative href against `bru://chrome/config/` — which holds nothing. Measured 2026-08-09: the
+    // defaults view came up with no stylesheet at all, white and serif, while `/config` beside it
+    // was themed. Leading slashes cost nothing and stop the next nested page repeating it.
     out.push_str(
         r#"<!doctype html>
 <meta charset="utf-8">
 <title>bru — config</title>
-<link rel="stylesheet" href="chrome.css">
-<link rel="stylesheet" href="theme.css">
-<link rel="stylesheet" href="user.css">
+<link rel="stylesheet" href="/chrome.css">
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/user.css">
 <body data-view="help">
 <main id="help">
 <h1>bru</h1>
 "#,
     );
+    // Each page names the other. Two views of one subject, and the address of the second is not
+    // something anybody should have to remember or be told twice.
     if defaults {
-        out.push_str(
-            "<p class=\"summary\">Every setting and binding bru ships, with the value it already \
-             has. bru writes no configuration file and needs none: these are compiled into the \
-             binary. Commented out, because this is a reference — un-comment a line only to take \
-             that one over. <code>:config-write --defaults &lt;file&gt;</code> writes this.</p>\n",
-        );
+        out.push_str(&format!(
+            "<p class=\"summary\">All {} settings and {} bindings bru ships, with the value each \
+             already has. bru writes no configuration file and needs none: these are compiled into \
+             the binary. Commented out, because this is a reference — un-comment a line only to \
+             take that one over. <code>:config-write --defaults &lt;file&gt;</code> writes this; \
+             <a href=\"/config\">what you have changed</a> is the other view.</p>\n",
+            crate::settings::SETTINGS.len(),
+            Bindings::defaults().all().len(),
+        ));
     } else {
         out.push_str(
             "<p class=\"summary\">Everything this browser is running that is not bru's own, as the \
-             Lua that would reproduce it. <code>:config-write &lt;file&gt;</code> writes this.</p>\n",
+             Lua that would reproduce it. <code>:config-write &lt;file&gt;</code> writes this; \
+             <a href=\"/config/defaults\">everything bru ships</a> is the other view.</p>\n",
         );
     }
     if lines.iter().all(|line| line.trim().is_empty()) {
         out.push_str("<p class=\"summary\">Nothing is customized.</p>\n");
     }
-    out.push_str("<pre class=\"cmd\">");
+    // A block per statement rather than one `<pre>`, so that a long one wraps with a hanging
+    // indent instead of sending the page sideways — see `#help .config` in `chrome/chrome.css`.
+    out.push_str("<div class=\"config\">\n");
     for line in &lines {
-        out.push_str(&crate::help::escape(line));
-        out.push('\n');
+        let class = if line.trim_start().starts_with("--") { " class=\"note\"" } else { "" };
+        out.push_str(&format!("<div{class}>{}</div>\n", crate::help::escape(line)));
     }
-    out.push_str("</pre>\n</main>\n");
+    out.push_str("</div>\n</main>\n");
     out
 }
 // --- end config commands -----------------------------------------------------------------------
@@ -2178,4 +2205,44 @@ mod tests {
         assert_eq!(out.action, KeyAction::NoMatch);
         assert_eq!(out.keystring, "");
     }
+
+// --- config commands -----------------------------------------------------------------------
+    /// `:config-write --defaults <file>` parses as a flag and a path; the other order puts the
+    /// flag **into the path**, because `maxsplit0` stops reading flags at the first word that is
+    /// not one so that a path may contain spaces. Measured 2026-08-09: the wrong order wrote a
+    /// file called `x.lua --force` and said "6 line(s)". `run_write` refuses that shape; this pins
+    /// the parse that makes the refusal necessary, so the two cannot drift apart.
+    #[test]
+    fn a_flag_after_the_file_lands_in_the_file_name() {
+        use crate::commands::{parse, Command};
+
+        assert_eq!(
+            parse("config-write --defaults /tmp/a.lua").unwrap(),
+            Command::ConfigWrite {
+                filename: "/tmp/a.lua".to_string(),
+                defaults: true,
+                force: false,
+            },
+        );
+        // The order a person types by habit, and what it actually means.
+        assert_eq!(
+            parse("config-write /tmp/a.lua --force").unwrap(),
+            Command::ConfigWrite {
+                filename: "/tmp/a.lua --force".to_string(),
+                defaults: false,
+                force: false,
+            },
+        );
+        // A path with a space in it is why the parser is this way, and it still works.
+        assert_eq!(
+            parse("config-write /tmp/my configs/a.lua").unwrap(),
+            Command::ConfigWrite {
+                filename: "/tmp/my configs/a.lua".to_string(),
+                defaults: false,
+                force: false,
+            },
+        );
+        assert!(parse("config-write").is_err(), "the file is not optional");
+    }
+// --- end config commands -------------------------------------------------------------------
 }

@@ -1070,6 +1070,33 @@ body[data-view="help"] {
     border-collapse: collapse;
 }
 
+/* --- config commands: bru://chrome/config -------------------------------------------------
+   The Lua that reproduces a configuration is one statement per line, and one statement can be
+   long: `url.searchengines` with nine engines in it is over four hundred characters. In a plain
+   `pre` that sends the *whole page* sideways — reported 2026-08-09 with the heading itself
+   scrolled off the left edge, which is the part that makes it more than an inconvenience.
+
+   So each statement is its own block and wraps. `overflow-wrap: anywhere` because there is
+   nowhere to break a URL politely, and the hanging indent is what keeps "one statement" legible
+   as one after it has wrapped — a continuation is visibly not a new line of Lua. It has to be a
+   block per line for that: `text-indent` applies once to a `pre`, not to each of its lines. */
+#help .config > div {
+    font-family: var(--font-family, monospace);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding-left: 4ch;
+    text-indent: -4ch;
+    line-height: 1.45;
+}
+
+/* A blank line between the sections is a blank line, not a collapsed nothing. */
+#help .config > div:empty { min-height: 1.45em; }
+
+/* Comments are the whole of `--defaults`, and half of a diff. Dimmed so that the lines which are
+   actually in force stand out of a file where most lines are not. */
+#help .config > div.note { color: var(--ui-fg-dim); }
+/* --- end config commands ------------------------------------------------------------------ */
+
 #help tr:nth-child(odd)  { background: var(--completion-odd-bg); }
 #help tr:nth-child(even) { background: var(--completion-even-bg); }
 
