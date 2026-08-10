@@ -405,6 +405,19 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 .enter_mode(*mode, false);
             if entered {
                 crate::ipc::set_mode(mode.name().to_string());
+                // **Passthrough says how to leave, because it is the mode where the usual way
+                // out is gone.** Every other mode ends on `<Escape>`; this is the one that hands
+                // `<Escape>` to the page, so `<Shift-Escape>` is the only key bru still answers
+                // and nothing on the screen said so. Reported 2026-08-10: `<Ctrl-V>` pressed to
+                // paste a password entered the mode — that is qutebrowser's own binding and bru
+                // keeps it — and from inside, with the bar reading PASSTHROUGH, there was no way
+                // to find the exit but to read the source.
+                //
+                // A message rather than a longer label: the label is drawn for as long as the
+                // mode lasts, and a permanent instruction is noise once it has been read twice.
+                if *mode == crate::modes::Mode::Passthrough {
+                    crate::message::info("passthrough: <Shift-Escape> leaves");
+                }
                 // --- src/caret.rs -----------------------------------------------------------
                 let now = state.lock().expect("state mutex poisoned").mode();
                 crate::caret::on_mode_change(state, browser, before, now);
