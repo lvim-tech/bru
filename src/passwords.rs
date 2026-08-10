@@ -805,11 +805,41 @@ pub fn on_filled(message: Option<&ProcessMessage>) -> bool {
 /// writes both. What survives of the guarantee is that bru fills only inside the form the focused
 /// element belongs to, and only fields shaped like a login — a page cannot make bru type the
 /// password into a field the user is not standing in.
+///
+/// # Why it walks into shadow roots
+///
+/// Neither `document.activeElement` nor `querySelectorAll` crosses a shadow boundary, and a login
+/// built out of web components puts both fields behind one. Measured 2026-08-10 on
+/// `https://www.reddit.com/login/`, whose fields are `<input>`s inside `<faceplate-text-input>`:
+/// the whole light document holds **0 inputs and 0 forms**, and with the password field focused
+/// `document.activeElement` is the `FACEPLATE-TEXT-INPUT` host — no `form`, and a tag name that is
+/// neither `INPUT` nor `TEXTAREA`, so the first line answered `nofield` and the user was told to
+/// follow a hint into a form they were already standing in. Reported by the user 2026-08-10.
+///
+/// So two changes, and only these two: the focus is followed **down** through
+/// `shadowRoot.activeElement` until it stops moving, and the inputs are collected by a walk that
+/// descends into every `shadowRoot` it passes rather than by one `querySelectorAll`. `chrome/hints.js`
+/// already walks shadow roots the same way (`find_shadow_roots`) — that is why `f` could reach the
+/// field this could not fill, and why the two now agree about what a page contains.
+///
+/// **What it costs** is the same weakening as the paragraph above, reaching one boundary further:
+/// on a page with no `<form>` the scope was already the whole document, and it now also sees the
+/// inputs components were holding behind their shadow roots. Inside a real `<form>` nothing widens
+/// but the boundary — the walk starts at that form and cannot leave it.
+///
+/// `composed:true` on the two events is *not* what fixed reddit — measured, it fills with and
+/// without — but a real keystroke's `input` event is composed, and a component listening on its
+/// host from the outside never sees one that is not.
 const FILL_JS: &str = "(function(secret,user){try{\
 var here=document.activeElement;\
+while(here&&here.shadowRoot&&here.shadowRoot.activeElement){here=here.shadowRoot.activeElement;}\
 if(!here||!here.form&&here.tagName!=='INPUT'&&here.tagName!=='TEXTAREA'){return 'nofield';}\
 var scope=here.form||document;\
-var inputs=[].slice.call(scope.querySelectorAll('input'));\
+var inputs=[];\
+(function deep(root){var all=root.querySelectorAll('*');\
+ for(var k=0;k<all.length;k++){var n=all[k];\
+  if(n.tagName==='INPUT'){inputs.push(n);}\
+  if(n.shadowRoot){deep(n.shadowRoot);}}})(scope);\
 function looks(e,re){return re.test(e.id||'')||re.test(e.name||'')||re.test(e.getAttribute('autocomplete')||'');}\
 var pw=null,i;\
 for(i=0;i<inputs.length;i++){if(inputs[i].type==='password'){pw=inputs[i];break;}}\
@@ -824,8 +854,8 @@ if(!pw&&!id){return 'nofield';}\
 var native=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');\
 function put(e,v){if(!e){return 0;}\
  if(native&&native.set){native.set.call(e,v);}else{e.value=v;}\
- e.dispatchEvent(new Event('input',{bubbles:true}));\
- e.dispatchEvent(new Event('change',{bubbles:true}));return 1;}\
+ e.dispatchEvent(new Event('input',{bubbles:true,composed:true}));\
+ e.dispatchEvent(new Event('change',{bubbles:true,composed:true}));return 1;}\
 var n=put(id,user)+put(pw,secret);\
 return n===2?'both':(pw?'password':'user');\
 }catch(x){return 'threw';}})";
