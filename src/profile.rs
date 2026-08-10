@@ -149,7 +149,7 @@ impl Profile {
     /// Let the directory go: drop the lock this process holds, and delete a scratch directory
     /// entirely. Called after `shutdown()`, when nothing is writing to it any more.
     pub fn release(self) {
-        if holder(&self.path) == Some(std::process::id()) {
+        if holder(&self.path) == Some(mark()) {
             let _ = std::fs::remove_file(self.path.join(LOCK));
         }
         if self.scratch {
@@ -174,36 +174,85 @@ fn throwaway(data_dir: &Path) -> Option<Profile> {
 /// Try to become the one process using `dir`.
 ///
 /// The symlink is the whole mechanism: `symlink(2)` is atomic and refuses to overwrite, so the
-/// success of that one call *is* the claim. Its target is the pid, so a lock nobody is behind can
-/// be told from one that is.
+/// success of that one call *is* the claim. Its target says who holds it, so a lock nobody is
+/// behind can be told from one that is.
 fn claim(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
     let lock = dir.join(LOCK);
-    let me = std::process::id().to_string();
-    if std::os::unix::fs::symlink(&me, &lock).is_ok() {
+    if std::os::unix::fs::symlink(mark(), &lock).is_ok() {
         return true;
     }
-    match holder(dir) {
-        // Held, and by something that is still running.
-        Some(pid) if is_alive(pid) => false,
-        // A crash left it behind, or it is not a lock this code wrote. Either way nobody is behind
-        // it: take it. Losing the race to replace it just means taking a scratch directory.
-        _ => {
-            let _ = std::fs::remove_file(&lock);
-            std::os::unix::fs::symlink(&me, &lock).is_ok()
-        }
+    if held(&std::fs::read_link(&lock).unwrap_or_default().to_string_lossy()) {
+        return false;
     }
+    // A crash left it behind, it belongs to a boot that is over, or it is not a lock this code
+    // wrote. Nobody is behind it either way: take it. Losing the race to replace it just means
+    // taking a scratch directory.
+    let _ = std::fs::remove_file(&lock);
+    std::os::unix::fs::symlink(mark(), &lock).is_ok()
 }
 
-/// The pid named by `dir`'s lock, if it has one that reads as a pid.
-fn holder(dir: &Path) -> Option<u32> {
-    std::fs::read_link(dir.join(LOCK))
-        .ok()?
-        .to_str()?
-        .parse()
+/// What this process writes into the lock: **the boot it belongs to, then its pid.**
+///
+/// The pid alone was the whole target once, and a reboot is what broke it. A lock is a file in
+/// `~/.local/share/bru`, so it survives a crash *and* the restart that follows; the pid it names
+/// does not, and the kernel hands that number to something else within seconds of the next boot.
+/// Measured on this machine 2026-08-10: bru crashed with the lock reading `3380`, the machine came
+/// back, pid 3380 became a `loki`, and every bru afterwards read a live pid, concluded another bru
+/// held the profile, and started on an empty one — no logins, no cookies, and no way out, because
+/// nothing was going to make `loki` exit. The cookies were never lost; bru had simply stopped
+/// looking at them.
+///
+/// The boot id changes on every boot, so a lock from a boot that is over is stale by arithmetic
+/// rather than by guesswork. A machine with no `/proc/sys/kernel/random/boot_id` gets `?`, which
+/// matches nothing and makes every lock stale — the safe direction: bru opens the profile it was
+/// asked for, and Chromium's own `SingletonLock` is still there for the case this one gets wrong.
+fn mark() -> String {
+    format!("{}:{}", boot_id(), std::process::id())
+}
+
+/// This boot's id, or `?` when the kernel does not offer one.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Whether a lock target names a bru that is **still running, in this boot**.
+///
+/// Three tests, and each one answers a way the old single test was wrong:
+///
+/// - **The boot.** A target from an earlier boot names a pid this kernel never issued to that
+///   process. This is the one that cost the user their logins.
+/// - **The process.** `/proc/<pid>` says a pid is in use, not that it is bru's. Within one boot a
+///   pid is reused too, and the number in a lock left by a crash is as likely to be somebody's
+///   compiler as anything. `comm` is truncated to 15 bytes by the kernel and is `bru` from a build
+///   directory and `bru-bin` from `~/bin`, so the test is the prefix.
+/// - **The shape.** A target this code did not write — the bare pid every bru before today wrote —
+///   has no boot id, cannot be shown to be current, and is treated as stale. That is what repairs a
+///   machine already in this state without anybody deleting a file by hand.
+fn held(target: &str) -> bool {
+    let Some((boot, pid)) = target.split_once(':') else {
+        return false;
+    };
+    if boot != boot_id() {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("comm"))
+        .map(|comm| comm.trim_start().starts_with("bru"))
+        .unwrap_or(false)
+}
+
+/// What `dir`'s lock names, verbatim.
+fn holder(dir: &Path) -> Option<String> {
+    Some(std::fs::read_link(dir.join(LOCK)).ok()?.to_str()?.to_string())
 }
 
 /// Whether a pid is still running. `/proc/<pid>` rather than `kill(pid, 0)` so that no signal is
@@ -282,7 +331,7 @@ mod tests {
         let t = TempDir::new("claim");
         let dir = t.dir.join("cef");
         assert!(claim(&dir), "an unclaimed directory must be claimable");
-        assert_eq!(holder(&dir), Some(std::process::id()));
+        assert_eq!(holder(&dir), Some(mark()));
         // The second call is this same process, but the lock does not know that: what it refuses is
         // a *live* holder, which is exactly what a second bru would find.
         assert!(
@@ -301,7 +350,7 @@ mod tests {
         assert!(!is_alive(dead));
 
         assert!(claim(&dir), "a lock nobody is behind must be replaceable");
-        assert_eq!(holder(&dir), Some(std::process::id()));
+        assert_eq!(holder(&dir), Some(mark()));
     }
 
     #[test]
@@ -382,5 +431,64 @@ mod tests {
         assert!(!named.exists());
         profile.release();
         assert!(!named.exists());
+    }
+
+    /// **The reboot that cost a user every login**, as three assertions.
+    ///
+    /// bru crashed with the machine on 2026-08-10 leaving `cef/bru.lock -> 3380`. The machine came
+    /// back, the kernel gave 3380 to a `loki`, and `is_alive(3380)` — the whole of the old test —
+    /// said yes. Every bru after that took a scratch profile and showed a browser with no cookies,
+    /// and it would have done so until `loki` exited, because nothing about waiting was going to
+    /// change the answer.
+    ///
+    /// Each case below returns `true` from the old rule and `false` from this one.
+    #[test]
+    fn a_lock_from_a_dead_boot_or_a_stranger_is_not_held() {
+        let me = std::process::id();
+
+        // The bare pid every bru wrote before this change. It cannot be shown to belong to this
+        // boot, so it is stale — which is what repairs a machine already in this state, with no
+        // file for anyone to delete by hand.
+        assert!(!held(&me.to_string()));
+
+        // This boot's own pid, spelled the new way: held, as long as this process reads as a bru.
+        // `cargo test` runs a binary named after the crate, so `comm` is `bru-<hash>` here.
+        if std::fs::read_to_string("/proc/self/comm").is_ok_and(|c| c.trim_start().starts_with("bru")) {
+            assert!(held(&mark()));
+        }
+
+        // The same pid, from a boot that is over. This is the reported failure exactly.
+        assert!(!held(&format!("0eeb0f0e-0000-0000-0000-000000000000:{me}")));
+
+        // This boot, a pid nothing can hold: `/proc/0` does not exist.
+        assert!(!held(&format!("{}:0", boot_id())));
+
+        // This boot, a live pid that is not a bru. Pid 1 is always running and is never bru.
+        assert!(!held(&format!("{}:1", boot_id())));
+    }
+
+    /// A lock left by a previous boot is taken rather than worked around.
+    #[test]
+    fn claim_takes_a_lock_left_by_an_earlier_boot() {
+        let dir = std::env::temp_dir().join(format!("bru-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Exactly what was on disk this morning: a bare pid, alive, belonging to something else.
+        std::os::unix::fs::symlink("1", dir.join(LOCK)).unwrap();
+        assert!(claim(&dir), "a lock with no boot id must not hold the profile");
+        assert_eq!(holder(&dir), Some(mark()));
+
+        // And a lock this boot really does hold is left alone.
+        let other = std::env::temp_dir().join(format!("bru-claim-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(mark(), other.join(LOCK)).unwrap();
+        if std::fs::read_to_string("/proc/self/comm").is_ok_and(|c| c.trim_start().starts_with("bru")) {
+            assert!(!claim(&other), "a live bru's lock must hold");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
