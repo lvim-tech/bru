@@ -727,7 +727,7 @@ wrap_task! {
                 Verdict::Proceed => {}
             }
 
-            let Some(mut browser) = state
+            let Some(browser) = state
                 .lock()
                 .expect("state mutex poisoned")
                 .active_browser()
