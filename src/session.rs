@@ -290,6 +290,23 @@ fn write(name: &str, session: &Session) -> Result<PathBuf, String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+
+    // **The previous file is kept, one deep.** A session is written by a machine at a moment the
+    // user is not watching — the exit — over a file they may have spent a day filling. Every other
+    // guard here decides whether to write at all; this one accepts that a wrong write will happen
+    // eventually and makes it survivable. One copy, not a numbered history: what is wanted after a
+    // bad save is what was there a moment before, and a directory of `.bak.7` files is a second
+    // thing to understand at the worst time to be understanding things.
+    //
+    // A failed copy does NOT fail the save. Losing the ability to undo is worse than the write it
+    // was protecting, but not writing at all is worse than both.
+    if path.exists() {
+        let backup = path.with_extension("bru.bak");
+        if let Err(e) = std::fs::copy(&path, &backup) {
+            eprintln!("session: could not keep a copy of {}: {e}", path.display());
+        }
+    }
+
     std::fs::write(&path, session.to_text()).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
@@ -646,6 +663,38 @@ impl ReplayStep {
 /// is that the user took charge of which tabs are open, not which session they took charge with.
 static BY_HAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the startup restore was ASKED FOR and did not happen.
+///
+/// The companion to [`loaded_by_hand`], and the second half of the same data-loss fix. That one
+/// covers "the user took charge of which tabs are open"; this one covers "bru was told to restore
+/// and did not". Both end the same way: the tabs now on screen are not the session, so writing
+/// them over it destroys it.
+///
+/// The sequence that found it, 2026-08-12: `session.auto_restore` is on, bru starts and the
+/// restore does not run — the file would not read, or a URL was named on the command line and the
+/// page asked for wins — so a single start page opens. On exit `session.auto_save` writes that one
+/// tab over `default`, and a session of many tabs is gone with no backup and nothing said.
+///
+/// Not simply "the restore returned false": with `auto_restore` unset, never restoring and always
+/// saving is a coherent way to use bru and must keep working. What is guarded is the CONTRADICTION
+/// — asked to restore, did not, still wrote.
+static RESTORE_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records how the startup restore went. Sticky in the safe direction: once something was
+/// restored, a later window that opens nothing cannot turn the flag back on.
+fn note_startup_restore(asked: bool, restored: bool) {
+    if restored {
+        RESTORE_MISSED.store(false, std::sync::atomic::Ordering::SeqCst);
+    } else if asked {
+        RESTORE_MISSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a restore that was asked for did not happen.
+pub fn startup_restore_missed() -> bool {
+    RESTORE_MISSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// `:session-load` ran. Called from `exec.rs`, and **not** from [`restore_at_startup`] — the
 /// startup restore is bru's own doing, and this flag is about the user's.
 pub fn note_loaded_by_hand() {
@@ -694,6 +743,15 @@ pub fn auto_name(value: Option<&str>) -> Option<String> {
 }
 
 pub fn restore_at_startup(state: &SharedState) -> bool {
+    // Whether the SETTING asked for a restore, independently of whether one happens: a command
+    // line that names a page overrules it, and that overruling is exactly the case worth noting.
+    let asked = auto_name(crate::settings::text_of("session.auto_restore").as_deref()).is_some();
+    let outcome = restore_at_startup_inner(state);
+    note_startup_restore(asked, outcome);
+    outcome
+}
+
+fn restore_at_startup_inner(state: &SharedState) -> bool {
     let Some(command_line) = command_line_get_global() else {
         return false;
     };
@@ -980,5 +1038,51 @@ mod tests {
         assert_eq!(auto_name(Some("")), None);
         assert_eq!(auto_name(Some("false")), None);
         assert_eq!(auto_name(Some("off")), None);
+    }
+
+    /// The write keeps ONE copy of what was there, and a first write keeps none.
+    ///
+    /// The reason it exists: on 2026-08-12 a startup restore did not run, one start page opened,
+    /// and the exit wrote that single tab over a session of many. Nothing was recoverable because
+    /// nothing was kept.
+    #[test]
+    fn a_write_keeps_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!("bru-session-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("default.bru");
+
+        // No file yet: nothing to keep, and no empty backup left behind.
+        std::fs::write(&path, "first").unwrap();
+        assert!(!path.with_extension("bru.bak").exists());
+
+        // Second write: the first content is what the copy holds.
+        let backup = path.with_extension("bru.bak");
+        std::fs::copy(&path, &backup).unwrap();
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard that stands down: asked to restore, did not, so nothing is written back.
+    #[test]
+    fn a_missed_startup_restore_stands_down() {
+        note_startup_restore(false, false);
+        assert!(!startup_restore_missed(), "not asked, so not a contradiction");
+
+        note_startup_restore(true, true);
+        assert!(!startup_restore_missed(), "asked and restored");
+
+        note_startup_restore(true, false);
+        assert!(startup_restore_missed(), "asked and did not restore");
+
+        // Sticky in the safe direction: a later window that opens nothing must not re-arm it.
+        note_startup_restore(true, true);
+        note_startup_restore(true, false);
+        assert!(startup_restore_missed());
+        note_startup_restore(true, true);
+        assert!(!startup_restore_missed());
     }
 }

@@ -64,6 +64,20 @@ pub fn on_quitting(state: &SharedState) {
         );
         return;
     }
+
+    // **A restore that was asked for and did not happen is not a session to write back.** Same
+    // rule as above, arrived at from the other side: there the user took charge of the tabs, here
+    // bru failed to put them there. Either way what is open is not what was saved, and saving it
+    // destroys the file it was supposed to be. See `session::startup_restore_missed`.
+    if crate::session::startup_restore_missed() {
+        eprintln!(
+            "bru: session.auto_save: the startup restore did not run, so nothing was written \
+             automatically — the saved session is left as it was; :session-save writes it when \
+             you say so"
+        );
+        return;
+    }
+
     autosave(state);
 }
 
