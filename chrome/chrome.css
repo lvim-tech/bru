@@ -567,6 +567,15 @@ body.mode-command {
     background: var(--completion-item-selected-bg);
     border-top: 1px solid var(--completion-item-selected-border-top);
     border-bottom: 1px solid var(--completion-item-selected-border-bottom);
+    /* `bolder`, not `bold`, and the difference is the point: this is a CONTRAST
+       with the rows around it, not a weight. The chrome's own weight is a
+       setting — `fonts.default_weight` — and someone who sets it to bold would
+       otherwise find the selected row exactly as heavy as every other, which is
+       the complaint this rule answers, arrived at from the other side.
+
+       Safe in a table: the grid columns are fixed percentages, so a heavier row
+       cannot move them, and a monospace face keeps the same advance either way. */
+    font-weight: bolder;
 }
 
 /* qutebrowser's own proportions for the URL completion — 40/50/10 in
@@ -716,6 +725,10 @@ body.mode-command {
 #prompt .prompt-item.selected {
     color: var(--prompts-selected-fg);
     background: var(--prompts-selected-bg);
+    /* The same contrast as the completion's selected row, for the same reason
+       and by the same rule. Two panels showing "you are here" two ways is a
+       thing the eye has to learn twice. */
+    font-weight: bolder;
 }
 
 /* The key hints. `b` is the key, `span` is what it does — bru's rows, built in
