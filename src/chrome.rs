@@ -241,9 +241,21 @@ fn user_css() -> String {
     // A store-less process — a renderer, a unit test — answers 0 for an unset int, and a 0px font
     // is a chrome nobody can read. The compiled-in default is the honest answer there.
     let size = if (6..=40).contains(&size) { size } else { 13 };
+    // An EMPTY family emits no declaration at all, rather than `--chrome-font-family: ;`.
+    //
+    // The two are not the same to CSS: an empty custom property is defined-but-empty, so
+    // `var(--chrome-font-family)` substitutes nothing and the whole `font-family` declaration
+    // becomes invalid at computed-value time. Leaving the property undefined lets `var()` do
+    // what it is for. "Set to nothing" and "not set" have to look different on the way out,
+    // because they mean different things on the way in.
+    let family_decl = if family.trim().is_empty() {
+        String::new()
+    } else {
+        format!("    --chrome-font-family: {family};\n")
+    };
     format!(
         "/* GENERATED from bru's own settings. Not themer's file: theme.css carries colours and \
-         not one rule, and a font is not a colour. */\n:root {{\n    --chrome-font-family: {family};\n\
+         not one rule, and a font is not a colour. */\n:root {{\n{family_decl}\
              \x20   --chrome-font-size: {size}px;\n    --chrome-font-weight: {weight};\n\
              \x20   --completion-max-h: {panel}px;\n}}\n"
     )

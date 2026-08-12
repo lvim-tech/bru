@@ -246,10 +246,15 @@ body {
        The fallbacks are the same values bru compiles in, so a document served
        before those settings exist still draws.
 
-       Monospace is the default and the reason is the completion: it is a table,
-       and columns that do not line up read as a bug. A proportional family is a
-       fair choice and it is the user's to make, not one to ship. */
-    font-family: var(--chrome-font-family, monospace);
+       family has NO fallback on purpose. bru's default for it is empty, and a
+       fallback here would put back exactly what that default gives up — the
+       chrome would still be monospace, and the setting would look ignored.
+       Undefined, `var()` leaves font-family unset and the engine's own font
+       draws, which is what "impose nothing" has to mean to be true.
+
+       If you set a proportional family, note what monospace was for: the
+       completion is a table, and columns that do not line up read as a bug. */
+    font-family: var(--chrome-font-family);
     font-size: var(--chrome-font-size, 13px);
     font-weight: var(--chrome-font-weight, normal);
     /* Not 1. At line-height 1 the line box is exactly the font size, which is

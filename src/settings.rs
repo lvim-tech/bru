@@ -1987,12 +1987,19 @@ pub const SETTINGS: &[Def] = &[
         // exist and fontconfig falls through — so a name copied out of a Qt config is worth checking
         // with `fc-match` before it is trusted.
         //
-        // The default is `monospace`, and the reason is written in `chrome.css`: the completion is a
-        // table, and columns that do not line up read as a bug. A proportional family is a fair
-        // choice and it is the user's to make; it is not one bru should ship.
+        // The default is EMPTY, and empty means "impose nothing": the declaration is left out of
+        // the generated CSS entirely and the engine's own font is what draws. That is still a
+        // default bru ships — every setting has one — it is simply a default that declines.
+        //
+        // It used to be `monospace`, for a real reason kept here rather than deleted: the
+        // completion is a table, and columns that do not line up read as a bug. Whoever sets a
+        // proportional family is choosing that, and the alignment is the price. The reason it is
+        // no longer shipped is narrower than the reason it was: a browser chrome that overrides
+        // the system's font before being asked is making a decision that belongs to the machine
+        // it runs on, and this one already has fontconfig to answer that question.
         name: "fonts.default_family",
         kind: Kind::Text,
-        default: Some("monospace"),
+        default: Some(""),
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
     },
