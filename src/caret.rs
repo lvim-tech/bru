@@ -29,6 +29,8 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::bindings::{Key, KeyInfo, Modifiers, NamedKey};
 use crate::commands::CaretMove;
+// The one decoder for what a page wrote — see `ipc::percent_decode`.
+use crate::ipc::percent_decode;
 use crate::modes::Mode;
 use crate::state::BruState;
 use crate::tabs::SharedState;
@@ -1082,34 +1084,6 @@ fn field(src: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Undo `encodeURIComponent`. Only the bytes it escapes appear, and it always emits `%XX` pairs.
-fn percent_decode(src: &str) -> String {
-    // **Bytes throughout, and never a slice of the `str`.** This read `&src[i + 1..i + 3]` and
-    // parsed that, which panics the moment the two bytes after a `%` are not a character boundary —
-    // `percent_decode("%aé")` aborted the process, because index 3 lands inside the two bytes of
-    // `é`. The input is a page-controlled field on the one query a web page is allowed to send, and
-    // a panic on the UI thread ends the browser: any site could have closed bru with one string.
-    // Measured 2026-08-09, standalone, before the fix. Indexing the byte array cannot panic on a
-    // boundary because a byte array has none.
-    let bytes = src.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let hex = |byte: u8| (byte as char).to_digit(16);
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push((high * 16 + low) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    // Whatever the bytes turn out to be, this is where malformed UTF-8 stops: a page can send any
-    // sequence and gets replacement characters rather than an error path.
-    String::from_utf8_lossy(&out).into_owned()
-}
 
 fn parse_two(src: &str) -> Option<(i32, i32)> {
     let mut parts = src.split(',');
@@ -1416,25 +1390,5 @@ mod tests {
         // reason it travels in a field of its own.
         assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
     }
-    /// A page cannot end the browser with a percent sign in front of a multi-byte character.
-    ///
-    /// **This aborted the process before 2026-08-09.** The decoder parsed `&src[i + 1..i + 3]` — a
-    /// slice of the `str` by byte index — and `%aé` puts index 3 inside the two bytes of `é`, which
-    /// is a panic, on the UI thread, from the one field a web page is allowed to put bytes in.
-    /// Every case below returns the input unchanged because none of them is a valid escape; what is
-    /// being asserted is that they *return*.
-    #[test]
-    fn a_malformed_escape_is_left_alone_rather_than_ending_the_process() {
-        assert_eq!(percent_decode("%aé"), "%aé");
-        assert_eq!(percent_decode("%é"), "%é");
-        assert_eq!(percent_decode("%"), "%");
-        assert_eq!(percent_decode("%A"), "%A");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("%%41"), "%A");
-        // And a well-formed one still decodes, so the guard did not swallow the feature.
-        assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
-        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
-    }
-
+    // The malformed-escape cases moved with the decoder itself into `ipc.rs` — see the note there.
 }

@@ -1519,9 +1519,71 @@ pub fn json_escape(src: &str) -> String {
     out
 }
 
+/// Undo `encodeURIComponent`. Only the bytes it escapes appear, and it always emits `%XX` pairs.
+///
+/// The other direction of `json_escape`, and it lives beside it for the same reason: this is what
+/// reads what a **page** wrote. `hints.rs` and `caret.rs` decode the fields of the one query a web
+/// page is allowed to send, and `utilcmds::jseval_url` decodes the body of a `javascript:` URL.
+/// There were three copies of this and the third had not been given the fix below — which is why
+/// there is now one.
+pub fn percent_decode(src: &str) -> String {
+    // **Bytes throughout, and never a slice of the `str`.** This read `&src[i + 1..i + 3]` and
+    // parsed that, which panics the moment the two bytes after a `%` are not a character boundary —
+    // `percent_decode("%aé")` aborted the process, because index 3 lands inside the two bytes of
+    // `é`. The input is a page-controlled field on the one query a web page is allowed to send, and
+    // a panic on the UI thread ends the browser: any site could have closed bru with one string.
+    // Measured 2026-08-09, standalone, before the fix. Indexing the byte array cannot panic on a
+    // boundary because a byte array has none.
+    let bytes = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let hex = |byte: u8| (byte as char).to_digit(16);
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((high * 16 + low) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Whatever the bytes turn out to be, this is where malformed UTF-8 stops: a page can send any
+    // sequence and gets replacement characters rather than an error path.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page cannot end the browser with a percent sign in front of a multi-byte character.
+    ///
+    /// **This aborted the process before 2026-08-09.** The decoder parsed `&src[i + 1..i + 3]` — a
+    /// slice of the `str` by byte index — and `%aé` puts index 3 inside the two bytes of `é`, which
+    /// is a panic, on the UI thread, from the one field a web page is allowed to put bytes in. Most
+    /// cases below return the input unchanged because none of them is a valid escape; what is being
+    /// asserted is that they *return*. Kept here, with the one decoder, rather than once per
+    /// caller — `utilcmds` had a copy with no test and it was still the broken version.
+    #[test]
+    fn a_percent_before_a_multi_byte_character_decodes_instead_of_panicking() {
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%A"), "%A");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%%41"), "%A");
+        // And the ordinary job it is there for.
+        assert_eq!(percent_decode("a%7Cb%2Cc%22d"), "a|b,c\"d");
+        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+        assert_eq!(
+            percent_decode("https%3A%2F%2Fwww.vesti.bg%2Fa%3Fb%3D1%26c%3D%C3%A4"),
+            "https://www.vesti.bg/a?b=1&c=ä"
+        );
+    }
 
     /// The reader's contract, pinned: it is for fields that cannot be negative.
     ///

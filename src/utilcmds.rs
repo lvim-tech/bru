@@ -46,6 +46,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::commands::{ClickTarget, ElementFilter, ProcessAction};
+// This module had a copy of its own, and it was the copy that still sliced the `str` — see
+// `ipc::percent_decode`.
+use crate::ipc::percent_decode;
 use crate::tabs::SharedState;
 
 /// `BRU_DEBUG_CMDS=1` traces what these commands resolved to, which is the only way to tell a
@@ -650,24 +653,6 @@ pub fn jseval_url(url: &str) -> Result<String, String> {
     Ok(percent_decode(body))
 }
 
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
 // ------------------------------------------------------------------------------------------------
 // The editor: edit-url and edit-command
 // ------------------------------------------------------------------------------------------------
@@ -1226,7 +1211,7 @@ fn query_value(query: &str, name: &str) -> Option<String> {
     query
         .split('&')
         .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
-        .map(|value| percent_decode(value))
+        .map(percent_decode)
 }
 
 fn query_has(query: &str, name: &str) -> bool {
