@@ -4,6 +4,22 @@
 //! GPU and zygote processes, distinguished by a `--type=` switch, so `execute_process` has to come
 //! before anything else and the non-browser cases must return without initialising CEF.
 
+// **The nested `if let` is the style here, and it is a choice rather than an omission.** Clippy would
+// have each of them collapsed into an edition-2024 let-chain; what that buys is one line fewer and
+// what it costs is a longer one — two conditions and a `&&` on a line that already carries a pattern
+// — plus a reflow of the block under it. With formatting authored rather than generated (see
+// `rustfmt.toml`, which turns rustfmt off for the same reason) nothing tidies up after that collapse:
+// it is a hand reindent of every block, across the adblock, cookies, ipc and password paths among
+// others, for no correctness gain at all.
+//
+// Said once, at the crate root, so that `cargo clippy --all-targets -- -D warnings` is clean and can
+// be run in CI — which is the whole point of not leaving 37 warnings standing. It is the only lint
+// bru allows away, and a new one has to earn its line here the same way.
+//
+// One attribute covers the tree: bru is a single binary crate — `Cargo.toml` declares `[[bin]]` and
+// no `[lib]` — so there is no `lib.rs` needing the same.
+#![allow(clippy::collapsible_if)]
+
 mod adblock;
 mod app;
 mod bindings;
