@@ -745,6 +745,19 @@ fn unquote(arg: &str) -> String {
 pub fn cmd_set_text(text: &str, space: bool, append: bool, run_on_count: bool, count: Option<u32>) {
     let text = replace_variables(text);
 
+    // {clipboard} / {primary} expand here too, not only in `open`, so a command-mode binding like
+    // `cmd-set-text -a {clipboard}` pastes the selection into the line. Read at keypress time, once
+    // per selection, never rescanned — the same contract as the `open` arm, and after
+    // `replace_variables` so a selection that holds `{url}` is not substituted a second time.
+    let text = match crate::clip::expand(Some(text.as_str())) {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(error) => {
+            crate::clip::message(error);
+            return;
+        }
+    };
+
     let text = match with(|cmd| cmd.cmd_set_text(&text, space, append)) {
         Ok(text) => text,
         Err(message) => {

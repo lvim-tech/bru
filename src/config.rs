@@ -344,6 +344,10 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("command", "<Ctrl-Shift-W>", "rl-filename-rubout"),
     ("command", "<Alt-Backspace>", "rl-backward-kill-word"),
     ("command", "<Ctrl-Y>", "rl-yank"),
+    // Paste the system selection into the line — `rl-yank` above is the readline kill-ring, not the
+    // clipboard, so without these there is no way to paste a copied URL into the address bar.
+    ("command", "<Ctrl-Shift-V>", "cmd-set-text -a {clipboard}"),
+    ("command", "<Shift-Ins>", "cmd-set-text -a {primary}"),
     ("command", "<Ctrl-?>", "rl-delete-char"),
     ("command", "<Ctrl-H>", "rl-backward-delete-char"),
     ("command", "<Escape>", "mode-leave"),
@@ -1539,7 +1543,9 @@ mod tests {
         // **289** since `<Ctrl-p>` in insert mode, which is `:password-fill` — the first binding in
         // this table that is not transcribed from `configdata.yml`, because the command it names is
         // not qutebrowser's either.
-        assert_eq!(total, 289, "the default table is not the one transcribed from configdata.yml");
+        // **291** since `<Ctrl-Shift-V>` and `<Shift-Ins>` paste the clipboard / primary into the
+        // command line — two more bindings that are bru's own, for the same reason `<Ctrl-p>` is.
+        assert_eq!(total, 291, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1558,7 +1564,10 @@ mod tests {
         // binding in this table that is bru's own, because the command it names is bru's own.
         assert_eq!(bindings.len(Mode::Insert), 5);
         assert_eq!(bindings.len(Mode::Hint), 5);
-        assert_eq!(bindings.len(Mode::Command), 32);
+        // **34**: qutebrowser's 32 plus `<Ctrl-Shift-V>` and `<Shift-Ins>`, which paste the
+        // clipboard / primary selection into the line via `cmd-set-text -a {clipboard}`. bru's own,
+        // because bru's command line is a readline widget with no clipboard of its own.
+        assert_eq!(bindings.len(Mode::Command), 34);
         assert_eq!(bindings.len(Mode::Passthrough), 1);
         assert_eq!(bindings.len(Mode::Caret), 29);
         assert_eq!(bindings.len(Mode::SetMark), 1);

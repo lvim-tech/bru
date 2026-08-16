@@ -1860,7 +1860,7 @@ mod tests {
         // thought not to draw; 281 since the twelve `t**` rows went with the two settings they
         // named — the only two falls in this number. 286 since five of the inspector's keys came
         // back, once the docked positions turned out to be drawable after all.
-        assert_eq!(DEFAULT_BINDINGS.len(), 289);
+        assert_eq!(DEFAULT_BINDINGS.len(), 291);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1921,7 +1921,9 @@ mod tests {
         // since the rows left and returned to the table.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        assert_eq!(live, 289, "the live-binding count moved");
+        // **291** since command mode got `<Ctrl-Shift-V>` / `<Shift-Ins>` to paste the clipboard /
+        // primary into the line — both run `cmd-set-text`, which was already live.
+        assert_eq!(live, 291, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1955,7 +1957,8 @@ mod tests {
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
         // Every one of them acts: the twelve that only explained themselves are gone, and the five
         // inspector keys that came back name commands that all draw something.
-        assert_eq!(live, 289);
+        // **291** with the two command-mode paste bindings, which run `cmd-set-text` — live already.
+        assert_eq!(live, 291);
     }
 // --- end src/help.rs -------------------------------------------------------
 

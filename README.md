@@ -13,7 +13,7 @@ Everything else follows from keeping that true.
 
 - **qutebrowser's vocabulary.** The default bindings are transcribed from `configdata.yml`, so `f`
   hints, `o` opens, `d` closes a tab, `gg` and `G` jump, `:` is the command line.
-  **289 default bindings, 174 commands, 72 settings.**
+  **291 default bindings, 174 commands, 72 settings.**
 - **One binary.** No embedded runtime to install, no Python, no Qt. CEF is a prebuilt Chromium
   distribution — nothing here compiles a browser engine.
 - **Its own data.** `~/.local/share/bru/` holds history, quickmarks, bookmarks, sessions and the
