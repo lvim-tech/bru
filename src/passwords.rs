@@ -253,12 +253,71 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) {
 // The guard between asking and filling
 // -----------------------------------------------------------------------------------------------
 
+/// Where a page is: scheme, host and port.
+///
+/// **Two precisions, and both are needed.** A store is keyed by *host* — an entry is
+/// `websites/abv.bg/me`, and [`entry_matches`] is written against a host — so that is what a lookup
+/// asks with. The guard in [`verdict`] needs the whole origin, because `https://bank.example` and
+/// `http://bank.example` are one host and only one of them keeps the password off the wire.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Origin {
+    /// Lower-cased, without the `://`.
+    pub scheme: String,
+    /// Lower-cased, with no port and no `user:password@`.
+    pub host: String,
+    /// The port only when the URL spells one out. Two URLs that both leave it out are on the same
+    /// port whatever the scheme's default is, so `None` compares equal to `None` and to nothing
+    /// else — bru does not know the default for a scheme it has never seen.
+    pub port: Option<String>,
+}
+
+impl Origin {
+    /// The origin of a tab's URL, or `None` when there is no host to look a password up by —
+    /// `about:blank`, `data:`, a URL with an empty authority.
+    pub fn of(url: &str) -> Option<Self> {
+        let (scheme, after) = url.split_once("://")?;
+        let authority = after.split(['/', '?', '#']).next()?;
+        // Everything up to the last `@` is credentials, not the host.
+        let authority = authority.rsplit('@').next()?;
+        // `[::1]:8443` — the colons inside the brackets are the address, and splitting on the first
+        // one would answer `[`. The previous host-only reader did exactly that.
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(rest) => {
+                let (inside, after) = rest.split_once(']')?;
+                (format!("[{inside}]"), after.strip_prefix(':'))
+            }
+            None => match authority.split_once(':') {
+                Some((host, port)) => (host.to_string(), Some(port)),
+                None => (authority.to_string(), None),
+            },
+        };
+        if scheme.is_empty() || host.is_empty() || host == "[]" {
+            return None;
+        }
+        Some(Self {
+            scheme: scheme.to_ascii_lowercase(),
+            host: host.to_ascii_lowercase(),
+            port: port.filter(|port| !port.is_empty()).map(str::to_string),
+        })
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}://{}", self.scheme, self.host)?;
+        match &self.port {
+            Some(port) => write!(f, ":{port}"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// One outstanding request, and what it was asked for.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pending {
     pub id: u64,
     pub browser: i32,
-    pub host: String,
+    pub origin: Origin,
     pub entry: String,
 }
 
@@ -279,17 +338,29 @@ pub enum Verdict {
 /// Without the host comparison the sequence is: ask on `abv.bg`, pinentry opens, follow a link to a
 /// hostile page, type the passphrase, and the password is typed into the hostile page's field.
 ///
+/// **The host alone is not the check.** It was, and it left the same sequence one step shorter: the
+/// page needs no link and no second host, it runs `location = 'http://bank.example/'` itself. Same
+/// host, so the comparison passed; a plaintext page, so the secret went out unencrypted the moment
+/// the form was submitted, and any port on the host was reachable the same way. The whole origin is
+/// compared, and a downgrade is named as what it is rather than reported as "the page changed".
+///
 /// A second `:password-fill` also cancels the first: its answer arrives with a stale id and is
 /// dropped rather than filled into whatever is focused by then.
-pub fn verdict(pending: &Pending, current_id: u64, current_browser: i32, current_host: &str) -> Verdict {
+pub fn verdict(pending: &Pending, current_id: u64, current_browser: i32, current: &Origin) -> Verdict {
     if pending.id != current_id {
         return Verdict::Discard("another password-fill replaced this one");
     }
     if pending.browser != current_browser {
         return Verdict::Discard("the tab changed while the password was being asked for");
     }
-    if !current_host.eq_ignore_ascii_case(&pending.host) {
+    if !current.host.eq_ignore_ascii_case(&pending.origin.host) {
         return Verdict::Discard("the page changed while the password was being asked for");
+    }
+    if current.scheme != pending.origin.scheme {
+        return Verdict::Discard("the page's scheme changed while the password was being asked for");
+    }
+    if current.port != pending.origin.port {
+        return Verdict::Discard("the page's port changed while the password was being asked for");
     }
     Verdict::Proceed
 }
@@ -456,18 +527,63 @@ mod tests {
         let pending = Pending {
             id: 7,
             browser: 3,
-            host: "abv.bg".to_string(),
+            origin: Origin::of("https://abv.bg/login").unwrap(),
             entry: "websites/abv.bg/me".to_string(),
         };
-        assert_eq!(verdict(&pending, 7, 3, "abv.bg"), Verdict::Proceed);
-        assert_eq!(verdict(&pending, 7, 3, "ABV.BG"), Verdict::Proceed);
+        let at = |url: &str| Origin::of(url).unwrap();
+        assert_eq!(verdict(&pending, 7, 3, &at("https://abv.bg/other")), Verdict::Proceed);
+        assert_eq!(verdict(&pending, 7, 3, &at("HTTPS://ABV.BG/")), Verdict::Proceed);
 
-        assert!(matches!(verdict(&pending, 8, 3, "abv.bg"), Verdict::Discard(_)), "a second ask");
-        assert!(matches!(verdict(&pending, 7, 4, "abv.bg"), Verdict::Discard(_)), "another tab");
+        let evil = at("https://evil.example/");
+        assert!(matches!(verdict(&pending, 8, 3, &at("https://abv.bg/")), Verdict::Discard(_)), "a second ask");
+        assert!(matches!(verdict(&pending, 7, 4, &at("https://abv.bg/")), Verdict::Discard(_)), "another tab");
         assert!(
-            matches!(verdict(&pending, 7, 3, "evil.example"), Verdict::Discard(_)),
+            matches!(verdict(&pending, 7, 3, &evil), Verdict::Discard(_)),
             "navigated away while pinentry was open",
         );
+    }
+
+    /// **The downgrade, as a test.** The host is the same in every case here, so the host comparison
+    /// alone says `Proceed` to all three — a page that sets `location` to its own `http://` twin
+    /// while pinentry is open, and the same host on another port, which is another service.
+    #[test]
+    fn a_secret_asked_for_over_https_is_never_filled_into_the_plaintext_twin() {
+        let pending = Pending {
+            id: 1,
+            browser: 1,
+            origin: Origin::of("https://bank.example/login").unwrap(),
+            entry: "websites/bank.example/me".to_string(),
+        };
+        let at = |url: &str| Origin::of(url).unwrap();
+        assert!(
+            matches!(verdict(&pending, 1, 1, &at("http://bank.example/login")), Verdict::Discard(_)),
+            "an https secret filled into http is an https secret sent in the clear",
+        );
+        assert!(
+            matches!(verdict(&pending, 1, 1, &at("https://bank.example:8443/login")), Verdict::Discard(_)),
+            "another port is another service, whoever answers on it",
+        );
+        // And the port being spelled out is not by itself a different origin from it being implied —
+        // it is not the same *string*, which is why this is compared as an origin and not as a URL.
+        assert!(matches!(verdict(&pending, 1, 1, &at("https://bank.example:443/")), Verdict::Discard(_)));
+        assert_eq!(verdict(&pending, 1, 1, &at("https://bank.example/anything")), Verdict::Proceed);
+    }
+
+    /// The reader, including the two spellings that used to answer nonsense: credentials before the
+    /// host, and an IPv6 address whose colons are the address rather than a port.
+    #[test]
+    fn an_origin_is_read_off_a_url_without_its_credentials_or_its_path() {
+        let of = |url: &str| Origin::of(url).map(|o| o.to_string());
+        assert_eq!(of("https://abv.bg/x?y#z").as_deref(), Some("https://abv.bg"));
+        assert_eq!(of("HTTPS://ABV.BG/").as_deref(), Some("https://abv.bg"));
+        assert_eq!(of("http://user:pw@example.com:8080/x").as_deref(), Some("http://example.com:8080"));
+        assert_eq!(of("https://[::1]:8443/x").as_deref(), Some("https://[::1]:8443"));
+        assert_eq!(of("https://[::1]/x").as_deref(), Some("https://[::1]"));
+        assert_eq!(of("bru://chrome/help").as_deref(), Some("bru://chrome"));
+        // Nothing to look a password up by.
+        assert_eq!(of("about:blank"), None);
+        assert_eq!(of("https:///x"), None);
+        assert_eq!(of(""), None);
     }
 }
 
@@ -500,15 +616,6 @@ static CANDIDATES: Mutex<Option<Vec<String>>> = Mutex::new(None);
 /// What the completion offers for `:password-fill`. Names, never values.
 pub fn candidates() -> Vec<String> {
     CANDIDATES.lock().ok().and_then(|c| c.clone()).unwrap_or_default()
-}
-
-/// The host of the tab a command is being run against, lower-cased and without its port.
-fn host_of(url: &str) -> Option<String> {
-    let after = url.split("://").nth(1)?;
-    let authority = after.split(['/', '?', '#']).next()?;
-    let host = authority.rsplit('@').next()?;
-    let host = host.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// The `passwords.show` command for one entry, from the setting or from bru's default.
@@ -594,7 +701,7 @@ pub fn fill(state: &crate::tabs::SharedState, entry: Option<&str>) {
             guard.tab_url(tab).unwrap_or_default(),
         )
     };
-    let Some(host) = host_of(&url) else {
+    let Some(origin) = Origin::of(&url) else {
         crate::message::error("password-fill: this tab has no host to look a password up by");
         return;
     };
@@ -604,15 +711,14 @@ pub fn fill(state: &crate::tabs::SharedState, entry: Option<&str>) {
         // Named outright: no listing, no matching. The user said which one.
         Some(entry) => {
             let entry = entry.trim().to_string();
-            let spec = show_spec(&entry, &host);
-            start(id, browser_id, host, entry, spec);
+            let spec = show_spec(&entry, &origin.host);
+            start(id, browser_id, origin, entry, spec);
         }
         // Bare: list, match, and either fill the one or offer the several.
         None => {
-            let host_for_thread = host.clone();
             std::thread::spawn(move || {
-                let answer = list_entries(&host_for_thread);
-                let mut task = Chose::new(id, browser_id, host_for_thread, answer);
+                let answer = list_entries(&origin.host);
+                let mut task = Chose::new(id, browser_id, origin, answer);
                 post_task(ThreadId::UI, Some(&mut task));
             });
         }
@@ -620,9 +726,9 @@ pub fn fill(state: &crate::tabs::SharedState, entry: Option<&str>) {
 }
 
 /// Ask the backend for one entry, on a thread, and post the answer back.
-fn start(id: u64, browser: i32, host: String, entry: String, spec: Spec) {
+fn start(id: u64, browser: i32, origin: Origin, entry: String, spec: Spec) {
     if let Ok(mut pending) = PENDING.lock() {
-        *pending = Some(Pending { id, browser, host: host.clone(), entry: entry.clone() });
+        *pending = Some(Pending { id, browser, origin, entry: entry.clone() });
     }
     crate::message::info(&format!("password-fill: asking for {entry}…"));
 
@@ -652,7 +758,7 @@ wrap_task! {
     struct Chose {
         id: u64,
         browser: i32,
-        host: String,
+        origin: Origin,
         answer: Result<Vec<String>, String>,
     }
 
@@ -666,19 +772,19 @@ wrap_task! {
                 }
             };
             let matched: Vec<String> =
-                entries_for(entries, &self.host).into_iter().map(str::to_string).collect();
+                entries_for(entries, &self.origin.host).into_iter().map(str::to_string).collect();
             if let Ok(mut slot) = CANDIDATES.lock() {
                 *slot = Some(if matched.is_empty() { entries.clone() } else { matched.clone() });
             }
             match matched.len() {
                 0 => crate::message::error(&format!(
                     "password-fill: no entry matches {} — :password-fill <Tab> lists them all",
-                    self.host
+                    self.origin.host
                 )),
                 1 => {
                     let entry = matched[0].clone();
-                    let spec = show_spec(&entry, &self.host);
-                    start(self.id, self.browser, self.host.clone(), entry, spec);
+                    let spec = show_spec(&entry, &self.origin.host);
+                    start(self.id, self.browser, self.origin.clone(), entry, spec);
                 }
                 // Several. The command line already knows how to choose from a list.
                 _ => crate::cmdline::cmd_set_text(":password-fill", true, false, false, None),
@@ -716,10 +822,18 @@ wrap_task! {
                 )
             };
             let Some(pending) = pending else { return };
-            let host = host_of(&url).unwrap_or_default();
+            // No origin at all — `about:blank`, a page that has gone away — is not the origin the
+            // secret was asked for, so it is a refusal like any other rather than an empty host that
+            // happens to compare unequal.
+            let Some(current) = Origin::of(&url) else {
+                crate::message::error(
+                    "password-fill: the tab is no longer on a page with an origin — not filling",
+                );
+                return;
+            };
 
             // **The guard, and it is the security check of the whole module.** See `verdict`.
-            match verdict(&pending, self.id, current_browser, &host) {
+            match verdict(&pending, self.id, current_browser, &current) {
                 Verdict::Discard(why) => {
                     crate::message::error(&format!("password-fill: {why} — not filling"));
                     return;
