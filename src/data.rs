@@ -684,6 +684,79 @@ fn read_if_present(path: &Path) -> Result<Option<String>> {
     }
 }
 
+
+// -----------------------------------------------------------------------------------------------
+// The completion module's view of this one
+// -----------------------------------------------------------------------------------------------
+
+/// Binds `src/data.rs` to `src/completion.rs`.
+///
+/// The two were written in parallel against a contract, and they met in the middle differently:
+/// completion expected to walk every row and filter in Rust, this module filters in SQL. SQL won on
+/// a measurement — 0.74 ms against 9,000 rows on the worst realistic keystroke — and it is also
+/// where qutebrowser filters history (`histcategory.py:75-83`). So the walk is fed rows that are
+/// already filtered, ordered and limited; completion's own filter then passes all of them, which
+/// costs nothing and keeps its unit tests meaningful against in-memory fixtures.
+pub struct DataSources;
+
+impl crate::completion::Sources for DataSources {
+    fn search_engines(&self) -> Vec<(String, String)> {
+        crate::open::engines().for_completion()
+    }
+
+    fn quickmarks(&self) -> Vec<(String, String)> {
+        with_data(|data| {
+            data.quickmarks()
+                .iter()
+                .map(|mark| (mark.url.clone(), mark.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn bookmarks(&self) -> Vec<(String, String)> {
+        with_data(|data| {
+            data.bookmarks()
+                .iter()
+                .map(|mark| (mark.url.clone(), mark.title.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn history(
+        &self,
+        pattern: &str,
+        visit: &mut dyn FnMut(crate::completion::HistoryRow<'_>) -> crate::completion::Flow,
+    ) {
+        let rows = with_data(|data| {
+            data.history_completion(pattern, crate::completion::MAX_ITEMS)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+        for row in &rows {
+            let flow = visit(crate::completion::HistoryRow {
+                url: &row.url,
+                title: &row.title,
+                atime: &row.atime,
+            });
+            if flow == crate::completion::Flow::Stop {
+                break;
+            }
+        }
+    }
+}
+
+/// Runs `f` against the one open `Data`, or answers `None` when there is no data directory to open.
+/// A completion that cannot reach the database shows the categories it can and no history — never
+/// an error in the user's face while they are typing.
+fn with_data<T>(f: impl FnOnce(&Data) -> T) -> Option<T> {
+    let data = instance()?;
+    let guard = data.lock().ok()?;
+    Some(f(&guard))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,76 +1307,4 @@ mod tests {
         // into a scan, not to fail on a loaded build machine.
         assert!(worst < std::time::Duration::from_millis(50), "the completion query took {worst:?} at 9,000 rows");
     }
-}
-
-// -----------------------------------------------------------------------------------------------
-// The completion module's view of this one
-// -----------------------------------------------------------------------------------------------
-
-/// Binds `src/data.rs` to `src/completion.rs`.
-///
-/// The two were written in parallel against a contract, and they met in the middle differently:
-/// completion expected to walk every row and filter in Rust, this module filters in SQL. SQL won on
-/// a measurement — 0.74 ms against 9,000 rows on the worst realistic keystroke — and it is also
-/// where qutebrowser filters history (`histcategory.py:75-83`). So the walk is fed rows that are
-/// already filtered, ordered and limited; completion's own filter then passes all of them, which
-/// costs nothing and keeps its unit tests meaningful against in-memory fixtures.
-pub struct DataSources;
-
-impl crate::completion::Sources for DataSources {
-    fn search_engines(&self) -> Vec<(String, String)> {
-        crate::open::engines().for_completion()
-    }
-
-    fn quickmarks(&self) -> Vec<(String, String)> {
-        with_data(|data| {
-            data.quickmarks()
-                .iter()
-                .map(|mark| (mark.url.clone(), mark.name.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-    }
-
-    fn bookmarks(&self) -> Vec<(String, String)> {
-        with_data(|data| {
-            data.bookmarks()
-                .iter()
-                .map(|mark| (mark.url.clone(), mark.title.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-    }
-
-    fn history(
-        &self,
-        pattern: &str,
-        visit: &mut dyn FnMut(crate::completion::HistoryRow<'_>) -> crate::completion::Flow,
-    ) {
-        let rows = with_data(|data| {
-            data.history_completion(pattern, crate::completion::MAX_ITEMS)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-        for row in &rows {
-            let flow = visit(crate::completion::HistoryRow {
-                url: &row.url,
-                title: &row.title,
-                atime: &row.atime,
-            });
-            if flow == crate::completion::Flow::Stop {
-                break;
-            }
-        }
-    }
-}
-
-/// Runs `f` against the one open `Data`, or answers `None` when there is no data directory to open.
-/// A completion that cannot reach the database shows the categories it can and no history — never
-/// an error in the user's face while they are typing.
-fn with_data<T>(f: impl FnOnce(&Data) -> T) -> Option<T> {
-    let data = instance()?;
-    let guard = data.lock().ok()?;
-    Some(f(&guard))
 }

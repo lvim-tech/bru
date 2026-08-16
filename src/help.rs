@@ -1046,7 +1046,7 @@ fn keys_reaching(doc: &Doc, by_key: &BTreeMap<String, Reached>) -> String {
 pub fn is_a_name_bru_ships(name: &str) -> bool {
     COMMANDS
         .iter()
-        .any(|doc| doc.names.iter().any(|shipped| *shipped == name))
+        .any(|doc| doc.names.contains(&name))
 }
 // --- end lua runtime ---------------------------------------------------------------------------
 
@@ -1064,6 +1064,24 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+
+/// The page for whatever bindings are loaded right now.
+///
+/// `chrome.rs` serves this on every request, so a `config.lua` reloaded in a later milestone is
+/// reflected without a restart.
+pub fn current_page() -> String {
+    match crate::state::BruState::instance() {
+        Some(state) => {
+            let bindings = state.lock().expect("state mutex poisoned").bindings_snapshot();
+            match bindings {
+                Some(bindings) => page(&bindings),
+                None => "<!doctype html><meta charset=\"utf-8\"><body>no bindings loaded".to_string(),
+            }
+        }
+        None => "<!doctype html><meta charset=\"utf-8\"><body>no browser state".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1735,7 +1753,7 @@ mod tests {
             let written: BTreeSet<String> = COMMANDS
                 .iter()
                 .filter(|doc| doc.names.iter().any(|name| names.contains(&name.to_string())))
-                .flat_map(|doc| flag_names(doc))
+                .flat_map(flag_names)
                 .collect();
 
             if read.is_empty() {
@@ -1947,22 +1965,5 @@ mod tests {
         let html = page(&b);
         assert!(!html.contains("<script>alert(1)"), "it must arrive as text");
         assert!(html.contains("&lt;script&gt;alert(1)"));
-    }
-}
-
-/// The page for whatever bindings are loaded right now.
-///
-/// `chrome.rs` serves this on every request, so a `config.lua` reloaded in a later milestone is
-/// reflected without a restart.
-pub fn current_page() -> String {
-    match crate::state::BruState::instance() {
-        Some(state) => {
-            let bindings = state.lock().expect("state mutex poisoned").bindings_snapshot();
-            match bindings {
-                Some(bindings) => page(&bindings),
-                None => "<!doctype html><meta charset=\"utf-8\"><body>no bindings loaded".to_string(),
-            }
-        }
-        None => "<!doctype html><meta charset=\"utf-8\"><body>no browser state".to_string(),
     }
 }
