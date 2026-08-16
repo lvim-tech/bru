@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::bindings::{BindingTrie, Key, KeyInfo, Match, NamedKey};
+// This module wrote `is_safe_colour` and `scrollbar.rs` needed it too — see `chrome.rs`.
+use crate::chrome::is_safe_colour;
 // The one decoder for what a page wrote, beside the escaper for what is written to it — see
 // `ipc::percent_decode` for why it is not a copy per module any more.
 use crate::ipc::percent_decode;
@@ -1086,17 +1088,6 @@ fn resolve(properties: &[(String, String)], name: &str, depth: usize) -> Option<
         Some(inner) => resolve(properties, inner.trim(), depth + 1),
         None => Some(value.to_string()),
     }
-}
-
-/// A colour is about to be interpolated into a JS string literal and then into `style.cssText`, and
-/// the file it came from is one themer writes. Nothing that could end either context gets through:
-/// no quote, no backslash, no semicolon, no brace, no angle bracket.
-fn is_safe_colour(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "#(), .%-/".contains(c))
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -149,15 +149,26 @@ pub fn css_with(theme: &str, page_wins: bool, look: &Look) -> String {
     // last fallbacks are everforest's, and they are reached only by a theme.css that has lost a
     // property — a wrong colour is recoverable and a scrollbar drawn transparent because
     // `background` came out empty is not.
+    //
+    // **Each source is filtered, and a value that fails falls through to the next.** These two
+    // strings are interpolated into a rule and then into a JS string literal (`json_escape` below),
+    // and a value carrying a `}` or a `;` closes the rule it is in and writes its own. `hints.rs`
+    // filtered its label colours from the first day and this did not, from the same settings and the
+    // same `theme.css` — see `chrome::is_safe_colour`. Falling through rather than refusing is what
+    // `label_style_json_from` does: a rejected colour leaves a scrollbar the wrong shade, and the
+    // alternative is one drawn transparent.
+    let safe = |value: &&str| crate::chrome::is_safe_colour(value);
     let track = look
         .track
         .as_deref()
-        .or_else(|| resolve(theme, "--completion-scrollbar-bg"))
+        .filter(safe)
+        .or_else(|| resolve(theme, "--completion-scrollbar-bg").filter(safe))
         .unwrap_or("#232929");
     let thumb = look
         .thumb
         .as_deref()
-        .or_else(|| resolve(theme, "--completion-scrollbar-fg"))
+        .filter(safe)
+        .or_else(|| resolve(theme, "--completion-scrollbar-fg").filter(safe))
         .unwrap_or("#849380");
     let bang = if page_wins { "" } else { " !important" };
     let w = if look.width == 0 { 12 } else { look.width };
@@ -415,6 +426,38 @@ mod tests {
         assert!(!css.contains("border-radius:1"), "{css}");
     }
 
+    /// **A colour that would close the rule never reaches the page.**
+    ///
+    /// Both spellings of the hole: a `scrollbar.thumb` setting, and a `theme.css` property. Neither
+    /// is a page's to write, so what this stops is malformed CSS rather than script — but `hints.rs`
+    /// filtered the same values from the same two files and this did not, and one of the two was
+    /// wrong. The rejected value falls through to the shipped colour, so the scrollbar still draws.
+    #[test]
+    fn a_colour_that_would_break_out_of_the_rule_is_refused_and_not_interpolated() {
+        let look = Look {
+            width: 12,
+            thumb: Some("red}*{display:none".to_string()),
+            track: Some("#111;background-image:url(x)".to_string()),
+        };
+        let css = css_with(&theme(), true, &look);
+        // `display:none` is in this stylesheet legitimately — it is what switches the stepper arrow
+        // off — so what is asserted is the *selector* the injected value brought with it.
+        assert!(!css.contains("*{display:none"), "a thumb colour wrote its own rule: {css}");
+        assert!(!css.contains("url("), "a track colour wrote its own declaration: {css}");
+        assert!(css.contains("background:#849380"), "the thumb lost its fallback: {css}");
+        assert!(css.contains("background:#232929"), "the track lost its fallback: {css}");
+
+        // A theme that carries the same thing, for the source the setting is not.
+        let poisoned = format!("{}\n--completion-scrollbar-fg: yellow}}*{{display:none;\n", theme());
+        let css = css_with(&poisoned, true, &shipped());
+        assert!(!css.contains("*{display:none"), "a theme property wrote its own rule: {css}");
+        assert!(!css.contains("yellow"), "the refused value was interpolated anyway: {css}");
+
+        // And an ordinary value still goes through, so the guard did not swallow the feature.
+        let look = Look { width: 12, thumb: Some("rgba(255, 247, 133, 0.9)".to_string()), track: None };
+        assert!(css_with(&theme(), true, &look).contains("background:rgba(255, 247, 133, 0.9)"));
+    }
+
     /// The colours come out of the theme and are real colours, not the `var(--bg)` the file writes.
     ///
     /// A page never loads `theme.css`, so a `var()` left in here would resolve against the *page's*
@@ -508,16 +551,25 @@ mod tests {
         assert!(keeper_call("x").contains(STYLE_ID));
     }
 
-    /// The CSS reaches the page as a JS string literal, so a theme holding a quote or a backslash
-    /// must not end it. `theme.css` is generated and holds neither today, which is exactly when a
-    /// guard like this is cheap to write and impossible to remember later.
+    /// The CSS reaches the page as a JS string literal, so a quote or a backslash in it must not end
+    /// that literal. **Two independent guards, and this is the second one.**
+    ///
+    /// A quote can no longer get this far through a colour — `is_safe_colour` refuses it at
+    /// `css_with` and the test above pins that — so the escaping is asserted against `keeper_call`
+    /// directly, which is the function that owns it. Written this way round on purpose: the colour
+    /// filter is a check on one source, and if a later rule interpolates something this filter never
+    /// sees, the string it lands in still has to hold.
     #[test]
-    fn a_quote_in_the_theme_cannot_close_the_string() {
-        let theme = ":root{\n--completion-scrollbar-bg: #fff\"; } body { display:none;\n}";
-        let code = keeper_call(&css_with(theme, true, &shipped()));
+    fn a_quote_in_the_css_cannot_close_the_string() {
+        let code = keeper_call("::-webkit-scrollbar{background:#fff\"; } body { display:none}");
         // The quote must arrive backslashed. Asserting the *absence* of `"; } body` would pass on a
         // script that never quoted the CSS at all, which is the bug this was written after.
         assert!(code.contains("#fff\\\"; } body"), "the quote was not escaped: {code}");
         assert!(code.contains(".set(\""), "the CSS is not inside a string at all: {code}");
+
+        // And the colour filter is the first guard: the same quote, arriving as a theme's colour,
+        // never reaches the CSS to need escaping.
+        let theme = ":root{\n--completion-scrollbar-bg: #fff\"; } body { display:none;\n}";
+        assert!(!css_with(theme, true, &shipped()).contains('"'));
     }
 }

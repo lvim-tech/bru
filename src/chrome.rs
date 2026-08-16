@@ -396,6 +396,25 @@ pub fn warn_if_incomplete() {
         if rest > 0 { format!(" and {rest} more") } else { String::new() },
     ));
 }
+/// Whether a theme's or a setting's colour may be interpolated into CSS that is handed to a page.
+///
+/// Every caller ends up in the same two places: a JS string literal, and then `style.cssText` inside
+/// the page. Nothing that could end either context gets through — no quote, no backslash, no
+/// semicolon, no brace, no angle bracket — so a value cannot close the rule it is in and open
+/// another, and cannot close the script it travels in.
+///
+/// **It lives here because more than one module needs it and only one had it.** `hints.rs` wrote
+/// this and filtered every label colour through it; `scrollbar.rs` took the same class of value from
+/// the same two files — a `scrollbar.thumb` setting and a `--completion-scrollbar-*` property — and
+/// interpolated it unchecked. Both sources are inside the trust boundary, so the reach was malformed
+/// CSS on the user's own pages rather than script; the inconsistency is the bug.
+pub(crate) fn is_safe_colour(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "#(), .%-/".contains(c))
+}
 // --- end src/chrome.rs: themes -----------------------------------------------------------------
 
 /// Hand a `Vec<u8>` to CEF as a resource. The crate ships every piece of this: a ReadHandler over a
