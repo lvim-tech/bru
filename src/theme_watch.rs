@@ -91,8 +91,12 @@ fn run(parent: PathBuf, dir: PathBuf) {
         return;
     }
 
-    // `inotify_event` is followed by a name, so the buffer holds several of both. Aligned by
-    // declaring it as the event type: a `[u8]` read into and then cast would be undefined behaviour.
+    // `inotify_event` is followed by a name, so the buffer holds several of both — which is why it is
+    // bytes and not the event type: the names are variable-length, so no array of events has the
+    // right shape. A `[u8]` has alignment 1 and `inotify_event` needs 4, so the header is *copied*
+    // out with `read_unaligned` below rather than borrowed where it lies; forming a
+    // `&inotify_event` into this buffer would be undefined behaviour whether or not the address
+    // happened to be even.
     const SLOTS: usize = 64;
     let mut buffer = [0u8; SLOTS * (std::mem::size_of::<libc::inotify_event>() + libc::NAME_MAX as usize + 1)];
     let mut on_dir = on_dir;
@@ -114,8 +118,11 @@ fn run(parent: PathBuf, dir: PathBuf) {
         let mut at = 0usize;
         let mut changed = false;
         while at + std::mem::size_of::<libc::inotify_event>() <= read as usize {
-            // SAFETY: `at` is inside what the kernel wrote, and the buffer is aligned for this type.
-            let event = unsafe { &*(buffer.as_ptr().add(at) as *const libc::inotify_event) };
+            // SAFETY: the loop condition put a whole event's worth of what the kernel wrote at `at`,
+            // and `read_unaligned` copies it out, so the byte buffer's alignment 1 is enough.
+            let event = unsafe {
+                std::ptr::read_unaligned(buffer.as_ptr().add(at) as *const libc::inotify_event)
+            };
             let name_len = event.len as usize;
             let name_at = at + std::mem::size_of::<libc::inotify_event>();
             let name = if name_len > 0 && name_at + name_len <= read as usize {
