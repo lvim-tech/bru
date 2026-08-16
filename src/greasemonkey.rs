@@ -460,8 +460,7 @@ fn first_line_of(message: &str) -> String {
     message
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .unwrap_or("the pattern is not valid")
         .trim_start_matches("error: ")
         .to_string()
@@ -1142,7 +1141,7 @@ pub(crate) fn evaluate(frame: &Frame, code: &str, script_url: Option<&str>) -> O
                 CefString::from(&e.script_resource_name()).to_string(),
                 e.line_number()
             ));
-            format!("<exception: {}>", CefString::from(&e.message()).to_string())
+            format!("<exception: {}>", CefString::from(&e.message()))
         })
     };
     context.exit();

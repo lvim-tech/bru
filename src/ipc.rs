@@ -224,10 +224,10 @@ impl BrowserSideHandler for BruQueryHandler {
                 // `offsetHeight` is one, and the string reader answers `None` for an unquoted
                 // value — which arrived here as a silent 0 and left the panel at 24px.
                 let px = json_number_field(request, "px").unwrap_or(0) as i32;
-                let Some(window) = frame.and_then(|frame| frame.browser()).and_then(|browser| {
-                    let mut browser = browser;
-                    window_of(Some(&mut browser))
-                }) else {
+                let Some(window) = frame
+                    .and_then(|frame| frame.browser())
+                    .and_then(|browser| window_of(Some(&browser)))
+                else {
                     fail(&callback, -9, "a height from a strip that belongs to no window");
                     return true;
                 };
@@ -354,7 +354,7 @@ impl BrowserSideHandler for BruQueryHandler {
                     // no lock of bru's own.
                     crate::tabs::schedule_select(
                         browser.as_ref().map(|browser| browser.identifier()),
-                        index as usize,
+                        index,
                     );
                 }
                 succeed(&callback, "");
@@ -1443,10 +1443,7 @@ fn json_field(src: &str, key: &str) -> Option<String> {
         let Some(after) = after.strip_prefix(':') else {
             continue;
         };
-        let after = after.trim_start();
-        let Some(after) = after.strip_prefix('"') else {
-            return None;
-        };
+        let after = after.trim_start().strip_prefix('"')?;
         return Some(json_unescape(after));
     }
 }

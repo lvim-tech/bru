@@ -404,7 +404,7 @@ fn open_of(question: Question) -> Open {
 /// A suffix cannot do that. If the tail still ends with the name, whatever precedes it is a query;
 /// if it does not, the name itself has been edited and *is* the new name. Nothing is ever removed
 /// from the middle.
-fn split_line<'a>(text: &'a str, name: &str) -> (String, String, String) {
+fn split_line(text: &str, name: &str) -> (String, String, String) {
     let cut = text.rfind('/').map(|at| at + 1).unwrap_or(0);
     let (dir, tail) = text.split_at(cut);
     if !name.is_empty() && tail.ends_with(name) {
@@ -587,7 +587,11 @@ fn leave_mode(window: u32) {
 /// handler, which is precisely where a navigation deadlocks. Posting also keeps this file's
 /// bookkeeping callable from a unit test: [`take_answer`] is the half the tests exercise, and only
 /// [`deliver`] posts (trap 13).
-static PENDING: Mutex<Vec<(Box<dyn FnOnce(Answer) + Send>, Answer)>> = Mutex::new(Vec::new());
+/// A callback owed an answer, paired with the answer it is owed. Named because [`RunPending`] spells
+/// the same type out again when it takes the queue.
+type Owed = Vec<(Box<dyn FnOnce(Answer) + Send>, Answer)>;
+
+static PENDING: Mutex<Owed> = Mutex::new(Vec::new());
 
 /// Windows owed a look at their queue once the current answer is out of the way. `_pop_later`
 /// (`prompt.py:100-102`), and scheduled rather than immediate for qutebrowser's own reason: the
@@ -627,7 +631,7 @@ wrap_task! {
 
     impl Task {
         fn execute(&self) {
-            let answers: Vec<(Box<dyn FnOnce(Answer) + Send>, Answer)> = match PENDING.lock() {
+            let answers: Owed = match PENDING.lock() {
                 Ok(mut pending) => std::mem::take(&mut *pending),
                 Err(_) => Vec::new(),
             };

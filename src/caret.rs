@@ -188,9 +188,12 @@ fn marks() -> &'static Mutex<Marks> {
 /// window with them now and ask `active_browser_in`. The collision is real too — the retry runs for
 /// up to 2.4 s, which is long enough for a second `'A` in another window to land inside it and take
 /// the first one's remaining attempts.
-fn pending_jump() -> &'static Mutex<HashMap<u32, (char, i32, i32, u32)>> {
-    static PENDING: LazyLock<Mutex<HashMap<u32, (char, i32, i32, u32)>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The mark being jumped to, where it is, and how many attempts are left — per window, which is what
+/// the key is. Named because it is written twice below and reads as four unrelated numbers otherwise.
+type Jumps = Mutex<HashMap<u32, (char, i32, i32, u32)>>;
+
+fn pending_jump() -> &'static Jumps {
+    static PENDING: LazyLock<Jumps> = LazyLock::new(|| Mutex::new(HashMap::new()));
     &PENDING
 }
 

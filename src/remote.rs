@@ -117,8 +117,7 @@ fn socket_from(args: &[String], runtime_dir: Option<&std::ffi::OsStr>) -> Option
     let named = args[..before]
         .iter()
         .filter_map(|arg| arg.strip_prefix(SOCKET_SWITCH))
-        .filter(|path| !path.is_empty())
-        .next_back();
+        .rfind(|path| !path.is_empty());
     if let Some(path) = named {
         return Some(PathBuf::from(path));
     }

@@ -925,7 +925,7 @@ mod tests {
     fn clearing_a_config_keeps_the_handlers_a_plugin_registered() {
         let config_side = register_source("return function() return 'config' end");
         let plugin_side = register_source("return function() return 'plugin' end");
-        forget_functions_except(&[plugin_side.clone()]);
+        forget_functions_except(std::slice::from_ref(&plugin_side));
         assert_eq!(call_string(&plugin_side, &[]), Ok("plugin".to_string()));
         assert!(call_string(&config_side, &[]).unwrap_err().contains("not reachable"));
     }

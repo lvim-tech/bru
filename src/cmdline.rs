@@ -905,8 +905,10 @@ pub fn on_mode_changed(window: u32, mode: &str) {
 /// repeat the other window's last command.
 ///
 /// `BTreeMap::new` is const and `HashMap::new` is not, which is the whole reason this is ordered.
-static LAST_COMMAND: Mutex<BTreeMap<(u32, Mode), (Command, Option<u32>)>> =
-    Mutex::new(BTreeMap::new());
+/// What `.` repeats, and the count it was run with, per window and per mode.
+type LastCommands = BTreeMap<(u32, Mode), (Command, Option<u32>)>;
+
+static LAST_COMMAND: Mutex<LastCommands> = Mutex::new(BTreeMap::new());
 
 /// Whether running `command` should make it the thing `.` repeats.
 ///

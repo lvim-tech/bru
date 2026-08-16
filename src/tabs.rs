@@ -535,8 +535,8 @@ pub fn render_tabs(snapshot: &TabsSnapshot) -> String {
     format!(
         "{{\"tabs\":[{}],\"favicons\":\"{}\",\"align\":\"{}\",\"tooltips\":{}}}",
         entries.join(","),
-        crate::ipc::json_escape(&crate::settings::choice_of("tabs.favicons.show")),
-        crate::ipc::json_escape(&crate::settings::choice_of("tabs.title.alignment")),
+        crate::ipc::json_escape(crate::settings::choice_of("tabs.favicons.show")),
+        crate::ipc::json_escape(crate::settings::choice_of("tabs.title.alignment")),
         crate::settings::is_on("tabs.tooltips"),
     )
 }

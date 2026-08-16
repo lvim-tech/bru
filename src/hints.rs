@@ -1231,7 +1231,7 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
                         return Some(true);
                     }
                     Match::Partial => crate::bindings::MatchType::PartialMatch,
-                    Match::NoMatch => {
+                    Match::None => {
                         open.command_sequence.clear();
                         crate::bindings::MatchType::NoMatch
                     }
@@ -1279,7 +1279,7 @@ pub fn handle_key(state: &SharedState, browser: &mut Browser, info: KeyInfo) -> 
             // --- end unhardcoded ---------------------------------------------------------------
             Match::Exact(index) => Outcome::Follow(*index),
             Match::Partial => Outcome::Pending,
-            Match::NoMatch => {
+            Match::None => {
                 // `BaseKeyParser.handle` clears the chain on a no-match. In letter mode there is
                 // nothing else to do with the key: it names no hint.
                 open.sequence.clear();

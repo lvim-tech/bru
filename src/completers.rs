@@ -576,7 +576,10 @@ const COMMAND_WIDTHS: &[u8] = &[20, 60, 20];
 /// Before `BruState` exists — a unit test, or a renderer process — the defaults are the truth, the
 /// same fallback `hints.rs` and `prompt.rs` take.
 fn command_rows() -> Vec<Vec<String>> {
-    static CACHE: Mutex<Option<(Vec<(Mode, String, String)>, Vec<Vec<String>>)>> = Mutex::new(None);
+    /// The bindings the rows were built from, and the rows. The key is what decides whether the
+    /// cached rows still describe the bindings in force.
+    type Cached = Option<(Vec<(Mode, String, String)>, Vec<Vec<String>>)>;
+    static CACHE: Mutex<Cached> = Mutex::new(None);
     // `Bindings::defaults` builds the whole 298-row table from its source text every call, which is
     // most of a millisecond; the live one is already built and is only cloned. Neither is worth
     // paying twice, so the fallback is built once as well.

@@ -166,6 +166,17 @@ pub fn macro_record(state: &SharedState, register: Option<char>) {
     }
 }
 
+/// The count `@` stashes: no count is one run, and the ceiling is real because a typo would
+/// otherwise wedge the UI thread for as long as it took to replay.
+///
+/// **A function rather than an expression inside [`macro_run`]** so that the test below can hold
+/// *this* and not a copy of it. It was a copy, spelled out again in the test, which is the shape this
+/// project has already paid for once — see `prompt.rs`'s note about a test that held the pure
+/// function while the bug was reintroduced at the call site.
+fn stashed_count(count: Option<u32>) -> u32 {
+    count.unwrap_or(1).clamp(1, MAX_COUNT)
+}
+
 /// `macro-run [register]`, with the count — `@`. Port of `MacroRecorder.macro_run` (macros.py:66).
 ///
 /// The count is stashed *now*, before the register keystroke, which is why `3@q` runs three times
@@ -176,8 +187,7 @@ pub fn macro_run(
     register: Option<char>,
     count: Option<u32>,
 ) {
-    recorder().lock().expect("macro recorder mutex poisoned").count =
-        count.unwrap_or(1).clamp(1, MAX_COUNT);
+    recorder().lock().expect("macro recorder mutex poisoned").count = stashed_count(count);
 
     match register {
         Some(register) => replay(state, browser, register),
@@ -554,17 +564,19 @@ mod tests {
 
         // This is why `run_macro` mode can have `supports_count = false` and `3@q` still run three
         // times: `macro-run` stores the count while the `3` is still normal mode's (macros.py:79).
-        recorder().lock().expect("macro recorder mutex poisoned").count =
-            Some(3u32).unwrap_or(1).clamp(1, MAX_COUNT);
+        // `stashed_count` is what it stores, asked directly — the test used to spell the expression
+        // out a second time, which is a test that passes while the call site drifts.
+        recorder().lock().expect("macro recorder mutex poisoned").count = stashed_count(Some(3));
         assert_eq!(recorder().lock().expect("macro recorder mutex poisoned").count, 3);
 
-        // And the ceiling is real: a typo cannot wedge the UI thread.
+        // And the ceiling is real: a typo cannot wedge the UI thread. No count at all is one run.
         recorder().lock().expect("macro recorder mutex poisoned").count =
-            Some(999_999u32).unwrap_or(1).clamp(1, MAX_COUNT);
+            stashed_count(Some(999_999));
         assert_eq!(
             recorder().lock().expect("macro recorder mutex poisoned").count,
             MAX_COUNT
         );
+        assert_eq!(stashed_count(None), 1);
     }
 
     /// **What recording costs a key that is not being recorded**, which is the question this design

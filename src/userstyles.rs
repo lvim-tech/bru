@@ -430,7 +430,7 @@ fn site_of(host: &str) -> Option<String> {
 pub fn covers(name: &str, url: &str) -> bool {
     let Some(host) = host_of(url) else { return false };
     let name = name.trim().trim_start_matches("www.").to_ascii_lowercase();
-    candidates(&host).iter().any(|candidate| *candidate == name)
+    candidates(&host).contains(&name)
 }
 
 #[cfg(test)]

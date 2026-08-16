@@ -360,7 +360,7 @@ fn dispatch(event: Event, fields: &[(&'static str, Arg)]) -> Vec<String> {
             .handlers
             .iter()
             .filter(|registration| registration.event == event)
-            .filter(|registration| !registry.disabled.iter().any(|name| *name == registration.plugin))
+            .filter(|registration| !registry.disabled.contains(&registration.plugin))
             .map(|registration| (registration.plugin.clone(), registration.handler.clone()))
             .collect()
     });

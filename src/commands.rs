@@ -20,6 +20,12 @@ use std::fmt;
 ///
 /// Variants exist for what bru implements or is about to; everything else in qutebrowser's default
 /// bindings lands in [`Command::Unimplemented`] with its original string.
+///
+/// **Every variant is the name of the command it is**, which is what makes the table below readable
+/// against `:help` and against qutebrowser's own list. Two of them therefore carry the enum's name —
+/// `CommandAccept` is `command-accept` and `EditCommand` is `edit-command` — and clippy would have
+/// those shortened. Shortening them would break the one rule the whole table follows.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum Command {
     /// `a ;; b ;; c` — run each in turn.
@@ -869,7 +875,7 @@ pub fn parse(s: &str) -> Result<Command, ParseError> {
     // as well, so it is tested before the general guard below rather than listed in it:
     // `:bind X scroll down ;; reload` has to bind the chain, not bind `scroll down` and then
     // reload. Everything after the key belongs to the command being bound, separators included.
-    if s.trim_start().split_whitespace().next() == Some("bind") {
+    if s.split_whitespace().next() == Some("bind") {
         return parse_bind(s);
     }
 // --- end config commands -----------------------------------------------------------------------

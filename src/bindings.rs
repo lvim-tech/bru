@@ -564,6 +564,11 @@ fn parse_special_key(body: &str) -> Result<KeyInfo, KeyParseError> {
 // ---------------------------------------------------------------------------------------------
 
 /// The three outcomes of matching. `QKeySequence.SequenceMatch` in qutebrowser.
+///
+/// The `…Match` suffix is Qt's — `SequenceMatch.NoMatch`, `PartialMatch`, `ExactMatch` — and it is
+/// kept so that a reader with qutebrowser's source open finds the same three words. Clippy would
+/// have them shortened, which is the right advice for a name nobody else chose.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchType {
     /// No binding starts with what has been typed. The chain is abandoned.
@@ -579,8 +584,11 @@ pub enum MatchType {
 /// `MatchResult.__post_init__` asserts "command is not None iff ExactMatch"; here the enum makes
 /// that unrepresentable rather than asserted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `None` and not `NoMatch`: the other two are `Partial` and `Exact`, so the suffix was on one
+/// variant of three. [`MatchType`] keeps Qt's spelling because Qt is where those three names come
+/// from; this enum is bru's own.
 pub enum Match<'a, V> {
-    NoMatch,
+    None,
     Partial,
     Exact(&'a V),
 }
@@ -588,7 +596,7 @@ pub enum Match<'a, V> {
 impl<V> Match<'_, V> {
     pub fn match_type(&self) -> MatchType {
         match self {
-            Match::NoMatch => MatchType::NoMatch,
+            Match::None => MatchType::NoMatch,
             Match::Partial => MatchType::PartialMatch,
             Match::Exact(_) => MatchType::ExactMatch,
         }
@@ -622,7 +630,7 @@ impl<V> BindingTrie<V> {
     pub fn insert(&mut self, sequence: &[KeyInfo], value: V) -> Option<V> {
         let mut node = self;
         for key in sequence {
-            node = node.children.entry(*key).or_insert_with(BindingTrie::new);
+            node = node.children.entry(*key).or_default();
         }
         node.value.replace(value)
     }
@@ -657,13 +665,13 @@ impl<V> BindingTrie<V> {
         for key in sequence {
             match node.children.get(key) {
                 Some(child) => node = child,
-                None => return Match::NoMatch,
+                None => return Match::None,
             }
         }
         match &node.value {
             Some(value) => Match::Exact(value),
             None if !node.children.is_empty() => Match::Partial,
-            None => Match::NoMatch,
+            None => Match::None,
         }
     }
 
@@ -830,7 +838,7 @@ impl KeyParser {
                 keystring: self.keystring(),
                 swallow: true,
             },
-            Match::NoMatch => {
+            Match::None => {
                 self.clear();
                 KeyOutcome {
                     action: KeyAction::NoMatch,
