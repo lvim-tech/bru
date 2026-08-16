@@ -1,0 +1,18 @@
+# This tree is formatted by hand, on purpose, and rustfmt is told so here rather than left to
+# disagree in silence.
+#
+# `cargo fmt --check` used to report 1372 hunks across all 53 files — and in both directions: it
+# wanted to inline lines that are broken deliberately and to break lines that are deliberately one.
+# Most of that is the prose. This project explains itself in long comment blocks whose wrapping,
+# tables and alignment are part of what they say, and a formatter that reflows them is a formatter
+# that edits the documentation.
+#
+# The cost of leaving it unsaid was the whole point: a `--check` that fails wholesale cannot be run
+# in CI, so it caught nothing, and anyone who ran `cargo fmt` once would have produced a diff nobody
+# could review. Turning formatting off says what is true — the layout is authored — and `cargo fmt`
+# and `cargo fmt --check` both become no-ops that pass, which is what makes them usable again.
+#
+# This is not a licence for sloppy layout. The style is the one already in the tree: roughly a
+# 100-column body, arguments broken one per line when they do not fit, and comments wrapped to the
+# same width as the code they sit above.
+disable_all_formatting = true
