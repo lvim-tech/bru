@@ -1987,9 +1987,15 @@ pub const SETTINGS: &[Def] = &[
         // exist and fontconfig falls through — so a name copied out of a Qt config is worth checking
         // with `fc-match` before it is trusted.
         //
-        // The default is EMPTY, and empty means "impose nothing": the declaration is left out of
-        // the generated CSS entirely and the engine's own font is what draws. That is still a
-        // default bru ships — every setting has one — it is simply a default that declines.
+        // **There is no default, and that is the point**: no family means "impose nothing", the
+        // declaration is left out of the generated CSS entirely, and the engine's own font is what
+        // draws. It is written `None` and not `Some("")` because `Kind::Text` refuses an empty
+        // value — a family of "" is not a family — so `Some("")` was a row that lied about itself:
+        // `default_value` parsed it, failed, and answered `None` anyway, and the meta-test that
+        // walks every default caught exactly that. `None` is what the twenty-odd other settings
+        // with nothing to ship already say, and `text_or_default` reads both as the empty string,
+        // so nothing downstream changes. `:config-unset fonts.default_family` is how a family that
+        // has been set is taken back off.
         //
         // It used to be `monospace`, for a real reason kept here rather than deleted: the
         // completion is a table, and columns that do not line up read as a bug. Whoever sets a
@@ -1999,7 +2005,7 @@ pub const SETTINGS: &[Def] = &[
         // it runs on, and this one already has fontconfig to answer that question.
         name: "fonts.default_family",
         kind: Kind::Text,
-        default: Some(""),
+        default: None,
         scopes: Scopes::GlobalOnly,
         backing: Backing::Chrome,
     },
@@ -4726,6 +4732,15 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: bad default: {e}", def.name));
             }
         }
+        // And a setting that ships nothing says so with `None`, not with a value its own kind would
+        // refuse. `fonts.default_family` was `Some("")` against a `Kind::Text` that rejects empty,
+        // which is what the loop above failed on: the row claimed a default the setting could not
+        // hold, and every reader was already getting `None` out of it. Pinned by name because
+        // "impose no font" is a deliberate choice and `Some("")` is the tempting way to spell it.
+        assert!(
+            def("fonts.default_family").is_some_and(|def| def.default.is_none()),
+            "an empty default is written None, not Some(\"\")",
+        );
         // Eight: three content/start-page settings, `statusbar.mode.style`, which is bru's own
         // rather than a name copied from qutebrowser, and the four `input.insert_mode.*` that
         // `focus.rs` reads. Raise this with the setting, never to make a failing build pass.
