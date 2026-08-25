@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::term_keys::{Step, TermKey, next_event, next_event_at_timeout};
 
-/// The browser keys are aimed at. Set once the page's browser exists.
+/// The page's browser. Where keys go unless a mode says otherwise.
 static TARGET: AtomicI32 = AtomicI32::new(0);
 
 /// Set when the loop should stop, so `leave` does not have to kill a thread.
@@ -93,6 +93,42 @@ fn post(key: TermKey) {
     post_task(ThreadId::UI, Some(&mut task));
 }
 
+/// Which browser this keystroke is for.
+///
+/// **In a window CEF answers this and here nobody does.** Views delivers a key to whichever view
+/// holds focus, and bru moves that focus itself: `:` runs `cmd-set-text`, which calls
+/// `host.set_focus(1)` on the bottom strip (`ipc.rs`), and every following keystroke lands in the
+/// `#cmdline` input without anything else being told. Windowless browsers have no such arrangement
+/// between them — there is no focus manager over four surfaces, only four hosts and whichever one
+/// is handed the event. So the routing bru gets for free in a window is written out here.
+///
+/// Measured 2026-08-25: with every key going to the page, `:` opened the command line, the status
+/// bar said `COMMAND`, and nothing could be typed into it. The mode was right; the keystrokes were
+/// going to the wrong browser.
+///
+/// The mode is read rather than a focus flag being kept, because the mode is what bru already keeps
+/// and a second copy of "where is focus" is a second thing to get out of step.
+fn target_for(state: &crate::tabs::SharedState) -> Option<Browser> {
+    let mode = state.lock().expect("state mutex poisoned").mode_in(0);
+    match mode {
+        // The command line is `#cmdline` in `bottom.html`.
+        crate::modes::Mode::Command => crate::ipc::bottom_chrome_browser_for(0),
+        // A question is `#prompt` in `panel.html`. The panel is not a terminal surface yet, so
+        // these fall through to the page rather than to a browser that does not exist — the keys
+        // are lost either way, and this way they are lost somewhere that can be seen.
+        crate::modes::Mode::Prompt | crate::modes::Mode::YesNo => page_browser(state),
+        _ => page_browser(state),
+    }
+}
+
+fn page_browser(state: &crate::tabs::SharedState) -> Option<Browser> {
+    let identifier = TARGET.load(Ordering::Relaxed);
+    if identifier == 0 {
+        return None;
+    }
+    state.lock().expect("state mutex poisoned").browser_with_id(identifier)
+}
+
 wrap_task! {
     struct KeyTask {
         code: i32,
@@ -103,18 +139,10 @@ wrap_task! {
 
     impl Task {
         fn execute(&self) {
-            let identifier = TARGET.load(Ordering::Relaxed);
-            if identifier == 0 {
-                return;
-            }
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
-            let browser = state
-                .lock()
-                .expect("state mutex poisoned")
-                .browser_with_id(identifier);
-            let Some(host) = browser.and_then(|browser| browser.host()) else {
+            let Some(host) = target_for(&state).and_then(|browser| browser.host()) else {
                 return;
             };
 

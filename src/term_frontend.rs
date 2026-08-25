@@ -303,6 +303,12 @@ fn create_surface(
     }
     if kind == SurfaceKind::Page {
         crate::term_input::aim_at(identifier);
+        // **A windowless browser is not focused by anything, because there is no window manager
+        // over it.** Without this the page receives keys and does nothing with the ones that are
+        // text: Chromium routes typing to the focused frame, and a browser nobody focused has none.
+        if let Some(host) = browser.host() {
+            host.set_focus(1);
+        }
         // **A tab, or the page is a browser nothing in bru knows about.** `hints.rs` answers "this
         // tab is in no window", the strip has nothing to draw and the status bar has no url —
         // measured 2026-08-25, with the page rendering perfectly and every one of those true at
