@@ -380,6 +380,11 @@ fn main() -> Result<(), &'static str> {
 
 
     run_message_loop();
+    // **Before `shutdown()`, not only after it.** The terminal is the user's, and handing it back
+    // must not wait on a library teardown that takes its time or does not return — a browser that
+    // exits leaving a pane in raw mode with a picture in it has failed at the last thing it does.
+    // `leave` is idempotent, so the call after the teardown stays as the belt to this brace.
+    crate::term_frontend::leave();
     shutdown();
     crate::remote::cleanup();
     // bru started this process, so bru ends it — see `ssh::stop`. After `shutdown`, so nothing is

@@ -859,13 +859,29 @@ wrap_task! {
 pub fn leave() {
     ACTIVE.store(false, Ordering::Relaxed);
     crate::term_input::stop();
-    if let Some(term) = TERM.get() {
-        let mut term = term.lock().expect("terminal state poisoned");
-        let mut out = std::io::stdout();
-        let _ = term.painter.clear(&mut out);
-        let _ = out.flush();
-        term.session.leave();
-    }
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let Ok(mut term) = term.lock() else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    // The presenter takes back its own image by id. That is the tidy half.
+    let _ = term.painter.clear(&mut out);
+    // **And then everything, by hand, because the tidy half was not enough.** Measured 2026-08-25:
+    // after `:quit` the pane still showed the tab strip and a band of the page under the shell's
+    // prompt. `d=I` removes the image this presenter knows about; anything a previous presenter
+    // left — a frame in flight when the size changed, an id from a run that crashed — is not its to
+    // know about. `d=A` is, and the cost of being thorough on the way out is one escape.
+    let _ = out.write_all(
+        crate::term_session::passthrough("\x1b_Ga=d,d=A,q=2\x1b\\").as_bytes(),
+    );
+    // The placeholder cells are text, and text belongs to the screen rather than to the image. The
+    // screen is cleared before it is handed back, so nothing is left holding cells that used to
+    // mean a picture.
+    let _ = out.write_all(b"\x1b[H\x1b[2J");
+    let _ = out.flush();
+    term.session.leave();
 }
 
 /// The render handler bru's one `Client` hands out, when this run draws into a terminal.
