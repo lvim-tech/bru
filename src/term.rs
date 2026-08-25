@@ -277,12 +277,21 @@ fn test_frame(width: u32, height: u32, phase: u32) -> Vec<u8> {
 ///
 /// Returns the name it created, so the caller can unlink it if kitty never did — a terminal that
 /// ignores the escape would otherwise leave 4 MB in `/dev/shm` per frame.
+/// `quiet` asks kitty for no response at all.
+///
+/// **A response nobody reads is input somebody else receives.** Measured 2026-08-25: the spike sent
+/// frames without `q`, never read the `OK` that came back for each one, and tmux delivered the
+/// backlog as *keystrokes* to whichever pane had focus — `Gi=1;OKGi=1;OK…` typed into a prompt two
+/// panes away. The probe wants the acknowledgement, because waiting for it is the measurement and
+/// the backpressure; the spike must not ask for one, because it paints on the UI thread and cannot
+/// stop to listen. Whoever cannot read the answer does not get to ask the question.
 pub(crate) fn write_image_shm(
     out: &mut impl Write,
     rgb: &[u8],
     width: u32,
     height: u32,
     sequence: u32,
+    quiet: bool,
 ) -> std::io::Result<Option<String>> {
     let name = format!("/bru-probe-{}-{sequence}", std::process::id());
     let c_name = std::ffi::CString::new(name.clone()).expect("no NUL in a formatted name");
@@ -332,8 +341,9 @@ pub(crate) fn write_image_shm(
     cleanup(fd);
 
     // The payload of a graphics escape is always base64, the name included.
+    let quiet = if quiet { ",q=2" } else { "" };
     let payload = format!(
-        "\x1b_Ga=T,i=1,f=24,t=s,s={width},v={height},C=1;{}\x1b\\",
+        "\x1b_Ga=T,i=1,f=24,t=s,s={width},v={height},C=1{quiet};{}\x1b\\",
         base64(name.as_bytes())
     );
     out.write_all(passthrough(&payload).as_bytes())?;
@@ -479,7 +489,7 @@ fn measure_shm(
 
         let at = Instant::now();
         let _ = out.write_all(b"\x1b[H");
-        let name = write_image_shm(&mut out, &frame, width, height, phase)
+        let name = write_image_shm(&mut out, &frame, width, height, phase, false)
             .map_err(|e| format!("could not write the image: {e}"))?;
         let acked = read_ack(stdin);
         cost.write += at.elapsed();

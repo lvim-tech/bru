@@ -100,7 +100,10 @@ wrap_render_handler! {
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let mut out = std::io::stdout();
             let _ = out.write_all(b"\x1b[H");
-            if let Ok(Some(name)) = crate::term::write_image_shm(&mut out, &rgb, width, height, sequence)
+            // `quiet`: this runs on the UI thread and cannot stop to read an answer, so it does
+            // not ask for one — see `write_image_shm`.
+            if let Ok(Some(name)) =
+                crate::term::write_image_shm(&mut out, &rgb, width, height, sequence, true)
             {
                     // kitty unlinks what it reads; a terminal that ignored the escape would leave
                     // the megabytes behind, so the name is remembered for one frame and removed
