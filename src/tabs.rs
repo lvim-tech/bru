@@ -1146,7 +1146,7 @@ pub fn move_current(state: &SharedState, to: usize) {
 /// on — qutebrowser's `tabs.last_close` default keeps a blank tab instead, and that is
 /// DECISIONS.md item 6, still open.
 pub fn close_current(state: &SharedState, force: bool) {
-    let (closed, remaining, pages, window, active, window_id, closing) = {
+    let (closing_browser, closed, remaining, pages, window, active, window_id, closing) = {
         let mut state = state.lock().expect("state mutex poisoned");
         // A pinned tab is not closed by a bare `d`. qutebrowser prompts here
         // (`tabbedbrowser.py:431`); bru has no yes/no mode, so it says why and does nothing, and
@@ -1173,8 +1173,13 @@ pub fn close_current(state: &SharedState, force: bool) {
             None
         };
 // --- end plugin events -----------------------------------------------------
+        // The browser behind the tab about to go, read before it goes. In a terminal this is the
+        // only handle on it: `take_active_tab` answers with a `BrowserView`, and a terminal tab has
+        // none — see `shell::TabSurface`.
+        let closing_browser = state.active_tab_browser();
         let closed = state.take_active_tab();
         (
+            closing_browser,
             closed,
             state.tab_count(),
             state.pages(),
@@ -1184,6 +1189,24 @@ pub fn close_current(state: &SharedState, force: bool) {
             closing,
         )
     };
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // **A terminal tab is closed by closing its browser**, because there is no view to take out of
+    // a panel and no last reference to drop. Before this the function returned here — `closed` is
+    // always `None` for a terminal tab — so the tab left bru's bookkeeping, the browser stayed
+    // alive, and the pane went on showing it until something else switched tabs. Measured
+    // 2026-08-25: `d` removed a tab from the strip and changed nothing on screen.
+    if crate::term_frontend::is_active() {
+        if let Some(identifier) = closing_browser {
+            crate::term_frontend::close_page(identifier);
+        }
+        if remaining == 0 {
+            crate::term_frontend::shut_down();
+            return;
+        }
+        select_in(state, window_id, active);
+        return;
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
     let Some(closed) = closed else {
         return;
     };

@@ -483,6 +483,28 @@ pub fn new_page(state: &crate::tabs::SharedState, url: &str) -> Option<i32> {
     Some(identifier)
 }
 
+/// Close one page browser and forget the surface it was painting into.
+///
+/// The browser is asked to close rather than dropped: a windowless browser has no view holding the
+/// last reference, so `close_browser` is the only thing that ends it. `force` is `1` because the
+/// page has already left bru's bookkeeping and a `beforeunload` prompt would have nowhere to be
+/// answered — the same call `:quit` makes, for the same reason.
+pub fn close_page(identifier: i32) {
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.of_browser.retain(|(id, _)| *id != identifier);
+            guard.surfaces[index_of(SurfaceKind::Page)] = None;
+        }
+    }
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        host.close_browser(1);
+    }
+}
+
 /// Show the page of a browser that already exists — the terminal's whole notion of "select a tab".
 pub fn show_page(identifier: i32) {
     let Some(term) = TERM.get() else {

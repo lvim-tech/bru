@@ -681,6 +681,17 @@ impl BruState {
     }
 
     // --- src/devtools.rs ------------------------------------------------------------------------
+    /// The browser behind the tab showing in the current window.
+    ///
+    /// **The one handle a terminal tab has.** A Views tab is reached through its `BrowserView` and
+    /// the browser found from there; a terminal tab has no view, and the browser id it was created
+    /// with is the whole of it.
+    pub fn active_tab_browser(&self) -> Option<i32> {
+        self.current_slot()
+            .and_then(|slot| slot.tabs.get(slot.active))
+            .and_then(|tab| tab.browser_id)
+    }
+
     /// The `BrowserView` of the tab showing in a named window.
     ///
     /// Two things a drag needs and cannot get from the browser: how tall the page is right now,
