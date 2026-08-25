@@ -48,18 +48,15 @@ pub struct WindowState {
     /// bru's own identifier for the window, and the one `:tab-give 1` names. Zero-based, like
     /// qutebrowser's `win_id`, so a count of `n` means window `n - 1` (`commands.py:475`).
     pub(crate) id: u32,
-    /// The top-level window, kept from `on_window_created` so views can be added to it later.
-    window: Option<Window>,
-    /// The window's vertical box layout, kept so a tab opened later can be given flex 1 like the
-    /// ones that were there when the window was built.
-    layout: Option<BoxLayout>,
-    // --- src/devtools.rs: the pages panel --------------------------------------------------------
-    /// The panel holding this window's tab views, and its horizontal layout. See [`set_pages_for`].
+    // --- src/shell.rs ----------------------------------------------------------------------------
+    /// How this window is drawn, and everything only that answer owns.
     ///
-    /// [`set_pages_for`]: BruState::set_pages_for
-    pages: Option<Panel>,
-    pages_layout: Option<BoxLayout>,
-    // --- end src/devtools.rs: the pages panel ----------------------------------------------------
+    /// **The handles that used to be four fields here.** They are Views' and a windowless frontend
+    /// has no equivalent of any of them, so they moved behind `Shell` rather than staying in a
+    /// struct both frontends share. The accessors below did not change shape: what changed is where
+    /// they read from, which is why this move touches no caller.
+    shell: crate::shell::Shell,
+    // --- end src/shell.rs ------------------------------------------------------------------------
     /// Identifiers of the browsers behind *this* window's two chrome strips. Keys that reach those
     /// must not be read as page movements — `j` in the command line is a letter, not a scroll — and
     /// they must be aimed at the tab showing in the window they arrived at, not in whichever window
@@ -225,10 +222,7 @@ impl BruState {
         self.next_window_id += 1;
         self.windows.push(WindowState {
             id,
-            window: None,
-            layout: None,
-            pages: None,
-            pages_layout: None,
+            shell: crate::shell::Shell::views(),
             chrome_browsers: Vec::new(),
             tabs: Vec::new(),
             active: 0,
@@ -292,17 +286,19 @@ impl BruState {
 
     pub fn set_window_for(&mut self, id: u32, window: Window, layout: Option<BoxLayout>) {
         if let Some(slot) = self.slot_mut(id) {
-            slot.window = Some(window);
-            slot.layout = layout;
+            if let Some(views) = slot.shell.as_views_mut() {
+                views.window = Some(window);
+                views.layout = layout;
+            }
         }
     }
 
     pub fn window_handle(&self, id: u32) -> Option<Window> {
-        self.slot(id).and_then(|slot| slot.window.clone())
+        self.slot(id).and_then(|slot| slot.shell.as_views()?.window.clone())
     }
 
     pub fn layout_handle(&self, id: u32) -> Option<BoxLayout> {
-        self.slot(id).and_then(|slot| slot.layout.clone())
+        self.slot(id).and_then(|slot| slot.shell.as_views()?.layout.clone())
     }
 
     // --- src/devtools.rs: the pages panel --------------------------------------------------------
@@ -315,8 +311,10 @@ impl BruState {
     /// instead, once, and never moved.
     pub fn set_pages_for(&mut self, id: u32, panel: Panel, layout: Option<BoxLayout>) {
         if let Some(slot) = self.slot_mut(id) {
-            slot.pages = Some(panel);
-            slot.pages_layout = layout;
+            if let Some(views) = slot.shell.as_views_mut() {
+                views.pages = Some(panel);
+                views.pages_layout = layout;
+            }
         }
     }
 
@@ -324,7 +322,10 @@ impl BruState {
     /// `on_window_created` has run, which is the window that has no pages yet.
     pub fn pages_of(&self, id: u32) -> (Option<Panel>, Option<BoxLayout>) {
         match self.slot(id) {
-            Some(slot) => (slot.pages.clone(), slot.pages_layout.clone()),
+            Some(slot) => match slot.shell.as_views() {
+                Some(views) => (views.pages.clone(), views.pages_layout.clone()),
+                None => (None, None),
+            },
             None => (None, None),
         }
     }
@@ -424,13 +425,13 @@ impl BruState {
 
     /// The current window's CEF handle.
     pub fn window(&self) -> Option<Window> {
-        self.current_slot().and_then(|slot| slot.window.clone())
+        self.current_slot().and_then(|slot| slot.shell.as_views()?.window.clone())
     }
 
     // --- src/devtools.rs: the pages panel --------------------------------------------------------
     /// The current window's pages panel — where a tab view is taken *out* of when it is closed.
     pub fn pages(&self) -> Option<Panel> {
-        self.current_slot().and_then(|slot| slot.pages.clone())
+        self.current_slot().and_then(|slot| slot.shell.as_views()?.pages.clone())
     }
     // --- end src/devtools.rs: the pages panel ----------------------------------------------------
 
@@ -438,7 +439,7 @@ impl BruState {
     pub fn window_handles(&self) -> Vec<Window> {
         self.windows
             .iter()
-            .filter_map(|slot| slot.window.clone())
+            .filter_map(|slot| slot.shell.as_views()?.window.clone())
             .collect()
     }
 

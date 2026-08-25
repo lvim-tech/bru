@@ -75,6 +75,8 @@ mod scrollbar;
 mod spawn;
 // `--ssh=<destination>`: an `ssh -D` SOCKS tunnel, and Chromium pointed at it.
 mod ssh;
+// How a window is drawn, and everything only that answer owns. The terminal frontend's seam.
+mod shell;
 mod session;
 mod settings;
 mod settingspage;
@@ -82,6 +84,11 @@ mod state;
 mod tabs;
 // A spike: the kitty graphics protocol and what this pane costs. `--term-probe` only.
 mod term;
+// The terminal frontend, phase by phase. Each is a module of its own so the phases do not collide.
+mod term_compose;
+mod term_keys;
+mod term_paint;
+mod term_session;
 // A spike: one windowless browser painted into the terminal. `--term-spike=<url>` only.
 mod term_spike;
 // Which terminal bru was launched from, and how to ask it for a pane. Used by `:spawn --split`.
