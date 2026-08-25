@@ -8,16 +8,18 @@
 //!
 //! ## The kitty graphics protocol, and the tax tmux puts on it
 //!
-//! A picture reaches a terminal as an escape sequence carrying base64. The fast way is shared
-//! memory — the program writes the pixels to a `/dev/shm` object and sends the *name* — and it is
-//! not available here: bru's user runs tmux inside kitty, and tmux is the one reading the escape.
-//! What works through a multiplexer is passthrough: tmux forwards a `DCS tmux;` wrapper to the
-//! terminal underneath, with every escape byte doubled, and `allow-passthrough` must be on for it
-//! to forward anything at all.
+//! A picture reaches a terminal as an escape sequence carrying base64 — four bytes on the wire for
+//! three of picture, and under tmux every 4096-byte chunk carries a `DCS tmux;` passthrough wrapper
+//! on top (with `allow-passthrough` on, or nothing is forwarded at all).
 //!
-//! So every frame goes down the pty as base64 — four bytes on the wire for three of picture — and
-//! every 4096-byte chunk of it carries its own wrapper. **That is the number this module measures**,
-//! and it is the number that decides whether the plan's C4 can use the transport it assumes.
+//! The other way is shared memory: the program writes the pixels into a `/dev/shm` object and sends
+//! only the **name**, and kitty opens it, reads it and unlinks it.
+//!
+//! **This module was written believing a multiplexer takes that away, and the measurement said
+//! otherwise.** Measured 2026-08-25 in tmux inside kitty, 990x1350: base64 is 8 fps, shared memory
+//! is 78 fps with every frame confirmed — 9.7x. tmux forwards the escape and kitty does the opening,
+//! so nothing about locality changed; the belief was wrong and cost nothing only because it was
+//! tested before anything was built on it. That is what this module is for.
 
 use std::io::{Read, Write};
 use std::time::Instant;
@@ -265,6 +267,89 @@ fn test_frame(width: u32, height: u32, phase: u32) -> Vec<u8> {
     rgb
 }
 
+/// Hand the pixels over in `/dev/shm` instead of down the pty.
+///
+/// **The transport the plan assumed a multiplexer takes away.** kitty's `t=s` says "the payload is
+/// the *name* of a POSIX shared memory object"; kitty opens it, reads the pixels and unlinks it. The
+/// assumption worth testing is that tmux does not break this: tmux only forwards the escape, and
+/// the object is opened by kitty on the same machine either way. If that holds, the 5 MB of base64
+/// this replaces never enters a pipe at all.
+///
+/// Returns the name it created, so the caller can unlink it if kitty never did — a terminal that
+/// ignores the escape would otherwise leave 4 MB in `/dev/shm` per frame.
+fn write_image_shm(
+    out: &mut impl Write,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    sequence: u32,
+) -> std::io::Result<Option<String>> {
+    let name = format!("/bru-probe-{}-{sequence}", std::process::id());
+    let c_name = std::ffi::CString::new(name.clone()).expect("no NUL in a formatted name");
+    // SAFETY: `c_name` is a valid NUL-terminated string that outlives the call. O_EXCL means this
+    // either creates a new object or fails; it never opens somebody else's.
+    let fd = unsafe {
+        libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600)
+    };
+    if fd < 0 {
+        return Ok(None);
+    }
+    // From here every exit has to close the descriptor and unlink the object, or the failure leaks.
+    let cleanup = |fd: i32| {
+        // SAFETY: `fd` came from `shm_open` above and is closed exactly once.
+        unsafe { libc::close(fd) };
+    };
+    // SAFETY: `fd` is a shared memory object this function just created and owns.
+    if unsafe { libc::ftruncate(fd, rgb.len() as libc::off_t) } != 0 {
+        cleanup(fd);
+        // SAFETY: the name is ours and the object exists.
+        unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        return Ok(None);
+    }
+    // SAFETY: the object has just been sized to `rgb.len()`, so a mapping of that length is within
+    // it; `MAP_SHARED` is what makes the bytes visible to the reader.
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            rgb.len(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        cleanup(fd);
+        // SAFETY: as above.
+        unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        return Ok(None);
+    }
+    // SAFETY: `mapped` is a writable mapping of exactly `rgb.len()` bytes, and the two regions
+    // cannot overlap — one is an anonymous file mapping, the other this process's heap.
+    unsafe { std::ptr::copy_nonoverlapping(rgb.as_ptr(), mapped.cast::<u8>(), rgb.len()) };
+    // SAFETY: unmapping the mapping just made, with the length it was made with.
+    unsafe { libc::munmap(mapped, rgb.len()) };
+    cleanup(fd);
+
+    // The payload of a graphics escape is always base64, the name included.
+    let payload = format!(
+        "\x1b_Ga=T,i=1,f=24,t=s,s={width},v={height},C=1;{}\x1b\\",
+        base64(name.as_bytes())
+    );
+    out.write_all(passthrough(&payload).as_bytes())?;
+    out.flush()?;
+    Ok(Some(name))
+}
+
+/// Remove a shared memory object kitty did not take.
+fn unlink_shm(name: &str) {
+    if let Ok(c_name) = std::ffi::CString::new(name) {
+        // SAFETY: the name is one this process created; unlinking a name that is already gone
+        // fails harmlessly and is not checked for that reason.
+        unsafe { libc::shm_unlink(c_name.as_ptr()) };
+    }
+}
+
 /// Wait for kitty to say it has the picture.
 ///
 /// **This is the difference between measuring a terminal and measuring a pipe.** Without it, the
@@ -365,6 +450,55 @@ fn measure(
     Ok(cost)
 }
 
+/// The same measurement, with the pixels handed over in shared memory instead of down the pty.
+///
+/// `pixels` is unchanged, `encode` is zero by construction — there is no base64 of a picture, only
+/// of a short name — and `write` is the copy into `/dev/shm` plus whatever kitty does with it.
+fn measure_shm(
+    width: u32,
+    height: u32,
+    budget: std::time::Duration,
+    stdin: &mut std::io::Stdin,
+) -> Result<Cost, String> {
+    let mut out = std::io::stdout();
+    let mut cost = Cost {
+        width,
+        height,
+        frames: 0,
+        acked: 0,
+        pixels: <_>::default(),
+        encode: <_>::default(),
+        write: <_>::default(),
+    };
+    let started = Instant::now();
+    let mut phase = 0u32;
+    while started.elapsed() < budget && cost.frames < 120 {
+        let at = Instant::now();
+        let frame = test_frame(width, height, phase);
+        cost.pixels += at.elapsed();
+
+        let at = Instant::now();
+        let _ = out.write_all(b"\x1b[H");
+        let name = write_image_shm(&mut out, &frame, width, height, phase)
+            .map_err(|e| format!("could not write the image: {e}"))?;
+        let acked = read_ack(stdin);
+        cost.write += at.elapsed();
+        if acked {
+            cost.acked += 1;
+        }
+        // kitty unlinks what it reads. What it did not read is ours to remove, or every frame
+        // leaves its megabytes behind.
+        if let Some(name) = name {
+            if !acked {
+                unlink_shm(&name);
+            }
+        }
+        cost.frames += 1;
+        phase += 1;
+    }
+    Ok(cost)
+}
+
 /// `bru --term-probe`: draw into this pane at three sizes and say what each one cost.
 ///
 /// **Nothing is printed while a picture is on screen.** kitty draws images over the cells, so the
@@ -392,6 +526,13 @@ pub fn probe() -> Result<(), String> {
         measured.push(cost?);
     }
 
+    // And the same full-pane picture again, handed over in shared memory rather than as base64.
+    let shm = measure_shm(pane.width, pane.height, std::time::Duration::from_millis(1500), &mut stdin);
+    let _ = delete_images(&mut out);
+    let _ = out.write_all(b"\x1b[H\x1b[2J");
+    let _ = out.flush();
+    let shm = shm?;
+
     // The screen belongs to the text again before a word of it is written.
     let _ = delete_images(&mut out);
     let _ = out.write_all(b"\x1b[H\x1b[2J\x1b[?25h");
@@ -404,8 +545,8 @@ pub fn probe() -> Result<(), String> {
     );
     if in_tmux() {
         println!(
-            "tmux: yes — shared memory is unavailable, so every frame goes down the pty as base64, \n\
-             wrapped per 4 KB chunk. This is the worst transport the protocol has."
+            "tmux: yes — base64 frames carry a passthrough wrapper per 4 KB chunk. Whether shared \n\
+             memory survives the multiplexer is measured below rather than assumed."
         );
     }
     if cfg!(debug_assertions) {
@@ -431,10 +572,39 @@ pub fn probe() -> Result<(), String> {
             cost.frames
         );
     }
+    println!(
+        "  {:>11}  {:>8.0}ms  {:>8.0}ms  {:>8.0}ms  {:>7.1}  {:>3}/{:<3}   <- shared memory",
+        format!("{}x{}", shm.width, shm.height),
+        shm.pixels.as_secs_f64() * 1000.0 / f64::from(shm.frames.max(1)),
+        shm.encode.as_secs_f64() * 1000.0 / f64::from(shm.frames.max(1)),
+        shm.per_frame() * 1000.0,
+        shm.fps(),
+        shm.acked,
+        shm.frames
+    );
+    println!();
+    if shm.acked == 0 {
+        println!(
+            "shared memory: kitty confirmed none of those, so `t=s` did not work here — the row \n\
+             above is the cost of writing to /dev/shm for nobody."
+        );
+    } else if let Some(full) = measured.last() {
+        println!(
+            "shared memory: {:.0} fps against {:.0} fps for base64 — {:.1}x.",
+            shm.fps(),
+            full.fps(),
+            shm.fps() / full.fps().max(f64::MIN_POSITIVE)
+        );
+    }
     println!();
 
-    let full = measured.last();
-    let acknowledged = measured.iter().any(|cost| cost.acked > 0);
+    // **The verdict is about the best transport that works, not about the first one tried.** The
+    // first version judged on base64 alone and printed "the transport is the limit" directly under
+    // a row showing shared memory doing the same picture ten times faster.
+    let base64_fps = measured.last().map(Cost::fps).unwrap_or_default();
+    let best = if shm.acked > 0 { shm.fps().max(base64_fps) } else { base64_fps };
+    let full = Some(best);
+    let acknowledged = measured.iter().any(|cost| cost.acked > 0) || shm.acked > 0;
     if !acknowledged {
         println!(
             "verdict: the terminal acknowledged nothing, so the `terminal` column is the speed of \n\
@@ -443,19 +613,19 @@ pub fn probe() -> Result<(), String> {
         );
         return Ok(());
     }
-    match full.map(Cost::fps) {
+    let by = if shm.acked > 0 && shm.fps() >= base64_fps { "shared memory" } else { "base64" };
+    match full {
         Some(fps) if fps >= 30.0 => println!(
-            "verdict: {fps:.0} fps at full pane, confirmed frame by frame. The transport is not \n\
-             what will limit a browser here."
+            "verdict: {fps:.0} fps at full pane over {by}, confirmed frame by frame. The transport \n\
+             is not what will limit a browser in this pane."
         ),
         Some(fps) if fps >= 12.0 => println!(
-            "verdict: {fps:.0} fps at full pane. Reading and scrolling are fine; video is not. \n\
-             Sending the picture smaller than the pane buys the difference."
+            "verdict: {fps:.0} fps at full pane over {by}. Reading and scrolling are fine; video is \n\
+             not. Sending the picture smaller than the pane buys the difference."
         ),
         Some(fps) => println!(
-            "verdict: {fps:.0} fps at full pane — the transport is the limit. Either the picture \n\
-             goes smaller than the pane, or this needs a terminal reached without a multiplexer \n\
-             in the way, where shared memory is available."
+            "verdict: {fps:.0} fps at full pane, and {by} is the best transport that worked here. \n\
+             The picture has to go smaller than the pane, or be compressed before it is sent."
         ),
         None => println!("verdict: the pane is too small to measure."),
     }
