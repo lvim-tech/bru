@@ -35,11 +35,12 @@ pub fn stop() {
     STOPPING.store(true, Ordering::Relaxed);
 }
 
-/// Read the terminal until told to stop.
-pub fn start() {
+/// Read the terminal until told to stop, beginning with bytes somebody else already read.
+pub fn start_with(pushback: Vec<u8>) {
     STOPPING.store(false, Ordering::Relaxed);
-    let _ = std::thread::Builder::new().name("bru-term-input".to_string()).spawn(|| {
+    let _ = std::thread::Builder::new().name("bru-term-input".to_string()).spawn(move || {
         let mut buffer: Vec<u8> = Vec::with_capacity(256);
+        buffer.extend_from_slice(&pushback);
         let mut chunk = [0u8; 256];
         let mut stdin = std::io::stdin();
         while !STOPPING.load(Ordering::Relaxed) {
@@ -97,7 +98,21 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
 const WHEEL_UP: u16 = 64;
 const WHEEL_DOWN: u16 = 65;
 
+/// How many mouse reports to log before going quiet.
+///
+/// **Three, because the question they answer is binary and asking it forever would be a log per
+/// pointer movement.** Either reports arrive or they do not; if they do, three of them show whether
+/// the numbers are cells or pixels.
+static MOUSE_SEEN: AtomicI32 = AtomicI32::new(0);
+
 fn post_mouse(mouse: TermMouse) {
+    let seen = MOUSE_SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen < 3 {
+        eprintln!(
+            "bru[term]: mouse report {seen}: button={} at ({},{}) pressed={} motion={} mods={}",
+            mouse.button, mouse.x, mouse.y, mouse.pressed, mouse.motion, mouse.modifiers
+        );
+    }
     // **A motion report with no button held is not something to send.** The terminal is asked for
     // 1002, which reports movement only while a button is down, but a terminal that answers 1003 as
     // well would otherwise post a task per pixel of pointer travel.

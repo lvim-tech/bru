@@ -146,6 +146,28 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         return Err("the terminal frontend is already running".to_string());
     }
     ACTIVE.store(true, Ordering::Relaxed);
+    // What the terminal actually agreed to, in the log rather than guessed at later. The mouse in
+    // particular has three ways to be wrong and they are indistinguishable from the outside: not
+    // forwarded at all, forwarded in cells, forwarded in pixels.
+    {
+        let guard = TERM.get().and_then(|term| term.lock().ok());
+        if let Some(guard) = guard {
+            eprintln!(
+                "bru[term]: pane {}x{} px, {}x{} cells ({}x{} per cell) via {:?}; tmux={}; \
+                 kitty-keyboard={:?}; mouse-pixels={}",
+                guard.size.width,
+                guard.size.height,
+                guard.size.cols,
+                guard.size.rows,
+                guard.size.cell_width,
+                guard.size.cell_height,
+                guard.size.source,
+                guard.session.in_tmux(),
+                guard.session.kitty_flags_before(),
+                guard.session.mouse_in_pixels(),
+            );
+        }
+    }
 
     // **A window slot, even with no window in it.** Everything in `state.rs` is keyed by one —
     // which mode keys are in, which browsers are chrome, which tab is showing — and none of that is
@@ -155,7 +177,15 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     for kind in SURFACES {
         create_surface(state, kind, url)?;
     }
-    crate::term_input::start();
+    // **Whatever was typed while the terminal was being asked questions.** `enter` reads the
+    // replies to its own queries off the same stdin the keyboard uses, and anything that was not a
+    // reply is kept rather than thrown away. Handing it to the input loop before that loop starts
+    // is what keeps a keystroke made during startup from being swallowed.
+    let pushback = TERM
+        .get()
+        .and_then(|term| term.lock().ok().map(|mut guard| guard.session.take_pushback()))
+        .unwrap_or_default();
+    crate::term_input::start_with(pushback);
     watch_size();
     Ok(())
 }
