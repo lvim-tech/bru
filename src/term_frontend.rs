@@ -612,6 +612,20 @@ pub fn set_pointer_shape(cursor: CursorType) {
 /// so comparing pointers compares the names without a lock or an allocation.
 static LAST_SHAPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// What an empty part of the pane is painted with.
+///
+/// The chrome's own background, so a gap where a surface has not painted yet reads as part of the
+/// browser rather than as a hole in it. Black if the theme has no answer — the one colour that is
+/// never mistaken for content.
+fn background() -> [u8; 3] {
+    match crate::chrome::chrome_background() {
+        // The chrome colour is `0xAARRGGBB` and opaque by construction; the alpha is dropped here
+        // for the same reason the compositor drops it — the terminal shows what is under nothing.
+        Some(colour) => [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8],
+        None => [0, 0, 0],
+    }
+}
+
 /// Where the page sits in the pane, in device pixels.
 ///
 /// The terminal reports a click in the pane's coordinates; the page is a rectangle inside it, under
@@ -692,6 +706,13 @@ fn present(term: &mut TermState) {
     if layers.is_empty() {
         return;
     }
+    // **The frame is wiped before the surfaces go back into it.** It is kept across frames, so a
+    // surface that shrank — or one whose last picture was dropped because its rectangle moved —
+    // leaves its old pixels exactly where they were. Measured 2026-08-26: the completion table drew
+    // over itself three times as it grew, each earlier and shorter render still legible under the
+    // current one. Filling costs one pass over 4 MB against a frame that already costs a composite
+    // and a transmit, and it is the difference between a picture and a palimpsest.
+    term.frame.fill(term.layout.pane, background());
     // **The popup goes on last, because it goes on top.** `compose` treats the order of the layers
     // as the z-order, and a `<select>` dropdown that drew under its own page would be a menu you
     // could see the edge of and never read.
