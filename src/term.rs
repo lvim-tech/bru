@@ -42,8 +42,11 @@ impl Raw {
             return Err("not a terminal".to_string());
         }
         let mut raw = saved;
-        // SAFETY: `raw` is a termios this function owns and has just filled from the terminal.
-        unsafe { libc::cfmakeraw(&mut raw) };
+        // **`cfmakeraw` would clear `ISIG`, and that is how a probe becomes unkillable.** Measured
+        // 2026-08-25: with the terminal drowning in queued frames, Ctrl-C reached a program that
+        // had turned the signal into a byte. Only echo and line-buffering are in the way of reading
+        // a reply, so only those two come off; ISIG stays and Ctrl-C stays a signal.
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON);
         // A query's answer arrives in one read or not at all: VMIN 0 with VTIME in tenths means a
         // read that waits at most that long and then gives up, which is what keeps a terminal that
         // does not answer from hanging the probe.
@@ -173,6 +176,18 @@ pub fn pane() -> Result<Pane, String> {
     Ok(Pane { width, height, cols, rows, source: "CSI 14t" })
 }
 
+/// Delete every image the terminal is holding for us.
+///
+/// **Through [`passthrough`], and that is the whole reason this is a function.** The first version
+/// wrote this escape straight to stdout while `write_image` wrapped its own — so under tmux the
+/// pictures were delivered and the deletes were eaten, and the last frame sat on top of the report
+/// it was supposed to be read with. A graphics escape that does not go through the same door as the
+/// others is a graphics escape that does not arrive.
+pub fn delete_images(out: &mut impl Write) -> std::io::Result<()> {
+    out.write_all(passthrough("\x1b_Ga=d,d=A\x1b\\").as_bytes())?;
+    out.flush()
+}
+
 /// How many bytes of base64 go in one escape. The protocol's own limit is 4096.
 const CHUNK: usize = 4096;
 
@@ -193,7 +208,12 @@ pub fn write_image(
         let end = (sent + CHUNK).min(encoded.len());
         let more = i32::from(end < encoded.len());
         let control = if first {
-            format!("a=T,q=2,i=1,f=24,s={width},v={height},C=1,m={more}")
+            // **No `q` at all, which is `q=0`, which is the only setting that answers.** kitty's
+            // levels are: 0 respond, 1 suppress the "OK" and keep errors, 2 suppress everything.
+            // The first version asked for `q=2` — nothing to wait for — so frames went into the
+            // pty as fast as `write` would take them and the terminal fell behind by however much
+            // memory the buffers had. The response is the backpressure; see [`draw_and_wait`].
+            format!("a=T,i=1,f=24,s={width},v={height},C=1,m={more}")
         } else {
             format!("m={more}")
         };
@@ -245,15 +265,48 @@ fn test_frame(width: u32, height: u32, phase: u32) -> Vec<u8> {
     rgb
 }
 
+/// Wait for kitty to say it has the picture.
+///
+/// **This is the difference between measuring a terminal and measuring a pipe.** Without it, the
+/// write returns as soon as the bytes are in a buffer somebody else will drain, so the "terminal"
+/// column reports the speed of `memcpy` and the queue behind it grows until the pane stops
+/// answering — which is exactly what happened on 2026-08-25 at 12 MB a frame through tmux.
+///
+/// The response is `ESC _ G ... ESC \`, and all that is needed is its terminator. `false` means
+/// none arrived before the read timed out (`VTIME`), which is a fact about the terminal worth
+/// reporting rather than an error: a multiplexer that swallows the reply leaves the measurement
+/// write-only, and the caller says so instead of quietly printing a number that means nothing.
+fn read_ack(stdin: &mut std::io::Stdin) -> bool {
+    let mut byte = [0u8; 1];
+    let mut after_escape = false;
+    // Bounded, because a terminal answering something else entirely must not spin here.
+    for _ in 0..8192 {
+        match stdin.read(&mut byte) {
+            Ok(1) => {
+                if after_escape && byte[0] == b'\\' {
+                    return true;
+                }
+                after_escape = byte[0] == 0x1b;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// One size's worth of measurement, with the three costs kept apart.
 ///
 /// **They are three and not one, and lumping them is how a spike lies.** Making the pixels is bru's
 /// own arithmetic and is what a debug build makes look terrible; base64 is the protocol's tax and
 /// scales with the picture; the write is the terminal's — the pty, tmux's passthrough, and kitty
-/// decoding and uploading a texture. Only the third is the thing this module exists to find out,
-/// and it is the smallest of the three in a debug build, so a single number would have buried it.
+/// decoding and uploading a texture. Only the third is the thing this module exists to find out.
 struct Cost {
+    width: u32,
+    height: u32,
     frames: u32,
+    /// How many of those frames the terminal actually confirmed. Fewer than `frames` means the
+    /// number below is a lower bound on speed and an upper bound on truth.
+    acked: u32,
     pixels: std::time::Duration,
     encode: std::time::Duration,
     write: std::time::Duration,
@@ -263,16 +316,32 @@ impl Cost {
     fn per_frame(&self) -> f64 {
         self.write.as_secs_f64() / f64::from(self.frames.max(1))
     }
+    fn fps(&self) -> f64 {
+        1.0 / self.per_frame().max(f64::MIN_POSITIVE)
+    }
 }
 
-/// Draw at one size for about `budget`, and report where the time went.
-fn measure(width: u32, height: u32, budget: std::time::Duration) -> Result<Cost, String> {
+/// Draw at one size until the budget runs out, waiting for each frame to land before sending the
+/// next one.
+fn measure(
+    width: u32,
+    height: u32,
+    budget: std::time::Duration,
+    stdin: &mut std::io::Stdin,
+) -> Result<Cost, String> {
     let mut out = std::io::stdout();
-    let mut cost =
-        Cost { frames: 0, pixels: <_>::default(), encode: <_>::default(), write: <_>::default() };
+    let mut cost = Cost {
+        width,
+        height,
+        frames: 0,
+        acked: 0,
+        pixels: <_>::default(),
+        encode: <_>::default(),
+        write: <_>::default(),
+    };
     let started = Instant::now();
     let mut phase = 0u32;
-    while started.elapsed() < budget && cost.frames < 60 {
+    while started.elapsed() < budget && cost.frames < 120 {
         let at = Instant::now();
         let frame = test_frame(width, height, phase);
         cost.pixels += at.elapsed();
@@ -285,6 +354,9 @@ fn measure(width: u32, height: u32, budget: std::time::Duration) -> Result<Cost,
         let _ = out.write_all(b"\x1b[H");
         write_image(&mut out, &encoded, width, height)
             .map_err(|e| format!("could not write the image: {e}"))?;
+        if read_ack(stdin) {
+            cost.acked += 1;
+        }
         cost.write += at.elapsed();
 
         cost.frames += 1;
@@ -295,11 +367,37 @@ fn measure(width: u32, height: u32, budget: std::time::Duration) -> Result<Cost,
 
 /// `bru --term-probe`: draw into this pane at three sizes and say what each one cost.
 ///
-/// **A sweep and not one size**, because the first attempt drew 30 full-pane frames — 358 MB of
-/// base64 through tmux — printed nothing until it was done, and looked like a hang. What a person
-/// needs from this is where the cliff is, and one size cannot show a cliff.
+/// **Nothing is printed while a picture is on screen.** kitty draws images over the cells, so the
+/// first version's report was rendered underneath its own last frame and could not be read — the
+/// measurements are collected in silence, the images are deleted, and only then is the table
+/// written.
 pub fn probe() -> Result<(), String> {
     let pane = pane()?;
+    let raw = Raw::enter()?;
+    let mut stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[?25l\x1b[H\x1b[2J");
+    let _ = out.flush();
+
+    let mut measured = Vec::new();
+    for divisor in [4u32, 2, 1] {
+        let (width, height) = (pane.width / divisor, pane.height / divisor);
+        if width < 16 || height < 16 {
+            continue;
+        }
+        let cost = measure(width, height, std::time::Duration::from_millis(1500), &mut stdin);
+        let _ = delete_images(&mut out);
+        let _ = out.write_all(b"\x1b[H\x1b[2J");
+        let _ = out.flush();
+        measured.push(cost?);
+    }
+
+    // The screen belongs to the text again before a word of it is written.
+    let _ = delete_images(&mut out);
+    let _ = out.write_all(b"\x1b[H\x1b[2J\x1b[?25h");
+    let _ = out.flush();
+    drop(raw);
+
     println!(
         "pane: {}x{} px, {}x{} cells, via {}",
         pane.width, pane.height, pane.cols, pane.rows, pane.source
@@ -312,59 +410,55 @@ pub fn probe() -> Result<(), String> {
     }
     if cfg!(debug_assertions) {
         println!(
-            "build: debug — making the pixels and the base64 are unoptimised here and are NOT what \n\
-             this measures. Watch the `terminal` column; build --release for the other two."
+            "build: debug — `pixels` and `base64` are unoptimised here and are NOT what this \n\
+             measures. Read the `terminal` column; build --release for the other two."
         );
     }
     println!();
-    println!("  {:>11}  {:>9}  {:>9}  {:>9}  {:>8}", "size", "pixels", "base64", "terminal", "fps");
-
-    let mut full = None;
-    for divisor in [4u32, 2, 1] {
-        let (width, height) = (pane.width / divisor, pane.height / divisor);
-        if width < 16 || height < 16 {
-            continue;
-        }
-        let cost = measure(width, height, std::time::Duration::from_millis(1500))?;
-        // Back to the top-left and clear, so the next size does not sit under the last one's frame.
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J");
-        let _ = out.flush();
-        let fps = 1.0 / cost.per_frame().max(f64::MIN_POSITIVE);
+    println!(
+        "  {:>11}  {:>9}  {:>9}  {:>9}  {:>7}  {:>7}",
+        "size", "pixels", "base64", "terminal", "fps", "acked"
+    );
+    for cost in &measured {
         println!(
-            "  {:>11}  {:>8.0}ms  {:>8.0}ms  {:>8.0}ms  {:>8.1}",
-            format!("{width}x{height}"),
+            "  {:>11}  {:>8.0}ms  {:>8.0}ms  {:>8.0}ms  {:>7.1}  {:>3}/{:<3}",
+            format!("{}x{}", cost.width, cost.height),
             cost.pixels.as_secs_f64() * 1000.0 / f64::from(cost.frames.max(1)),
             cost.encode.as_secs_f64() * 1000.0 / f64::from(cost.frames.max(1)),
             cost.per_frame() * 1000.0,
-            fps
+            cost.fps(),
+            cost.acked,
+            cost.frames
         );
-        if divisor == 1 {
-            full = Some(fps);
-        }
     }
-
     println!();
-    match full {
+
+    let full = measured.last();
+    let acknowledged = measured.iter().any(|cost| cost.acked > 0);
+    if !acknowledged {
+        println!(
+            "verdict: the terminal acknowledged nothing, so the `terminal` column is the speed of \n\
+             writing into a buffer and not of drawing. Under tmux this usually means \n\
+             `allow-passthrough` is off, or the reply is not being forwarded back."
+        );
+        return Ok(());
+    }
+    match full.map(Cost::fps) {
         Some(fps) if fps >= 30.0 => println!(
-            "verdict: the terminal keeps up at full pane ({fps:.0} fps of writing). A browser here \n\
-             is watchable, and the transport is not what will limit it."
+            "verdict: {fps:.0} fps at full pane, confirmed frame by frame. The transport is not \n\
+             what will limit a browser here."
         ),
         Some(fps) if fps >= 12.0 => println!(
-            "verdict: {fps:.0} fps of writing at full pane. Reading and scrolling are fine; video \n\
-             is not. A smaller pane or a scaled-down picture buys the difference."
+            "verdict: {fps:.0} fps at full pane. Reading and scrolling are fine; video is not. \n\
+             Sending the picture smaller than the pane buys the difference."
         ),
         Some(fps) => println!(
-            "verdict: {fps:.0} fps at full pane — the transport is the limit. Either the picture is \n\
-             sent smaller than the pane, or this needs a terminal where shared memory is reachable \n\
-             (i.e. not through tmux)."
+            "verdict: {fps:.0} fps at full pane — the transport is the limit. Either the picture \n\
+             goes smaller than the pane, or this needs a terminal reached without a multiplexer \n\
+             in the way, where shared memory is available."
         ),
         None => println!("verdict: the pane is too small to measure."),
     }
-    println!(
-        "the `terminal` column is the only one that says anything about this terminal; the other \n\
-         two are bru's own arithmetic and belong to the CPU."
-    );
     Ok(())
 }
 
