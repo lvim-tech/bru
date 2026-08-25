@@ -100,6 +100,24 @@ pub enum FirstTab<'a> {
 pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
     debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // **A terminal run has one pane, so it has one window.** Making a second here would build a CEF
+    // Views window — a real one, on the desktop, beside the terminal — which is not what `:open -w`
+    // means to somebody looking at a pane. The window that exists is answered instead, and the
+    // caller's tab goes into it; `open` below says so out loud, once, so this is not silent.
+    //
+    // The genuine analogue of a second window is a second *pane*, and that is `:spawn --split`
+    // (`terminal.rs`) — a separate bru, which is also a separate Chromium profile, and therefore a
+    // separate set of logins. Saying that is better than pretending either way.
+    if crate::term_frontend::is_active() {
+        return state
+            .lock()
+            .expect("state mutex poisoned")
+            .current_window_id()
+            .unwrap_or(0);
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
+
     // Before anything else: the three delegates below all carry this id, and the first tab needs
     // somewhere to be pushed.
     let window_id = state
@@ -204,6 +222,16 @@ pub fn create(state: &SharedState, first: FirstTab<'_>) -> u32 {
 
 /// Open a window on `url` and bring it to the front — every `-w` spelling, and `U`.
 pub fn open(state: &SharedState, url: &str) -> u32 {
+    if crate::term_frontend::is_active() {
+        // The page is still opened — the request was to see it, and the window was how. See
+        // `create` for why a terminal has one window.
+        crate::message::info(
+            "a terminal pane holds one window; opened in a tab. `:spawn --split bru --term <url>`              gives a pane of its own",
+        );
+        let window_id = create(state, FirstTab::None);
+        tabs::new_tab_in(state, window_id, url, false);
+        return window_id;
+    }
     let window_id = create(state, FirstTab::Url(url));
     tabs::focus(state, window_id);
     window_id
