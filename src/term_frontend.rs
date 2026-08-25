@@ -472,6 +472,57 @@ pub fn show_page(identifier: i32) {
     crate::term_input::aim_at(identifier);
 }
 
+/// Show the pointer shape the page is asking for.
+///
+/// **kitty takes a CSS pointer name over OSC 22**, which is the only way a program in a terminal can
+/// say anything about the mouse pointer — it is drawn by the terminal and bru never touches it.
+/// Without this the pointer stays an I-beam over every link, which is the one piece of feedback a
+/// person uses to tell a link from text.
+///
+/// Wrapped for tmux like every other escape meant for the terminal underneath: tmux has no idea what
+/// OSC 22 is and would eat it.
+pub fn set_pointer_shape(cursor: CursorType) {
+    if !is_active() {
+        return;
+    }
+    // CEF's `cef_cursor_type_t` against the CSS names kitty answers to. Only the shapes a page
+    // actually asks for are named; everything else is the default, because a pointer that guessed
+    // would be a pointer that lies about what is under it.
+    let shape = match cursor.get_raw() {
+        x if x == CursorType::HAND.get_raw() => "pointer",
+        x if x == CursorType::IBEAM.get_raw() => "text",
+        x if x == CursorType::WAIT.get_raw() => "wait",
+        x if x == CursorType::CROSS.get_raw() => "crosshair",
+        x if x == CursorType::HELP.get_raw() => "help",
+        x if x == CursorType::EASTWESTRESIZE.get_raw()
+            || x == CursorType::EASTRESIZE.get_raw()
+            || x == CursorType::WESTRESIZE.get_raw() =>
+        {
+            "ew-resize"
+        }
+        x if x == CursorType::NORTHSOUTHRESIZE.get_raw()
+            || x == CursorType::NORTHRESIZE.get_raw()
+            || x == CursorType::SOUTHRESIZE.get_raw() =>
+        {
+            "ns-resize"
+        }
+        _ => "default",
+    };
+    if LAST_SHAPE.swap(shape.as_ptr() as usize, Ordering::Relaxed) == shape.as_ptr() as usize {
+        // The same shape twice is the same shape. A page reports a cursor per mouse move, and an
+        // escape per move would be a write to the terminal for every pixel of pointer travel.
+        return;
+    }
+    let payload = format!("\x1b]22;{shape}\x1b\\");
+    let mut out = std::io::stdout();
+    let _ = out.write_all(crate::term_session::passthrough(&payload).as_bytes());
+    let _ = out.flush();
+}
+
+/// The last shape sent, by the address of its `&'static str` — the names are compile-time constants,
+/// so comparing pointers compares the names without a lock or an allocation.
+static LAST_SHAPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Where the page sits in the pane, in device pixels.
 ///
 /// The terminal reports a click in the pane's coordinates; the page is a rectangle inside it, under

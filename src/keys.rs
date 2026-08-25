@@ -625,6 +625,23 @@ wrap_display_handler! {
     }
 
     impl DisplayHandler {
+        // --- src/term_frontend.rs -----------------------------------------------------------
+        // **The pointer over a link.** In a window the toolkit changes the cursor and bru never
+        // hears about it; in a terminal the pointer belongs to the terminal, and this is the only
+        // notification that says what is under it. `1` would mean "bru drew the cursor itself",
+        // which it cannot — the answer is `0` and the shape is a request, not a claim.
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: ::std::os::raw::c_ulong,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> ::std::os::raw::c_int {
+            crate::term_frontend::set_pointer_shape(type_);
+            0
+        }
+        // --- end src/term_frontend.rs -------------------------------------------------------
+
         fn on_address_change(
             &self,
             browser: Option<&mut Browser>,

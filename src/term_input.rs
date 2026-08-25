@@ -105,6 +105,14 @@ const WHEEL_DOWN: u16 = 65;
 /// the numbers are cells or pixels.
 static MOUSE_SEEN: AtomicI32 = AtomicI32::new(0);
 
+/// Where the pointer was last reported, so a report that moved it nowhere costs nothing.
+///
+/// **Mode 1003 reports every motion, and most of them are the same cell twice.** A terminal reports
+/// in whatever resolution it has; two reports that resolve to one position are one position, and
+/// posting a task for the second is a task that tells Chromium what it already knows. Packed into
+/// one atomic so the reader thread needs no lock on the busiest path it has.
+static LAST_POINTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 fn post_mouse(mouse: TermMouse) {
     let seen = MOUSE_SEEN.fetch_add(1, Ordering::Relaxed);
     if seen < 3 {
@@ -113,13 +121,20 @@ fn post_mouse(mouse: TermMouse) {
             mouse.button, mouse.x, mouse.y, mouse.pressed, mouse.motion, mouse.modifiers
         );
     }
-    // **A motion report with no button held is not something to send.** The terminal is asked for
-    // 1002, which reports movement only while a button is down, but a terminal that answers 1003 as
-    // well would otherwise post a task per pixel of pointer travel.
-    if mouse.motion && !mouse.pressed {
-        return;
+    if mouse.motion {
+        let packed = (u64::from(mouse.x as u32) << 32) | u64::from(mouse.y as u32);
+        if LAST_POINTER.swap(packed, Ordering::Relaxed) == packed {
+            return;
+        }
     }
-    let mut task = MouseTask::new(mouse.button, mouse.x, mouse.y, mouse.modifiers, mouse.pressed);
+    let mut task = MouseTask::new(
+        mouse.button,
+        mouse.x,
+        mouse.y,
+        mouse.modifiers,
+        mouse.pressed,
+        mouse.motion,
+    );
     post_task(ThreadId::UI, Some(&mut task));
 }
 
@@ -130,6 +145,7 @@ wrap_task! {
         y: i32,
         modifiers: u32,
         pressed: bool,
+        motion: bool,
     }
 
     impl Task {
@@ -158,6 +174,14 @@ wrap_task! {
                 return;
             }
             let event = MouseEvent { x, y, modifiers: self.modifiers };
+
+            // **Pointing is its own event and most of them are only that.** Without it Chromium
+            // never learns the pointer moved: no `:hover`, no cursor over a link, and a click on
+            // anything that waits for a `mousemove` first does nothing.
+            if self.motion {
+                host.send_mouse_move_event(Some(&event), 0);
+                return;
+            }
 
             if matches!(self.button, WHEEL_UP | WHEEL_DOWN) {
                 // Only on the press: SGR reports a wheel notch once, and acting on the release too

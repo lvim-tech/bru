@@ -86,8 +86,16 @@ const CURSOR_SHOW: &str = "\x1b[?25h";
 /// `1016` is SGR-pixel encoding: reports carry pixel coordinates rather than cell coordinates, which
 /// is the whole reason this is worth having — CEF wants a pixel inside a 990x1350 surface, and a
 /// cell number would have to be multiplied back up by the cell size and would land the click up to
-/// 9 px left and 25 px above where the user pointed. `1002` is button-and-drag tracking: presses,
-/// releases, and motion *while a button is down*. `1003` (report every motion) is deliberately not
+/// 9 px left and 25 px above where the user pointed.
+///
+/// **`1003` and not `1002`, and it was the other way round until a browser needed hover.** `1002`
+/// reports motion only while a button is held, which is enough to drag and not enough to *point*:
+/// Chromium never learns that the pointer moved, so `:hover` never fires, the cursor never changes
+/// over a link, and a click on an element that expects a `mousemove` first does nothing at all.
+/// Measured 2026-08-25 — clicks that "sometimes worked" were clicks on elements that did not need
+/// the move. The cost is a report per pixel of pointer travel, and `term_input` answers that by
+/// dropping the ones that did not change anything. The old reasoning follows, kept because the
+/// trade it describes is real and is now simply decided the other way. `1003` was deliberately not
 /// used: it is a report per mouse-move at the terminal's polling rate, and `:hover` is not worth a
 /// flood of escape sequences through a pty.
 ///
@@ -99,8 +107,8 @@ const CURSOR_SHOW: &str = "\x1b[?25h";
 /// which caps its coordinates at 223 and which this codebase does not read. Measured 2026-08-25 in
 /// tmux, which speaks `1006` and not `1016`: with only `1016` asked for, not one click arrived in a
 /// form bru could use. Asking for both means SGR either way and pixels where they are on offer.
-const MOUSE_ON: &str = "\x1b[?1006h\x1b[?1016h\x1b[?1002h";
-const MOUSE_OFF: &str = "\x1b[?1002l\x1b[?1016l\x1b[?1006l";
+const MOUSE_ON: &str = "\x1b[?1006h\x1b[?1016h\x1b[?1003h";
+const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1016l\x1b[?1006l";
 
 /// Ask whether the pixel encoding actually took: `CSI ? 1016 $ p`.
 ///
@@ -1323,13 +1331,17 @@ mod tests {
     /// The encoding is set before the reporting mode, or the first click arrives in the old one.
     #[test]
     fn the_mouse_encoding_is_set_before_the_reporting_mode() {
-        assert!(MOUSE_ON.find("1016h").unwrap() < MOUSE_ON.find("1002h").unwrap());
+        assert!(MOUSE_ON.find("1016h").unwrap() < MOUSE_ON.find("1003h").unwrap());
         // **`1006` before `1016`, and both before the tracking mode.** `1016` extends SGR and a
         // terminal that does not know it ignores the escape, leaving the default X10 encoding —
         // which is the failure this ordering exists to prevent. Off in the mirror order.
         assert!(MOUSE_ON.find("1006h").unwrap() < MOUSE_ON.find("1016h").unwrap());
         assert!(MOUSE_OFF.find("1016l").unwrap() < MOUSE_OFF.find("1006l").unwrap());
-        assert!(MOUSE_OFF.find("1002l").unwrap() < MOUSE_OFF.find("1016l").unwrap());
+        // Every motion, so that pointing at something is something the page is told about.
+        assert!(MOUSE_ON.contains("1003h") && MOUSE_OFF.contains("1003l"));
+        // The tracking mode goes off first, so the last thing the terminal does with the mouse is
+        // stop reporting rather than change the encoding of reports it is still sending.
+        assert!(MOUSE_OFF.find("1003l").unwrap() < MOUSE_OFF.find("1016l").unwrap());
     }
 
     /// One write, and a device status report last so that the reader stops on an answer rather than
