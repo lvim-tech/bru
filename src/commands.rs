@@ -238,7 +238,7 @@ pub enum Command {
     /// `cmdline` is the whole rest of the line, unsplit: `spawn` is a `maxsplit=0` command and
     /// `src/spawn.rs` splits it with its own `shlex`, because the quotes have to survive
     /// (`spawn -u qute-pass -u "login: (.+)"` is three arguments, not four).
-    Spawn { cmdline: String, userscript: bool, detach: bool, messages: bool, verbose: bool },
+    Spawn { cmdline: String, userscript: bool, detach: bool, split: bool, messages: bool, verbose: bool },
     /// `edit-text` (`<Ctrl-E>` in insert mode), and `open-editor`, its pre-1.0 spelling.
     EditText,
     /// `insert-text <text>` — `<Shift-Ins>` is `insert-text -- {primary}`.
@@ -1552,12 +1552,30 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             let has = |names: &[&str]| names.iter().any(|n| flags.iter().any(|f| f == n));
             let userscript = has(&["u", "userscript"]);
             let detach = has(&["d", "detach"]);
+            // **Long form only, and that is not an oversight.** Flag parsing stops at the first
+            // non-flag word, so every short letter bru claims is one a *script* can no longer be
+            // given before its own arguments start — and `-s` is as common a script flag as they
+            // come. The four qutebrowser already spent are spent; this one is bru's own and can
+            // afford the four extra characters.
+            let split = has(&["split"]);
             if cmdline.is_empty() {
                 return Err(bad("needs something to run"));
             }
             // `cmdutils.check_exclusive((userscript, detach), 'ud')`.
             if userscript && detach {
                 return Err(bad("--userscript and --detach are mutually exclusive"));
+            }
+            // **The environment is why, and it is a hard why rather than a policy.** A userscript
+            // is bru's `BRU_*` variables and a FIFO to write back on — and a split does not run the
+            // program, it asks the *terminal's* process to run it. kitty spawns it from the kitty
+            // process, tmux from the server; neither inherits anything bru exported. A
+            // `--userscript --split` would start a script whose whole protocol was missing and
+            // whose failure would look like the script's own bug.
+            if userscript && split {
+                return Err(bad(
+                    "--userscript and --split are mutually exclusive: a pane is spawned by \
+                     the terminal, which does not inherit bru's BRU_* environment",
+                ));
             }
             // `-o` shows the output in a new tab, which needs a `bru://process/<pid>` page bru
             // does not have. Unimplemented rather than silently dropped: a `:spawn -o` that ran
@@ -1569,6 +1587,7 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
                     cmdline,
                     userscript,
                     detach,
+                    split,
                     messages: has(&["m", "output-messages"]),
                     verbose: has(&["v", "verbose"]),
                 }
@@ -3514,6 +3533,7 @@ mod tests {
                 cmdline: "~/.config/bru/userscripts/qute-pass".to_string(),
                 userscript: true,
                 detach: false,
+                split: false,
                 messages: false,
                 verbose: false,
             }
@@ -3526,6 +3546,7 @@ mod tests {
                 cmdline: "qute-pass --password-only".to_string(),
                 userscript: true,
                 detach: false,
+                split: false,
                 messages: false,
                 verbose: false,
             }
@@ -3541,6 +3562,39 @@ mod tests {
             crate::spawn::shlex(&cmdline).unwrap(),
             ["qute-pass", "-U", "secret", "-u", "login: (.+)", "-d", "dmenu"]
         );
+    }
+
+    /// `--split` is bru's own flag and has no short letter — see the comment beside its parse.
+    #[test]
+    fn spawn_can_ask_for_a_pane() {
+        let Command::Spawn { cmdline, split, userscript, .. } =
+            parse("spawn --split htop").unwrap()
+        else {
+            panic!("expected a spawn")
+        };
+        assert_eq!(cmdline, "htop");
+        assert!(split);
+        assert!(!userscript);
+        // Without it, nothing changes.
+        let Command::Spawn { split, .. } = parse("spawn htop").unwrap() else {
+            panic!("expected a spawn")
+        };
+        assert!(!split);
+        // And `-s` is a *script's* letter, so it stays in the tail where the script can read it.
+        let Command::Spawn { cmdline, split, .. } = parse("spawn mpv -s x.mkv").unwrap() else {
+            panic!("expected a spawn")
+        };
+        assert_eq!(cmdline, "mpv -s x.mkv");
+        assert!(!split);
+    }
+
+    /// A userscript in a pane would be a userscript with none of its environment — the terminal
+    /// spawns it, not bru. Refused at the parse rather than half-run.
+    #[test]
+    fn a_userscript_cannot_be_split_off_into_a_pane() {
+        let why = parse("spawn --userscript --split qute-pass").expect_err("refused");
+        assert!(format!("{why}").contains("mutually exclusive"), "{why}");
+        assert!(format!("{why}").contains("BRU_*"), "the reason is named: {why}");
     }
 
     #[test]

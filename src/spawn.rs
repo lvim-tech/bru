@@ -74,6 +74,9 @@ pub struct Opts {
     /// `-d` / `--detach`: put the child in its own process group with its standard streams on
     /// `/dev/null`, so it outlives bru and does not hold bru's terminal.
     pub detach: bool,
+    /// `--split`: run it in a new pane of the terminal bru was launched from, rather than as a
+    /// child of bru. See `terminal.rs` for which terminals can be asked and how.
+    pub split: bool,
     /// `-m` / `--output-messages`: show what the program printed as a message.
     pub output_messages: bool,
     /// `-v` / `--verbose`: say when it started and when it exited.
@@ -534,6 +537,48 @@ fn start(id: u64, selection: Option<String>) {
 /// A plain `:spawn`: no FIFO, no `BRU_*` environment, the process inherits bru's own.
 fn run_plain(command: &str, args: &[String], opts: Opts) {
     let path = expand_user(command);
+    // --- src/terminal.rs -----------------------------------------------------------------------
+    // **`--split` does not change what runs, it changes who runs it.** The terminal's own
+    // remote-control command becomes the program and the user's line becomes its tail, so
+    // everything below — the stdio, the wait, the `--verbose` line — applies to the *client* that
+    // asks for the pane, not to what ends up in it. That is the honest shape rather than a
+    // limitation to hide: `kitten @ launch` exits as soon as kitty has the window, so a
+    // `--verbose` split reports the client's pid and its immediate exit, and there is no child of
+    // bru's left to report on afterwards.
+    if opts.split {
+        let terminal = crate::terminal::detect();
+        let mut argv = vec![path.to_string_lossy().to_string()];
+        argv.extend(args.iter().cloned());
+        match crate::terminal::split_command(terminal, &argv) {
+            Some(line) => {
+                let (program, rest) = line.split_first().expect("split_command never answers empty");
+                let mut child = Command::new(program);
+                child.args(rest);
+                configure_stdio(&mut child, opts);
+                match child.spawn() {
+                    Ok(child) => {
+                        if opts.verbose {
+                            message(&format!("asked {program} for a pane (pid {})", child.id()));
+                        }
+                        watch(child, program.to_string(), opts, None);
+                    }
+                    Err(problem) => error(&format!(
+                        "spawn: could not run {program}: {problem} — {}",
+                        crate::terminal::split_hint(terminal)
+                    )),
+                }
+                return;
+            }
+            // No terminal to ask. Running it anyway beats refusing: the command is what the user
+            // wanted and the pane was how they wanted it shown, so the fallback says what it did
+            // instead of failing on a preference.
+            None => message(&format!(
+                "spawn: --split: {} — running it as a child of bru instead",
+                crate::terminal::split_hint(terminal)
+            )),
+        }
+    }
+    // --- end src/terminal.rs -------------------------------------------------------------------
     let mut child = Command::new(&path);
     child.args(args);
     configure_stdio(&mut child, opts);

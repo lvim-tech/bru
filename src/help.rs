@@ -393,11 +393,15 @@ pub const COMMANDS: &[Doc] = &[
     Doc { names: &["fake-key"], args: "<keystring>", flags: &["-g/--global"],
         what: "Send a keypress to the page as if it had been typed.", example: "fake-key <Escape>" },
     Doc { names: &["spawn"], args: "<command> [arguments…]",
-        flags: &["-u/--userscript", "-d/--detach", "-o/--output", "-m/--output-messages",
-                 "-v/--verbose"],
-        what: "Run a program, or with -u a userscript. -o would show the output in a tab bru has \
-               no page for, and the command does nothing when it is given rather than running the \
-               program and showing nothing.",
+        flags: &["-u/--userscript", "-d/--detach", "--split", "-o/--output",
+                 "-m/--output-messages", "-v/--verbose"],
+        what: "Run a program, or with -u a userscript. --split runs it in a new pane of the \
+               terminal bru was launched from (kitty, tmux or wezterm), and falls back to a child \
+               of bru with a message when there is no terminal to ask; it cannot be combined with \
+               -u, because the terminal spawns the program and does not inherit bru's BRU_* \
+               environment. -o would show the output in a tab bru has no page for, and the \
+               command does nothing when it is given rather than running the program and showing \
+               nothing.",
         example: "spawn true" },
     Doc { names: &["process"], args: "[pid] [show|terminate|kill]", flags: &[],
         what: "Look at what :spawn started, or stop it.", example: "process" },

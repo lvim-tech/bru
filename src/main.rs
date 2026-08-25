@@ -78,6 +78,8 @@ mod settings;
 mod settingspage;
 mod state;
 mod tabs;
+// Which terminal bru was launched from, and how to ask it for a pane. Used by `:spawn --split`.
+mod terminal;
 // How bru learns that ~/.config/bru/theme.css has been rewritten under it.
 mod theme_watch;
 // `bru --remote <line>` — the one door into a running browser from outside it.

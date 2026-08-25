@@ -673,7 +673,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         // is in `spawn.rs`'s module docs; what matters here is that a `Command::Spawn` can only be
         // built by `commands::parse`, and the three things that call it are a binding, the command
         // line, and a line a running userscript wrote back. A page reaches none of them.
-        Command::Spawn { cmdline, userscript, detach, messages, verbose } => {
+        Command::Spawn { cmdline, userscript, detach, split, messages, verbose } => {
             crate::spawn::spawn(
                 // The browser, because a `--userscript` has to ask the page what it has selected
                 // before it can build `BRU_SELECTED_TEXT`. It is the tab the key was aimed at, not
@@ -684,6 +684,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 crate::spawn::Opts {
                     userscript: *userscript,
                     detach: *detach,
+                    split: *split,
                     output_messages: *messages,
                     verbose: *verbose,
                 },
