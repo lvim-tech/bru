@@ -25,6 +25,9 @@ static TARGET: AtomicI32 = AtomicI32::new(0);
 /// Set when the loop should stop, so `leave` does not have to kill a thread.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// How many keys the reader has taken off the terminal, for the diagnostic above.
+static READ: AtomicI32 = AtomicI32::new(0);
+
 /// Aim the keyboard at a browser.
 pub fn aim_at(identifier: i32) {
     TARGET.store(identifier, Ordering::Relaxed);
@@ -82,6 +85,18 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
         match step {
             Step::Key(key, n) => {
                 buffer.drain(..n);
+                // **Logged on the reader's side, before anything is posted.** One line here and no
+                // matching line from `target_for` means the reader is alive and the UI thread is
+                // not; no line at all means the reader is where it stopped.
+                let seen = READ.fetch_add(1, Ordering::Relaxed);
+                if seen < 20 {
+                    eprintln!(
+                        "bru[term]: read {seen}: code={} char={} press={}",
+                        key.windows_key_code,
+                        key.character,
+                        key.is_press()
+                    );
+                }
                 if key.is_press() {
                     post(key);
                 }

@@ -136,7 +136,8 @@ fn index_of(kind: SurfaceKind) -> usize {
 pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> {
     let session = TerminalSession::enter()?;
     let size = session.size();
-    let layout = layout_for(size);
+    // Nothing is docked in a frontend that has not started yet.
+    let layout = layout_for(size, false);
     let frame = Frame::new(layout.pane.width, layout.pane.height)
         .ok_or("the pane is too small to draw a browser in")?;
     let placement = Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols);
@@ -300,7 +301,13 @@ pub fn divert_diagnostics() {
 }
 
 /// The layout for a pane of this size, at this scale.
-fn layout_for(size: PaneSize) -> Layout {
+///
+/// **`inspector` is a parameter and not a question this asks**, and that is not style. It used to
+/// call `inspector_open()`, which takes the state lock this module keeps — and both callers already
+/// hold it. `std::sync::Mutex` is not reentrant, so the second lock never returned: `:` opened the
+/// command line, the completion's new height reached `relayout`, and the browser stopped. Measured
+/// 2026-08-26. Every value this needs is now handed to it by someone holding the lock already.
+fn layout_for(size: PaneSize, inspector: bool) -> Layout {
     layout(&LayoutRequest {
         // The session measures in `u32` because a pixel count cannot be negative; the compositor
         // works in `i32` because a rectangle's corner can be. `try_into` rather than `as`: a pane
@@ -321,7 +328,7 @@ fn layout_for(size: PaneSize) -> Layout {
         panel_height: crate::window::completion_height(0),
         // The same number the Views delegate answers with, so a height dragged in one frontend
         // means the same thing in the other.
-        inspector_height: if inspector_open() { crate::devtools::height_for(0) } else { 0 },
+        inspector_height: if inspector { crate::devtools::height_for(0) } else { 0 },
     })
 }
 
@@ -339,7 +346,7 @@ pub fn relayout() {
         let Ok(mut guard) = term.lock() else {
             return;
         };
-        let next = layout_for(guard.size);
+        let next = layout_for(guard.size, guard.inspector);
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
@@ -728,7 +735,7 @@ pub fn resized(size: PaneSize) {
             return;
         }
         term.size = size;
-        term.layout = layout_for(size);
+        term.layout = layout_for(size, term.inspector);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.
