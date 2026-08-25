@@ -82,6 +82,11 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
+    /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
+    /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
+    /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
+    /// corruption.
+    popup_pixels: Option<Painted>,
 }
 
 /// A surface's last frame, kept because a repaint of one surface has to redraw all of them.
@@ -102,12 +107,14 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// The surfaces the MVP draws, in the order they are created and composed.
+/// The surfaces the frontend draws, in the order they are created and composed.
 ///
-/// The panel is absent and that is deliberate: it is zero-height until something opens it
-/// (`window.rs`'s `PANEL_HEIGHT`), and a fourth windowless browser that paints nothing is a fourth
-/// browser to keep in step for no picture. The inspector is absent for the reason `shell.rs` gives.
-const SURFACES: [SurfaceKind; 3] = [SurfaceKind::Page, SurfaceKind::Top, SurfaceKind::Bottom];
+/// The panel is here even though it is zero-height most of the time: it is where the completion
+/// table and the prompt are drawn, and a `:` with no completion under it is half a command line.
+/// Its height is whatever the page measured — see [`layout_for`]. The inspector is absent for the
+/// reason `shell.rs` gives.
+const SURFACES: [SurfaceKind; 4] =
+    [SurfaceKind::Page, SurfaceKind::Top, SurfaceKind::Bottom, SurfaceKind::Panel];
 
 fn index_of(kind: SurfaceKind) -> usize {
     SURFACES.iter().position(|&k| k == kind).unwrap_or(0)
@@ -133,6 +140,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         of_browser: Vec::new(),
         pending: None,
         popup: None,
+        popup_pixels: None,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -262,9 +270,54 @@ fn layout_for(size: PaneSize) -> Layout {
         scale: 1.0,
         top_visible: true,
         bottom_visible: true,
-        panel_height: 0,
+        // **The page's own measurement, not a number computed here.** `chrome/panel.js` reports
+        // `prompt.offsetHeight + completion.offsetHeight` after it has drawn both, and that is what
+        // sizes the panel in a window too (`window.rs`'s `preferred_size`). A height reported after
+        // the draw cannot disagree with what was drawn; one guessed before it can.
+        panel_height: crate::window::completion_height(0),
         inspector_height: 0,
     })
+}
+
+/// Lay the surfaces out again at the same pane size, because something above changed height.
+///
+/// **The panel is the only thing that does this**, and it does it often: every keystroke in the
+/// command line can grow or shrink the completion table under it. In a window CEF notices, because
+/// the strip answers a new `preferred_size` and the box layout runs; here nothing notices unless it
+/// is told.
+pub fn relayout() {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let browsers = {
+        let Ok(mut guard) = term.lock() else {
+            return;
+        };
+        let next = layout_for(guard.size);
+        if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel) {
+            return;
+        }
+        guard.layout = next;
+        // The page's height moved with the panel's, so its last frame is the wrong shape. Dropping
+        // it means one frame of that surface missing rather than one frame of it stretched.
+        guard.surfaces[index_of(SurfaceKind::Page)] = None;
+        guard.surfaces[index_of(SurfaceKind::Panel)] = None;
+        guard.of_browser.clone()
+    };
+    resize_browsers(&browsers);
+}
+
+/// Tell every surface's browser that its rectangle moved.
+fn resize_browsers(browsers: &[(i32, SurfaceKind)]) {
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    for (identifier, _) in browsers {
+        let browser = state.lock().expect("state mutex poisoned").browser_with_id(*identifier);
+        if let Some(host) = browser.and_then(|browser| browser.host()) {
+            host.was_resized();
+        }
+    }
 }
 
 /// Make one windowless browser for one surface.
@@ -277,6 +330,7 @@ fn create_surface(
         SurfaceKind::Page => url.to_string(),
         SurfaceKind::Top => "bru://chrome/top.html".to_string(),
         SurfaceKind::Bottom => "bru://chrome/bottom.html".to_string(),
+        SurfaceKind::Panel => "bru://chrome/panel.html".to_string(),
         other => return Err(format!("no terminal surface for {other:?}")),
     };
     if let Some(term) = TERM.get() {
@@ -434,6 +488,22 @@ fn present(term: &mut TermState) {
     if layers.is_empty() {
         return;
     }
+    // **The popup goes on last, because it goes on top.** `compose` treats the order of the layers
+    // as the z-order, and a `<select>` dropdown that drew under its own page would be a menu you
+    // could see the edge of and never read.
+    let popup = term.popup.zip(term.popup_pixels.as_ref());
+    let popup_layer = popup.and_then(|(rect, painted)| {
+        let (Ok(width), Ok(height)) =
+            (i32::try_from(painted.width), i32::try_from(painted.height))
+        else {
+            return None;
+        };
+        let surface = Surface::new(&painted.bgra, width, height)?;
+        Some(crate::term_compose::popup_layer(surface, rect, term.layout.rect_of(SurfaceKind::Page)))
+    });
+    if let Some(layer) = popup_layer {
+        layers.push(layer);
+    }
     let damaged = crate::term_compose::compose(&mut term.frame, &layers);
     if damaged.is_none() {
         return;
@@ -472,15 +542,7 @@ pub fn resized(size: PaneSize) {
             .set_placement(Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols));
         term.of_browser.clone()
     };
-    for (identifier, _) in browsers {
-        let Some(state) = crate::state::BruState::instance() else {
-            return;
-        };
-        let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
-        if let Some(host) = browser.and_then(|browser| browser.host()) {
-            host.was_resized();
-        }
-    }
+    resize_browsers(&browsers);
 }
 
 /// Put the terminal back and stop. Idempotent.
@@ -565,7 +627,10 @@ wrap_render_handler! {
             };
             if let Ok(mut term) = term.lock() {
                 if show == 0 {
+                    // The rectangle and the pixels go together: a popup that has been hidden must
+                    // not leave its last frame behind to be composited over the next page.
                     term.popup = None;
+                    term.popup_pixels = None;
                 }
             }
         }
@@ -596,10 +661,11 @@ wrap_render_handler! {
             let Ok(mut term) = term.lock() else {
                 return;
             };
-            // The popup layer is a second surface over the page. It is recorded but not yet
-            // composed — `term_compose::popup_layer` is written and tested, and wiring it needs the
-            // popup's own buffer kept apart from the page's, which is the next piece of C7.
-            if type_.get_raw() != PaintElementType::VIEW.get_raw() {
+            // The popup layer is a surface of its own, kept apart from the page's — see
+            // `TermState::popup_pixels`.
+            if type_.get_raw() == PaintElementType::POPUP.get_raw() {
+                term.popup_pixels = Some(Painted { bgra: bgra.to_vec(), width, height });
+                present(&mut term);
                 return;
             }
             let Some(kind) = surface_of(&term, browser) else {

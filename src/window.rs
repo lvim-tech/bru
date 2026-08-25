@@ -256,7 +256,7 @@ pub fn set_completion_height(window: u32, height: i32) -> i32 {
     set_height_in(&COMPLETION_HEIGHTS, window, height)
 }
 
-fn completion_height(window: u32) -> i32 {
+pub(crate) fn completion_height(window: u32) -> i32 {
     height_in(&COMPLETION_HEIGHTS, window)
 }
 // --- end src/completers.rs -----------------------------------------------------------------

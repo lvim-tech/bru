@@ -893,6 +893,12 @@ fn resize_bar(window: u32, rows: i32) {
     if was == wanted {
         return;
     }
+    // See `completers::apply_height`: in a terminal the panel's size is the compositor's
+    // arithmetic, not a view's preferred size.
+    if crate::term_frontend::is_active() {
+        crate::term_frontend::relayout();
+        return;
+    }
     let Some(mut browser) = crate::ipc::bottom_chrome_browser_for(window) else {
         return;
     };

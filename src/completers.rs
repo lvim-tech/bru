@@ -1143,6 +1143,15 @@ pub fn apply_height(window: u32, px: i32) {
         // resize a Views tree on every scroll report.
         return;
     }
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // A terminal window has no box layout to invalidate: the panel's rectangle is arithmetic the
+    // compositor does, and what has to happen is that the arithmetic runs again with the new
+    // height. Same trigger, same measured number, a different thing done with it.
+    if crate::term_frontend::is_active() {
+        crate::term_frontend::relayout();
+        return;
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
     // **The panel's browser, not the bar's.** `bottom_chrome_browser_for` was right while the bar
     // and the table were one view; it now points at the strip that never changes size, so this was
     // invalidating the layout of the one thing that had nothing to relayout.
