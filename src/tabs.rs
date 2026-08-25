@@ -420,6 +420,27 @@ impl BruState {
         Some(slot.tabs.len() - 1)
     }
 
+    /// Appends a tab that has no view, for a window drawn into a terminal.
+    ///
+    /// **The browser id is known at creation here, and in the Views path it is not.** A
+    /// `BrowserView` is made before its browser exists, which is why `note_tab_browser` has to match
+    /// one to the other afterwards by view identity. A windowless browser is created synchronously
+    /// and hands its identifier straight back, so the matching step has nothing to do and the tab is
+    /// complete the moment it is pushed.
+    pub fn push_term_tab_in(&mut self, window: u32, browser_id: i32) -> Option<usize> {
+        let slot = self.slot_mut(window)?;
+        slot.tabs.push(Tab {
+            surface: crate::shell::TabSurface::Term,
+            browser_id: Some(browser_id),
+            title: String::new(),
+            url: String::new(),
+            pinned: false,
+            muted: false,
+            loading: false,
+        });
+        Some(slot.tabs.len() - 1)
+    }
+
     /// Removes the showing tab and moves the selection to the one that takes its place.
     pub fn take_active_tab(&mut self) -> Option<BrowserView> {
         let window = self.current_window_id()?;

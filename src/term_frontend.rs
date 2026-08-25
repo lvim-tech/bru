@@ -138,6 +138,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         return Err("the terminal frontend is already running".to_string());
     }
     ACTIVE.store(true, Ordering::Relaxed);
+    divert_diagnostics();
 
     // **A window slot, even with no window in it.** Everything in `state.rs` is keyed by one —
     // which mode keys are in, which browsers are chrome, which tab is showing — and none of that is
@@ -205,6 +206,41 @@ wrap_task! {
     }
 }
 
+/// Send bru's own chatter somewhere other than the picture.
+///
+/// **Every `eprintln!` in bru lands on top of the page.** Measured 2026-08-25 with abv.bg drawing
+/// correctly in the pane: `bru[adblock]: blocked 0 of 1 requests` and `bru: hint: this tab is in no
+/// window` were painted across the middle of it, because stderr is the same terminal the image is
+/// in. In a window they go to whatever shell started bru and bother nobody; here they are graffiti
+/// on the one surface that matters.
+///
+/// They are not silenced, they are moved: `$XDG_RUNTIME_DIR/bru/term.log`, truncated per run, so
+/// `tail -f` in another pane is the same diagnostic it always was. If the file cannot be opened the
+/// messages stay where they are — a browser that refused to start because it could not open a log
+/// would be worse than one that draws over itself.
+fn divert_diagnostics() {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(dir).join("bru");
+    if std::fs::create_dir_all(&path).is_err() {
+        return;
+    }
+    let path = path.join("term.log");
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    use std::os::fd::AsRawFd;
+    // SAFETY: `dup2` takes two descriptor numbers. `file` is open for the duration of the call, and
+    // stderr is a descriptor this process owns. Leaking the `File` afterwards is deliberate: the
+    // duplicate must outlive it, and closing it here would close the log out from under stderr.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+    std::mem::forget(file);
+    eprintln!("bru: --term: diagnostics go here, because the terminal is holding the page");
+}
+
 /// The layout for a pane of this size, at this scale.
 fn layout_for(size: PaneSize) -> Layout {
     layout(&LayoutRequest {
@@ -267,6 +303,11 @@ fn create_surface(
     }
     if kind == SurfaceKind::Page {
         crate::term_input::aim_at(identifier);
+        // **A tab, or the page is a browser nothing in bru knows about.** `hints.rs` answers "this
+        // tab is in no window", the strip has nothing to draw and the status bar has no url —
+        // measured 2026-08-25, with the page rendering perfectly and every one of those true at
+        // once.
+        state.lock().expect("state mutex poisoned").push_term_tab_in(0, identifier);
     } else {
         // The chrome strips have to be known as chrome, or a `j` typed into the command line would
         // be read as a page movement — `state.rs`'s `chrome_browsers`, and the reason it exists.

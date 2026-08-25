@@ -121,6 +121,10 @@ pub struct Docked {
 /// is its browser, and the compositor decides where it lands.
 pub enum TabSurface {
     Views(BrowserView),
+    /// A windowless tab: **there is nothing to hold.** The browser is the tab, and where it lands
+    /// is the compositor's arithmetic rather than a handle's property. Every place that wanted the
+    /// view now has to say what it does without one, which is the whole reason this is an enum.
+    Term,
 }
 
 impl TabSurface {
@@ -128,6 +132,7 @@ impl TabSurface {
     pub fn view(&self) -> Option<&BrowserView> {
         match self {
             TabSurface::Views(view) => Some(view),
+            TabSurface::Term => None,
         }
     }
 
@@ -135,6 +140,7 @@ impl TabSurface {
     pub fn into_view(self) -> Option<BrowserView> {
         match self {
             TabSurface::Views(view) => Some(view),
+            TabSurface::Term => None,
         }
     }
 }
