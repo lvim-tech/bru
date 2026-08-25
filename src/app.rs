@@ -496,6 +496,21 @@ wrap_browser_process_handler! {
             let start_page = crate::open::start_page();
             let url = CefString::from(first_page(&switched, &positional, &start_page).as_str());
 
+            // --- src/term_spike.rs ------------------------------------------------------------
+            // **The spike replaces the window rather than joining it.** A windowless browser is not
+            // a `BrowserView` and has no window to be added to, so there is nothing here for the two
+            // to share; this is the fork the plan's C2 makes properly, spelled as an early return
+            // while it is still a spike.
+            let raw: Vec<String> = std::env::args().collect();
+            if let Some(spike_url) = crate::term_spike::url_from(&raw) {
+                if let Err(why) = crate::term_spike::start(spike_url) {
+                    eprintln!("bru: --term-spike: {why}");
+                    crate::term_spike::quit_soon();
+                }
+                return;
+            }
+            // --- end src/term_spike.rs --------------------------------------------------------
+
             // The first window, made by the same function `:open -w` uses — see `window::create`.
             // `FirstTab::Startup` is the one thing about it that is special: `--restore` may fill it
             // instead of the start page, and only the first window asks.

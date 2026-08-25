@@ -82,6 +82,8 @@ mod state;
 mod tabs;
 // A spike: the kitty graphics protocol and what this pane costs. `--term-probe` only.
 mod term;
+// A spike: one windowless browser painted into the terminal. `--term-spike=<url>` only.
+mod term_spike;
 // Which terminal bru was launched from, and how to ask it for a pane. Used by `:spawn --split`.
 mod terminal;
 // How bru learns that ~/.config/bru/theme.css has been rewritten under it.
@@ -303,7 +305,16 @@ fn main() -> Result<(), &'static str> {
     }
     // --- end src/ssh.rs -------------------------------------------------------------------------
 
+    // --- src/term_spike.rs --------------------------------------------------------------------
+    // **Only under the switch, because the header says not to enable it otherwise**
+    // (`cef_types.h`: "Do not enable this value if the application does not use windowless
+    // rendering"). It has to be decided here: `initialize` consumes it, and a browser cannot be
+    // made windowless later by asking nicely.
+    let windowless = i32::from(term_spike::url_from(&raw).is_some());
+    // --- end src/term_spike.rs ----------------------------------------------------------------
+
     let settings = Settings {
+        windowless_rendering_enabled: windowless,
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.
         no_sandbox: 1,
@@ -387,6 +398,10 @@ fn handover(args: &[String]) -> Option<String> {
             return None;
         }
         if arg == "--ssh" || arg.starts_with("--ssh=") {
+            return None;
+        }
+        // The terminal spike is a browser of its own by construction: it paints into *this* pane.
+        if arg.starts_with("--term-spike") {
             return None;
         }
     }

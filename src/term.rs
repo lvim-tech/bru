@@ -29,13 +29,13 @@ use std::time::Instant;
 /// A browser that leaves the terminal raw has failed at its one terminal-citizenship job, so the
 /// restore is a `Drop` and not a line at the end of a function: an early return, a `?` and a panic
 /// all pass through it.
-struct Raw {
+pub(crate) struct Raw {
     fd: i32,
     saved: libc::termios,
 }
 
 impl Raw {
-    fn enter() -> Result<Raw, String> {
+    pub(crate) fn enter() -> Result<Raw, String> {
         let fd = std::io::stdin().as_raw_fd();
         // SAFETY: `termios` is a plain C struct with no invalid bit patterns, and `tcgetattr` fills
         // it or reports failure without touching it.
@@ -277,7 +277,7 @@ fn test_frame(width: u32, height: u32, phase: u32) -> Vec<u8> {
 ///
 /// Returns the name it created, so the caller can unlink it if kitty never did — a terminal that
 /// ignores the escape would otherwise leave 4 MB in `/dev/shm` per frame.
-fn write_image_shm(
+pub(crate) fn write_image_shm(
     out: &mut impl Write,
     rgb: &[u8],
     width: u32,
@@ -342,7 +342,7 @@ fn write_image_shm(
 }
 
 /// Remove a shared memory object kitty did not take.
-fn unlink_shm(name: &str) {
+pub(crate) fn unlink_shm(name: &str) {
     if let Ok(c_name) = std::ffi::CString::new(name) {
         // SAFETY: the name is one this process created; unlinking a name that is already gone
         // fails harmlessly and is not checked for that reason.
