@@ -1150,6 +1150,43 @@ restarted — ssh authentication cannot be repeated by a browser that noticed th
 
 It buys reachability, not privacy: the remote machine sees every host bru asks for.
 
+## In the terminal
+
+`--term` draws bru into the terminal it was started from, over the kitty graphics protocol:
+
+```sh
+bru --term https://example.com/
+```
+
+It is the same browser. The tab strip and the status bar are the same `bru://chrome` pages a window
+draws, every binding works because a key still arrives through `on_pre_key_event`, and the smooth
+scroll is unchanged — `j` synthesises a wheel event inside the process, so it never depended on what
+a terminal can deliver. Hints, the command line, completion, `<select>` menus and the mouse all
+work.
+
+Needs a terminal that speaks the kitty graphics protocol — kitty itself, and others that implement
+it. `bru --term-probe` draws test frames into the pane and reports what they cost, which is the
+quickest way to find out whether a given terminal is up to it.
+
+**Profiles.** Two brus cannot share one Chromium profile, so a terminal bru started while a windowed
+one is running falls back to a scratch profile that is deleted on exit — cookies and logins with it.
+Give it one of its own to keep them:
+
+```sh
+bru --term --user-data-dir=~/.local/share/bru/term https://example.com/
+```
+
+**Diagnostics go to `$XDG_RUNTIME_DIR/bru/term.log`**, not to the pane — bru's own messages and
+Chromium's both, because stderr is the same terminal the page is drawn in. `tail -f` it in another
+pane.
+
+**Under tmux**, two things are tmux's to give:
+
+- `mouse on` makes tmux keep the mouse for its own pane handling, and bru never sees a click. Set
+  `mouse off` for the window bru is in.
+- the kitty keyboard protocol is not passed through unless `extended-keys` is on, and without it
+  `<Ctrl-j>`, `<Ctrl-i>` and `<Ctrl-m>` cannot be told from `<Enter>`, `<Tab>` and `<Enter>`.
+
 ### A pane of the terminal
 
 `:spawn --split <command>` runs the command in a new pane of the terminal bru was launched from —
