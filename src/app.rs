@@ -502,6 +502,21 @@ wrap_browser_process_handler! {
             // to share; this is the fork the plan's C2 makes properly, spelled as an early return
             // while it is still a spike.
             let raw: Vec<String> = std::env::args().collect();
+            // --- src/term_frontend.rs ---------------------------------------------------------
+            // The real terminal frontend, which replaces the window for the same reason the spike
+            // does: a windowless browser is not a `BrowserView` and there is no window to add it
+            // to.
+            if crate::term_frontend::requested(&raw) {
+                let page = crate::term_frontend::url_from(&raw)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| url.to_string());
+                if let Err(why) = crate::term_frontend::start(&self.state, &page) {
+                    eprintln!("bru: --term: {why}");
+                    crate::term_spike::quit_soon();
+                }
+                return;
+            }
+            // --- end src/term_frontend.rs -----------------------------------------------------
             if let Some(spike_url) = crate::term_spike::url_from(&raw) {
                 if let Err(why) = crate::term_spike::start(spike_url) {
                     eprintln!("bru: --term-spike: {why}");

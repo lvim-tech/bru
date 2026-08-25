@@ -356,6 +356,16 @@ wrap_client! {
             Some(BruDisplayHandler::new(self.state.clone()))
         }
 
+        // --- src/term_frontend.rs -----------------------------------------------------------
+        // **One client serves every browser, so it serves the terminal's too.** `on_paint` is
+        // handed the browser it is painting, so a single handler can tell four surfaces apart —
+        // see the module header there. In a Views run this answers `None` and CEF never enters
+        // windowless rendering for a browser that has a window.
+        fn render_handler(&self) -> Option<RenderHandler> {
+            crate::term_frontend::render_handler()
+        }
+        // --- end src/term_frontend.rs -------------------------------------------------------
+
         // M11: where `/`'s match count comes from. src/find.rs owns what it does with it.
         fn find_handler(&self) -> Option<FindHandler> {
             Some(crate::find::BruFindHandler::new())

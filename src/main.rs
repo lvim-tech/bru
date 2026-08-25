@@ -86,6 +86,8 @@ mod tabs;
 mod term;
 // The terminal frontend, phase by phase. Each is a module of its own so the phases do not collide.
 mod term_compose;
+mod term_frontend;
+mod term_input;
 mod term_keys;
 mod term_paint;
 mod term_session;
@@ -317,7 +319,22 @@ fn main() -> Result<(), &'static str> {
     // (`cef_types.h`: "Do not enable this value if the application does not use windowless
     // rendering"). It has to be decided here: `initialize` consumes it, and a browser cannot be
     // made windowless later by asking nicely.
-    let windowless = i32::from(term_spike::url_from(&raw).is_some());
+    let windowless =
+        i32::from(term_spike::url_from(&raw).is_some() || term_frontend::requested(&raw));
+
+    // **Checked here, before `initialize`, because the alternative is a browser with nowhere to
+    // draw.** A `--term` run whose stdout is a pipe would open no window, paint into a file and
+    // read keys from nothing. One line beats starting Chromium to find that out.
+    if term_frontend::requested(&raw) && !term_frontend::terminal_is_there() {
+        eprintln!(
+            "bru: --term: stdout is not a terminal, so there is no pane to draw in. Run it from a \n\
+             terminal, or drop the switch to get a window."
+        );
+        if let Some(profile) = profile {
+            profile.release();
+        }
+        return Err("--term needs a terminal");
+    }
     // --- end src/term_spike.rs ----------------------------------------------------------------
 
     let settings = Settings {
@@ -364,6 +381,9 @@ fn main() -> Result<(), &'static str> {
     // bru started this process, so bru ends it — see `ssh::stop`. After `shutdown`, so nothing is
     // still trying to load a page through it.
     crate::ssh::stop();
+    // The terminal goes back to what it was, on the way out and on every other exit path — see
+    // `term_session.rs`, which holds the guarantee this line only completes.
+    crate::term_frontend::leave();
 
     // After shutdown, so nothing is still writing to the directory being let go of.
     if let Some(profile) = profile {
@@ -407,8 +427,9 @@ fn handover(args: &[String]) -> Option<String> {
         if arg == "--ssh" || arg.starts_with("--ssh=") {
             return None;
         }
-        // The terminal spike is a browser of its own by construction: it paints into *this* pane.
-        if arg.starts_with("--term-spike") {
+        // The terminal frontend and its spike are browsers of their own by construction: they paint
+        // into *this* pane, and a pane cannot be handed to a process that is already running.
+        if arg.starts_with("--term") {
             return None;
         }
     }
