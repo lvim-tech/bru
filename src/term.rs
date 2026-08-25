@@ -181,8 +181,12 @@ const CHUNK: usize = 4096;
 /// `i=1` reuses one image id, so the terminal replaces the picture rather than accumulating a new
 /// one per frame — the difference between a browser and a memory leak with a view. `q=2` asks for
 /// no acknowledgement, because a reply would arrive on the same stdin the key reader owns.
-pub fn write_image(out: &mut impl Write, rgb: &[u8], width: u32, height: u32) -> std::io::Result<()> {
-    let encoded = base64(rgb);
+pub fn write_image(
+    out: &mut impl Write,
+    encoded: &str,
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
     let mut sent = 0;
     let mut first = true;
     while sent < encoded.len() {
@@ -241,63 +245,125 @@ fn test_frame(width: u32, height: u32, phase: u32) -> Vec<u8> {
     rgb
 }
 
-/// `bru --term-probe`: draw into this pane and say what it cost.
+/// One size's worth of measurement, with the three costs kept apart.
+///
+/// **They are three and not one, and lumping them is how a spike lies.** Making the pixels is bru's
+/// own arithmetic and is what a debug build makes look terrible; base64 is the protocol's tax and
+/// scales with the picture; the write is the terminal's — the pty, tmux's passthrough, and kitty
+/// decoding and uploading a texture. Only the third is the thing this module exists to find out,
+/// and it is the smallest of the three in a debug build, so a single number would have buried it.
+struct Cost {
+    frames: u32,
+    pixels: std::time::Duration,
+    encode: std::time::Duration,
+    write: std::time::Duration,
+}
+
+impl Cost {
+    fn per_frame(&self) -> f64 {
+        self.write.as_secs_f64() / f64::from(self.frames.max(1))
+    }
+}
+
+/// Draw at one size for about `budget`, and report where the time went.
+fn measure(width: u32, height: u32, budget: std::time::Duration) -> Result<Cost, String> {
+    let mut out = std::io::stdout();
+    let mut cost =
+        Cost { frames: 0, pixels: <_>::default(), encode: <_>::default(), write: <_>::default() };
+    let started = Instant::now();
+    let mut phase = 0u32;
+    while started.elapsed() < budget && cost.frames < 60 {
+        let at = Instant::now();
+        let frame = test_frame(width, height, phase);
+        cost.pixels += at.elapsed();
+
+        let at = Instant::now();
+        let encoded = base64(&frame);
+        cost.encode += at.elapsed();
+
+        let at = Instant::now();
+        let _ = out.write_all(b"\x1b[H");
+        write_image(&mut out, &encoded, width, height)
+            .map_err(|e| format!("could not write the image: {e}"))?;
+        cost.write += at.elapsed();
+
+        cost.frames += 1;
+        phase += 1;
+    }
+    Ok(cost)
+}
+
+/// `bru --term-probe`: draw into this pane at three sizes and say what each one cost.
+///
+/// **A sweep and not one size**, because the first attempt drew 30 full-pane frames — 358 MB of
+/// base64 through tmux — printed nothing until it was done, and looked like a hang. What a person
+/// needs from this is where the cliff is, and one size cannot show a cliff.
 pub fn probe() -> Result<(), String> {
     let pane = pane()?;
-    let bytes_per_frame = (pane.width * pane.height * 3) as usize;
     println!(
         "pane: {}x{} px, {}x{} cells, via {}",
         pane.width, pane.height, pane.cols, pane.rows, pane.source
     );
-    println!(
-        "one frame: {:.2} MB of pixels, {:.2} MB as base64{}",
-        bytes_per_frame as f64 / 1e6,
-        bytes_per_frame as f64 * 4.0 / 3.0 / 1e6,
-        if in_tmux() { " (plus tmux's passthrough wrapper per 4 KB chunk)" } else { "" }
-    );
     if in_tmux() {
-        println!("tmux: yes — shared memory is unavailable, every frame goes down the pty");
+        println!(
+            "tmux: yes — shared memory is unavailable, so every frame goes down the pty as base64, \n\
+             wrapped per 4 KB chunk. This is the worst transport the protocol has."
+        );
     }
-    println!("drawing 30 frames, watch the band move…");
-
-    let mut out = std::io::stdout();
-    // Home the cursor and hide it, so the picture lands in the same place every time.
-    let _ = out.write_all(b"\x1b[H\x1b[?25l");
-    let started = Instant::now();
-    let mut encode = std::time::Duration::ZERO;
-    for phase in 0..30u32 {
-        let at = Instant::now();
-        let frame = test_frame(pane.width, pane.height, phase);
-        encode += at.elapsed();
-        write_image(&mut out, &frame, pane.width, pane.height)
-            .map_err(|e| format!("could not write the image: {e}"))?;
-        let _ = out.write_all(b"\x1b[H");
+    if cfg!(debug_assertions) {
+        println!(
+            "build: debug — making the pixels and the base64 are unoptimised here and are NOT what \n\
+             this measures. Watch the `terminal` column; build --release for the other two."
+        );
     }
-    let elapsed = started.elapsed();
-    let _ = out.write_all(b"\x1b[?25h\n");
-    let _ = out.flush();
+    println!();
+    println!("  {:>11}  {:>9}  {:>9}  {:>9}  {:>8}", "size", "pixels", "base64", "terminal", "fps");
 
-    let fps = 30.0 / elapsed.as_secs_f64();
-    println!(
-        "30 frames in {:.2}s -> {:.1} fps ({:.2} MB/s of base64 down the pty)",
-        elapsed.as_secs_f64(),
-        fps,
-        bytes_per_frame as f64 * 4.0 / 3.0 * 30.0 / elapsed.as_secs_f64() / 1e6
-    );
-    println!(
-        "of which {:.2}s was making the pixels, so the terminal's share is {:.2}s",
-        encode.as_secs_f64(),
-        (elapsed - encode).as_secs_f64()
-    );
-    println!(
-        "verdict: {}",
-        if fps >= 30.0 {
-            "watchable — a browser can be driven in this pane"
-        } else if fps >= 12.0 {
-            "usable for reading and scrolling, not for video"
-        } else {
-            "too slow for a browser in this pane at this size"
+    let mut full = None;
+    for divisor in [4u32, 2, 1] {
+        let (width, height) = (pane.width / divisor, pane.height / divisor);
+        if width < 16 || height < 16 {
+            continue;
         }
+        let cost = measure(width, height, std::time::Duration::from_millis(1500))?;
+        // Back to the top-left and clear, so the next size does not sit under the last one's frame.
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J");
+        let _ = out.flush();
+        let fps = 1.0 / cost.per_frame().max(f64::MIN_POSITIVE);
+        println!(
+            "  {:>11}  {:>8.0}ms  {:>8.0}ms  {:>8.0}ms  {:>8.1}",
+            format!("{width}x{height}"),
+            cost.pixels.as_secs_f64() * 1000.0 / f64::from(cost.frames.max(1)),
+            cost.encode.as_secs_f64() * 1000.0 / f64::from(cost.frames.max(1)),
+            cost.per_frame() * 1000.0,
+            fps
+        );
+        if divisor == 1 {
+            full = Some(fps);
+        }
+    }
+
+    println!();
+    match full {
+        Some(fps) if fps >= 30.0 => println!(
+            "verdict: the terminal keeps up at full pane ({fps:.0} fps of writing). A browser here \n\
+             is watchable, and the transport is not what will limit it."
+        ),
+        Some(fps) if fps >= 12.0 => println!(
+            "verdict: {fps:.0} fps of writing at full pane. Reading and scrolling are fine; video \n\
+             is not. A smaller pane or a scaled-down picture buys the difference."
+        ),
+        Some(fps) => println!(
+            "verdict: {fps:.0} fps at full pane — the transport is the limit. Either the picture is \n\
+             sent smaller than the pane, or this needs a terminal where shared memory is reachable \n\
+             (i.e. not through tmux)."
+        ),
+        None => println!("verdict: the pane is too small to measure."),
+    }
+    println!(
+        "the `terminal` column is the only one that says anything about this terminal; the other \n\
+         two are bru's own arithmetic and belong to the CPU."
     );
     Ok(())
 }
