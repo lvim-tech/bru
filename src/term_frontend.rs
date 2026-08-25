@@ -340,15 +340,29 @@ pub fn relayout() {
             return;
         };
         let next = layout_for(guard.size);
-        if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel) {
+        if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
+            && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
+        {
             return;
         }
+        // **Only the surfaces whose rectangle actually moved.** `was_resized` is not a repaint
+        // request, it is a size change: Chromium re-lays out the whole document behind it. Telling
+        // every browser meant re-laying out the *page* — a real one, with hundreds of elements —
+        // on every keystroke in the command line, because every keystroke changes the completion
+        // table's height. Measured 2026-08-25: typing in `:` stopped being typing.
+        let moved: Vec<(i32, SurfaceKind)> = guard
+            .of_browser
+            .iter()
+            .filter(|(_, kind)| next.rect_of(*kind) != guard.layout.rect_of(*kind))
+            .copied()
+            .collect();
+        for (_, kind) in &moved {
+            // A surface whose rectangle changed has a last frame of the wrong shape. Dropping it
+            // means one frame of that surface missing rather than one frame of it stretched.
+            guard.surfaces[index_of(*kind)] = None;
+        }
         guard.layout = next;
-        // The page's height moved with the panel's, so its last frame is the wrong shape. Dropping
-        // it means one frame of that surface missing rather than one frame of it stretched.
-        guard.surfaces[index_of(SurfaceKind::Page)] = None;
-        guard.surfaces[index_of(SurfaceKind::Panel)] = None;
-        guard.of_browser.clone()
+        moved
     };
     resize_browsers(&browsers);
 }

@@ -70,6 +70,15 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
             return;
         }
         let step = if quiet { next_event_at_timeout(buffer) } else { next_event(buffer) };
+        // **A step that consumes nothing must not be looped on.** Everything but `Incomplete`
+        // promises progress, and a parser that answered `Invalid(0)` or `Key(_, 0)` would spin this
+        // thread forever on the same byte — with the reader never reaching the next `read`, which is
+        // a keyboard that has stopped working and a core at 100%. Dropping one byte is the smallest
+        // move that guarantees termination, and it resynchronises on the next.
+        if !matches!(step, Step::Incomplete) && step.consumed() == 0 {
+            buffer.drain(..1);
+            continue;
+        }
         match step {
             Step::Key(key, n) => {
                 buffer.drain(..n);
