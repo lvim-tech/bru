@@ -203,6 +203,58 @@ impl TermKey {
     }
 }
 
+/// A mouse report, in the units the terminal sent it in.
+///
+/// **`x` and `y` are whatever the terminal is reporting in** — cells under SGR 1006, pixels under
+/// SGR 1016 — and this type does not know which. Converting is the caller's, because only the
+/// caller knows which mode it asked the terminal for and how big a cell is; a struct that guessed
+/// would be wrong by a factor of the font size and look like a browser clicking at random.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TermMouse {
+    /// `0` left, `1` middle, `2` right; `64`/`65` are wheel up/down, which SGR encodes as buttons.
+    pub button: u16,
+    pub x: i32,
+    pub y: i32,
+    /// `cef_event_flags_t`, from the same bits the modifier keys use.
+    pub modifiers: u32,
+    /// `true` for a press or a drag, `false` for the release — SGR's final byte, `M` against `m`.
+    pub pressed: bool,
+    /// A motion report rather than a press: bit 32 of the button field.
+    pub motion: bool,
+}
+
+/// `CSI < button ; x ; y M|m`.
+fn parse_sgr_mouse(params: &[u8], final_byte: u8) -> Option<TermMouse> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut fields = text.split(';');
+    let raw_button: u32 = fields.next()?.parse().ok()?;
+    let x: i32 = fields.next()?.parse().ok()?;
+    let y: i32 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    // The modifier bits live in the button field: 4 shift, 8 alt, 16 ctrl. Bit 32 is motion and bit
+    // 64 marks the wheel, which SGR reports as buttons 64 and 65 rather than as a scroll.
+    let mut modifiers = 0u32;
+    if raw_button & 4 != 0 {
+        modifiers |= CEF_SHIFT_DOWN;
+    }
+    if raw_button & 8 != 0 {
+        modifiers |= CEF_ALT_DOWN;
+    }
+    if raw_button & 16 != 0 {
+        modifiers |= CEF_CONTROL_DOWN;
+    }
+    Some(TermMouse {
+        button: u16::try_from(raw_button & 0b1100_0011).ok()?,
+        x,
+        y,
+        modifiers,
+        pressed: final_byte == b'M',
+        motion: raw_button & 32 != 0,
+    })
+}
+
 /// What the front of the buffer turned out to be, and how much of it to drop.
 ///
 /// The byte count is on the variant rather than returned alongside because the two are never
@@ -212,6 +264,10 @@ impl TermKey {
 pub enum Step {
     /// A key event, and the bytes it took.
     Key(TermKey, usize),
+    /// A mouse report, and the bytes it took. Separate from [`Step::Ignored`] because a click is
+    /// something to act on and a focus change is not; they arrive through the same `CSI <` door and
+    /// were told apart nowhere until something wanted the clicks.
+    Mouse(TermMouse, usize),
     /// A complete, understood sequence that is not a key: a mouse report, a focus change, the reply
     /// to a query, a bracketed-paste marker. Drop these bytes and carry on — quietly, because they
     /// are not errors and there will be many.
@@ -229,7 +285,7 @@ impl Step {
     #[allow(dead_code)] // Waits for C3's read loop, which is the only thing that drains a buffer.
     pub fn consumed(&self) -> usize {
         match self {
-            Step::Key(_, n) | Step::Ignored(n) | Step::Invalid(n) => *n,
+            Step::Key(_, n) | Step::Mouse(_, n) | Step::Ignored(n) | Step::Invalid(n) => *n,
             Step::Incomplete => 0,
         }
     }
@@ -300,6 +356,9 @@ fn parse_escape(input: &[u8], flush: bool, depth: u8) -> Step {
         // arriving faster than the timeout, and each is dealt with one at a time.
         0x1B if depth < 1 => match parse(&input[1..], flush, depth + 1) {
             Step::Key(k, n) => Step::Key(alt(k), n + 1),
+            // A mouse report does not become Alt-anything: the modifiers a click carries are in its
+            // own button field, and a leading ESC before one is the prefix bytes, not a held key.
+            Step::Mouse(m, n) => Step::Mouse(m, n + 1),
             Step::Ignored(n) => Step::Ignored(n + 1),
             Step::Invalid(n) => Step::Invalid(n + 1),
             Step::Incomplete => Step::Incomplete,
@@ -317,6 +376,7 @@ fn parse_escape(input: &[u8], flush: bool, depth: u8) -> Step {
         // Alt-anything, the legacy way. `ESC` then the key exactly as it would have arrived alone.
         _ => match parse_legacy(&input[1..]) {
             Step::Key(k, n) => Step::Key(alt(k), n + 1),
+            Step::Mouse(m, n) => Step::Mouse(m, n + 1),
             Step::Ignored(n) => Step::Ignored(n + 1),
             Step::Invalid(n) => Step::Invalid(n + 1),
             Step::Incomplete => Step::Incomplete,
@@ -431,6 +491,14 @@ fn parse_csi_body(input: &[u8], start: usize) -> Step {
     // `CSI ? … u` is the terminal answering what keyboard flags it has, `CSI > … c` is a device
     // attribute. All of them arrive on the same stdin as the keys do.
     if let Some(&first) = raw.first() {
+        if first == b'<' && matches!(final_byte, b'M' | b'm') {
+            return match parse_sgr_mouse(&raw[1..], final_byte) {
+                Some(mouse) => Step::Mouse(mouse, consumed),
+                // A `CSI <` that is not three numbers is not a mouse report bru understands, and
+                // guessing at one would click somewhere nobody pointed.
+                None => Step::Ignored(consumed),
+            };
+        }
         if matches!(first, b'<' | b'=' | b'>' | b'?') {
             return Step::Ignored(consumed);
         }
@@ -1483,13 +1551,56 @@ mod tests {
         assert_eq!(next_event(&[0xD1, 0x41]), Step::Invalid(1));
     }
 
+    /// **The SGR mouse report is data now, not noise.** It used to be `Ignored` with every other
+    /// report on this stdin; it became a step of its own the day something wanted to click.
+    #[test]
+    fn an_sgr_mouse_report_is_read_rather_than_dropped() {
+        let Step::Mouse(press, n) = next_event(b"\x1b[<0;10;20M") else {
+            panic!("a left press at 10,20")
+        };
+        assert_eq!((n, press.button, press.x, press.y), (11, 0, 10, 20));
+        assert!(press.pressed);
+        assert!(!press.motion);
+
+        let Step::Mouse(release, _) = next_event(b"\x1b[<0;10;20m") else {
+            panic!("the release of the same press")
+        };
+        assert!(!release.pressed);
+
+        // The modifiers travel in the button field: 16 is ctrl, and it must not be read as a button.
+        let Step::Mouse(ctrl, _) = next_event(b"\x1b[<16;5;5M") else {
+            panic!("a ctrl-click")
+        };
+        assert_eq!(ctrl.button, 0);
+        assert_eq!(ctrl.modifiers, super::CEF_CONTROL_DOWN);
+
+        // Bit 32 is motion; the button underneath it is still the button.
+        let Step::Mouse(drag, _) = next_event(b"\x1b[<32;7;7M") else {
+            panic!("a drag")
+        };
+        assert!(drag.motion);
+        assert_eq!(drag.button, 0);
+
+        // The wheel is reported as buttons 64 and 65 rather than as a scroll.
+        let Step::Mouse(wheel, _) = next_event(b"\x1b[<64;1;1M") else {
+            panic!("a wheel notch")
+        };
+        assert_eq!(wheel.button, 64);
+
+        // A `CSI <` that is not three numbers is not a report to guess at.
+        assert_eq!(next_event(b"\x1b[<0;10M"), Step::Ignored(8));
+        assert_eq!(next_event(b"\x1b[<0;10;20;30M"), Step::Ignored(14));
+        // And half of one is not one yet.
+        assert_eq!(next_event(b"\x1b[<0;10;2"), Step::Incomplete);
+    }
+
     #[test]
     fn reports_that_share_the_keyboards_stdin_are_ignored_and_not_typed() {
-        // The SGR mouse report, which arrives constantly once mouse reporting is on.
-        assert_eq!(next_event(b"\x1b[<0;10;20M"), Step::Ignored(11));
-        assert_eq!(next_event(b"\x1b[<0;10;20m"), Step::Ignored(11));
-        // The X10 form, whose three trailing bytes are not parameters.
+        // The X10 form, whose three trailing bytes are not parameters. Still ignored: bru asks the
+        // terminal for SGR, so an X10 report is a terminal answering a question nobody asked, and
+        // its coordinates cap at 223 anyway.
         assert_eq!(next_event(b"\x1b[M\x20\x21\x22"), Step::Ignored(6));
+        // The rest of what shares this stdin.
         assert_eq!(next_event(b"\x1b[M\x20"), Step::Incomplete);
         // Focus in and out.
         assert_eq!(next_event(b"\x1b[I"), Step::Ignored(3));
@@ -1520,10 +1631,17 @@ mod tests {
         // What the read loop actually does: keep asking, keep dropping what was consumed.
         let mut buf: &[u8] = b"gg\x1b[97;5u\x1b[A\x1b[<0;1;1M\x1bOP";
         let mut got = Vec::new();
+        let mut clicks: Vec<TermMouse> = Vec::new();
         loop {
             match next_event(buf) {
                 Step::Key(k, n) => {
                     got.push(k.to_key_info().map(|i| i.to_string()));
+                    buf = &buf[n..];
+                }
+                // The click in the middle of the stream is now a step of its own, and the keys
+                // either side of it must still come out in order.
+                Step::Mouse(m, n) => {
+                    clicks.push(m);
                     buf = &buf[n..];
                 }
                 Step::Ignored(n) | Step::Invalid(n) => buf = &buf[n..],
@@ -1531,6 +1649,10 @@ mod tests {
             }
         }
         assert!(buf.is_empty(), "the whole buffer was consumed");
+        assert_eq!(clicks.len(), 1, "the mouse report was read once");
+        assert_eq!(clicks[0].button, 0);
+        assert_eq!((clicks[0].x, clicks[0].y), (1, 1));
+        assert!(clicks[0].pressed);
         let got: Vec<String> = got.into_iter().map(|s| s.unwrap_or_default()).collect();
         assert_eq!(got, ["g", "g", "<Ctrl+a>", "<Up>", "<F1>"]);
     }

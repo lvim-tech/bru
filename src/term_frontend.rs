@@ -441,6 +441,17 @@ pub fn show_page(identifier: i32) {
     crate::term_input::aim_at(identifier);
 }
 
+/// Where the page sits in the pane, in device pixels.
+///
+/// The terminal reports a click in the pane's coordinates; the page is a rectangle inside it, under
+/// the tab strip. Without this a click near the top of the page would land in the strip's rows and
+/// the page would be told about a press somewhere above its own first row.
+pub fn page_rect() -> Option<Rect> {
+    let term = TERM.get()?;
+    let guard = term.lock().ok()?;
+    Some(guard.layout.rect_of(SurfaceKind::Page))
+}
+
 /// Which surface a browser paints into.
 fn surface_of(term: &TermState, browser: Option<&mut Browser>) -> Option<SurfaceKind> {
     let identifier = browser.map(|browser| browser.identifier());

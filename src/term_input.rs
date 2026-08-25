@@ -17,7 +17,7 @@ use cef::*;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use crate::term_keys::{Step, TermKey, next_event, next_event_at_timeout};
+use crate::term_keys::{Step, TermKey, TermMouse, next_event, next_event_at_timeout};
 
 /// The page's browser. Where keys go unless a mode says otherwise.
 static TARGET: AtomicI32 = AtomicI32::new(0);
@@ -76,14 +76,94 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
                     post(key);
                 }
             }
-            // Mouse reports, focus changes, query replies, paste markers. Quietly, because they are
-            // not errors and there will be many.
+            Step::Mouse(mouse, n) => {
+                buffer.drain(..n);
+                post_mouse(mouse);
+            }
+            // Focus changes, query replies, paste markers. Quietly, because they are not errors and
+            // there will be many.
             Step::Ignored(n) | Step::Invalid(n) => {
                 buffer.drain(..n);
             }
             // Nothing whole yet. On a quiet read there is nothing more coming either, so the buffer
             // is left alone rather than spun on.
             Step::Incomplete => return,
+        }
+    }
+}
+
+/// SGR's wheel buttons. The protocol reports a scroll as a press of button 64 or 65 rather than as
+/// a scroll of its own, which is why they are named here instead of read as buttons.
+const WHEEL_UP: u16 = 64;
+const WHEEL_DOWN: u16 = 65;
+
+fn post_mouse(mouse: TermMouse) {
+    // **A motion report with no button held is not something to send.** The terminal is asked for
+    // 1002, which reports movement only while a button is down, but a terminal that answers 1003 as
+    // well would otherwise post a task per pixel of pointer travel.
+    if mouse.motion && !mouse.pressed {
+        return;
+    }
+    let mut task = MouseTask::new(mouse.button, mouse.x, mouse.y, mouse.modifiers, mouse.pressed);
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct MouseTask {
+        button: u16,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        pressed: bool,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            // A click is always the page's. The chrome strips have nothing clickable in them —
+            // there is no tab to close with a pointer and no button on the status bar — and a
+            // click that fell through to one would be a press in a document with nothing to press.
+            let Some(host) = page_browser(&state).and_then(|browser| browser.host()) else {
+                return;
+            };
+            let Some(page) = crate::term_frontend::page_rect() else {
+                return;
+            };
+            // SGR counts from 1 and reports in the pane's coordinates; CEF wants 0-based coordinates
+            // inside the surface it is painting.
+            let x = self.x - 1 - page.x;
+            let y = self.y - 1 - page.y;
+            if x < 0 || y < 0 || x >= page.width || y >= page.height {
+                return;
+            }
+            let event = MouseEvent { x, y, modifiers: self.modifiers };
+
+            if matches!(self.button, WHEEL_UP | WHEEL_DOWN) {
+                // Only on the press: SGR reports a wheel notch once, and acting on the release too
+                // would scroll twice per notch. The step is the one `j` uses, so a wheel and a key
+                // move the page by the same amount.
+                if self.pressed {
+                    let step = crate::scroll::step();
+                    let delta = if self.button == WHEEL_UP { step } else { -step };
+                    host.send_mouse_wheel_event(Some(&event), 0, delta);
+                }
+                return;
+            }
+
+            let button = match self.button {
+                0 => MouseButtonType::LEFT,
+                1 => MouseButtonType::MIDDLE,
+                2 => MouseButtonType::RIGHT,
+                // A button bru has no name for is a button bru does not press.
+                _ => return,
+            };
+            // The move first, so the page knows where the pointer is before it is told it was
+            // pressed — a click delivered to a page that thinks the pointer is elsewhere hits
+            // whatever was under the old position.
+            host.send_mouse_move_event(Some(&event), 0);
+            host.send_mouse_click_event(Some(&event), button, i32::from(!self.pressed), 1);
         }
     }
 }
