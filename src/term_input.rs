@@ -131,10 +131,14 @@ wrap_task! {
             let Some(page) = crate::term_frontend::page_rect() else {
                 return;
             };
-            // SGR counts from 1 and reports in the pane's coordinates; CEF wants 0-based coordinates
-            // inside the surface it is painting.
-            let x = self.x - 1 - page.x;
-            let y = self.y - 1 - page.y;
+            // SGR counts from 1 and reports in the pane's coordinates; CEF wants 0-based
+            // coordinates inside the surface it is painting. **And the units are not always
+            // pixels** — a terminal that does not know mode 1016 reports cells, and multiplying is
+            // the difference between clicking where the user pointed and clicking in the top-left
+            // corner of the page. See `term_frontend::mouse_scale`.
+            let (scale_x, scale_y) = crate::term_frontend::mouse_scale();
+            let x = (self.x - 1) * scale_x - page.x;
+            let y = (self.y - 1) * scale_y - page.y;
             if x < 0 || y < 0 || x >= page.width || y >= page.height {
                 return;
             }

@@ -446,6 +446,28 @@ pub fn show_page(identifier: i32) {
 /// The terminal reports a click in the pane's coordinates; the page is a rectangle inside it, under
 /// the tab strip. Without this a click near the top of the page would land in the strip's rows and
 /// the page would be told about a press somewhere above its own first row.
+/// How a mouse report's coordinates turn into pixels in the pane.
+///
+/// `(1, 1)` when the terminal reports pixels; the cell size when it reports cells. Multiplying by
+/// the cell puts the pointer at that cell's top-left corner, which is the best a cell-resolution
+/// report can say and is what every terminal application does with one.
+pub fn mouse_scale() -> (i32, i32) {
+    let Some(term) = TERM.get() else {
+        return (1, 1);
+    };
+    let Ok(guard) = term.lock() else {
+        return (1, 1);
+    };
+    if guard.session.mouse_in_pixels() {
+        (1, 1)
+    } else {
+        (
+            i32::try_from(guard.size.cell_width).unwrap_or(1).max(1),
+            i32::try_from(guard.size.cell_height).unwrap_or(1).max(1),
+        )
+    }
+}
+
 pub fn page_rect() -> Option<Rect> {
     let term = TERM.get()?;
     let guard = term.lock().ok()?;

@@ -94,8 +94,20 @@ const CURSOR_SHOW: &str = "\x1b[?25h";
 /// The order matters and is not cosmetic. Setting `1016` first means the very first report is
 /// already in the new encoding; the other way round leaves a window in which a click is delivered
 /// in the old one and is parsed as a cell coordinate at pixel scale.
-const MOUSE_ON: &str = "\x1b[?1016h\x1b[?1002h";
-const MOUSE_OFF: &str = "\x1b[?1002l\x1b[?1016l";
+/// **`1006` first, and it is not redundant.** `1016` is an extension of SGR encoding and a terminal
+/// that has never heard of it ignores the escape silently — leaving reports in the default X10 form,
+/// which caps its coordinates at 223 and which this codebase does not read. Measured 2026-08-25 in
+/// tmux, which speaks `1006` and not `1016`: with only `1016` asked for, not one click arrived in a
+/// form bru could use. Asking for both means SGR either way and pixels where they are on offer.
+const MOUSE_ON: &str = "\x1b[?1006h\x1b[?1016h\x1b[?1002h";
+const MOUSE_OFF: &str = "\x1b[?1002l\x1b[?1016l\x1b[?1006l";
+
+/// Ask whether the pixel encoding actually took: `CSI ? 1016 $ p`.
+///
+/// **The two encodings look identical on the wire** — `CSI < b ; x ; y M` either way — so the only
+/// thing that tells cells from pixels is whether the terminal accepted the mode. Guessing from the
+/// magnitude of the numbers works until somebody clicks in the top-left corner.
+const MOUSE_PIXELS_QUERY: &str = "\x1b[?1016$p";
 
 /// Synchronised output. C4 wraps a whole batch of surface uploads in these so the terminal commits
 /// the frame in one go instead of showing the page updated and the chrome strips not yet. The
@@ -763,6 +775,8 @@ pub(crate) struct TerminalSession {
     /// the protocol was already in use by something outside bru — a tmux with its own extended-keys
     /// setting, for instance.
     kitty_flags_before: Option<u8>,
+    /// Whether mouse reports carry pixels rather than cells — see [`MOUSE_PIXELS_QUERY`].
+    mouse_pixels: bool,
     /// Bytes read while waiting for query answers that were not answers.
     ///
     /// **These are keystrokes and they are not to be thrown away.** A person who typed while bru was
@@ -893,6 +907,14 @@ impl TerminalSession {
         write(MOUSE_ON).map_err(unwind)?;
         modes.mouse = true;
         publish_leave(modes);
+        write(MOUSE_PIXELS_QUERY).map_err(unwind)?;
+        let (pixels_reply, _) = split_reply(read_answers(tty), b'y');
+        let mouse_pixels = pixels_reply
+            .as_deref()
+            .and_then(parse_decrqm)
+            .is_some_and(|(mode, state)| {
+                mode == 1016 && matches!(state, ModeState::Set | ModeState::PermanentlySet)
+            });
         if in_band_supported {
             write(IN_BAND_RESIZE_ON).map_err(unwind)?;
             modes.in_band_resize = true;
@@ -923,6 +945,7 @@ impl TerminalSession {
             modes,
             size,
             kitty_flags_before,
+            mouse_pixels,
             pushback: leftover,
             last_size,
             resize_tx,
@@ -952,6 +975,12 @@ impl TerminalSession {
     /// The keyboard-protocol flags the terminal reported before this session pushed its own.
     /// `None` means the terminal never answered `CSI ? u`, which is how it says it has no such
     /// protocol — and C6 has to fall back to reading plain control bytes.
+    /// Whether a mouse report's `x`/`y` are pixels. `false` means cells, and the caller multiplies
+    /// by [`PaneSize::cell_width`] and [`PaneSize::cell_height`] to find out where the pointer is.
+    pub(crate) fn mouse_in_pixels(&self) -> bool {
+        self.mouse_pixels
+    }
+
     pub(crate) fn kitty_flags_before(&self) -> Option<u8> {
         self.kitty_flags_before
     }
@@ -1295,6 +1324,11 @@ mod tests {
     #[test]
     fn the_mouse_encoding_is_set_before_the_reporting_mode() {
         assert!(MOUSE_ON.find("1016h").unwrap() < MOUSE_ON.find("1002h").unwrap());
+        // **`1006` before `1016`, and both before the tracking mode.** `1016` extends SGR and a
+        // terminal that does not know it ignores the escape, leaving the default X10 encoding —
+        // which is the failure this ordering exists to prevent. Off in the mirror order.
+        assert!(MOUSE_ON.find("1006h").unwrap() < MOUSE_ON.find("1016h").unwrap());
+        assert!(MOUSE_OFF.find("1016l").unwrap() < MOUSE_OFF.find("1006l").unwrap());
         assert!(MOUSE_OFF.find("1002l").unwrap() < MOUSE_OFF.find("1016l").unwrap());
     }
 
