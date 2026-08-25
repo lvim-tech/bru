@@ -477,8 +477,13 @@ pub fn show_page(identifier: i32) {
     let Ok(mut guard) = term.lock() else {
         return;
     };
-    // Exactly one browser is the page at a time. Everything else keeps painting into nothing, which
-    // costs a `memcpy` a frame and buys a tab that is still alive when it is switched back to.
+    // Exactly one browser is the page at a time.
+    let leaving: Vec<i32> = guard
+        .of_browser
+        .iter()
+        .filter(|(id, kind)| *kind == SurfaceKind::Page && *id != identifier)
+        .map(|(id, _)| *id)
+        .collect();
     guard.of_browser.retain(|(id, kind)| *kind != SurfaceKind::Page || *id == identifier);
     if !guard.of_browser.iter().any(|(id, _)| *id == identifier) {
         guard.of_browser.push((identifier, SurfaceKind::Page));
@@ -486,6 +491,31 @@ pub fn show_page(identifier: i32) {
     guard.surfaces[index_of(SurfaceKind::Page)] = None;
     drop(guard);
     crate::term_input::aim_at(identifier);
+
+    // **A windowless browser that has not changed does not paint, and switching tabs changes
+    // nothing about the page being switched to.** Measured 2026-08-25: the tab strip and the status
+    // bar updated, the keyboard followed, and the pane went on showing the tab that had just been
+    // left — because the only thing that had happened to the incoming browser was that bru started
+    // reading it again. `was_hidden` is the pair CEF offers for exactly this, and `invalidate` is
+    // what asks for the frame that makes the switch visible.
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    for id in leaving {
+        let browser = state.lock().expect("state mutex poisoned").browser_with_id(id);
+        if let Some(host) = browser.and_then(|browser| browser.host()) {
+            // A background tab that is told it is hidden stops painting frames nobody composites —
+            // which is the CPU a terminal frontend would otherwise spend on tabs that are not shown.
+            host.was_hidden(1);
+        }
+    }
+    let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        host.was_hidden(0);
+        host.was_resized();
+        host.invalidate(PaintElementType::VIEW);
+        host.set_focus(1);
+    }
 }
 
 /// Show the pointer shape the page is asking for.

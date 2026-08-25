@@ -238,8 +238,25 @@ fn post(key: TermKey) {
 ///
 /// The mode is read rather than a focus flag being kept, because the mode is what bru already keeps
 /// and a second copy of "where is focus" is a second thing to get out of step.
+/// How many key routings to log before going quiet. Enough to see a `:` and a word after it.
+static ROUTED: AtomicI32 = AtomicI32::new(0);
+
 fn target_for(state: &crate::tabs::SharedState) -> Option<Browser> {
     let mode = state.lock().expect("state mutex poisoned").mode_in(0);
+    let chosen = route(state, mode);
+    let seen = ROUTED.fetch_add(1, Ordering::Relaxed);
+    if seen < 12 {
+        eprintln!(
+            "bru[term]: key {seen}: mode={mode:?} -> browser={:?} (page={}, bottom={:?})",
+            chosen.as_ref().map(|browser| browser.identifier()),
+            TARGET.load(Ordering::Relaxed),
+            crate::ipc::bottom_chrome_browser_for(0).map(|browser| browser.identifier()),
+        );
+    }
+    chosen
+}
+
+fn route(state: &crate::tabs::SharedState, mode: crate::modes::Mode) -> Option<Browser> {
     match mode {
         // The command line is `#cmdline` in `bottom.html`.
         crate::modes::Mode::Command => crate::ipc::bottom_chrome_browser_for(0),
