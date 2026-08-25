@@ -138,7 +138,6 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         return Err("the terminal frontend is already running".to_string());
     }
     ACTIVE.store(true, Ordering::Relaxed);
-    divert_diagnostics();
 
     // **A window slot, even with no window in it.** Everything in `state.rs` is keyed by one —
     // which mode keys are in, which browsers are chrome, which tab is showing — and none of that is
@@ -206,7 +205,14 @@ wrap_task! {
     }
 }
 
-/// Send bru's own chatter somewhere other than the picture.
+/// Send every diagnostic somewhere other than the picture.
+///
+/// **Called before `initialize`, and the first version was not.** Redirecting stderr from
+/// `on_context_initialized` moves bru's own `eprintln!` and nothing else: by then CEF is up and
+/// Chromium's logging already holds the descriptor it was given. Measured 2026-08-25 on vesti.bg —
+/// `ERROR:net/socket/ssl_client_socket_impl.cc:964 handshake failed` painted across the page, from
+/// a logger bru never calls. The redirect has to happen before the library that inherits it starts.
+///
 ///
 /// **Every `eprintln!` in bru lands on top of the page.** Measured 2026-08-25 with abv.bg drawing
 /// correctly in the pane: `bru[adblock]: blocked 0 of 1 requests` and `bru: hint: this tab is in no
@@ -218,7 +224,7 @@ wrap_task! {
 /// `tail -f` in another pane is the same diagnostic it always was. If the file cannot be opened the
 /// messages stay where they are — a browser that refused to start because it could not open a log
 /// would be worse than one that draws over itself.
-fn divert_diagnostics() {
+pub fn divert_diagnostics() {
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
         return;
     };

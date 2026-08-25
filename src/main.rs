@@ -335,6 +335,13 @@ fn main() -> Result<(), &'static str> {
         }
         return Err("--term needs a terminal");
     }
+    // **After the refusal above and before `initialize`.** After, because the refusal is the one
+    // message that has to reach a person looking at a shell rather than a log file — diverting
+    // first would have hidden the explanation for not starting. Before, because Chromium's own
+    // logging inherits this descriptor when CEF comes up, and it is the noisier of the two writers.
+    if term_frontend::requested(&raw) {
+        term_frontend::divert_diagnostics();
+    }
     // --- end src/term_spike.rs ----------------------------------------------------------------
 
     let settings = Settings {
