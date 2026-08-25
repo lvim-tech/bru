@@ -14,12 +14,19 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// `Arc` — the delayed-close task below is one. The strong reference lives in `BruApp`.
 static INSTANCE: OnceLock<Weak<Mutex<BruState>>> = OnceLock::new();
 
-/// One top-level window: its CEF handles, its chrome, and its tabs.
+/// One top-level window: what both frontends share, and a [`Shell`] holding what only one of them
+/// has.
 ///
 /// Everything in here used to be a field of [`BruState`], because there was one window. Splitting
 /// it out is what makes `gD`, `U` and every `-w` spelling mean something — and it is also what keeps
 /// two windows from pushing into each other's tab strip, which a single `active` index could not.
-
+///
+/// **The CEF *handles* are no longer among them.** A `Window`, a `BoxLayout`, a `Panel` and a docked
+/// inspector are things the Views frontend has and a windowless one does not, so they moved behind
+/// `shell`; what is left here is true of a window however it is drawn — which id it is, what tabs it
+/// holds, which one is showing, and what mode its keys are in.
+///
+/// [`Shell`]: crate::shell::Shell
 pub struct WindowState {
     /// bru's own identifier for the window, and the one `:tab-give 1` names. Zero-based, like
     /// qutebrowser's `win_id`, so a count of `n` means window `n - 1` (`commands.py:475`).
@@ -682,7 +689,7 @@ impl BruState {
     pub fn active_view_in(&self, window: u32) -> Option<BrowserView> {
         self.slot(window)
             .and_then(|slot| slot.tabs.get(slot.active))
-            .map(|tab| tab.view.clone())
+            .and_then(|tab| tab.surface.view().cloned())
     }
     // --- end src/devtools.rs --------------------------------------------------------------------
 

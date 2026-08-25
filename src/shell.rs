@@ -104,3 +104,38 @@ pub struct Docked {
     pub drag_from: Option<i32>,
 }
 // --- end src/devtools.rs ----------------------------------------------------------------------
+
+// --- src/tabs.rs ------------------------------------------------------------------------------
+/// What a tab is drawn in.
+///
+/// **The plan had this moved out of `Tab` and into `ViewsShell`, keyed by index. It is here
+/// instead, and the reason is `tab-give`.** A tab is handed between windows *whole* — `Tab` carries
+/// the pin, the mute and the browser id across, because a `BrowserView` alone would lose them
+/// (`tabs.rs`, `detach_active_tab_in`). A parallel `Vec` on the shell would have to be moved
+/// between two windows' shells in step with that, and a pair of vectors that must agree is a pair
+/// of vectors that will one day disagree — silently, with a tab drawing another tab's page.
+///
+/// Naming the type here achieves what the seam is for: `tabs.rs` and `state.rs` stop saying
+/// `BrowserView` in a struct both frontends share. What they say instead is "whatever this shell
+/// draws a tab in", and the terminal's answer is that there is nothing to hold — a windowless tab
+/// is its browser, and the compositor decides where it lands.
+pub enum TabSurface {
+    Views(BrowserView),
+}
+
+impl TabSurface {
+    /// The `BrowserView`, when this tab is drawn in one.
+    pub fn view(&self) -> Option<&BrowserView> {
+        match self {
+            TabSurface::Views(view) => Some(view),
+        }
+    }
+
+    /// The same, given up — for the paths that hand a view back to a caller who will re-parent it.
+    pub fn into_view(self) -> Option<BrowserView> {
+        match self {
+            TabSurface::Views(view) => Some(view),
+        }
+    }
+}
+// --- end src/tabs.rs --------------------------------------------------------------------------

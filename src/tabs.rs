@@ -41,7 +41,8 @@ pub struct TabsSnapshot {
 }
 
 pub struct Tab {
-    pub(crate) view: BrowserView,
+    /// What this tab is drawn in — see `shell::TabSurface` for why the type is the shell's.
+    pub(crate) surface: crate::shell::TabSurface,
     /// Learned from `BrowserViewDelegate::on_browser_created`, not at creation: `browser_view_create`
     /// returns before the browser exists, so this is `None` for the moment in between.
     pub(crate) browser_id: Option<i32>,
@@ -76,13 +77,13 @@ impl BruState {
     /// The current window's tab views.
     pub fn tab_views(&self) -> Vec<BrowserView> {
         self.current_slot()
-            .map(|slot| slot.tabs.iter().map(|tab| tab.view.clone()).collect())
+            .map(|slot| slot.tabs.iter().filter_map(|tab| tab.surface.view().cloned()).collect())
             .unwrap_or_default()
     }
 
     pub fn tab_views_in(&self, window: u32) -> Vec<BrowserView> {
         self.slot(window)
-            .map(|slot| slot.tabs.iter().map(|tab| tab.view.clone()).collect())
+            .map(|slot| slot.tabs.iter().filter_map(|tab| tab.surface.view().cloned()).collect())
             .unwrap_or_default()
     }
 
@@ -91,7 +92,10 @@ impl BruState {
     pub fn note_tab_browser(&mut self, view: &mut BrowserView, identifier: i32) {
         for slot in &mut self.windows {
             for tab in &mut slot.tabs {
-                if tab.view.is_same(Some(&mut View::from(&*view))) != 0 {
+                let Some(held) = tab.surface.view() else {
+                    continue;
+                };
+                if held.is_same(Some(&mut View::from(&*view))) != 0 {
                     tab.browser_id = Some(identifier);
                     return;
                 }
@@ -388,7 +392,9 @@ impl BruState {
                 kept.push(tab);
             } else {
                 closed.push(tab.url.clone());
-                taken.push(tab.view.clone());
+                if let Some(view) = tab.surface.view() {
+                    taken.push(view.clone());
+                }
             }
         }
         slot.tabs = kept;
@@ -403,7 +409,7 @@ impl BruState {
     pub fn push_tab_in(&mut self, window: u32, view: BrowserView) -> Option<usize> {
         let slot = self.slot_mut(window)?;
         slot.tabs.push(Tab {
-            view,
+            surface: crate::shell::TabSurface::Views(view),
             browser_id: None,
             title: String::new(),
             url: String::new(),
@@ -420,7 +426,7 @@ impl BruState {
         let tab = self.detach_active_tab_in(window)?;
         // Kept so `u` can open it again. Only the URL — see `BruState::closed`.
         self.closed.push(tab.url.clone());
-        Some(tab.view)
+        tab.surface.into_view()
     }
 
     /// The same removal without the undo entry: the tab is not being closed, it is being handed to
@@ -1215,10 +1221,14 @@ pub fn give_tab(state: &SharedState, to: Option<u32>) {
     };
 
     if let Some(old_pages) = &old_pages {
-        old_pages.remove_child_view(Some(&mut View::from(&tab.view)));
+        if let Some(view) = tab.surface.view() {
+            old_pages.remove_child_view(Some(&mut View::from(view)));
+        }
     }
 
-    let view = tab.view.clone();
+    let Some(view) = tab.surface.view().cloned() else {
+        return;
+    };
     let (index, new_pages, layout) = {
         let mut state = state.lock().expect("state mutex poisoned");
         let index = state.attach_tab_in(target, tab);
