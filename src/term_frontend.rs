@@ -29,7 +29,7 @@ use cef::*;
 // CEF's own rectangle, which the compositor's `Rect` shadows in this file.
 use cef::Rect as CefRect;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::term_compose::{Frame, Layer, Layout, LayoutRequest, Rect, Surface, SurfaceKind, layout};
@@ -187,6 +187,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         .unwrap_or_default();
     crate::term_input::start_with(pushback);
     watch_size();
+    install_interrupt();
     Ok(())
 }
 
@@ -606,6 +607,119 @@ pub fn resized(size: PaneSize) {
         term.of_browser.clone()
     };
     resize_browsers(&browsers);
+}
+
+/// Close the browsers and let the message loop end, so CEF shuts down properly.
+///
+/// **The difference between this and `quit_soon` is everything Chromium writes on the way out.**
+/// `quit_message_loop` alone ends the loop and `main` then calls `shutdown()`, which is what flushes
+/// cookies, history and saved logins to disk — but only for browsers that have been closed. So the
+/// browsers go first, and the loop ends when the last of them is gone (`state.rs` does that already,
+/// on the last `on_before_close`). If none of them can be found, the loop is ended directly rather
+/// than leaving a browser that cannot be quit.
+pub fn shut_down() {
+    let Some(state) = crate::state::BruState::instance() else {
+        quit_soon();
+        return;
+    };
+    let browsers: Vec<i32> = TERM
+        .get()
+        .and_then(|term| term.lock().ok().map(|guard| guard.of_browser.clone()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(identifier, _)| identifier)
+        .collect();
+    let mut closed = false;
+    for identifier in browsers {
+        let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+        if let Some(host) = browser.and_then(|browser| browser.host()) {
+            host.close_browser(1);
+            closed = true;
+        }
+    }
+    if !closed {
+        quit_soon();
+    }
+}
+
+/// Ctrl-C, `kill`, and the terminal going away.
+///
+/// **A browser hit with Ctrl-C should stop the way one whose window was closed stops.** The session
+/// layer's own handler restores the terminal and re-raises with the default disposition, which is
+/// the honest thing for a process that was killed — and the wrong thing for this one, because being
+/// killed is exactly what loses the cookies. So the first signal asks for a clean shutdown and the
+/// second one takes the honest path: a browser that will not stop must still be stoppable.
+fn install_interrupt() {
+    // SAFETY: `pipe2` fills two descriptors or reports failure.
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return;
+    }
+    let (read, write) = (fds[0], fds[1]);
+    INTERRUPT_PIPE.store(write, Ordering::Release);
+    for signum in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: `sigaction` is filled entirely before it is installed, and the handler below is
+        // async-signal-safe — it writes one byte and returns.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_interrupt as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signum, &action, std::ptr::null_mut());
+        }
+    }
+    let _ = std::thread::Builder::new().name("bru-term-quit".to_string()).spawn(move || {
+        let mut byte = [0u8; 1];
+        // SAFETY: reading one byte into a local buffer from a descriptor this process owns.
+        while unsafe { libc::read(read, byte.as_mut_ptr().cast(), 1) } == 1 {
+            let mut task = ShutdownTask::new();
+            post_task(ThreadId::UI, Some(&mut task));
+        }
+    });
+}
+
+/// The write end of the pipe the handler pokes. `0` before [`install_interrupt`] has run.
+static INTERRUPT_PIPE: AtomicI32 = AtomicI32::new(0);
+
+/// How many interrupts have arrived. The second one is not asked politely.
+static INTERRUPTS: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_interrupt(signum: libc::c_int) {
+    if INTERRUPTS.fetch_add(1, Ordering::Relaxed) > 0 {
+        // SAFETY: both are async-signal-safe. Restoring the default disposition first is what makes
+        // the re-raise terminate rather than re-enter this handler.
+        unsafe {
+            libc::signal(signum, libc::SIG_DFL);
+            libc::raise(signum);
+        }
+        return;
+    }
+    let fd = INTERRUPT_PIPE.load(Ordering::Acquire);
+    if fd != 0 {
+        let byte = b"q";
+        // SAFETY: `write` is async-signal-safe; a full pipe means a shutdown is already pending,
+        // and the short write that follows is ignored for exactly that reason.
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+}
+
+wrap_task! {
+    struct ShutdownTask;
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = crate::state::BruState::instance() else {
+                quit_message_loop();
+                return;
+            };
+            // The same road `:quit` takes, so that whatever `auto_save.session` and the plugin
+            // events do on the way out happens here too.
+            crate::lifetime::on_quitting(&state);
+            shut_down();
+        }
+    }
 }
 
 /// Put the terminal back and stop. Idempotent.

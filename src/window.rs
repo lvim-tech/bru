@@ -223,6 +223,16 @@ pub fn close(state: &SharedState, window_id: u32) {
 /// Close every window, which is what ends the process: `BruState::on_before_close` stops the message
 /// loop when the last browser in the last window has gone.
 pub fn close_all(state: &SharedState) {
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // **A terminal run has no window handle to close, so this walked an empty list and `:quit` did
+    // nothing.** Measured 2026-08-25: the only way out was Ctrl-C, which kills the process before
+    // CEF can shut down — and Chromium writes its cookies, its history and its `Login Data` during
+    // that shutdown. A browser with no clean exit is a browser that forgets every login.
+    if crate::term_frontend::is_active() {
+        crate::term_frontend::shut_down();
+        return;
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
     let windows = state
         .lock()
         .expect("state mutex poisoned")
