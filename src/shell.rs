@@ -71,4 +71,36 @@ pub struct ViewsShell {
     /// instead, once, and never moved.
     pub pages: Option<Panel>,
     pub pages_layout: Option<BoxLayout>,
+    /// The inspector docked under this window's pages, if one is.
+    ///
+    /// **Views-only by construction, which is why it is here and not beside the tabs.** A docked
+    /// inspector is a `BrowserView` in a layout and a divider strip that resizes it by dragging;
+    /// the terminal frontend has neither a view to dock nor a pointer to drag with, and will answer
+    /// the same question a different way or not at all. See `devtools.rs`.
+    pub devtools: Option<Docked>,
 }
+
+// --- src/devtools.rs --------------------------------------------------------------------------
+/// A docked inspector: the view in the window, and who it is for.
+pub struct Docked {
+    pub view: BrowserView,
+    /// The browser being inspected. `follow_tab` compares it with the tab on screen.
+    pub inspects: i32,
+    /// The inspector's *own* browser, learned from the view the moment it is docked. It is what
+    /// `on_before_close` sees when the panel is closed by its own button rather than by `:devtools`.
+    pub browser_id: Option<i32>,
+    /// The strip above it that resizes it, made with it and going with it.
+    ///
+    /// Held here rather than beside it so the two cannot drift: every place that shows, hides or
+    /// removes the inspector has the divider in the same hand, and there is no window state in
+    /// which one exists without the other.
+    pub divider: Option<BrowserView>,
+    /// The inspector's height when the pointer went down on the divider, in DIP.
+    ///
+    /// The drag reports how far the pointer has moved **from where it started**, so the height it
+    /// asks for is this number minus that distance — which is why the start has to be kept. `None`
+    /// when no drag is in progress; a `drag` phase that arrives without a `start` is ignored rather
+    /// than guessed at.
+    pub drag_from: Option<i32>,
+}
+// --- end src/devtools.rs ----------------------------------------------------------------------

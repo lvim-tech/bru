@@ -19,30 +19,6 @@ static INSTANCE: OnceLock<Weak<Mutex<BruState>>> = OnceLock::new();
 /// Everything in here used to be a field of [`BruState`], because there was one window. Splitting
 /// it out is what makes `gD`, `U` and every `-w` spelling mean something — and it is also what keeps
 /// two windows from pushing into each other's tab strip, which a single `active` index could not.
-// --- src/devtools.rs -----------------------------------------------------------------------------
-/// A docked inspector: the view in the window, and who it is for.
-struct Docked {
-    view: BrowserView,
-    /// The browser being inspected. `follow_tab` compares it with the tab on screen.
-    inspects: i32,
-    /// The inspector's *own* browser, learned from the view the moment it is docked. It is what
-    /// `on_before_close` sees when the panel is closed by its own button rather than by `:devtools`.
-    browser_id: Option<i32>,
-    /// The strip above it that resizes it, made with it and going with it.
-    ///
-    /// Held here rather than beside it so the two cannot drift: every place that shows, hides or
-    /// removes the inspector has the divider in the same hand, and there is no window state in
-    /// which one exists without the other.
-    divider: Option<BrowserView>,
-    /// The inspector's height when the pointer went down on the divider, in DIP.
-    ///
-    /// The drag reports how far the pointer has moved **from where it started**, so the height it
-    /// asks for is this number minus that distance — which is why the start has to be kept. `None`
-    /// when no drag is in progress; a `drag` phase that arrives without a `start` is ignored rather
-    /// than guessed at.
-    drag_from: Option<i32>,
-}
-// --- end src/devtools.rs -------------------------------------------------------------------------
 
 pub struct WindowState {
     /// bru's own identifier for the window, and the one `:tab-give 1` names. Zero-based, like
@@ -84,8 +60,7 @@ pub struct WindowState {
     ///
     /// One per window rather than one per tab: CEF makes an inspector per browser, but only one can
     /// be under the pages at a time, and which one that is follows the tab on screen — see
-    /// `devtools::follow_tab`.
-    devtools: Option<Docked>,
+    /// `devtools::follow_tab`. Lives on the shell — see `shell::ViewsShell::devtools`.
     // --- end src/devtools.rs --------------------------------------------------------------------
     /// The half-typed key chain and count this window is holding, and the mode they belong to.
     ///
@@ -227,7 +202,6 @@ impl BruState {
             tabs: Vec::new(),
             active: 0,
             last_active: None,
-            devtools: None,
             modes: crate::modes::ModeManager::new(),
             pending_keys: (crate::modes::Mode::Normal, Vec::new(), String::new()),
         });
@@ -350,29 +324,36 @@ impl BruState {
     ) {
         let browser_id = view.browser().map(|browser| browser.identifier());
         if let Some(slot) = self.slot_mut(id) {
-            slot.devtools =
-                Some(Docked { view, inspects, browser_id, divider, drag_from: None });
+            if let Some(views) = slot.shell.as_views_mut() {
+                views.devtools = Some(crate::shell::Docked {
+                    view,
+                    inspects,
+                    browser_id,
+                    divider,
+                    drag_from: None,
+                });
+            }
         }
     }
 
     /// The docked view and the browser it is for.
     pub fn inspector_in(&self, id: u32) -> Option<(BrowserView, i32)> {
         self.slot(id)
-            .and_then(|slot| slot.devtools.as_ref())
+            .and_then(|slot| slot.shell.as_views()?.devtools.as_ref())
             .map(|docked| (docked.view.clone(), docked.inspects))
     }
 
     /// Forget it and hand the view back, so the caller can take it out of the window.
     pub fn take_inspector(&mut self, id: u32) -> Option<BrowserView> {
         self.slot_mut(id)
-            .and_then(|slot| slot.devtools.take())
+            .and_then(|slot| slot.shell.as_views_mut()?.devtools.take())
             .map(|docked| docked.view)
     }
 
     /// The divider strip above this window's docked inspector, if one is docked.
     pub fn divider_in(&self, id: u32) -> Option<BrowserView> {
         self.slot(id)
-            .and_then(|slot| slot.devtools.as_ref())
+            .and_then(|slot| slot.shell.as_views()?.devtools.as_ref())
             .and_then(|docked| docked.divider.clone())
     }
 
@@ -384,8 +365,9 @@ impl BruState {
         self.windows
             .iter()
             .find(|slot| {
-                slot.devtools
-                    .as_ref()
+                slot.shell
+                    .as_views()
+                    .and_then(|views| views.devtools.as_ref())
                     .and_then(|docked| docked.divider.as_ref())
                     .and_then(|view| view.browser())
                     .map(|browser| browser.identifier())
@@ -396,7 +378,9 @@ impl BruState {
 
     /// Remember the height a drag started from, or forget it when the drag ends.
     pub fn set_drag_from(&mut self, id: u32, height: Option<i32>) {
-        if let Some(docked) = self.slot_mut(id).and_then(|slot| slot.devtools.as_mut()) {
+        if let Some(docked) =
+            self.slot_mut(id).and_then(|slot| slot.shell.as_views_mut()?.devtools.as_mut())
+        {
             docked.drag_from = height;
         }
     }
@@ -404,7 +388,7 @@ impl BruState {
     /// The height the drag in progress started from, if one is in progress.
     pub fn drag_from(&self, id: u32) -> Option<i32> {
         self.slot(id)
-            .and_then(|slot| slot.devtools.as_ref())
+            .and_then(|slot| slot.shell.as_views()?.devtools.as_ref())
             .and_then(|docked| docked.drag_from)
     }
 
@@ -414,8 +398,9 @@ impl BruState {
         self.windows
             .iter()
             .find(|slot| {
-                slot.devtools
-                    .as_ref()
+                slot.shell
+                    .as_views()
+                    .and_then(|views| views.devtools.as_ref())
                     .and_then(|docked| docked.browser_id)
                     == Some(identifier)
             })
