@@ -125,6 +125,40 @@ fn socket_from(args: &[String], runtime_dir: Option<&std::ffi::OsStr>) -> Option
     Some(PathBuf::from(dir).join("bru").join("ipc.sock"))
 }
 
+/// How many bytes of path a unix socket address can hold, this NUL included.
+///
+/// Taken from `libc::sockaddr_un`'s own field rather than written as 108, because the number is the
+/// C struct's and not a constant of this protocol: it is 108 on Linux and 104 on the BSDs, and a
+/// literal here would be a fact about one kernel spelled as if it were a fact about sockets.
+fn sun_path_capacity() -> usize {
+    // A zeroed `sockaddr_un` is only ever read for the length of its array. Nothing is bound, sent
+    // or connected with it.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_path.len()
+}
+
+/// Refuse a path the address cannot hold, saying which limit and by how much.
+///
+/// **std's own answer is `path must be shorter than SUN_LEN`, and it is useless twice over**: it
+/// names a C macro rather than a number, and it does not repeat the path — so a person whose socket
+/// lives under a long scratch directory is told a rule they cannot apply to a path they cannot see.
+/// Measured 2026-08-25 with a `--socket=` under a session scratch directory: the browser started,
+/// ran with no remote, and the line it printed explained nothing.
+///
+/// The limit is the array minus the terminating NUL. Bytes, not characters: a path is bytes to the
+/// kernel and a non-ASCII directory name spends more of them than it looks like it should.
+fn check_socket_path(path: &std::path::Path) -> Result<(), String> {
+    let bytes = path.as_os_str().as_encoded_bytes().len();
+    let limit = sun_path_capacity().saturating_sub(1);
+    if bytes > limit {
+        return Err(format!(
+            "the socket path is {bytes} bytes and a unix socket address holds {limit}: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------------------------
 // The caller's side
 // -----------------------------------------------------------------------------------------------
@@ -139,6 +173,7 @@ pub fn send(line: &str) -> Result<(), String> {
     let Some(path) = socket_path() else {
         return Err("no $XDG_RUNTIME_DIR, so there is nowhere for the socket to be".to_string());
     };
+    check_socket_path(&path)?;
     let stream = UnixStream::connect(&path)
         .map_err(|e| format!("no bru is listening on {}: {e}", path.display()))?;
     stream
@@ -240,6 +275,10 @@ pub fn listen() {
 /// if nothing does, the file is a corpse and removing it is safe. Doing it the other way round —
 /// unlink first, bind after — would take the socket out from under a browser that was using it.
 fn bind(path: &std::path::Path) -> Result<UnixListener, String> {
+    // Before the bind, so the failure is named rather than being std's `SUN_LEN` — and before the
+    // `AddrInUse` dance below, which would otherwise try to `connect` and then `remove_file` a path
+    // that was never a socket in the first place.
+    check_socket_path(path)?;
     match UnixListener::bind(path) {
         Ok(listener) => return Ok(listener),
         Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
@@ -529,6 +568,31 @@ mod socket_tests {
     fn the_last_switch_wins() {
         let line = args(&["bru", "--socket=/tmp/a.sock", "--socket=/tmp/b.sock"]);
         assert_eq!(socket_from(&line, None), Some(PathBuf::from("/tmp/b.sock")));
+    }
+
+    /// **The message std would have given instead.** `path must be shorter than SUN_LEN` names a C
+    /// macro and repeats nothing; this names the two numbers and the path, which is what a person
+    /// with a socket under a long scratch directory needs to see.
+    #[test]
+    fn a_socket_path_too_long_for_the_address_is_refused_by_name() {
+        let limit = super::sun_path_capacity() - 1;
+        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(limit)));
+        let why = super::check_socket_path(&long).expect_err("a path one byte over the limit");
+        assert!(why.contains(&format!("{} bytes", limit + 5)), "{why}");
+        assert!(why.contains(&limit.to_string()), "{why}");
+        assert!(why.contains("/tmp/xxx"), "the path is repeated: {why}");
+    }
+
+    /// Exactly the limit fits: the NUL is the byte the array keeps for itself, and an off-by-one
+    /// here would refuse a path the kernel accepts.
+    #[test]
+    fn a_socket_path_at_the_limit_is_allowed() {
+        let limit = super::sun_path_capacity() - 1;
+        let exact = PathBuf::from("/".repeat(limit));
+        assert_eq!(exact.as_os_str().as_encoded_bytes().len(), limit);
+        assert!(super::check_socket_path(&exact).is_ok());
+        // And the default, which is the path every run that names no socket uses.
+        assert!(super::check_socket_path(&PathBuf::from("/run/user/1000/bru/ipc.sock")).is_ok());
     }
 
     /// An empty value is not a path. Falling through to the default beats binding to "".
