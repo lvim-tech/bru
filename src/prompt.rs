@@ -2018,11 +2018,24 @@ wrap_dialog_handler! {
             callback: Option<&mut FileDialogCallback>,
         ) -> ::std::os::raw::c_int {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            // --- src/term_frontend.rs -------------------------------------------------------
+            // **Returning 0 hands the dialog to Chromium, and with no window to parent it on that
+            // is a segfault rather than a fallback.** Measured 2026-08-25 on `dox.bg`, whose upload
+            // area opens a file picker: `FileSelectHelper::RunFileChooserOnUIThread` called
+            // `aura::Window::GetToplevelWindow` on a windowless browser and the process died. CEF's
+            // own header warns of it in the mildest terms — "some functionality that requires a
+            // parent window may not function correctly" — and this is what that turned out to mean.
+            //
+            // So a terminal run claims every file dialog, including the ones it cannot answer: a
+            // dialog that does nothing beats a browser that is gone.
+            let claimed = i32::from(crate::term_frontend::is_active());
             let Some(callback) = callback.map(|callback| callback.clone()) else {
-                return 0;
+                return claimed;
             };
+            // --- end src/term_frontend.rs ---------------------------------------------------
             let browser = browser.as_deref();
             let Some(window) = window_of(browser) else {
+                eprintln!("bru[prompt]: a file dialog for a browser in no window; cancelled");
                 callback.cancel();
                 return 1;
             };
