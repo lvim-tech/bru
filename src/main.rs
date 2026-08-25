@@ -195,6 +195,60 @@ fn main() -> Result<(), &'static str> {
         );
     }
 
+    // --- src/remote.rs: the other door ---------------------------------------------------------
+    // **`--remote-debugging-port` costs bru no code, and that is exactly why it is owed this.** CEF
+    // reads the switch off the argv `args::Args` hands it — the field behind it is
+    // `remote_debugging_port` in `cef_types.h` — so the port opens with nothing here asking for it.
+    // Measured 2026-08-25 against `Chrome/151.0.7922.72`: `Runtime.evaluate`, `Page.navigate`,
+    // `Page.captureScreenshot`, `Accessibility.getFullAXTree` and `Input.dispatchKeyEvent` each
+    // drive a live bru. A door that wide is owed the paragraph `remote.rs` writes for its socket
+    // ("What it is not"), and three of its facts are not ones a reader should have to infer:
+    //
+    // - **It is a wider boundary than `--remote`'s, not the same one.** That socket sits in
+    //   `$XDG_RUNTIME_DIR`, which the kernel gives this user alone at mode 0700, and is itself
+    //   0600. This is a loopback TCP port, and *every local account* can connect to 127.0.0.1.
+    //   Measured on this machine 2026-08-25 with the port open: `/proc/net/tcp` holds one listener
+    //   for it and its local address is `0100007F`, i.e. 127.0.0.1, and a connection to the same
+    //   port on this host's LAN address is refused. Loopback-only is Chromium's default, not
+    //   something bru sets — `--remote-debugging-address` is honoured by headless Chromium, which
+    //   CEF is not, so there is no switch here to get it wrong with.
+    // - **A CDP client is bru, not a page inside it.** `ipc.rs` refuses `cefQuery` from any frame
+    //   that is not a `bru://` page, and `Runtime.evaluate` aimed at a chrome target does not walk
+    //   around that check — it *satisfies* it, because the injected code genuinely runs in a
+    //   `bru://` frame. There is no second boundary inside the port.
+    // - **The chrome pages are on the list and cannot be taken off it.** `/json/list` answers with
+    //   four targets: the page, plus `bru://chrome/top.html`, `bottom.html` and `panel.html`. CEF
+    //   151 exposes no target-filtering hook — the whole remote-debugging surface it offers is that
+    //   one settings field — so a client has to pick its target by URL or it will drive the tab
+    //   strip by accident. Said in the README beside the example, because that is where somebody
+    //   writing the client is looking.
+    //
+    // Said out loud at startup for the same reason `--private` is: a browser behaving differently
+    // from the one a person thinks they started is worth a line.
+    let debugging_port =
+        CefString::from(&cmd_line.switch_value(Some(&CefString::from("remote-debugging-port"))))
+            .to_string();
+    if cmd_line.has_switch(Some(&CefString::from("remote-debugging-port"))) == 1 {
+        // `0` is Chromium's "pick one", and it writes the number it picked to `DevToolsActivePort`
+        // in the profile rather than to this line, so the line must not pretend to know it.
+        let where_to_look = if debugging_port.trim() == "0" {
+            " (0: Chromium picks the port and writes it to DevToolsActivePort in the profile)"
+        } else {
+            ""
+        };
+        eprintln!(
+            "bru: --remote-debugging-port={debugging_port}: the DevTools protocol is \
+             listening on 127.0.0.1{where_to_look}"
+        );
+        eprintln!(
+            "bru: --remote-debugging-port: anything that can reach that port drives this \
+             browser, bru's own bru:// chrome pages included; every local account can reach \
+             127.0.0.1"
+        );
+    }
+    // --- end src/remote.rs: the other door -----------------------------------------------------
+
+
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
         // Chromium sandbox is worth having back before this is used for anything real.
@@ -207,10 +261,12 @@ fn main() -> Result<(), &'static str> {
         // `<root>/Default/Cookies` is a real SQLite file holding the row (`is_persistent = 1`).
         // Setting `cache_path` to the root as well was measured too and changed nothing at all —
         // the two profile trees differed only in a blob UUID and one cache entry's name, 4.9 MB
-        // either way. That rule describes the Alloy runtime; these BrowserViews are Chrome style,
-        // where the profile is `<root_cache_path>/Default` on disk whatever this field says. So
-        // there is nothing to switch on here, and a `--cache-path` switch would have been a name
-        // with no behaviour behind it. What survives a restart is decided by `--private` above.
+        // either way. The header attributes that rule to the Alloy runtime, and **these
+        // BrowserViews are Alloy style** — `window.rs:1128` sets `RuntimeStyle::ALLOY` and says
+        // why — so the promise does not hold even where the header claims it does. The profile is
+        // `<root_cache_path>/Default` on disk whatever this field says. So there is nothing to
+        // switch on here, and a `--cache-path` switch would have been a name with no behaviour
+        // behind it. What survives a restart is decided by `--private` above.
         root_cache_path: profile
             .as_ref()
             .map(|profile| CefString::from(profile.path().to_string_lossy().as_ref()))
@@ -260,6 +316,20 @@ fn handover(args: &[String]) -> Option<String> {
             return None;
         }
         if arg == "--new-instance" || arg == "--remote" {
+            return None;
+        }
+        // **The two switches that ask for a browser of their own, and used to be eaten here.**
+        // `--socket=` needs no arm because nothing is listening on a socket of one's own, so the
+        // send below fails and this bru becomes the browser (see the test). These two have no such
+        // luck: measured 2026-08-25, `bru --remote-debugging-port=9222 https://x` with a bru
+        // already running handed the page over and exited, so the port was never opened and
+        // nothing said so — the person asked for a debuggable browser and got a tab in an
+        // undebuggable one. `--ssh` is the same shape and worse: the page would load in a browser
+        // that is not going through the tunnel that was asked for.
+        if arg == "--remote-debugging-port" || arg.starts_with("--remote-debugging-port=") {
+            return None;
+        }
+        if arg == "--ssh" || arg.starts_with("--ssh=") {
             return None;
         }
     }
@@ -331,5 +401,33 @@ mod tests {
         // fails and this bru becomes the browser. That is asserted by the shape of `main`, not
         // here, and it is why a scratch browser still works.
         assert!(handover(&argv(&["--socket=/run/user/1000/x.sock"])).is_some());
+    }
+
+    /// **A switch whose whole point is this process must not be answered by another one.** Both of
+    /// these used to fall through to the handover and die without a word — see the comment beside
+    /// their arms. A URL alongside them changes nothing: the URL is why a person reaches for the
+    /// switch in the first place.
+    #[test]
+    fn a_debugging_port_or_a_tunnel_is_a_browser_of_your_own() {
+        assert_eq!(handover(&argv(&["--remote-debugging-port=9222"])), None);
+        assert_eq!(
+            handover(&argv(&["--remote-debugging-port=9222", "https://example.com/"])),
+            None
+        );
+        // Chromium spells its switches with `=`; the bare form is what a typo looks like, and it
+        // has to refuse too rather than hand the page over on the way to failing.
+        assert_eq!(handover(&argv(&["--remote-debugging-port"])), None);
+        assert_eq!(handover(&argv(&["--ssh=user@host"])), None);
+        assert_eq!(handover(&argv(&["--ssh=user@host", "https://example.com/"])), None);
+        assert_eq!(handover(&argv(&["--ssh"])), None);
+    }
+
+    /// The prefix match is a match on *these* switches and not on everything that starts like them.
+    /// `--remote` is already refused by its own arm; the point here is that a longer name bru does
+    /// not know stays a page hand-over rather than silently becoming a second browser.
+    #[test]
+    fn a_switch_that_merely_starts_the_same_is_not_one_of_them() {
+        assert!(handover(&argv(&["--remote-debugging-pipe", "https://example.com/"])).is_some());
+        assert!(handover(&argv(&["--sshfs=/mnt/x", "https://example.com/"])).is_some());
     }
 }
