@@ -1094,6 +1094,70 @@ default address first, which is the one you are using. The socket is in `$XDG_RU
 0600: **it is not a security boundary**, and anything that can write it can drive the browser,
 `:spawn` included.
 
+### The DevTools protocol
+
+`--remote-debugging-port` opens Chromium's own protocol, so anything that speaks CDP — Playwright,
+`chrome-devtools-mcp`, an agent's browser driver — drives bru without bru growing a verb for it:
+
+```sh
+bru --new-instance --socket=/tmp/b.sock --remote-debugging-port=9222 &
+curl -s http://127.0.0.1:9222/json/version
+```
+
+That spelling is also the answer to "how do I debug a second bru while my main one runs": the
+switch refuses to hand its page over to a running browser, so it always starts one of its own, and
+`--socket=` keeps the two remotes apart. `--remote-debugging-port=0` lets Chromium pick a port and
+writes the number it picked to `DevToolsActivePort` in the profile directory.
+
+**`/json/list` answers with four targets, not one.** bru's chrome is HTML in browsers of its own, so
+the page sits beside `bru://chrome/top.html`, `bottom.html` and `panel.html`. Pick the target by
+URL — a client that takes "the first one" will end up driving the tab strip. CEF exposes no way to
+hide them.
+
+**The port is a wider boundary than the socket above.** It is loopback TCP, which every local
+account can connect to, where the socket is 0600 inside a 0700 `$XDG_RUNTIME_DIR`. A CDP client is
+not a web page with extra powers — it is bru: it can evaluate inside the `bru://` chrome pages,
+which is everything `window.cefQuery`'s "chrome pages only" check protects.
+
+What an agent's verbs map to, so there is no need for bru to grow its own:
+
+| verb | CDP |
+|---|---|
+| navigate | `Page.navigate` |
+| eval | `Runtime.evaluate` |
+| snapshot | `Accessibility.getFullAXTree` |
+| click, type | `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent` |
+| screenshot | `Page.captureScreenshot` |
+
+`Page.captureScreenshot` frames the **page only** — the tab strip and the status bar are separate
+browsers, so they are separate targets.
+
+### Through an ssh tunnel
+
+`--ssh=<destination>` runs `ssh -N -D` and points Chromium at the SOCKS proxy it opens, so the page
+renders on this machine and only the bytes it fetches take the long way:
+
+```sh
+bru --ssh=user@host http://localhost:3000/   # the remote machine's localhost
+```
+
+Everything else about the connection — port, identity, jump host — belongs in `~/.ssh/config`,
+which `ssh` reads for itself. The prompt for a passphrase or a token appears in the terminal bru was
+started from, and bru waits up to a minute for the tunnel to answer. If it cannot come up, bru does
+not start: a browser that quietly went out of the local interface instead is the one thing the
+switch exists to prevent. If the tunnel dies later, bru says so once and loads fail until it is
+restarted — ssh authentication cannot be repeated by a browser that noticed three hours later.
+
+It buys reachability, not privacy: the remote machine sees every host bru asks for.
+
+### A pane of the terminal
+
+`:spawn --split <command>` runs the command in a new pane of the terminal bru was launched from —
+kitty (`kitten @ launch`), tmux (`tmux split-window`) or wezterm (`wezterm cli split-pane`). With no
+terminal to ask, it says so and runs the command as a child of bru instead. It cannot be combined
+with `--userscript`: a pane is spawned by the terminal's own process, which does not inherit the
+`BRU_*` environment a userscript is written against.
+
 ## Where it stands
 
 Around 65 000 lines across 55 modules, 173 commands, 625 tests. Sessions, cookies,
