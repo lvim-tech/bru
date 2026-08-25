@@ -399,9 +399,38 @@ mod tests {
         Look { width: 12, thumb: None, track: None }
     }
 
-    /// The theme bru ships, which is what these tests resolve against.
+    /// A theme these tests own, and **not the one the machine is wearing**.
+    ///
+    /// `chrome::theme_css()` reads `~/.config/bru/theme.css`, so every assertion about a fallback
+    /// colour was an assertion about whoever ran the test. Measured 2026-08-25 on a machine whose
+    /// theme defines `--completion-scrollbar-fg`: a refused value fell back to that theme's
+    /// `#8b9b86` rather than to the shipped `#849380`, and
+    /// `a_colour_that_would_break_out_of_the_rule_is_refused_and_not_interpolated` failed — on a
+    /// tree with nothing wrong with it. A test that passes only on a machine with no theme is a
+    /// test about the machine.
+    ///
+    /// It defines neither scrollbar property on purpose: what the tests below check is what happens
+    /// when the *setting* is refused, and the fallback they name is the shipped constant. A theme
+    /// that supplied one would be answering the question before it was asked.
     fn theme() -> String {
-        String::from_utf8_lossy(&crate::chrome::theme_css()).into_owned()
+        // **One declaration per line, because that is what `declared` reads.** `theme.css` is
+        // generated in exactly this shape and the resolver is deliberately not a CSS parser; a
+        // fixture written as one long line resolves nothing and fails as if the colour were absent.
+        [":root {", "  --bg: #232929;", "  --fg: #d3c6aa;", "  --ui-fg: #849380;", "}"].join("\n")
+    }
+
+    /// A theme that *does* name the scrollbar's colours, for the one test that is about a theme
+    /// being overridden rather than about a fallback being reached.
+    fn theme_with_scrollbar() -> String {
+        [
+            ":root {",
+            "  --bg: #232929;",
+            "  --fg: #d3c6aa;",
+            "  --completion-scrollbar-fg: #8b9b86;",
+            "  --completion-scrollbar-bg: #292f33;",
+            "}",
+        ]
+        .join("\n")
     }
 
     /// **The one rule that removes the arrows**, and the reason the module exists.
@@ -512,7 +541,7 @@ mod tests {
         assert!(css.contains("background:transparent"), "{css}");
         // The theme's own colour is gone rather than sitting behind the override as a second
         // declaration the cascade would have to settle.
-        let theme = theme();
+        let theme = theme_with_scrollbar();
         let themed = css_with(&theme, true, &shipped());
         let thumb = resolve(&theme, "--completion-scrollbar-fg").expect("the theme has one");
         assert!(themed.contains(thumb), "{themed}");

@@ -10,7 +10,7 @@
 //!
 //! It is also the one module in the terminal path where a mistake is memory corruption rather than
 //! a wrong picture. `on_paint` hands over a raw pointer whose length is *not* in its type (see
-//! `term_spike.rs`, where the `unsafe` slice is built and commented); by the time anything reaches
+//! `term_frontend.rs`, where the `unsafe` slice is built and commented); by the time anything reaches
 //! here the length has been committed to, and [`Surface::new`] refuses a buffer that does not match
 //! its dimensions rather than trusting the caller twice. Below that every copy goes through
 //! `get`/`get_mut` on a slice: there is no `unsafe` in this file and there is no reason for one.

@@ -91,8 +91,6 @@ mod term_input;
 mod term_keys;
 mod term_paint;
 mod term_session;
-// A spike: one windowless browser painted into the terminal. `--term-spike=<url>` only.
-mod term_spike;
 // Which terminal bru was launched from, and how to ask it for a pane. Used by `:spawn --split`.
 mod terminal;
 // How bru learns that ~/.config/bru/theme.css has been rewritten under it.
@@ -314,13 +312,12 @@ fn main() -> Result<(), &'static str> {
     }
     // --- end src/ssh.rs -------------------------------------------------------------------------
 
-    // --- src/term_spike.rs --------------------------------------------------------------------
+    // --- src/term_frontend.rs -----------------------------------------------------------------
     // **Only under the switch, because the header says not to enable it otherwise**
     // (`cef_types.h`: "Do not enable this value if the application does not use windowless
     // rendering"). It has to be decided here: `initialize` consumes it, and a browser cannot be
     // made windowless later by asking nicely.
-    let windowless =
-        i32::from(term_spike::url_from(&raw).is_some() || term_frontend::requested(&raw));
+    let windowless = i32::from(term_frontend::requested(&raw));
 
     // **Checked here, before `initialize`, because the alternative is a browser with nowhere to
     // draw.** A `--term` run whose stdout is a pipe would open no window, paint into a file and
@@ -342,7 +339,7 @@ fn main() -> Result<(), &'static str> {
     if term_frontend::requested(&raw) {
         term_frontend::divert_diagnostics();
     }
-    // --- end src/term_spike.rs ----------------------------------------------------------------
+    // --- end src/term_frontend.rs -------------------------------------------------------------
 
     let settings = Settings {
         windowless_rendering_enabled: windowless,

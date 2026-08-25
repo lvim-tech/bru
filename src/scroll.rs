@@ -292,6 +292,17 @@ fn jump(browser: &mut Browser, down: bool) {
 ///
 /// The lock is taken, read, and dropped before any CEF call — `tabs.rs` explains why at length.
 fn viewport(state: &SharedState) -> Option<(i32, i32)> {
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // **A terminal window has no view to measure, and answering `None` here is not harmless.**
+    // `<Ctrl-D>`, `<Ctrl-F>` and `<Ctrl-U>` are viewport-relative by definition; with no height they
+    // fall back to the single-step default and quietly move the page a fraction of what was asked
+    // for. The compositor knows the page's rectangle exactly — it is the one that decided it — so
+    // the answer is there rather than absent.
+    if crate::term_frontend::is_active() {
+        let page = crate::term_frontend::page_rect()?;
+        return (page.width > 0 && page.height > 0).then_some((page.width, page.height));
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
     let (views, active) = {
         let state = state.lock().ok()?;
         (state.tab_views(), state.active_tab())
