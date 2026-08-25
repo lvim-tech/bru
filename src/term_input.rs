@@ -168,8 +168,15 @@ wrap_task! {
             // the difference between clicking where the user pointed and clicking in the top-left
             // corner of the page. See `term_frontend::mouse_scale`.
             let (scale_x, scale_y) = crate::term_frontend::mouse_scale();
-            let x = (self.x - 1) * scale_x - page.x;
-            let y = (self.y - 1) * scale_y - page.y;
+            // **The middle of the cell, not its corner.** A cell-resolution report says which cell
+            // the pointer was in and nothing about where in it — and this terminal's cell is 9x25
+            // px, so the top-left corner can be most of a line of text above what was pointed at.
+            // Measured 2026-08-25: clicks on links "sometimes" worked, and the ones that failed
+            // were the ones whose cell corner fell outside the link's box. The centre is the best
+            // estimate of a point that is known only to be somewhere in the cell, and it halves the
+            // worst case in both axes. With pixel reports the scale is 1 and this adds nothing.
+            let x = (self.x - 1) * scale_x + scale_x / 2 - page.x;
+            let y = (self.y - 1) * scale_y + scale_y / 2 - page.y;
             if x < 0 || y < 0 || x >= page.width || y >= page.height {
                 return;
             }
