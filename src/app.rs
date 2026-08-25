@@ -158,6 +158,22 @@ wrap_app! {
             // `PageLoadTracker::OnSoftNavigation`; it is not what the fix rests on.
             add_to_switch(command_line, "disable-features", "SoftNavigationDetection");
 
+            // --- src/ssh.rs ---------------------------------------------------------------
+            // **`append_switch_with_value` on its own is right here and wrong four lines up.**
+            // The trap `add_to_switch` exists for is a switch CEF pre-fills and Chromium reads a
+            // single value of; `--proxy-server` is neither — bru is the only writer, and there is
+            // nothing arriving in it to be overwritten. `ssh.rs` answers `None` in every process
+            // but the browser one (the port lives in that process's `OnceLock`), which is also
+            // where it is wanted: Chromium hands the proxy configuration to the network service
+            // itself rather than by way of each child's command line.
+            if let Some(proxy) = crate::ssh::proxy_switch() {
+                command_line.append_switch_with_value(
+                    Some(&CefString::from("proxy-server")),
+                    Some(&CefString::from(proxy.as_str())),
+                );
+            }
+            // --- end src/ssh.rs -----------------------------------------------------------
+
             // **WebAuthn's conditional UI eats the first Escape after a hint lands in a login
             // field, in the browser process, before bru is ever given the key.** Reported by the
             // user 2026-08-09 on `https://accounts.google.com/`: Escape took two presses to leave

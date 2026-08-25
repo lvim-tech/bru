@@ -73,6 +73,8 @@ mod prompt;
 mod scroll;
 mod scrollbar;
 mod spawn;
+// `--ssh=<destination>`: an `ssh -D` SOCKS tunnel, and Chromium pointed at it.
+mod ssh;
 mod session;
 mod settings;
 mod settingspage;
@@ -250,6 +252,31 @@ fn main() -> Result<(), &'static str> {
     }
     // --- end src/remote.rs: the other door -----------------------------------------------------
 
+    // --- src/ssh.rs -----------------------------------------------------------------------------
+    // **Before `initialize`, because the switch it produces has to be on the command line CEF is
+    // about to read**, and after the subprocess check above, because a renderer that started its
+    // own ssh would be one tunnel per process and one password prompt per tab.
+    //
+    // A failure here **ends the run**. A person who asked to browse through a tunnel and got a
+    // browser that quietly went out of this machine's own interface has been given the one thing
+    // they were trying to avoid — so the rule is the same one `--private` follows: the switch
+    // either means what it says or bru does not start.
+    if let Some(destination) = ssh::destination_from(&raw) {
+        if let Err(why) = ssh::start(destination) {
+            eprintln!("bru: --ssh={destination}: {why}");
+            // **The scratch profile is let go of here or it is not let go of at all.** It was made
+            // a few lines up and the release at the end of `main` is past this return, so a
+            // `--private` run whose tunnel failed used to leave its directory behind — measured
+            // 2026-08-25 against `--ssh=nowhere.invalid`, which left 66 MB of `cef.<pid>` for the
+            // next start's sweep to find. CEF has not been initialised, so nothing else is holding
+            // it.
+            if let Some(profile) = profile {
+                profile.release();
+            }
+            return Err("the ssh tunnel could not be started");
+        }
+    }
+    // --- end src/ssh.rs -------------------------------------------------------------------------
 
     let settings = Settings {
         // The sandbox needs a setuid helper installed by root. Off until bru is packaged; the
@@ -291,6 +318,9 @@ fn main() -> Result<(), &'static str> {
     run_message_loop();
     shutdown();
     crate::remote::cleanup();
+    // bru started this process, so bru ends it — see `ssh::stop`. After `shutdown`, so nothing is
+    // still trying to load a page through it.
+    crate::ssh::stop();
 
     // After shutdown, so nothing is still writing to the directory being let go of.
     if let Some(profile) = profile {
