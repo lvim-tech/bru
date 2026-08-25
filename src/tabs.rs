@@ -74,16 +74,25 @@ pub struct Tab {
 /// [`BruState::set_tab_url`], [`BruState::set_tab_title`] and [`BruState::is_active_browser`] —
 /// search every window, because a page in a background window still reports its title.
 impl BruState {
-    /// The current window's tab views.
-    pub fn tab_views(&self) -> Vec<BrowserView> {
+    /// The current window's tab views, **one entry per tab, in strip order**.
+    ///
+    /// **`Option` per tab and not a filtered list, and that distinction cost a crash.** When a tab's
+    /// view became `TabSurface`, this filtered the ones that had none — and `select_in` guards its
+    /// index against `tab_count_in` and then indexes *this*, so a window holding one viewless tab
+    /// produced a list shorter than the count and `views[index]` walked off the end. Measured
+    /// 2026-08-25: following a hint aborted the browser, because a panic inside a CEF task cannot
+    /// unwind. A list whose indices are tab indices must have an entry for every tab, and the
+    /// absence has to be in the type where a caller has to look at it.
+    pub fn tab_views(&self) -> Vec<Option<BrowserView>> {
         self.current_slot()
-            .map(|slot| slot.tabs.iter().filter_map(|tab| tab.surface.view().cloned()).collect())
+            .map(|slot| slot.tabs.iter().map(|tab| tab.surface.view().cloned()).collect())
             .unwrap_or_default()
     }
 
-    pub fn tab_views_in(&self, window: u32) -> Vec<BrowserView> {
+    /// The same for a named window. See [`BruState::tab_views`] for why the entries are optional.
+    pub fn tab_views_in(&self, window: u32) -> Vec<Option<BrowserView>> {
         self.slot(window)
-            .map(|slot| slot.tabs.iter().filter_map(|tab| tab.surface.view().cloned()).collect())
+            .map(|slot| slot.tabs.iter().map(|tab| tab.surface.view().cloned()).collect())
             .unwrap_or_default()
     }
 
@@ -756,6 +765,36 @@ pub fn push_tabs_everywhere() {
 /// safe to call from a posted UI task and **not** from inside a message-router query handler — it
 /// creates a browser (CEF-NOTES trap 12).
 pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bool) {
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // **A terminal window has no `BrowserView` to make and no panel to put one in.** Before this,
+    // following a hint that opened a tab took the Views path, made a view nothing drew, and left
+    // `select_in` indexing a list that no longer matched the tabs — measured 2026-08-25, and it
+    // aborted the browser, because a panic inside a CEF task cannot unwind.
+    if crate::term_frontend::is_active() {
+        let Some(identifier) = crate::term_frontend::new_page(state, url) else {
+            return;
+        };
+        let Some(index) =
+            state.lock().expect("state mutex poisoned").push_term_tab_in(window_id, identifier)
+        else {
+            return;
+        };
+        crate::events::fire(crate::events::Event::TabOpened, Some(window_id), || {
+            vec![
+                ("index", crate::lua::Arg::Int(index as i64)),
+                ("url", crate::lua::Arg::Text(url.to_string())),
+                ("title", crate::lua::Arg::Text(String::new())),
+            ]
+        });
+        if !background {
+            select_in(state, window_id, index);
+        }
+        let snapshot =
+            state.lock().expect("state mutex poisoned").tabs_snapshot_in(window_id);
+        crate::ipc::set_tabs_for(window_id, render_tabs(&snapshot));
+        return;
+    }
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
     let (client, pages, layout) = {
         let state = state.lock().expect("state mutex poisoned");
         let (pages, layout) = state.pages_of(window_id);
@@ -832,6 +871,9 @@ pub fn attach_all_in(state: &SharedState, window_id: u32) {
         return;
     };
     for (index, view) in views.iter().enumerate() {
+        let Some(view) = view else {
+            continue;
+        };
         attach(&pages, layout.as_ref(), view, index);
     }
 }
@@ -877,12 +919,24 @@ pub fn select_in(state: &SharedState, window_id: u32, index: usize) {
     };
 
     for (i, view) in views.iter().enumerate() {
-        View::from(view).set_visible(i32::from(i == index));
+        if let Some(view) = view {
+            View::from(view).set_visible(i32::from(i == index));
+        }
     }
 
     // Visibility alone does not move focus, and a hidden view that keeps it swallows every key —
     // the new tab would look right and answer nothing.
-    View::from(&views[index]).request_focus();
+    if let Some(Some(view)) = views.get(index) {
+        View::from(view).request_focus();
+    }
+    // A terminal window shows a tab by pointing the page surface at its browser; there is no
+    // visibility to toggle and no view to focus.
+    if crate::term_frontend::is_active() {
+        let showing = state.lock().expect("state mutex poisoned").tab_browser_in(window_id, index);
+        if let Some(identifier) = showing {
+            crate::term_frontend::show_page(identifier);
+        }
+    }
 
     // --- src/devtools.rs ------------------------------------------------------------------------
     // An inspector belongs to one browser, so it is shown only while that browser's tab is. Without

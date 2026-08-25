@@ -1252,7 +1252,7 @@ fn send_to_every_tab(name: &str, argument: Option<&str>) {
         };
         guard.tab_views()
     };
-    for view in views {
+    for view in views.into_iter().flatten() {
         let Some(frame) = view.browser().and_then(|browser| browser.main_frame()) else {
             continue;
         };

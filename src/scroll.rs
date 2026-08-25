@@ -296,7 +296,10 @@ fn viewport(state: &SharedState) -> Option<(i32, i32)> {
         let state = state.lock().ok()?;
         (state.tab_views(), state.active_tab())
     };
-    let bounds = View::from(views.get(active)?).bounds();
+    // A tab drawn into a terminal has no view to measure. The viewport is then the compositor's
+    // page rectangle, which `term_frontend` owns; until this asks it, a terminal run answers `None`
+    // here and the movements that need a viewport height fall back to their default step.
+    let bounds = View::from(views.get(active)?.as_ref()?).bounds();
     (bounds.width > 0 && bounds.height > 0).then_some((bounds.width, bounds.height))
 }
 

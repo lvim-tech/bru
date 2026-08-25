@@ -457,9 +457,12 @@ pub fn restore(state: &SharedState, session: &Session, clear: bool, history: boo
 fn close_all_tabs(state: &SharedState) {
     let (views, window) = {
         let mut state = state.lock().expect("state mutex poisoned");
-        let views = state.tab_views();
+        // **The count comes from the tabs and not from the views.** They were the same number
+        // until a tab could be drawn without one; taking `views.len()` turns would now leave a
+        // viewless tab behind in a window being emptied.
+        let views: Vec<BrowserView> = state.tab_views().into_iter().flatten().collect();
         let window = state.window();
-        for _ in 0..views.len() {
+        for _ in 0..state.tab_count() {
             state.take_active_tab();
         }
         (views, window)

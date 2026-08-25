@@ -264,6 +264,7 @@ pub fn push_rules() {
             .window_ids()
             .into_iter()
             .flat_map(|window| guard.tab_views_in(window))
+            .flatten()
             .collect::<Vec<_>>()
     };
     for view in views {

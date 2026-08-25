@@ -325,6 +325,62 @@ fn create_surface(
     Ok(())
 }
 
+/// Make a page browser for a new tab, and show it.
+///
+/// **A terminal window has one page rectangle, so the tab that is showing is the browser mapped to
+/// it.** There is no panel to add a second view to and no visibility to toggle: switching tabs is
+/// changing which browser the compositor reads the page surface from, and the others go on living
+/// with their paints dropped. That is the whole of tab switching here, and it is why
+/// `TabSurface::Term` holds nothing.
+pub fn new_page(state: &crate::tabs::SharedState, url: &str) -> Option<i32> {
+    let window_info = WindowInfo::default().set_as_windowless(0);
+    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+    let mut client = crate::keys::BruClient::new(state.clone());
+    {
+        let term = TERM.get()?;
+        term.lock().ok()?.pending = Some(SurfaceKind::Page);
+    }
+    let browser = browser_host_create_browser_sync(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&CefString::from(url)),
+        Some(&settings),
+        None,
+        None,
+    );
+    let term = TERM.get()?;
+    let mut guard = term.lock().ok()?;
+    guard.pending = None;
+    let browser = browser?;
+    let identifier = browser.identifier();
+    guard.of_browser.push((identifier, SurfaceKind::Page));
+    drop(guard);
+    if let Some(host) = browser.host() {
+        host.set_focus(1);
+    }
+    show_page(identifier);
+    Some(identifier)
+}
+
+/// Show the page of a browser that already exists — the terminal's whole notion of "select a tab".
+pub fn show_page(identifier: i32) {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let Ok(mut guard) = term.lock() else {
+        return;
+    };
+    // Exactly one browser is the page at a time. Everything else keeps painting into nothing, which
+    // costs a `memcpy` a frame and buys a tab that is still alive when it is switched back to.
+    guard.of_browser.retain(|(id, kind)| *kind != SurfaceKind::Page || *id == identifier);
+    if !guard.of_browser.iter().any(|(id, _)| *id == identifier) {
+        guard.of_browser.push((identifier, SurfaceKind::Page));
+    }
+    guard.surfaces[index_of(SurfaceKind::Page)] = None;
+    drop(guard);
+    crate::term_input::aim_at(identifier);
+}
+
 /// Which surface a browser paints into.
 fn surface_of(term: &TermState, browser: Option<&mut Browser>) -> Option<SurfaceKind> {
     let identifier = browser.map(|browser| browser.identifier());

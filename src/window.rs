@@ -1095,11 +1095,12 @@ wrap_window_delegate! {
             // the first 0 would leave the others open.
             // The views are collected under the lock and the lock is dropped before any of them is
             // asked to close — try_close_browser reaches bru's own life-span handler.
-            let mut views = self
+            let views = self
                 .state
                 .lock()
                 .expect("state mutex poisoned")
                 .tab_views_in(self.window_id);
+            let mut views: Vec<BrowserView> = views.into_iter().flatten().collect();
             views.extend(self.top_view.borrow().clone());
             views.extend(self.bottom_view.borrow().clone());
 
