@@ -40,11 +40,20 @@ impl Modifiers {
     pub const KEYPAD: Modifiers = Modifiers(1 << 4);
 
     // Bit values from `cef_event_flags_t`, sys bindings x86_64_unknown_linux_gnu.rs:2699–2724.
-    const CEF_SHIFT_DOWN: u32 = 2;
-    const CEF_CONTROL_DOWN: u32 = 4;
-    const CEF_ALT_DOWN: u32 = 8;
-    const CEF_COMMAND_DOWN: u32 = 128;
-    const CEF_IS_KEY_PAD: u32 = 512;
+    //
+    // **`pub(crate)` because `term_keys.rs` builds this same bitfield from the other end.** A key
+    // arriving from the terminal has to be handed to `from_cef` in CEF's own spelling, so the
+    // module that spells it needs these numbers — and a second private copy of them is a second
+    // place for `cef_event_flags_t` to change out from under. Two of the flags CEF defines are
+    // named here for that module's use and read by nothing in this one: `from_cef` ignores the lock
+    // states, and a binding cannot be written against them.
+    pub(crate) const CEF_CAPS_LOCK_ON: u32 = 1;
+    pub(crate) const CEF_SHIFT_DOWN: u32 = 2;
+    pub(crate) const CEF_CONTROL_DOWN: u32 = 4;
+    pub(crate) const CEF_ALT_DOWN: u32 = 8;
+    pub(crate) const CEF_COMMAND_DOWN: u32 = 128;
+    pub(crate) const CEF_NUM_LOCK_ON: u32 = 256;
+    pub(crate) const CEF_IS_KEY_PAD: u32 = 512;
 
     /// Translate CEF's `KeyEvent::modifiers` bitfield.
     pub fn from_cef(modifiers: u32) -> Modifiers {
