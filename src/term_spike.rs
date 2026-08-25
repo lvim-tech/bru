@@ -137,6 +137,22 @@ pub fn start(url: &str) -> Result<(), String> {
         pane.width, pane.height
     );
 
+    // **Everything printed so far is in the way of the picture, and under tmux it cannot be moved
+    // out of it afterwards.** A kitty image is placed at *kitty's* cursor, and the escape that
+    // carries it goes through passthrough — around tmux's screen model rather than through it — so
+    // `\x1b[H` sent from here moves a cursor tmux owns and not the one the image lands at.
+    // Measured 2026-08-25: with six lines of startup log above it, the frame began six lines down
+    // and its bottom fell off the pane.
+    //
+    // Clearing the pane through the normal path makes tmux repaint, which is what puts kitty's own
+    // cursor at the top-left. **It is a mitigation and not the fix**: anything that repaints the
+    // pane afterwards moves the cursor again. The real answer is kitty's Unicode placeholders
+    // (`U=1`), where the image is transmitted once and *placed* by drawing placeholder characters
+    // through the ordinary text path, which tmux understands natively. That belongs to C4.
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[2J\x1b[H\x1b[?25l");
+    let _ = out.flush();
+
     let window_info = WindowInfo::default().set_as_windowless(0);
     let settings = BrowserSettings {
         // The default is 30 and the probe measured the terminal doing 78. Asking for 60 is asking
