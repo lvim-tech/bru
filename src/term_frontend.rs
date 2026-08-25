@@ -82,6 +82,8 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
+    /// Whether a docked inspector is showing. The browser behind it outlives being hidden.
+    inspector: bool,
     /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
     /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
@@ -113,7 +115,17 @@ pub fn is_active() -> bool {
 /// table and the prompt are drawn, and a `:` with no completion under it is half a command line.
 /// Its height is whatever the page measured — see [`layout_for`]. The inspector is absent for the
 /// reason `shell.rs` gives.
-const SURFACES: [SurfaceKind; 4] =
+const SURFACES: [SurfaceKind; 6] = [
+    SurfaceKind::Page,
+    SurfaceKind::Top,
+    SurfaceKind::Bottom,
+    SurfaceKind::Panel,
+    SurfaceKind::Divider,
+    SurfaceKind::Inspector,
+];
+
+/// The surfaces made when the frontend starts. The other two are made when `:devtools` asks.
+const AT_STARTUP: [SurfaceKind; 4] =
     [SurfaceKind::Page, SurfaceKind::Top, SurfaceKind::Bottom, SurfaceKind::Panel];
 
 fn index_of(kind: SurfaceKind) -> usize {
@@ -141,6 +153,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
+        inspector: false,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -174,7 +187,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     // about a `Window` handle. The slot is the window; the handle was only ever how Views drew it.
     state.lock().expect("state mutex poisoned").open_window_slot();
 
-    for kind in SURFACES {
+    for kind in AT_STARTUP {
         create_surface(state, kind, url)?;
     }
     // **Whatever was typed while the terminal was being asked questions.** `enter` reads the
@@ -306,7 +319,9 @@ fn layout_for(size: PaneSize) -> Layout {
         // sizes the panel in a window too (`window.rs`'s `preferred_size`). A height reported after
         // the draw cannot disagree with what was drawn; one guessed before it can.
         panel_height: crate::window::completion_height(0),
-        inspector_height: 0,
+        // The same number the Views delegate answers with, so a height dragged in one frontend
+        // means the same thing in the other.
+        inspector_height: if inspector_open() { crate::devtools::height_for(0) } else { 0 },
     })
 }
 
@@ -362,6 +377,7 @@ fn create_surface(
         SurfaceKind::Top => "bru://chrome/top.html".to_string(),
         SurfaceKind::Bottom => "bru://chrome/bottom.html".to_string(),
         SurfaceKind::Panel => "bru://chrome/panel.html".to_string(),
+        SurfaceKind::Divider => "bru://chrome/divider.html".to_string(),
         other => return Err(format!("no terminal surface for {other:?}")),
     };
     if let Some(term) = TERM.get() {
@@ -795,6 +811,100 @@ pub fn render_handler() -> Option<RenderHandler> {
     is_active().then(TermRenderHandler::new)
 }
 
+// The client the docked inspector is created with.
+//
+// **A render handler and nothing else, and the nothing else is the point.** `devtools.rs` passes
+// `None` for the inspector's client in a window, deliberately: bru's own client carries the keyboard
+// handler, and `j` in a DevTools console has to type a `j` rather than scroll the page behind it. A
+// windowless inspector cannot have `None` — with no render handler CEF has nowhere to paint and the
+// panel is a browser nobody can see — so it gets the one handler it needs and none of the ones it
+// must not have.
+//
+// The comment is out here because `wrap_client!` matches the struct itself, and a doc comment on it
+// expands to an attribute the macro has no rule for — the same note `csp.rs` leaves on `wrap_task!`.
+wrap_client! {
+    pub struct InspectorClient {}
+
+    impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> {
+            render_handler()
+        }
+    }
+}
+
+/// Open the inspector as a windowless browser, and make room for it.
+///
+/// **`show_dev_tools`'s `window_info` is ignored for a browser inside a `BrowserView`** — that is
+/// `devtools.rs`'s whole opening argument, and it is why every position opens a window there. A
+/// terminal tab is not inside a `BrowserView`, so here the same argument is honoured and the
+/// inspector can be windowless like everything else in the pane.
+pub fn open_inspector(host: &BrowserHost) -> bool {
+    if !is_active() {
+        return false;
+    }
+    // The divider first, so the strip exists before the panel it resizes.
+    let state = match crate::state::BruState::instance() {
+        Some(state) => state,
+        None => return false,
+    };
+    if surface_browser(SurfaceKind::Divider).is_none() {
+        let _ = create_surface(&state, SurfaceKind::Divider, "");
+    }
+
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.pending = Some(SurfaceKind::Inspector);
+            guard.inspector = true;
+        }
+    }
+    let window_info = WindowInfo::default().set_as_windowless(0);
+    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+    let mut client = InspectorClient::new();
+    host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.pending = None;
+        }
+    }
+    relayout();
+    true
+}
+
+/// Put the inspector away: stop giving it room, and stop drawing what it last painted.
+///
+/// The browser behind it is left alone for the reason `devtools.rs` gives at length — closing a
+/// docked inspector is the measured SIGSEGV that file is arranged around — so this hides it exactly
+/// as the Views frontend does, by taking away its rectangle.
+pub fn close_inspector() {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    if let Ok(mut guard) = term.lock() {
+        guard.inspector = false;
+        guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
+        guard.surfaces[index_of(SurfaceKind::Divider)] = None;
+    }
+    relayout();
+}
+
+/// Whether the inspector is showing.
+pub fn inspector_open() -> bool {
+    TERM.get()
+        .and_then(|term| term.lock().ok().map(|guard| guard.inspector))
+        .unwrap_or(false)
+}
+
+/// The browser painting one surface, if one is.
+fn surface_browser(kind: SurfaceKind) -> Option<i32> {
+    let term = TERM.get()?;
+    let guard = term.lock().ok()?;
+    guard
+        .of_browser
+        .iter()
+        .find(|(_, known)| *known == kind)
+        .map(|(identifier, _)| *identifier)
+}
+
 wrap_render_handler! {
     pub struct TermRenderHandler {}
 
@@ -896,9 +1006,19 @@ wrap_render_handler! {
                 present(&mut term);
                 return;
             }
+            // **A browser met for the first time is recorded here**, and the inspector is why:
+            // `show_dev_tools` creates its browser and hands nothing back, so the only place its
+            // identifier can be learned is the first time it paints. `pending` says which surface
+            // was being asked for; after this it is known by id like the rest.
+            let identifier = browser.as_ref().map(|browser| browser.identifier());
             let Some(kind) = surface_of(&term, browser) else {
                 return;
             };
+            if let Some(identifier) = identifier {
+                if !term.of_browser.iter().any(|(known, _)| *known == identifier) {
+                    term.of_browser.push((identifier, kind));
+                }
+            }
             let slot = index_of(kind);
             term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
             present(&mut term);
