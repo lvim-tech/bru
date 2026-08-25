@@ -511,8 +511,14 @@ wrap_browser_process_handler! {
                     .map(str::to_string)
                     .unwrap_or_else(|| url.to_string());
                 if let Err(why) = crate::term_frontend::start(&self.state, &page) {
+                    // **The terminal goes back before the reason is printed, not after.** A message
+                    // written while the alternate screen is up is a message nobody reads: it is
+                    // cleared by the leave sequence a moment later, and what the user sees is a
+                    // browser that started and went quiet. `leave` is idempotent and safe when the
+                    // frontend never got as far as existing.
+                    crate::term_frontend::leave();
                     eprintln!("bru: --term: {why}");
-                    crate::term_spike::quit_soon();
+                    crate::term_frontend::quit_soon();
                 }
                 return;
             }

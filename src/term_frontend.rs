@@ -172,6 +172,27 @@ fn watch_size() {
     });
 }
 
+/// Stop the browser, without touching a screen that has already been given back.
+///
+/// **Not the spike's `quit_soon`, and the difference is one escape.** That one deletes the images
+/// and clears the screen on its way out, which is right while a picture is on it — and wrong after
+/// a failure, where the last thing written is the reason and clearing wipes it. Measured
+/// 2026-08-25: the message survived the leave sequence and was then erased by the quit.
+pub fn quit_soon() {
+    let mut task = QuitTask::new();
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct QuitTask;
+
+    impl Task {
+        fn execute(&self) {
+            quit_message_loop();
+        }
+    }
+}
+
 wrap_task! {
     struct ResizeTask {
         size: PaneSize,

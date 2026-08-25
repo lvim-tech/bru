@@ -830,17 +830,28 @@ impl TerminalSession {
                 .map_err(|e| format!("could not write to the terminal: {e}"))
         };
 
-        write(ALT_SCREEN_ON)?;
+        // **From here on a failure has to put the terminal back before it reports itself.**
+        // Measured 2026-08-25: `enter` switched to the alternate screen, failed on the size two
+        // dozen lines later, and returned the reason to a caller whose `eprintln!` went to that
+        // alternate screen — which was then cleared, and never left. The user saw a terminal that
+        // had gone quiet and said nothing. A constructor that fails half-built owes the unwinding,
+        // and `restore_now` is exactly the unwinding every other exit path already uses.
+        let unwind = |why: String| -> String {
+            restore_now();
+            why
+        };
+
+        write(ALT_SCREEN_ON).map_err(unwind)?;
         modes.alt_screen = true;
         publish_leave(modes);
-        write(CURSOR_HIDE)?;
+        write(CURSOR_HIDE).map_err(unwind)?;
         modes.cursor_hidden = true;
         publish_leave(modes);
 
         // --- ask everything at once, then read one stream -----------------------------------------
         let mut answers = Vec::new();
         for round in query_plan(in_tmux) {
-            write(&round)?;
+            write(&round).map_err(unwind)?;
             answers.extend_from_slice(&read_answers(tty));
         }
 
@@ -864,29 +875,32 @@ impl TerminalSession {
         let cell = replies.iter().find_map(|r| parse_cell_size(r));
 
         let (rows, cols, xpixel, ypixel) = winsize(out)
-            .ok_or("the kernel reports no window size for this terminal".to_string())?;
-        let size = compose_size(rows, cols, (xpixel, ypixel), text_area, cell).ok_or(
-            "the terminal reports no size in pixels and no cell size, so there is no way to know \
-             how big a page may be drawn",
-        )?;
+            .ok_or_else(|| unwind("the kernel reports no window size for this terminal".to_string()))?;
+        let size = compose_size(rows, cols, (xpixel, ypixel), text_area, cell).ok_or_else(|| {
+            unwind(
+                "the terminal reports no size in pixels and no cell size, so there is no way to \
+                 know how big a page may be drawn"
+                    .to_string(),
+            )
+        })?;
 
         // --- the modes that depend on the answers -------------------------------------------------
         if kitty_flags_before.is_some() {
-            write(&kitty_push(KITTY_FLAGS))?;
+            write(&kitty_push(KITTY_FLAGS)).map_err(unwind)?;
             modes.kitty_keyboard = true;
             publish_leave(modes);
         }
-        write(MOUSE_ON)?;
+        write(MOUSE_ON).map_err(unwind)?;
         modes.mouse = true;
         publish_leave(modes);
         if in_band_supported {
-            write(IN_BAND_RESIZE_ON)?;
+            write(IN_BAND_RESIZE_ON).map_err(unwind)?;
             modes.in_band_resize = true;
             publish_leave(modes);
         }
 
         // --- resize, from either direction, into one channel --------------------------------------
-        let (winch_read, winch_write) = self_pipe()?;
+        let (winch_read, winch_write) = self_pipe().map_err(unwind)?;
         WINCH_PIPE.store(winch_write, Ordering::Release);
         install_handler(libc::SIGWINCH, on_winch);
 
