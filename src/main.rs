@@ -80,6 +80,8 @@ mod settings;
 mod settingspage;
 mod state;
 mod tabs;
+// A spike: the kitty graphics protocol and what this pane costs. `--term-probe` only.
+mod term;
 // Which terminal bru was launched from, and how to ask it for a pane. Used by `:spawn --split`.
 mod terminal;
 // How bru learns that ~/.config/bru/theme.css has been rewritten under it.
@@ -97,6 +99,29 @@ fn main() -> Result<(), &'static str> {
     // Has to run before any other CEF call.
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
+    let raw: Vec<String> = std::env::args().collect();
+
+    // --- src/term.rs ------------------------------------------------------------------------------
+    // **First, because this run is not a browser and must not be mistaken for one.**
+    //
+    // Measured 2026-08-25, by getting it wrong: with the check further down, `bru --term-probe`
+    // reached `handover()` a few lines below, matched none of its refusals, and handed `open -w` to
+    // the browser that was already running — so the probe printed nothing, exited 0, and opened a
+    // window in somebody's browser instead. That is the same failure `--remote-debugging-port` had
+    // and it is the shape of the trap: **every switch that means "this process does something other
+    // than be a browser" has to be answered before the handover, not after it.** `--remote` is
+    // above for the same reason.
+    if raw.iter().any(|arg| arg == "--term-probe") {
+        return match term::probe() {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                eprintln!("bru: --term-probe: {why}");
+                Err("the terminal probe failed")
+            }
+        };
+    }
+    // --- end src/term.rs --------------------------------------------------------------------------
+
     // --- src/remote.rs --------------------------------------------------------------------------
     // **Read off the raw argv, before CEF sees the command line, and taking everything after it.**
     //
@@ -104,7 +129,6 @@ fn main() -> Result<(), &'static str> {
     // option produces — an argv list with the URL appended — and CEF's parser would take `-t` for a
     // switch of its own and the URL for a positional. So the rest of the line is the message,
     // joined with spaces, and nothing else on it is looked at.
-    let raw: Vec<String> = std::env::args().collect();
     if let Some(at) = raw.iter().position(|arg| arg == "--remote") {
         let line = raw[at + 1..].join(" ");
         return match remote::send(&line) {
@@ -131,6 +155,7 @@ fn main() -> Result<(), &'static str> {
         // Nothing was listening, or it would not take it. Be the browser.
     }
     // --- end src/remote.rs ----------------------------------------------------------------------
+
 
     let args = args::Args::new();
     let Some(cmd_line) = args.as_cmd_line() else {
