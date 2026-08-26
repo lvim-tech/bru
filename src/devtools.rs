@@ -1183,16 +1183,63 @@ fn http_get(port: u16, path: &str) -> Option<String> {
             .ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    let response = String::from_utf8_lossy(&response).into_owned();
-    let (head, body) = response.split_once("\r\n\r\n")?;
-    let status = head.split_whitespace().nth(1)?;
-    if status != "200" {
+    // **`HTTP/1.1`, and the body read by its length rather than to end of stream.** Both halves are
+    // measured, 2026-08-26, against this CEF's own port:
+    //
+    //   HTTP/1.0  ->      0 bytes, connection closed — Chromium's DevTools server does not answer it
+    //   HTTP/1.1  ->   1915 bytes, 200 OK, connection **left open**, `Connection: close` or not
+    //
+    // So the first version asked in a dialect the server ignores; and had it not, `read_to_end` on
+    // a connection nobody closes would have blocked to the read timeout and then thrown away
+    // everything it had, because a timed-out read is an `Err`. The symptom of both was the same
+    // line — "the port is not answering" — about a port answering perfectly.
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").ok()?;
+
+    let mut response: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut headers_end = None;
+    let mut length = None;
+    // A read that fails is the end of what there is — including a timeout, which is why what has
+    // arrived is kept rather than discarded with the error. `read == 0` is the server closing.
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if headers_end.is_none() {
+            if let Some(at) = find(&response, b"\r\n\r\n") {
+                headers_end = Some(at + 4);
+                let head = String::from_utf8_lossy(&response[..at]).to_ascii_lowercase();
+                length = head.lines().find_map(|line| {
+                    line.strip_prefix("content-length:")?.trim().parse::<usize>().ok()
+                });
+            }
+        }
+        // Stop on the length the server promised. Without this the loop runs to the read timeout on
+        // every request, which is two seconds of a browser waiting for nothing.
+        if let (Some(start), Some(length)) = (headers_end, length) {
+            if response.len() >= start + length {
+                break;
+            }
+        }
+    }
+
+    let start = headers_end?;
+    let head = String::from_utf8_lossy(&response[..start]).into_owned();
+    if head.split_whitespace().nth(1)? != "200" {
         return None;
     }
-    Some(body.to_string())
+    let body = match length {
+        Some(length) => response.get(start..start + length)?,
+        None => response.get(start..)?,
+    };
+    Some(String::from_utf8_lossy(body).into_owned())
+}
+
+/// The first index of `needle` in `haystack`. Written out because the whole of it is this line and
+/// a dependency for that would be a dependency for that.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 /// The `(url, devtoolsFrontendUrl)` of every target in a `/json/list` body.
