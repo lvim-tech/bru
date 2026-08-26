@@ -813,13 +813,13 @@ pub fn shut_down() {
         quit_soon();
         return;
     };
-    let browsers: Vec<i32> = TERM
-        .get()
-        .and_then(|term| term.lock().ok().map(|guard| guard.of_browser.clone()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(identifier, _)| identifier)
-        .collect();
+    // **Every browser bru has registered, not the compositor's surfaces.** `of_browser` holds the
+    // page that is *showing* plus the chrome — `show_page` keeps exactly one page entry, which is
+    // its job — so a background tab's browser is in neither list. Closing only `of_browser` left
+    // those alive, `BruState::on_before_close` never saw its list empty, the message loop never
+    // ended, and a `:quit` with two tabs was a browser that hangs instead of one that saves its
+    // cookies. The state's registry is the one list every created browser passes through.
+    let browsers: Vec<i32> = state.lock().expect("state mutex poisoned").browser_ids();
     let mut closed = false;
     for identifier in browsers {
         let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
@@ -877,6 +877,13 @@ static INTERRUPTS: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_interrupt(signum: libc::c_int) {
     if INTERRUPTS.fetch_add(1, Ordering::Relaxed) > 0 {
+        // **The terminal goes back before the process goes down.** This handler replaced the
+        // session layer's own, whose whole job was to restore before re-raising — so the second
+        // signal used to kill the process with the termios still raw and the alternate screen
+        // still up, and the shell that got the terminal back got it broken. The restore is
+        // async-signal-safe by construction (`term_session::restore_now`) and does its work at
+        // most once, so a shutdown that already restored makes this a no-op.
+        crate::term_session::restore_for_signal();
         // SAFETY: both are async-signal-safe. Restoring the default disposition first is what makes
         // the re-raise terminate rather than re-enter this handler.
         unsafe {
@@ -913,10 +920,23 @@ wrap_task! {
     }
 }
 
-/// Put the terminal back and stop. Idempotent.
+/// Whether [`leave`] has done its work. What makes the second call a no-op rather than a repeat.
+static LEFT: AtomicBool = AtomicBool::new(false);
+
+/// Put the terminal back and stop. Idempotent — and the idempotence is escapes, not only state.
+///
+/// **`main` calls this twice on purpose** — once before `shutdown()` so the terminal is not
+/// hostage to a library teardown, and once after as the belt to that brace. The first version made
+/// the second call repeat the whole sequence: `d=A` deleted every image the *restored* terminal
+/// was holding, and `CSI 2J` cleared the screen the user had just been handed back — the shell
+/// prompt and everything above it, wiped by the browser on its way out. The session's own
+/// `shut_down` was guarded; the escapes written around it were not.
 pub fn leave() {
     ACTIVE.store(false, Ordering::Relaxed);
     crate::term_input::stop();
+    if LEFT.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some(term) = TERM.get() else {
         return;
     };

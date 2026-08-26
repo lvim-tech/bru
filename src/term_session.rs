@@ -690,6 +690,18 @@ fn restore_now() {
     }
 }
 
+/// Put the terminal back from a signal handler that lives outside this module.
+///
+/// `term_frontend`'s interrupt handler takes over `SIGINT`/`SIGTERM` so the first signal can ask
+/// for a clean shutdown — and its *second*-signal path re-raises with the default disposition,
+/// which kills the process. Re-raising without restoring first would leave the shell in raw mode
+/// on the alternate screen: exactly the failure this module exists to make impossible, reachable
+/// again through a handler it did not install. [`restore_now`] is async-signal-safe (see its
+/// comment), so handing it out costs nothing and closes that path.
+pub(crate) fn restore_for_signal() {
+    restore_now();
+}
+
 /// The handler for the signals that mean "this process is ending".
 ///
 /// It restores and then **re-raises with the default disposition**, rather than calling `exit`. That

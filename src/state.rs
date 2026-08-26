@@ -714,6 +714,16 @@ impl BruState {
             .cloned()
     }
 
+    /// Every live browser's identifier. The terminal frontend's shutdown closes them all: a
+    /// background tab's browser there is in no window's view tree and no compositor surface, so
+    /// nothing else holds a handle that could end it.
+    pub fn browser_ids(&mut self) -> Vec<i32> {
+        self.browsers
+            .iter_mut()
+            .map(|browser| browser.identifier())
+            .collect()
+    }
+
     /// Enter a mode in the current window, clearing the pending chain of the one left behind.
     /// `only_if_normal` is what stops a page's focus event dragging you out of passthrough.
     pub fn enter_mode(&mut self, mode: crate::modes::Mode, only_if_normal: bool) -> bool {
