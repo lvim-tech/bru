@@ -27,7 +27,8 @@
 //! Measured 2026-08-25 in the `--term-probe` spike (`term.rs`): with the pane drowning in queued
 //! frames, `Ctrl-C` did not reach a process that had used `cfmakeraw` — because `cfmakeraw` clears
 //! `ISIG`, which turns `Ctrl-C` from a signal into the byte `0x03` that nobody was reading. So this
-//! module clears exactly two bits, `ECHO` and `ICANON`, and leaves `ISIG` on. That is not a
+//! module clears `ECHO` and `ICANON` in the local flags and the two flow-control bits in the input
+//! flags, and leaves `ISIG` on. That is not a
 //! compromise: with the kitty keyboard protocol pushed (below), the terminal sends `Ctrl-C` as an
 //! escape sequence and no `SIGINT` is generated at all, so `ISIG` costs nothing in normal running
 //! and is the escape hatch for every moment when the protocol is *not* active — before the push,
@@ -578,12 +579,13 @@ pub(crate) fn size_changed(last: Option<PaneSize>, next: PaneSize) -> bool {
 /// - **`ISIG`** — the one the spike got wrong on 2026-08-25 and the module header explains. Stays.
 /// - **`IEXTEN`** — `Ctrl-V`'s literal-next quoting. Harmless with `ICANON` off, and turning it off
 ///   would be a change nobody can name a consequence of.
-/// - **`IXON`/`IXOFF`** — software flow control, so `Ctrl-S` still stops the terminal's output and
-///   `Ctrl-Q` starts it. **This is a known cost and a deferred decision, not an oversight:** while
-///   the kitty protocol is pushed those two keys arrive as escape sequences and never reach the line
-///   discipline, so it costs nothing in the running frontend; on a terminal without the protocol,
-///   `Ctrl-S` will look like a hang. Clearing it means deciding what `Ctrl-S` *does* in bru, which
-///   is a bindings question and belongs with C6.
+/// - **`IXON`/`IXOFF`** — software flow control. **Cleared, and the deferred decision this comment
+///   used to describe is now made.** `<Ctrl-Q>` is bound to `quit` in `config.rs`, and a key the
+///   line discipline swallows as XON can never reach a binding: it starts the terminal's output
+///   again and goes no further. `Ctrl-S` stops being a way to make the pane look hung, which is the
+///   other half of the same bargain and no loss — it is bound to nothing, so it now does nothing.
+///   The frontend is a full-screen application and does not want the terminal deciding when it may
+///   write.
 /// - **`ICRNL`** — CR to NL on input. Same argument: with flag 8 pushed, `Enter` is a sequence.
 /// - **`OPOST`** — output post-processing, so a lone `\n` still gets its carriage return. Every
 ///   escape this module and C4 write is absolutely positioned or self-terminating, so post
@@ -597,6 +599,7 @@ pub(crate) fn size_changed(last: Option<PaneSize>, next: PaneSize) -> bool {
 pub(crate) fn raw_termios(saved: libc::termios, vtime: libc::cc_t) -> libc::termios {
     let mut raw = saved;
     raw.c_lflag &= !(libc::ECHO | libc::ICANON);
+    raw.c_iflag &= !(libc::IXON | libc::IXOFF);
     raw.c_cc[libc::VMIN] = 0;
     raw.c_cc[libc::VTIME] = vtime;
     raw
@@ -1606,13 +1609,18 @@ mod tests {
         // libc with it.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         saved.c_lflag = libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN;
-        saved.c_iflag = libc::IXON | libc::ICRNL;
+        saved.c_iflag = libc::IXON | libc::IXOFF | libc::ICRNL;
         saved.c_oflag = libc::OPOST;
 
         let raw = raw_termios(saved, QUERY_VTIME);
         assert_eq!(raw.c_lflag & libc::ECHO, 0, "echo would print the escape sequences");
         assert_eq!(raw.c_lflag & libc::ICANON, 0, "line buffering would hold every key until Enter");
         assert_ne!(raw.c_lflag & libc::ISIG, 0, "Ctrl-C must stay a signal — see the module header");
+        // A key the line discipline eats as flow control cannot reach a binding, and `<Ctrl-Q>` is
+        // bound to `quit`.
+        assert_eq!(raw.c_iflag & libc::IXON, 0, "Ctrl-Q must be a key, not XON");
+        assert_eq!(raw.c_iflag & libc::IXOFF, 0, "and Ctrl-S must not be able to stop the pane");
+        assert_ne!(raw.c_iflag & libc::ICRNL, 0, "the other input flags are left alone");
         assert_ne!(raw.c_oflag & libc::OPOST, 0, "an error message still has to be readable");
         assert_eq!(raw.c_cc[libc::VMIN], 0, "a read must be able to return nothing");
         assert_eq!(raw.c_cc[libc::VTIME], QUERY_VTIME);
