@@ -39,16 +39,19 @@
 //!
 //! ## What this module expects the terminal to have been put in
 //!
-//! Enabling the protocol is C3's job (`term_session.rs`), not this one's, but the parser is written
-//! for a terminal that was asked for all five progressive-enhancement flags — `CSI > 31 u`:
+//! Enabling the protocol is C3's job (`term_session.rs`), and what it pushes is **four** flags —
+//! `CSI > 15 u`, `KITTY_FLAGS` there, with its reason for leaving the fifth out:
 //!
 //! ```text
 //!  1  disambiguate escape codes    Escape arrives as CSI 27 u, so a lone ESC needs no timeout
 //!  2  report event types           press / repeat / release, instead of press only
 //!  4  report alternate keys        the shifted key and the base layout key — see above
 //!  8  report all keys as escapes   Ctrl-C is a key, not a SIGINT the tty ate first
-//! 16  report associated text       what the keypress actually types, dead keys composed
 //! ```
+//!
+//! Flag 16 (report associated text) is *not* asked for — flag 4's shifted key already carries the
+//! text every binding cares about — but the parser reads the text field when a terminal sends one
+//! anyway, because the flags are the session's request and not a promise about the wire.
 //!
 //! It parses the legacy forms anyway, because the flags can be refused, tmux can be in the middle,
 //! and the first bytes arrive before the reply to the query does.

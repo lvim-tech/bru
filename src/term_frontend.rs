@@ -51,7 +51,10 @@ pub fn requested(args: &[String]) -> bool {
 /// The page `--term` opens with: the first bare argument, as everywhere else in bru.
 pub fn url_from(args: &[String]) -> Option<&str> {
     let before = args.iter().position(|arg| arg == "--remote").unwrap_or(args.len());
-    args[1..before]
+    // `get(1..before)` rather than `[1..before]`: an argv with nothing before `--remote` — empty,
+    // or an argv[0] that *is* `--remote` — makes the range backwards, and indexing a backwards
+    // range is a panic where "no page" is the answer.
+    args.get(1..before)?
         .iter()
         .find(|arg| !arg.starts_with('-') && !arg.trim().is_empty())
         .map(|url| url.trim())
@@ -540,8 +543,17 @@ pub fn new_page(state: &crate::tabs::SharedState, url: &str) -> Option<i32> {
 pub fn close_page(identifier: i32) {
     if let Some(term) = TERM.get() {
         if let Ok(mut guard) = term.lock() {
+            // The page slot's picture goes only if this browser was the one painting it.
+            // `of_browser` holds exactly one page entry — the tab that is showing — so closing a
+            // background tab must not blank the surface the visible one is drawn from.
+            let was_showing = guard
+                .of_browser
+                .iter()
+                .any(|(id, kind)| *id == identifier && *kind == SurfaceKind::Page);
             guard.of_browser.retain(|(id, _)| *id != identifier);
-            guard.surfaces[index_of(SurfaceKind::Page)] = None;
+            if was_showing {
+                guard.surfaces[index_of(SurfaceKind::Page)] = None;
+            }
         }
     }
     let Some(state) = crate::state::BruState::instance() else {
