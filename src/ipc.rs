@@ -1121,6 +1121,11 @@ pub fn reapply_theme_everywhere() {
     reload_chrome_everywhere();
     crate::userstyles::repaint();
     crate::scrollbar::push_rules();
+    // --- src/term_frontend.rs -------------------------------------------------------------------
+    // The compositor keeps the chrome background it wipes the frame with, rather than reading the
+    // theme per frame; this is the one path a theme change travels, so this is where it learns.
+    crate::term_frontend::refresh_background();
+    // --- end src/term_frontend.rs ---------------------------------------------------------------
 }
 // --- end src/chrome.rs: fonts ----------------------------------------------
 

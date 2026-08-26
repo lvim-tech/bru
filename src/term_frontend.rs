@@ -87,6 +87,14 @@ struct TermState {
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
     /// corruption.
     popup_pixels: Option<Painted>,
+    /// What an empty part of the pane is painted with — the chrome background, **read once**.
+    ///
+    /// It used to be asked of the theme inside `present`, which meant `theme.css` read off the disk
+    /// and the settings store locked on *every frame*, under this module's own lock, inside a CEF
+    /// paint callback — a disk read per keystroke at the pace the command line repaints. The theme
+    /// changes when a person changes it; [`refresh_background`] is on that path, and nothing else
+    /// moves this.
+    background: [u8; 3],
 }
 
 /// A surface's last frame, kept because a repaint of one surface has to redraw all of them.
@@ -152,6 +160,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
+        background: background_from_theme(),
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -632,13 +641,32 @@ static MISMATCH: AtomicI32 = AtomicI32::new(0);
 ///
 /// The chrome's own background, so a gap where a surface has not painted yet reads as part of the
 /// browser rather than as a hole in it. Black if the theme has no answer — the one colour that is
-/// never mistaken for content.
-fn background() -> [u8; 3] {
+/// never mistaken for content. Called at startup and on a theme change, never per frame — see
+/// [`TermState::background`].
+fn background_from_theme() -> [u8; 3] {
     match crate::chrome::chrome_background() {
         // The chrome colour is `0xAARRGGBB` and opaque by construction; the alpha is dropped here
         // for the same reason the compositor drops it — the terminal shows what is under nothing.
         Some(colour) => [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8],
         None => [0, 0, 0],
+    }
+}
+
+/// The theme changed: read the chrome background again and keep it for the frames to come.
+///
+/// Called from `ipc::reapply_theme_everywhere`, which is the one place a theme change funnels
+/// through — `:colorscheme`, the inotify watch and `--reload` all end up there. The theme is read
+/// **before** the lock is taken, because reading it is a disk read and a settings-store lock, and
+/// neither belongs inside this module's mutex.
+pub fn refresh_background() {
+    if !is_active() {
+        return;
+    }
+    let fresh = background_from_theme();
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.background = fresh;
+        }
     }
 }
 
@@ -742,7 +770,7 @@ fn present(term: &mut TermState) {
     // over itself three times as it grew, each earlier and shorter render still legible under the
     // current one. Filling costs one pass over 4 MB against a frame that already costs a composite
     // and a transmit, and it is the difference between a picture and a palimpsest.
-    term.frame.fill(term.layout.pane, background());
+    term.frame.fill(term.layout.pane, term.background);
     // **The popup goes on last, because it goes on top.** `compose` treats the order of the layers
     // as the z-order, and a `<select>` dropdown that drew under its own page would be a menu you
     // could see the edge of and never read.
