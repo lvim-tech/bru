@@ -1413,7 +1413,70 @@ fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
         .map(|frame| CefString::from(&frame.url()).to_string())
         .unwrap_or_default();
     set_place(0, Some(wanted.unwrap_or(Place::Bottom)));
+
+    // --- the native road, read out of the header rather than guessed at ---------------------------
+    // **`show_dev_tools`' `windowInfo` is honoured — unless DevTools is already open.** The header
+    // says both halves in one sentence: "If the DevTools browser is already open then it will be
+    // focused, in which case the windowInfo, client and settings parameters will be ignored. The
+    // windowInfo parameter will be ignored if this browser is wrapped in a cef_browser_view_t."
+    //
+    // A terminal tab is not wrapped in a `BrowserView`, so the second clause does not apply — and
+    // the first one was what three earlier attempts kept walking into. Each measured
+    // `has_dev_tools() == 1` *after* the call and read it as "created"; it means "there was already
+    // one, and everything you passed was thrown away". So the old one is closed first, and only
+    // then is a windowless one asked for. That is the road `terminal-browser` takes with Electron's
+    // `setDevToolsWebContents`, which CEF does not expose — this is the nearest thing it does.
+    //
+    // If it works, the inspector is the same frontend a window gets: no screencast, no address bar,
+    // every panel. If it does not, the port road below still docks one, with the remote-debugging
+    // shell that comes with attaching over a WebSocket.
+    if let Some(host) = page.host() {
+        if host.has_dev_tools() != 0 {
+            host.close_dev_tools();
+        }
+        let state = crate::state::BruState::instance();
+        if let Some(state) = state.as_ref() {
+            if crate::term_frontend::open_native_inspector(&host, state) {
+                trace("term inspector asked for natively");
+                // **A promise with a deadline.** `show_dev_tools` returns before its browser has
+                // painted, and a browser that never paints is indistinguishable from one that is
+                // slow — until the deadline passes. If nothing has arrived by then the claim is
+                // withdrawn and the port road runs, so a CEF that ignores the request costs a
+                // second and not the feature.
+                fall_back_if_silent(port, url);
+                return;
+            }
+        }
+    }
     ask_for_frontend(port, url);
+}
+
+/// Wait for the native inspector to paint; if it does not, dock one through the port instead.
+fn fall_back_if_silent(port: u16, url: String) {
+    let _ = std::thread::Builder::new().name("bru-devtools-wait".to_string()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let mut task = NativeVerdict::new(port, url);
+        post_task(ThreadId::UI, Some(&mut task));
+    });
+}
+
+wrap_task! {
+    struct NativeVerdict {
+        port: u16,
+        url: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if crate::term_frontend::has_native_inspector() {
+                trace("native inspector painted; the port road is not needed");
+                return;
+            }
+            crate::term_frontend::give_up_on_native();
+            trace("native inspector never painted; falling back to the port");
+            ask_for_frontend(self.port, self.url.clone());
+        }
+    }
 }
 
 /// Fetch the inspector's URL **off the UI thread**, then open it on the UI thread.

@@ -1211,6 +1211,59 @@ pub fn focus_inspector() -> bool {
 /// what routes that first question, and setting it is also what makes [`layout_for`] carve the
 /// space out. The surfaces whose rectangles moved — the page above all — are told before the
 /// creation, so the shrink and the new panel arrive as one reflow rather than two.
+/// Ask CEF for a windowless inspector, the way a window gets one.
+///
+/// **The claim is left standing until a frame arrives.** `show_dev_tools` returns before the browser
+/// it makes has painted, so clearing it here would drop the inspector's first frame at
+/// `surface_of` — which is exactly what an earlier attempt did, and why it read as CEF refusing.
+/// Whatever paints claims it; if nothing paints, `has_native_inspector` says so and the caller
+/// falls back to the port.
+///
+/// The room is given on that first frame and not before: a band of empty pane where an inspector is
+/// not is worse than no inspector.
+pub fn open_native_inspector(host: &BrowserHost, state: &crate::tabs::SharedState) -> bool {
+    let Some(term) = TERM.get() else {
+        return false;
+    };
+    {
+        let Ok(mut guard) = term.lock() else {
+            return false;
+        };
+        if guard.inspector.is_some() {
+            return false;
+        }
+        guard.pending = Some(SurfaceKind::Inspector);
+    }
+    let window_info = WindowInfo::default().set_as_windowless(0);
+    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+    let mut client = InspectorClient::new(state.clone());
+    host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
+    if crate::term_input::debug() {
+        eprintln!("bru[term]: asked CEF for a windowless inspector natively");
+    }
+    // A paint may already have arrived — `show_dev_tools` can create the browser synchronously.
+    // Either way the claim stands until one does; `give_up_on_native` is what withdraws it.
+    true
+}
+
+/// Withdraw the native claim, so an unclaimed frame is not read as the inspector's.
+pub fn give_up_on_native() {
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            if guard.inspector.is_none() && guard.pending == Some(SurfaceKind::Inspector) {
+                guard.pending = None;
+            }
+        }
+    }
+}
+
+/// Whether a native windowless inspector has painted.
+pub fn has_native_inspector() -> bool {
+    TERM.get()
+        .and_then(|term| term.lock().ok().map(|guard| guard.inspector.is_some()))
+        .unwrap_or(false)
+}
+
 pub fn open_inspector(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> {
     let term = TERM.get().ok_or("the terminal frontend is not running")?;
     let moved = {
