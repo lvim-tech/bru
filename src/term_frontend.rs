@@ -163,7 +163,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     // What the terminal actually agreed to, in the log rather than guessed at later. The mouse in
     // particular has three ways to be wrong and they are indistinguishable from the outside: not
     // forwarded at all, forwarded in cells, forwarded in pixels.
-    {
+    if crate::term_input::debug() {
         let guard = TERM.get().and_then(|term| term.lock().ok());
         if let Some(guard) = guard {
             eprintln!(
@@ -971,6 +971,12 @@ pub fn open_inspector(host: &BrowserHost) -> bool {
     let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     let mut client = InspectorClient::new();
     host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
+    if crate::term_input::debug() {
+        eprintln!(
+            "bru[term]: show_dev_tools asked for a windowless inspector; has_dev_tools={}",
+            host.has_dev_tools()
+        );
+    }
     if let Some(term) = TERM.get() {
         if let Ok(mut guard) = term.lock() {
             guard.pending = None;
@@ -1128,6 +1134,11 @@ wrap_render_handler! {
                 if !term.of_browser.iter().any(|(known, _)| *known == identifier) {
                     term.of_browser.push((identifier, kind));
                 }
+            }
+            if kind == SurfaceKind::Inspector && crate::term_input::debug() {
+                // The one thing that says whether CEF honoured the windowless request: an inspector
+                // in a window of its own never paints through here.
+                eprintln!("bru[term]: the inspector painted {width}x{height} into the pane");
             }
             let slot = index_of(kind);
             term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });

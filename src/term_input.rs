@@ -28,6 +28,14 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 /// How many keys the reader has taken off the terminal, for the diagnostic above.
 static READ: AtomicI32 = AtomicI32::new(0);
 
+/// `BRU_DEBUG_TERM=1`. **Behind a switch like every other debug line in this tree**, because a
+/// diagnostic that always runs is a diagnostic nobody reads: it fills the log with answers to
+/// questions that were settled days ago, and buries the one line that matters when a new question
+/// arrives. The counters stay bounded either way.
+pub(crate) fn debug() -> bool {
+    std::env::var_os("BRU_DEBUG_TERM").is_some()
+}
+
 /// Aim the keyboard at a browser.
 pub fn aim_at(identifier: i32) {
     TARGET.store(identifier, Ordering::Relaxed);
@@ -89,7 +97,7 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
                 // matching line from `target_for` means the reader is alive and the UI thread is
                 // not; no line at all means the reader is where it stopped.
                 let seen = READ.fetch_add(1, Ordering::Relaxed);
-                if seen < 20 {
+                if seen < 20 && debug() {
                     eprintln!(
                         "bru[term]: read {seen}: code={} char={} press={}",
                         key.windows_key_code,
@@ -139,7 +147,7 @@ static LAST_POINTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 fn post_mouse(mouse: TermMouse) {
     let seen = MOUSE_SEEN.fetch_add(1, Ordering::Relaxed);
-    if seen < 3 {
+    if seen < 3 && debug() {
         eprintln!(
             "bru[term]: mouse report {seen}: button={} at ({},{}) pressed={} motion={} mods={}",
             mouse.button, mouse.x, mouse.y, mouse.pressed, mouse.motion, mouse.modifiers
@@ -269,7 +277,7 @@ fn target_for(state: &crate::tabs::SharedState) -> Option<Browser> {
     let mode = state.lock().expect("state mutex poisoned").mode_in(0);
     let chosen = route(state, mode);
     let seen = ROUTED.fetch_add(1, Ordering::Relaxed);
-    if seen < 12 {
+    if seen < 12 && debug() {
         eprintln!(
             "bru[term]: key {seen}: mode={mode:?} -> browser={:?} (page={}, bottom={:?})",
             chosen.as_ref().map(|browser| browser.identifier()),
