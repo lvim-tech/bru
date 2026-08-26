@@ -82,8 +82,6 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
-    /// Whether a docked inspector is showing. The browser behind it outlives being hidden.
-    inspector: bool,
     /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
     /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
@@ -154,7 +152,6 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
-        inspector: false,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -346,7 +343,7 @@ pub fn relayout() {
         let Ok(mut guard) = term.lock() else {
             return;
         };
-        let next = layout_for(guard.size, guard.inspector);
+        let next = layout_for(guard.size, false);
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
@@ -756,7 +753,7 @@ pub fn resized(size: PaneSize) {
             return;
         }
         term.size = size;
-        term.layout = layout_for(size, term.inspector);
+        term.layout = layout_for(size, false);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.
@@ -942,83 +939,31 @@ wrap_client! {
     }
 }
 
-/// Open the inspector as a windowless browser, and make room for it.
+/// Say where the inspector is going, and let CEF put it there.
 ///
-/// **`show_dev_tools`'s `window_info` is ignored for a browser inside a `BrowserView`** — that is
-/// `devtools.rs`'s whole opening argument, and it is why every position opens a window there. A
-/// terminal tab is not inside a `BrowserView`, so here the same argument is honoured and the
-/// inspector can be windowless like everything else in the pane.
-pub fn open_inspector(host: &BrowserHost) -> bool {
+/// **This tried to be a docked panel and could not be.** `devtools.rs` opens by observing that
+/// `show_dev_tools`'s `window_info` is ignored for a browser inside a `BrowserView`, and the
+/// obvious reading is that a browser outside one would have it honoured. Measured 2026-08-26 with a
+/// windowless `window_info`, a client carrying a render handler, and `windowless_rendering_enabled`
+/// on: `has_dev_tools()` answered 1 and **no frame ever arrived** — CEF made a desktop window
+/// anyway. The inspector's home is decided by the browser it inspects, not by what is passed here.
+///
+/// There is no second road in this CEF: it exposes no way to ask for the inspector's URL, so it
+/// cannot be opened as an ordinary windowless browser either. What is left is a window beside the
+/// terminal, which is *useful* — it inspects the right page — and only surprising if nothing says
+/// so. So this says so, once, and returns `false` to let the ordinary path run.
+///
+/// The compositor keeps its `Divider` and `Inspector` rectangles for the day this becomes possible;
+/// nothing reserves space for them meanwhile, because a band of empty pane where an inspector is
+/// not is worse than no inspector.
+pub fn note_inspector_window() {
     if !is_active() {
-        return false;
-    }
-    // The divider first, so the strip exists before the panel it resizes.
-    let state = match crate::state::BruState::instance() {
-        Some(state) => state,
-        None => return false,
-    };
-    if surface_browser(SurfaceKind::Divider).is_none() {
-        let _ = create_surface(&state, SurfaceKind::Divider, "");
-    }
-
-    if let Some(term) = TERM.get() {
-        if let Ok(mut guard) = term.lock() {
-            guard.pending = Some(SurfaceKind::Inspector);
-            guard.inspector = true;
-        }
-    }
-    let window_info = WindowInfo::default().set_as_windowless(0);
-    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
-    let mut client = InspectorClient::new();
-    host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
-    if crate::term_input::debug() {
-        eprintln!(
-            "bru[term]: show_dev_tools asked for a windowless inspector; has_dev_tools={}",
-            host.has_dev_tools()
-        );
-    }
-    if let Some(term) = TERM.get() {
-        if let Ok(mut guard) = term.lock() {
-            guard.pending = None;
-        }
-    }
-    relayout();
-    true
-}
-
-/// Put the inspector away: stop giving it room, and stop drawing what it last painted.
-///
-/// The browser behind it is left alone for the reason `devtools.rs` gives at length — closing a
-/// docked inspector is the measured SIGSEGV that file is arranged around — so this hides it exactly
-/// as the Views frontend does, by taking away its rectangle.
-pub fn close_inspector() {
-    let Some(term) = TERM.get() else {
         return;
-    };
-    if let Ok(mut guard) = term.lock() {
-        guard.inspector = false;
-        guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
-        guard.surfaces[index_of(SurfaceKind::Divider)] = None;
     }
-    relayout();
-}
-
-/// Whether the inspector is showing.
-pub fn inspector_open() -> bool {
-    TERM.get()
-        .and_then(|term| term.lock().ok().map(|guard| guard.inspector))
-        .unwrap_or(false)
-}
-
-/// The browser painting one surface, if one is.
-fn surface_browser(kind: SurfaceKind) -> Option<i32> {
-    let term = TERM.get()?;
-    let guard = term.lock().ok()?;
-    guard
-        .of_browser
-        .iter()
-        .find(|(_, known)| *known == kind)
-        .map(|(identifier, _)| *identifier)
+    crate::message::info(
+        "the inspector opens in a window of its own: CEF decides where DevTools lives and does not \
+         take a windowless request for it",
+    );
 }
 
 wrap_render_handler! {
