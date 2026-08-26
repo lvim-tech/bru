@@ -1180,9 +1180,24 @@ bru --term --user-data-dir=~/.local/share/bru/term https://example.com/
 Chromium's both, because stderr is the same terminal the page is drawn in. `tail -f` it in another
 pane.
 
-**The inspector opens in a window of its own.** CEF decides where DevTools lives — from the browser
-being inspected, not from what it is asked for — and does not take a windowless request for it. The
-window inspects the right page; `:devtools` says so when it opens one.
+**The inspector docks in the pane — through the DevTools port.** CEF decides where its own DevTools
+window lives and does not take a windowless request for it, so bru does not ask: with
+`--remote-debugging-port=<port>` open, `:devtools` reads the page's target off `/json/list`, loads
+the DevTools frontend the same port serves (`/devtools/inspector.html`, bundled, no network) in one
+more windowless browser, and composites it under or beside the page. `:devtools right` moves it,
+`:devtools window` still opens CEF's window by name, and `devtools.height` / `devtools.width` size
+it. Click in the panel to type into it and click the page to come back — focus follows the click,
+as it does between windows; `:devtools-focus` is the keyboard spelling of the first.
+
+```sh
+bru --term --remote-debugging-port=9222 https://example.com/
+```
+
+The port must be a *named* one: bru allow-lists the frontend's WebSocket origin before Chromium
+starts (`--remote-allow-origins`, added for you), and an origin can only be written down in advance
+when the port can — `=0` gets a panel that boots and never connects, and `:devtools` says so.
+Without the port, `:devtools` refuses and names this line. What the port opens up is written beside
+the startup notice in `main.rs`; the DevTools protocol section above applies to it unchanged.
 
 **`BRU_DEBUG_TERM=1`** adds what the terminal negotiated and where the first keys and clicks went,
 to the log above. It is the first thing to reach for when a key or a click does not arrive.
