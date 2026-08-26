@@ -975,23 +975,30 @@ wrap_client! {
     }
 }
 
-/// Say where the inspector is going, and let CEF put it there.
+/// Where the inspector goes, and why it is not in the pane.
 ///
-/// **This tried to be a docked panel and could not be.** `devtools.rs` opens by observing that
-/// `show_dev_tools`'s `window_info` is ignored for a browser inside a `BrowserView`, and the
-/// obvious reading is that a browser outside one would have it honoured. Measured 2026-08-26 with a
-/// windowless `window_info`, a client carrying a render handler, and `windowless_rendering_enabled`
-/// on: `has_dev_tools()` answered 1 and **no frame ever arrived** — CEF made a desktop window
-/// anyway. The inspector's home is decided by the browser it inspects, not by what is passed here.
+/// **Three roads tried, three measurements, all on 2026-08-26.**
 ///
-/// There is no second road in this CEF: it exposes no way to ask for the inspector's URL, so it
-/// cannot be opened as an ordinary windowless browser either. What is left is a window beside the
-/// terminal, which is *useful* — it inspects the right page — and only surprising if nothing says
-/// so. So this says so, once, and returns `false` to let the ordinary path run.
+/// 1. `show_dev_tools`'s `window_info`. `devtools.rs` opens by noting it is ignored for a browser
+///    inside a `BrowserView`; the obvious reading is that one outside would have it honoured. It is
+///    not: `has_dev_tools()` answered 1 and no frame ever arrived.
+/// 2. The same again, after finding that the claim registering the inspector's first frame was
+///    being cleared before that frame could arrive. Fixing that changed nothing — the first reading
+///    was right for the wrong reason.
+/// 3. `LifeSpanHandler::on_before_dev_tools_popup`, which is the shape the Views frontend docks
+///    through: CEF asking rather than being told. The callback fires with every field present, the
+///    window info is set windowless, the client carries a render handler, `use_default_window` is
+///    cleared — and CEF 151 makes a desktop window regardless.
 ///
-/// The compositor keeps its `Divider` and `Inspector` rectangles for the day this becomes possible;
-/// nothing reserves space for them meanwhile, because a band of empty pane where an inspector is
-/// not is worse than no inspector.
+/// The inspector's home is decided by the browser it inspects, and a windowless parent does not
+/// change that answer.
+///
+/// So `:devtools` opens a window beside the terminal, which is *useful* — it inspects the right
+/// page — and only surprising if nothing says so. This says so, once. The compositor keeps its
+/// `Divider` and `Inspector` rectangles, and `layout` knows how to put one on either side, for the
+/// day a road opens; nothing reserves space meanwhile, because a band of empty pane where an
+/// inspector is not is worse than no inspector.
+
 // **`on_before_dev_tools_popup` is not the road either, and this is the third measurement of it.**
 //
 // The callback fires (`active=true`, every field present), the window info is set windowless, the
