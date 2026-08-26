@@ -218,6 +218,20 @@ wrap_task! {
             // were the ones whose cell corner fell outside the link's box. The centre is the best
             // estimate of a point that is known only to be somewhere in the cell, and it halves the
             // worst case in both axes. With pixel reports the scale is 1 and this adds nothing.
+            //
+            // **And the centre is where this ends — the ceiling is tmux's, and it is real.** Asked
+            // directly with DECRQM on 2026-08-26, tmux next-3.8 answered `?1016;0$y` — mode 1016
+            // *not recognized* — and `?1006;1$y` for the cell encoding it does speak; its binary
+            // and man page carry standard/button/all/utf8/sgr mouse flags and no pixel one. So
+            // through tmux every report is a cell, and no fixed point inside the cell beats the
+            // centre: the page's line grid and the terminal's cell grid share no phase, so a target
+            // shorter than the cell contains a reachable row with probability height/cell_height
+            // whatever offset is picked — a ~18 px link band under a 25 px cell is simply
+            // unreachable about a quarter of the time, at any cell. That is the "sometimes" in
+            // "hover sometimes misses a link", and it is a limitation, not a bug: pixel reports
+            // need the pane to sit on a terminal that speaks 1016 (kitty does, tmux does not
+            // forward it), and anything sharper from here would mean probing Chromium for a target
+            // near the point rather than trusting the point.
             let pane_x = (self.x - 1) * scale_x + scale_x / 2;
             let pane_y = (self.y - 1) * scale_y + scale_y / 2;
             // **The page's, or the docked inspector's — whichever is under the pointer.** The
