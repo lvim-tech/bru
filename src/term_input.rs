@@ -292,10 +292,16 @@ fn route(state: &crate::tabs::SharedState, mode: crate::modes::Mode) -> Option<B
     match mode {
         // The command line is `#cmdline` in `bottom.html`.
         crate::modes::Mode::Command => crate::ipc::bottom_chrome_browser_for(0),
-        // A question is `#prompt` in `panel.html`. The panel is not a terminal surface yet, so
-        // these fall through to the page rather than to a browser that does not exist — the keys
-        // are lost either way, and this way they are lost somewhere that can be seen.
-        crate::modes::Mode::Prompt | crate::modes::Mode::YesNo => page_browser(state),
+        // A question is `#prompt` in `panel.html` — **which is a terminal surface**, made at
+        // startup with the other three. This used to fall through to the page behind a comment
+        // claiming the panel did not exist yet; the claim had been true of an earlier draft and
+        // nothing re-read it, so every character typed at a download prompt went into the page
+        // under it. The same routing `focus_panel_chrome` does for a window, written out here for
+        // the same reason `Command`'s is. The page is the fallback, not the answer: keys sent to a
+        // browser that is gone are lost invisibly, and the page is at least somewhere on screen.
+        crate::modes::Mode::Prompt | crate::modes::Mode::YesNo => {
+            crate::ipc::panel_chrome_browser_for(0).or_else(|| page_browser(state))
+        }
         _ => page_browser(state),
     }
 }
