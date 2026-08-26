@@ -82,8 +82,6 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
-    /// Whether a docked inspector has painted at least once, and therefore has room.
-    inspector: bool,
     /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
     /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
@@ -154,7 +152,6 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
-        inspector: false,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -346,7 +343,7 @@ pub fn relayout() {
         let Ok(mut guard) = term.lock() else {
             return;
         };
-        let next = layout_for(guard.size, guard.inspector);
+        let next = layout_for(guard.size, false);
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
@@ -756,7 +753,7 @@ pub fn resized(size: PaneSize) {
             return;
         }
         term.size = size;
-        term.layout = layout_for(size, term.inspector);
+        term.layout = layout_for(size, false);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.
@@ -959,80 +956,17 @@ wrap_client! {
 /// The compositor keeps its `Divider` and `Inspector` rectangles for the day this becomes possible;
 /// nothing reserves space for them meanwhile, because a band of empty pane where an inspector is
 /// not is worse than no inspector.
-pub fn open_inspector(host: &BrowserHost) -> bool {
+pub fn note_inspector_window() {
     if !is_active() {
-        return false;
-    }
-    // **`pending` is set and deliberately not cleared here.** The first attempt cleared it as soon
-    // as `show_dev_tools` returned — and a browser paints when it is ready, not when the call that
-    // made it returns. So the inspector's first frame arrived at a handler that no longer knew what
-    // it was looking at, `surface_of` answered `None`, and the pixels were dropped in silence. That
-    // looked exactly like CEF refusing the windowless request, which is what it was read as.
-    // Whatever registers the browser clears it; until then an unclaimed frame belongs to the
-    // inspector, because nothing else is being made.
-    if let Some(term) = TERM.get() {
-        if let Ok(mut guard) = term.lock() {
-            guard.pending = Some(SurfaceKind::Inspector);
-        }
-    }
-    let window_info = WindowInfo::default().set_as_windowless(0);
-    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
-    let mut client = InspectorClient::new();
-    host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
-    if crate::term_input::debug() {
-        eprintln!(
-            "bru[term]: asked for a windowless inspector; has_dev_tools={}",
-            host.has_dev_tools()
-        );
-    }
-    true
-}
-
-/// The inspector has painted: give it room, and stop expecting it.
-///
-/// **Room is given on the first frame and not before.** An inspector that never paints must not
-/// shrink the page for a band that stays empty — which is what the first attempt did, and it was
-/// worse than having no inspector at all.
-fn inspector_arrived() {
-    let Some(term) = TERM.get() else {
         return;
-    };
-    let already = {
-        let Ok(mut guard) = term.lock() else {
-            return;
-        };
-        let already = guard.inspector;
-        guard.inspector = true;
-        guard.pending = None;
-        already
-    };
-    if !already {
-        relayout();
     }
+    crate::message::info(
+        "the inspector opens in a window of its own — CEF decides where DevTools lives. \
+         `--remote-debugging-port` is the way to inspect this page from anywhere else",
+    );
 }
 
-/// Put the inspector away: stop giving it room and stop drawing its last frame.
-///
-/// The browser is left alone for the reason `devtools.rs` gives at length — closing a docked
-/// inspector is the measured SIGSEGV that file is arranged around.
-pub fn close_inspector() {
-    let Some(term) = TERM.get() else {
-        return;
-    };
-    if let Ok(mut guard) = term.lock() {
-        guard.inspector = false;
-        guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
-        guard.surfaces[index_of(SurfaceKind::Divider)] = None;
-    }
-    relayout();
-}
 
-/// Whether the inspector is showing.
-pub fn inspector_open() -> bool {
-    TERM.get()
-        .and_then(|term| term.lock().ok().map(|guard| guard.inspector))
-        .unwrap_or(false)
-}
 
 wrap_render_handler! {
     pub struct TermRenderHandler {}
@@ -1146,19 +1080,6 @@ wrap_render_handler! {
             if let Some(identifier) = identifier {
                 if !term.of_browser.iter().any(|(known, _)| *known == identifier) {
                     term.of_browser.push((identifier, kind));
-                }
-            }
-            if kind == SurfaceKind::Inspector {
-                if crate::term_input::debug() {
-                    eprintln!("bru[term]: the inspector painted {width}x{height} into the pane");
-                }
-                // Out of the lock and back in: `inspector_arrived` relayouts, and relayout takes
-                // this same lock. See `layout_for` for what re-entering it costs.
-                let first = !term.inspector;
-                if first {
-                    drop(term);
-                    inspector_arrived();
-                    return;
                 }
             }
             let slot = index_of(kind);

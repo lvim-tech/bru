@@ -168,12 +168,6 @@ pub fn toggle(browser: &mut Browser, wanted: Option<Place>) {
     // A terminal has one docked panel and `:devtools` toggles it, so a second call closes what the
     // first opened — the Views path reaches the same conclusion through `inspector_in`, which has no
     // view to answer with here.
-    // A terminal has one docked panel and `:devtools` toggles it; the Views path reaches the same
-    // conclusion through `inspector_in`, which has no view to answer with here.
-    if crate::term_frontend::inspector_open() {
-        crate::term_frontend::close_inspector();
-        return;
-    }
     let place = wanted.unwrap_or(Place::Bottom);
     // **Said before `show_dev_tools`, because the answer is wanted inside it.** CEF creates the
     // DevTools browser synchronously enough that `on_popup_browser_view_created` is reached from
@@ -232,13 +226,6 @@ pub fn close(browser: &mut Browser) {
     // a docked inspector is the measured SIGSEGV. Taking its rectangle away is what "hidden" means
     // in a terminal, and the browser behind it goes when its tab does.
     // --- end src/term_frontend.rs ---------------------------------------------------------------
-    // Hidden, not closed, for the reason `toggle` gives at length: `close_dev_tools` on a docked
-    // inspector is the measured SIGSEGV. Taking its rectangle away is what "hidden" means here.
-    if crate::term_frontend::inspector_open() {
-        crate::term_frontend::close_inspector();
-        trace("close: terminal inspector hidden");
-        return;
-    }
     if host.has_dev_tools() != 0 {
         host.close_dev_tools();
     }
@@ -1093,9 +1080,7 @@ fn open(host: &BrowserHost) {
     // calls ignored is honoured there — and the inspector can be windowless like everything else in
     // the pane. See `term_frontend::open_inspector`, including why it needs a client where this
     // needs none.
-    if crate::term_frontend::open_inspector(host) {
-        return;
-    }
+    crate::term_frontend::note_inspector_window();
     // --- end src/term_frontend.rs ---------------------------------------------------------------
     let settings = BrowserSettings::default();
     host.show_dev_tools(None, None, Some(&settings), None);
