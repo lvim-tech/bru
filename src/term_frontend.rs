@@ -737,6 +737,8 @@ static LAST_SHAPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 /// How many size mismatches have been reported. Bounded for the reason every counter here is.
 static MISMATCH: AtomicI32 = AtomicI32::new(0);
+/// How many frames have been drawn, for the timing line in [`present`].
+static PRESENTS: AtomicI32 = AtomicI32::new(0);
 
 /// How many pointer routings have been reported. Bounded like every counter here.
 static POINTED: AtomicI32 = AtomicI32::new(0);
@@ -932,10 +934,12 @@ fn present(term: &mut TermState) {
     if let Some(layer) = popup_layer {
         layers.push(layer);
     }
+    let started = crate::term_input::debug().then(std::time::Instant::now);
     let damaged = crate::term_compose::compose(&mut term.frame, &layers);
     if damaged.is_none() {
         return;
     }
+    let composed = started.map(|at| at.elapsed());
     let mut out = std::io::stdout();
     let _ = term.session.begin_sync(&mut out);
     let _ = term.painter.paint(
@@ -946,6 +950,21 @@ fn present(term: &mut TermState) {
     );
     let _ = term.session.end_sync(&mut out);
     let _ = out.flush();
+    // **Where a frame's time actually goes, split at the one seam that matters.** Composing is
+    // bru's own cost and is the same everywhere; the write is the terminal's, and a host that
+    // decodes each frame and re-encodes it for the terminal underneath charges for it here. Every
+    // thirtieth frame, because a line per frame is its own delay.
+    if let (Some(at), Some(composed)) = (started, composed) {
+        let seen = PRESENTS.fetch_add(1, Ordering::Relaxed);
+        if seen % 30 == 0 {
+            eprintln!(
+                "bru[term]: present {seen}: composed in {}ms, written in {}ms ({:?})",
+                composed.as_millis(),
+                at.elapsed().saturating_sub(composed).as_millis(),
+                term.painter.transport()
+            );
+        }
+    }
 }
 
 /// A new pane size: re-lay everything out and tell every browser.
