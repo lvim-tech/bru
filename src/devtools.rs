@@ -1159,14 +1159,24 @@ fn http_get(port: u16, path: &str) -> Option<String> {
 /// A scanner, not a JSON library: the body is a flat array of flat objects whose interesting
 /// values are all strings, and the four escape rules a URL can carry are the whole grammar this
 /// needs. Depth is tracked so a string inside a nested value cannot be mistaken for a key, and an
-/// object missing either field contributes nothing rather than half a pair.
-fn targets_from_json(body: &str) -> Vec<(String, String)> {
+/// object missing what a caller needs contributes what it has rather than being guessed at.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Target {
+    url: String,
+    /// The target's id, from which the *local* frontend URL is built — see [`frontend_url_for`].
+    id: Option<String>,
+    /// The `devtoolsFrontendUrl` the list itself offers. Measured 2026-08-26 against this CEF:
+    /// it points at `https://chrome-devtools-frontend.appspot.com/serve_rev/@<hash>/…` — the
+    /// internet — and is the fallback, not the answer.
+    frontend: Option<String>,
+}
+
+fn targets_from_json(body: &str) -> Vec<Target> {
     let mut targets = Vec::new();
     let mut depth = 0usize;
     let mut pending_key: Option<String> = None;
     let mut key: Option<String> = None;
-    let mut url: Option<String> = None;
-    let mut frontend: Option<String> = None;
+    let mut current = Target::default();
     let mut chars = body.chars();
     while let Some(c) = chars.next() {
         match c {
@@ -1176,8 +1186,9 @@ fn targets_from_json(body: &str) -> Vec<(String, String)> {
                 };
                 if depth == 2 {
                     match key.take() {
-                        Some(k) if k == "url" => url = Some(text),
-                        Some(k) if k == "devtoolsFrontendUrl" => frontend = Some(text),
+                        Some(k) if k == "url" => current.url = text,
+                        Some(k) if k == "id" => current.id = Some(text),
+                        Some(k) if k == "devtoolsFrontendUrl" => current.frontend = Some(text),
                         Some(_) => {}
                         None => pending_key = Some(text),
                     }
@@ -1187,8 +1198,9 @@ fn targets_from_json(body: &str) -> Vec<(String, String)> {
             '{' | '[' => depth += 1,
             '}' | ']' => {
                 if depth == 2 && c == '}' {
-                    if let (Some(url), Some(frontend)) = (url.take(), frontend.take()) {
-                        targets.push((url, frontend));
+                    let done = std::mem::take(&mut current);
+                    if !done.url.is_empty() && (done.id.is_some() || done.frontend.is_some()) {
+                        targets.push(done);
                     }
                     pending_key = None;
                     key = None;
@@ -1237,17 +1249,32 @@ fn read_json_string(chars: &mut std::str::Chars<'_>) -> Option<String> {
     None
 }
 
-/// The full frontend URL for the target whose page is `url`, or `None` with the reason told apart
-/// by the caller from the target count.
-fn frontend_url_for(targets: &[(String, String)], url: &str, port: u16) -> Option<String> {
+/// The full frontend URL for the target whose page is `url`, or `None` when no target matches.
+///
+/// **Built against the local server, from the target's id.** Measured 2026-08-26 on this CEF
+/// (`Chrome/151.0.7922.72`, port `=0`): the list's own `devtoolsFrontendUrl` points at
+/// `chrome-devtools-frontend.appspot.com` — the internet, at a pinned revision — while the same
+/// port serves the *bundled* frontend itself: `/devtools/inspector.html` answers 200 with the real
+/// loader, its module and stylesheet subresources answer with real bytes, and the page's own CSP
+/// carries `connect-src … ws://127.0.0.1:*`, which is exactly the WebSocket it is being asked to
+/// open. Local wins: no network, and a frontend that cannot disagree with its browser's version.
+/// The appspot URL stays as the fallback for a target that arrives without an id.
+fn frontend_url_for(targets: &[Target], url: &str, port: u16) -> Option<String> {
     let matched = targets
         .iter()
-        .find(|(target, _)| target == url || target.trim_end_matches('/') == url.trim_end_matches('/'))
-        .map(|(_, frontend)| frontend)?;
-    if matched.starts_with("http://") || matched.starts_with("https://") {
-        return Some(matched.clone());
+        .find(|target| {
+            target.url == url || target.url.trim_end_matches('/') == url.trim_end_matches('/')
+        })?;
+    if let Some(id) = &matched.id {
+        return Some(format!(
+            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{id}"
+        ));
     }
-    Some(format!("http://127.0.0.1:{port}{matched}"))
+    let frontend = matched.frontend.as_ref()?;
+    if frontend.starts_with("http://") || frontend.starts_with("https://") {
+        return Some(frontend.clone());
+    }
+    Some(format!("http://127.0.0.1:{port}{frontend}"))
 }
 
 /// `:devtools` in a terminal pane: dock through the port, or say exactly what is missing.
@@ -1360,40 +1387,45 @@ fn open(host: &BrowserHost) {
 mod tests {
     use super::*;
 
-    /// The shape `/json/list` actually answers with, measured 2026-08-25: a flat array of flat
-    /// objects, every interesting value a string. The parser must take the two fields the terminal
-    /// dock needs and step over everything else — nested values included, because a `description`
-    /// is allowed to hold anything.
+    /// The shape `/json/list` actually answers with — measured 2026-08-26 against this CEF
+    /// (`Chrome/151.0.7922.72`, `--remote-debugging-port=0`), abbreviated but field for field.
+    /// Note what the measurement showed: `devtoolsFrontendUrl` points at the *internet* (appspot,
+    /// pinned revision), which is why the id is what the local frontend URL is built from.
     #[test]
-    fn the_target_list_yields_url_and_frontend_pairs() {
+    fn the_target_list_yields_urls_ids_and_frontends() {
         let body = r#"[ {
             "description": "",
-            "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/AB12",
-            "id": "AB12",
+            "devtoolsFrontendUrl": "https://chrome-devtools-frontend.appspot.com/serve_rev/@2903d/inspector.html?ws=127.0.0.1:42591/devtools/page/5A11",
+            "id": "5A11",
+            "title": "bru bar",
+            "type": "page",
+            "url": "bru://chrome/bottom.html",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:42591/devtools/page/5A11"
+        }, {
+            "devtoolsFrontendUrl": "https://chrome-devtools-frontend.appspot.com/serve_rev/@2903d/inspector.html?ws=127.0.0.1:42591/devtools/page/3A2F",
+            "id": "3A2F",
             "title": "Example Domain",
             "type": "page",
-            "url": "https://example.org/",
-            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/AB12"
-        }, {
-            "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/CD34",
-            "url": "bru://chrome/top.html"
+            "url": "https://example.org/"
         } ]"#;
         let targets = targets_from_json(body);
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].0, "https://example.org/");
-        assert!(targets[0].1.ends_with("/devtools/page/AB12"));
-        assert_eq!(targets[1].0, "bru://chrome/top.html");
+        assert_eq!(targets[0].url, "bru://chrome/bottom.html");
+        assert_eq!(targets[0].id.as_deref(), Some("5A11"));
+        assert_eq!(targets[1].url, "https://example.org/");
+        assert!(targets[1].frontend.as_deref().unwrap_or("").starts_with("https://"));
     }
 
-    /// Escapes a URL can carry: Chromium writes `&` as `&` in some of its JSON, and a title
-    /// between the fields may hold anything at all.
+    /// Escapes a URL can carry, and junk between the fields: a title may hold anything at all.
     #[test]
     fn json_escapes_are_unescaped_and_junk_between_fields_is_stepped_over() {
         let body = r#"[{"title":"a \"quoted\" title, with ] and } inside",
-            "url":"https://x/?a=1&b=2","devtoolsFrontendUrl":"/devtools/i.html"}]"#;
+            "url":"https://x/?a=1\u0026b=2","id":"AB"}]"#;
         let targets = targets_from_json(body);
-        assert_eq!(targets, vec![("https://x/?a=1&b=2".to_string(), "/devtools/i.html".to_string())]);
-        // An object missing either field contributes nothing rather than half a pair.
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://x/?a=1&b=2");
+        assert_eq!(targets[0].id.as_deref(), Some("AB"));
+        // An object with a URL and no way to reach it contributes nothing rather than half a target.
         assert!(targets_from_json(r#"[{"url":"https://x/"}]"#).is_empty());
         assert!(targets_from_json("").is_empty());
         assert!(targets_from_json(r#"[{"url":"unterminated"#).is_empty());
@@ -1402,36 +1434,35 @@ mod tests {
     /// A nested object as a value must not shift which strings read as keys.
     #[test]
     fn a_nested_value_does_not_derail_the_scan() {
-        let body = r#"[{"extra":{"url":"https://wrong/"},"url":"https://right/",
-            "devtoolsFrontendUrl":"/devtools/i.html"}]"#;
+        let body = r#"[{"extra":{"url":"https://wrong/"},"url":"https://right/","id":"CD"}]"#;
         let targets = targets_from_json(body);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].0, "https://right/");
+        assert_eq!(targets[0].url, "https://right/");
     }
 
-    /// The match is by URL because the port's list is the only mapping there is; a relative
-    /// frontend URL is made absolute against the loopback port, an absolute one is believed.
+    /// The match is by URL because the port's list is the only mapping there is; the local
+    /// frontend is built from the id, and the list's own (remote) URL is only the fallback.
     #[test]
-    fn the_frontend_url_is_matched_by_page_url_and_made_absolute() {
+    fn the_frontend_url_is_local_when_the_target_has_an_id() {
         let targets = vec![
-            ("bru://chrome/top.html".to_string(), "/devtools/a.html".to_string()),
-            ("https://example.org/".to_string(), "/devtools/b.html".to_string()),
+            Target { url: "bru://chrome/top.html".into(), id: Some("AA".into()), frontend: None },
+            Target { url: "https://example.org/".into(), id: Some("BB".into()), frontend: None },
         ];
-        assert_eq!(
-            frontend_url_for(&targets, "https://example.org/", 9222),
-            Some("http://127.0.0.1:9222/devtools/b.html".to_string())
-        );
+        let local =
+            "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/BB";
+        assert_eq!(frontend_url_for(&targets, "https://example.org/", 9222), Some(local.into()));
         // The trailing slash is the one normalisation allowed: the two spellings are one page.
-        assert_eq!(
-            frontend_url_for(&targets, "https://example.org", 9222),
-            Some("http://127.0.0.1:9222/devtools/b.html".to_string())
-        );
+        assert_eq!(frontend_url_for(&targets, "https://example.org", 9222), Some(local.into()));
         assert_eq!(frontend_url_for(&targets, "https://elsewhere.org/", 9222), None);
-        let absolute =
-            vec![("https://x/".to_string(), "http://127.0.0.1:9222/devtools/c.html".to_string())];
+        // No id: the list's own URL, believed when absolute and made absolute when not.
+        let fallback = vec![
+            Target { url: "https://x/".into(), id: None, frontend: Some("https://a/i.html".into()) },
+            Target { url: "https://y/".into(), id: None, frontend: Some("/devtools/i.html".into()) },
+        ];
+        assert_eq!(frontend_url_for(&fallback, "https://x/", 9222), Some("https://a/i.html".into()));
         assert_eq!(
-            frontend_url_for(&absolute, "https://x/", 9222),
-            Some("http://127.0.0.1:9222/devtools/c.html".to_string())
+            frontend_url_for(&fallback, "https://y/", 9222),
+            Some("http://127.0.0.1:9222/devtools/i.html".into())
         );
     }
 }
