@@ -1045,6 +1045,19 @@ impl Painter {
     /// application's screen, and erasing text is the session's job. What this does is release the
     /// pixels kitty is storing, so that a browser that has stopped is not also a picture the
     /// terminal is still holding.
+    /// Give one image back and forget its cells.
+    ///
+    /// **Deleting is not how a band is redrawn** — re-transmitting its id replaces it in place, with
+    /// nothing blank in between. This is for a band that has stopped existing, which happens only
+    /// when the layout leaves fewer of them than it had.
+    pub fn forget(&mut self, out: &mut impl Write, image_id: u32) -> std::io::Result<()> {
+        let escape = delete_escape(image_id);
+        out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
+        self.placed.retain(|placement| placement.image_id != image_id);
+        self.drawn.retain(|id| *id != image_id);
+        Ok(())
+    }
+
     /// **Every image, not just the one this painter was made with.** The picture is several bands
     /// and each is an image the terminal is holding pixels for; deleting one of them would leave the
     /// rest on screen with nothing drawing them.

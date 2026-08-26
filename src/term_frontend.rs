@@ -106,6 +106,9 @@ struct TermState {
     /// changes when a person changes it; [`refresh_background`] is on that path, and nothing else
     /// moves this.
     background: [u8; 3],
+    /// How many bands the terminal is holding pixels for, so that a layout with fewer of them can
+    /// take the surplus back.
+    bands_drawn: usize,
     /// Every band must be sent on the next frame, whatever the damage says.
     ///
     /// **Set whenever the bands themselves changed.** After [`forget_bands`] the terminal is holding
@@ -183,6 +186,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         inspector: None,
         background: background_from_theme(),
         redraw_all: true,
+        bands_drawn: 0,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -980,6 +984,14 @@ fn present(term: &mut TermState) {
         let placement = Placement::new(id, row, 1, rows, cols);
         let _ = term.painter.paint_at(&mut out, pixels, width as u32, band.height as u32, &placement);
     }
+    // The bands that existed last time and do not now — the layout left fewer of them. Taken back
+    // here, inside the synchronised update, so nothing is ever seen missing.
+    for index in bands.len()..term.bands_drawn {
+        if let Ok(index) = u32::try_from(index) {
+            let _ = term.painter.forget(&mut out, crate::term_paint::IMAGE_ID_BAND + index);
+        }
+    }
+    term.bands_drawn = bands.len();
     let _ = term.session.end_sync(&mut out);
     let _ = out.flush();
     // **Where a frame's time actually goes, split at the one seam that matters.** Composing is
@@ -999,16 +1011,15 @@ fn present(term: &mut TermState) {
     }
 }
 
-/// Take every band image back, because where the bands *are* has changed.
+/// Say that the cuts have moved, so every band goes out again on the next frame.
 ///
-/// **A band's id is bound to its position and to nothing else.** When the cuts move — a panel opens,
-/// the inspector docks, the pane is resized — the picture would otherwise keep whatever bands the
-/// old layout left behind, drawn at places no band occupies any more. Deleting them all costs one
-/// escape each and the next frame draws every one that is still wanted.
+/// **It does not delete anything, and that is the point.** Deleting the images and letting the next
+/// frame put them back leaves the pane blank in between — and `relayout` runs on *every keystroke*
+/// in the command line, because the completion table changes height under it. Measured 2026-08-27:
+/// typing made the whole pane blink. Re-transmitting a band's id replaces it in place with nothing
+/// blank in between, so a moved band needs no deletion; only a band that has stopped existing does,
+/// and [`present`] takes those back itself.
 fn forget_bands(term: &mut TermState) {
-    let mut out = std::io::stdout();
-    let _ = term.painter.clear(&mut out);
-    let _ = out.flush();
     term.redraw_all = true;
 }
 
