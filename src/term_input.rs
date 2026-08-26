@@ -292,7 +292,12 @@ wrap_task! {
             // not — measured 2026-08-26, with every click landing in the docked inspector at the
             // right coordinates and nothing happening, because as far as Chromium could tell no
             // button was ever down.
-            let event = MouseEvent { x, y, modifiers: self.modifiers | held };
+            //
+            // **On the release the flag comes off**, because by then the button is not held. A
+            // mouse-up that still claims the button is down describes a state that never exists,
+            // and the sequence a click is made of stops being one.
+            let modifiers = if self.pressed { self.modifiers | held } else { self.modifiers };
+            let event = MouseEvent { x, y, modifiers };
             // The move first, so the page knows where the pointer is before it is told it was
             // pressed — a click delivered to a page that thinks the pointer is elsewhere hits
             // whatever was under the old position.
