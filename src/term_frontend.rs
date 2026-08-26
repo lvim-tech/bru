@@ -1438,15 +1438,18 @@ pub fn close_inspector() {
 /// The page and the inspector are the two surfaces a pointer means anything to; the chrome strips
 /// have nothing clickable in them. Answered together with the browser's identifier so the mouse
 /// task has one question to ask under one lock.
-pub fn pointer_target(x: i32, y: i32) -> Option<(i32, Rect, SurfaceKind)> {
+pub fn pointer_target(x: i32, y: i32, press: bool) -> Option<(i32, Rect, SurfaceKind)> {
     let term = TERM.get()?;
     let guard = term.lock().ok()?;
     let inside = |rect: &Rect| {
         x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
     };
-    if crate::term_input::debug() {
+    // **Presses only.** The first version logged the first six routings of any kind, and mode 1003
+    // reports every pixel of pointer travel — so the six were six motions over whatever the pointer
+    // crossed first, and the clicks they were meant to explain were long past the cap.
+    if crate::term_input::debug() && press {
         let seen = POINTED.fetch_add(1, Ordering::Relaxed);
-        if seen < 6 {
+        if seen < 8 {
             let inspector = guard.layout.rect_of(SurfaceKind::Inspector);
             let page = guard.layout.rect_of(SurfaceKind::Page);
             eprintln!(

@@ -218,7 +218,7 @@ wrap_task! {
             // pointer and no button on the status bar — and a click that fell through to one would
             // be a press in a document with nothing to press.
             let Some((identifier, rect, kind)) =
-                crate::term_frontend::pointer_target(pane_x, pane_y)
+                crate::term_frontend::pointer_target(pane_x, pane_y, self.pressed && !self.motion)
             else {
                 return;
             };
