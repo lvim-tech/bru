@@ -157,6 +157,9 @@ const WHEEL_DOWN: u16 = 65;
 /// the numbers are cells or pixels.
 static MOUSE_SEEN: AtomicI32 = AtomicI32::new(0);
 
+/// How many clicks have been reported as sent. Bounded like every counter here.
+static SENT: AtomicI32 = AtomicI32::new(0);
+
 /// Where the pointer was last reported, so a report that moved it nowhere costs nothing.
 ///
 /// **Mode 1003 reports every motion, and most of them are the same cell twice.** A terminal reports
@@ -249,6 +252,13 @@ wrap_task! {
                 .browser_with_id(identifier)
                 .and_then(|browser| browser.host());
             let Some(host) = host else {
+                // **The lookup failing is silent otherwise, and silence was the bug.** A browser
+                // bru does not know about answers `None` here, and every event for it was dropped
+                // without a word — which is exactly how the docked inspector came to route clicks
+                // perfectly and act on none of them.
+                if crate::term_input::debug() {
+                    eprintln!("bru[term]: no host for browser {identifier} ({kind:?}); event dropped");
+                }
                 return;
             };
             let (x, y) = (pane_x - rect.x, pane_y - rect.y);
@@ -315,6 +325,18 @@ wrap_task! {
             // The move first, so the page knows where the pointer is before it is told it was
             // pressed — a click delivered to a page that thinks the pointer is elsewhere hits
             // whatever was under the old position.
+            if crate::term_input::debug() {
+                let seen = SENT.fetch_add(1, Ordering::Relaxed);
+                if seen < 8 {
+                    eprintln!(
+                        "bru[term]: click -> browser {identifier} ({kind:?}) at {x},{y} \
+                         button={:?} up={} modifiers={:#x}",
+                        button,
+                        i32::from(!self.pressed),
+                        modifiers
+                    );
+                }
+            }
             host.send_mouse_move_event(Some(&event), 0);
             host.send_mouse_click_event(Some(&event), button, i32::from(!self.pressed), 1);
         }
