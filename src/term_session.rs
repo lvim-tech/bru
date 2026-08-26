@@ -783,6 +783,8 @@ pub(crate) struct TerminalSession {
     kitty_flags_before: Option<u8>,
     /// Whether mouse reports carry pixels rather than cells — see [`MOUSE_PIXELS_QUERY`].
     mouse_pixels: bool,
+    /// Whether the terminal said it can read a frame out of shared memory.
+    shared_memory: bool,
     /// Bytes read while waiting for query answers that were not answers.
     ///
     /// **These are keystrokes and they are not to be thrown away.** A person who typed while bru was
@@ -937,6 +939,26 @@ impl TerminalSession {
             publish_leave(modes);
         }
 
+        // --- can this terminal read a frame out of shared memory? ----------------------------------
+        // **Asked once, here, because a real frame never asks.** Frames carry `q=2` and get silence
+        // by design, so a host that refuses `t=s` refuses all of them without bru ever hearing it —
+        // a black pane at full frame rate. See `term_paint::shm_query_escape`.
+        let shared_memory = match crate::term_paint::shm_probe_publish() {
+            None => false, // no `/dev/shm` to offer: nothing to ask about.
+            Some(name) => {
+                let asked =
+                    write(&format!("{}\x1b[5n", crate::term_paint::shm_query_escape(&name, in_tmux)));
+                let answered = if asked.is_ok() { read_answers(tty) } else { Vec::new() };
+                let verdict = crate::term_paint::shm_query_answer(&answered);
+                crate::term_paint::shm_probe_release(&name);
+                // Everything that was not the answer is somebody's keystrokes, as in every round.
+                pushback.extend_from_slice(&answered);
+                asked.map_err(unwind)?;
+                // Silence says nothing; only a refusal is a refusal.
+                verdict.unwrap_or(true)
+            }
+        };
+
         // --- resize, from either direction, into one channel --------------------------------------
         let (winch_read, winch_write) = self_pipe().map_err(unwind)?;
         WINCH_PIPE.store(winch_write, Ordering::Release);
@@ -962,6 +984,7 @@ impl TerminalSession {
             size,
             kitty_flags_before,
             mouse_pixels,
+            shared_memory,
             pushback,
             last_size,
             resize_tx,
@@ -980,6 +1003,15 @@ impl TerminalSession {
 
     pub(crate) fn in_tmux(&self) -> bool {
         self.in_tmux
+    }
+
+    /// The transport the terminal agreed to, rather than the one this machine could publish.
+    pub(crate) fn transport(&self) -> crate::term_paint::Transport {
+        if self.shared_memory {
+            crate::term_paint::Transport::SharedMemory
+        } else {
+            crate::term_paint::Transport::Base64
+        }
     }
 
     /// Which modes are actually in force. C4 reads `in_band_resize` and the sync flag through the

@@ -179,6 +179,66 @@ fn most_significant_byte_diacritic(id: u32) -> Option<char> {
 /// with an id it chose, and reading that answer is exactly what a presenter that cannot listen
 /// must not do. This is a considered guess and is labelled as one.
 pub const IMAGE_ID_VIEW: u32 = 0xbe;
+/// The image the transport probe hands over, which is never displayed. Its own id so that failing
+/// the probe cannot disturb either of the two real images.
+pub const IMAGE_ID_PROBE: u32 = 0xbd;
+
+/// Put one pixel in shared memory for the transport probe to offer the terminal.
+///
+/// `None` when this machine has no usable `/dev/shm` at all — in which case there is nothing to ask
+/// about and [`Transport::Base64`] is the answer without a round trip.
+pub(crate) fn shm_probe_publish() -> Option<String> {
+    let name = format!("/bru-probe-{}", std::process::id());
+    shm_publish(&name, &[0u8; 3]).ok().map(|()| name)
+}
+
+/// Take the probe's object back. Harmless if the terminal already consumed it.
+pub(crate) fn shm_probe_release(name: &str) {
+    shm_unlink(name);
+}
+
+/// Ask the terminal whether it can read a frame out of shared memory — `a=q` transmits nothing and
+/// displays nothing, it only answers.
+///
+/// **This exists because a frame does not answer.** Real frames carry `q=2`, which asks for silence,
+/// so a terminal that cannot read `t=s` refuses every one of them and bru never hears about it: the
+/// pane stays black at full speed. `Transport::Base64` used to be reachable only when `shm_publish`
+/// failed *locally*, which is a different question from whether the thing drawing the screen can
+/// open the object. Measured 2026-08-26 in zellij 0.46.0.
+pub(crate) fn shm_query_escape(name: &str, in_tmux: bool) -> String {
+    let escape = format!(
+        "\x1b_Gi={IMAGE_ID_PROBE},a=q,t=s,f=24,s=1,v=1;{}\x1b\\",
+        base64(name.as_bytes())
+    );
+    passthrough(&escape, in_tmux)
+}
+
+/// What the terminal answered: `Some(true)` for `OK`, `Some(false)` for a refusal such as
+/// `ENOENT:...`, and `None` when it said nothing about this image at all.
+///
+/// **Silence is not a refusal.** A terminal that answers nothing has told us nothing, and the
+/// transport that has been working since this frontend was written is the better guess than one
+/// chosen from an absence.
+pub(crate) fn shm_query_answer(bytes: &[u8]) -> Option<bool> {
+    let mut at = 0;
+    while let Some(start) = bytes[at..].windows(3).position(|w| w == b"\x1b_G") {
+        let start = at + start + 3;
+        let end = bytes[start..].windows(2).position(|w| w == b"\x1b\\")? + start;
+        let body = &bytes[start..end];
+        let split = body.iter().position(|&b| b == b';');
+        if let Some(split) = split {
+            let (keys, payload) = (&body[..split], &body[split + 1..]);
+            if keys.windows(2).any(|w| w == b"i=")
+                && String::from_utf8_lossy(keys).contains(&format!("i={IMAGE_ID_PROBE}"))
+            {
+                return Some(payload.starts_with(b"OK"));
+            }
+        }
+        at = end;
+    }
+    None
+}
+
 /// The popup layer (a `<select>` dropdown), which composes over the view. Its own id so the two do
 /// not replace each other.
 pub const IMAGE_ID_POPUP: u32 = 0xbf;
@@ -703,13 +763,18 @@ pub struct Painter {
 }
 
 impl Painter {
-    pub fn new(placement: Placement, in_tmux: bool, place: Place) -> Painter {
+    pub fn new(
+        placement: Placement,
+        in_tmux: bool,
+        place: Place,
+        transport: Transport,
+    ) -> Painter {
         Painter {
             placement,
             style: Style::Explicit,
             in_tmux,
             place,
-            transport: Transport::SharedMemory,
+            transport,
             placed: None,
             sequence: 0,
             handed_over: VecDeque::new(),
@@ -1113,7 +1178,7 @@ mod tests {
     /// the only thing between a wrong number and a picture made of whatever was next in memory.
     #[test]
     fn a_short_frame_is_refused_rather_than_read_past() {
-        let mut painter = Painter::new(Placement::new(190, 1, 1, 2, 2), false, Place::Placeholders);
+        let mut painter = Painter::new(Placement::new(190, 1, 1, 2, 2), false, Place::Placeholders, Transport::SharedMemory);
         let mut out = Vec::new();
         let error = painter.paint(&mut out, &[0u8; 11], 2, 2).expect_err("4 pixels need 12 bytes");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -1122,6 +1187,33 @@ mod tests {
 
     /// The division of labour: pixels every frame, placeholder cells only when the geometry moved.
     ///
+    /// **The distinction the black pane turned on.** `OK` is a yes, anything else is a no, and
+    /// nothing at all is neither — the three have to stay three.
+    #[test]
+    fn the_transport_question_can_be_answered_no() {
+        assert_eq!(shm_query_answer(b"\x1b_Gi=189;OK\x1b\\"), Some(true));
+        assert_eq!(shm_query_answer(b"\x1b_Gi=189;ENOENT:No such file\x1b\\"), Some(false));
+        assert_eq!(shm_query_answer(b"\x1b_Gi=189;EBADF:bad medium\x1b\\"), Some(false));
+        assert_eq!(shm_query_answer(b""), None, "silence is not a refusal");
+        assert_eq!(shm_query_answer(b"\x1b_Gi=190;OK\x1b\\"), None, "another image's answer");
+        // The reply can arrive behind whatever else the terminal was saying.
+        assert_eq!(shm_query_answer(b"\x1b[0n\x1b_Gi=189;OK\x1b\\"), Some(true));
+    }
+
+    /// The question transmits nothing and displays nothing — `a=q` is the whole point, because
+    /// asking must not put a picture on a screen the caller has not finished setting up.
+    #[test]
+    fn the_transport_question_only_asks() {
+        let escape = shm_query_escape("/bru-probe-7", false);
+        assert_eq!(
+            escape,
+            format!("\x1b_Gi=189,a=q,t=s,f=24,s=1,v=1;{}\x1b\\", base64(b"/bru-probe-7"))
+        );
+        assert!(!escape.contains("a=T"), "a query, never a display");
+        // …and under tmux it has to go around tmux like every other graphics escape.
+        assert!(shm_query_escape("/bru-probe-7", true).starts_with("\x1bPtmux;"));
+    }
+
     /// **The zellij case, in a test.** The escape must say `C=1` and must not say `U=1`, because a
     /// host that ignores placeholders draws a picture from the first and nothing at all from the
     /// second — and acknowledges both.
@@ -1143,8 +1235,7 @@ mod tests {
     /// back — and no placeholder cell is ever written, because nothing is standing in for text.
     #[test]
     fn the_cursor_is_borrowed_for_the_picture_and_given_back() {
-        let mut painter = Painter::new(Placement::new(42, 7, 3, 1, 1), false, Place::AtCursor);
-        painter.transport = Transport::Base64;
+        let mut painter = Painter::new(Placement::new(42, 7, 3, 1, 1), false, Place::AtCursor, Transport::Base64);
         let frame = [0u8; 3];
 
         let mut out = Vec::new();
@@ -1176,8 +1267,7 @@ mod tests {
     /// The transport is forced to base64 here so the test needs no `/dev/shm` and no terminal.
     #[test]
     fn the_placeholder_cells_are_written_once_and_the_pixels_every_time() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders);
-        painter.transport = Transport::Base64;
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders, Transport::Base64);
         let frame = [0u8; 3];
 
         let mut first = Vec::new();
@@ -1202,8 +1292,7 @@ mod tests {
     /// Moving the picture re-writes the cells; setting the same placement twice does not.
     #[test]
     fn moving_the_picture_writes_the_cells_again() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders);
-        painter.transport = Transport::Base64;
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders, Transport::Base64);
         let frame = [0u8; 3];
         let mut sink = Vec::new();
         painter.paint(&mut sink, &frame, 1, 1).expect("a frame");
@@ -1218,7 +1307,7 @@ mod tests {
     /// The pane is not the only thing in the terminal: what is transmitted must be given back.
     #[test]
     fn clearing_frees_the_image_the_terminal_is_holding() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), true, Place::Placeholders);
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), true, Place::Placeholders, Transport::SharedMemory);
         let mut out = Vec::new();
         painter.clear(&mut out).expect("a write to a Vec");
         let out = String::from_utf8(out).expect("utf-8");

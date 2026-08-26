@@ -159,7 +159,8 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     let frame = Frame::new(layout.pane.width, layout.pane.height)
         .ok_or("the pane is too small to draw a browser in")?;
     let placement = Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols);
-    let painter = Painter::new(placement, session.in_tmux(), place_for_host());
+    let painter =
+        Painter::new(placement, session.in_tmux(), place_for_host(), session.transport());
 
     let term = TermState {
         session,
@@ -188,7 +189,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         if let Some(guard) = guard {
             eprintln!(
                 "bru[term]: pane {}x{} px, {}x{} cells ({}x{} per cell) via {:?}; tmux={}; \
-                 kitty-keyboard={:?}; mouse-pixels={}; place={:?}",
+                 kitty-keyboard={:?}; mouse-pixels={}; place={:?}; transport={:?}",
                 guard.size.width,
                 guard.size.height,
                 guard.size.cols,
@@ -200,6 +201,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
                 guard.session.kitty_flags_before(),
                 guard.session.mouse_in_pixels(),
                 place_for_host(),
+                guard.painter.transport(),
             );
         }
     }

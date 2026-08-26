@@ -371,17 +371,30 @@ pub(crate) fn unlink_shm(name: &str) {
 /// none arrived before the read timed out (`VTIME`), which is a fact about the terminal worth
 /// reporting rather than an error: a multiplexer that swallows the reply leaves the measurement
 /// write-only, and the caller says so instead of quietly printing a number that means nothing.
+/// What the terminal said about the frame just written: `true` only for `OK`.
+///
+/// **The payload is read, not just the terminator.** This used to return `true` for any reply that
+/// ended in `ESC \\`, which counts a refusal as an acknowledgement — and a refusal is exactly what a
+/// terminal sends when it cannot read the transport. Measured 2026-08-26 in zellij 0.46.0: 61 of 61
+/// frames "acknowledged" at 206 fps into a pane that stayed black, because every one of those was
+/// the terminal saying no. A number that cannot say no is not a measurement.
 fn read_ack(stdin: &mut std::io::Stdin) -> bool {
     let mut byte = [0u8; 1];
     let mut after_escape = false;
+    let mut body = Vec::with_capacity(32);
     // Bounded, because a terminal answering something else entirely must not spin here.
     for _ in 0..8192 {
         match stdin.read(&mut byte) {
             Ok(1) => {
                 if after_escape && byte[0] == b'\\' {
-                    return true;
+                    // Everything after the `;` is the answer: `OK`, or a reason it is not.
+                    let body = String::from_utf8_lossy(&body);
+                    return body.rsplit(';').next().is_some_and(|tail| tail.starts_with("OK"));
                 }
                 after_escape = byte[0] == 0x1b;
+                if !after_escape {
+                    body.push(byte[0]);
+                }
             }
             _ => return false,
         }
@@ -595,8 +608,9 @@ pub fn probe() -> Result<(), String> {
     println!();
     if shm.acked == 0 {
         println!(
-            "shared memory: kitty confirmed none of those, so `t=s` did not work here — the row \n\
-             above is the cost of writing to /dev/shm for nobody."
+            "shared memory: the terminal confirmed none of those, so `t=s` did not work here — the \n\
+             row above is the cost of writing to /dev/shm for nobody. bru will send frames as \n\
+             base64 instead; it asks this same question at startup."
         );
     } else if let Some(full) = measured.last() {
         println!(
