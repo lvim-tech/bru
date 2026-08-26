@@ -90,6 +90,11 @@ struct TermState {
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
     /// corruption.
     popup_pixels: Option<Painted>,
+    /// The docked inspector's browser, while `:devtools` has one open — a windowless browser on
+    /// the `devtoolsFrontendUrl` the DevTools port hands out, composited like any other surface.
+    /// `Some` is also what makes [`layout_for`] reserve the inspector's rectangle, read under the
+    /// lock the caller already holds for the reason that function's comment gives.
+    inspector: Option<i32>,
     /// What an empty part of the pane is painted with — the chrome background, **read once**.
     ///
     /// It used to be asked of the theme inside `present`, which meant `theme.css` read off the disk
@@ -122,8 +127,9 @@ pub fn is_active() -> bool {
 ///
 /// The panel is here even though it is zero-height most of the time: it is where the completion
 /// table and the prompt are drawn, and a `:` with no completion under it is half a command line.
-/// Its height is whatever the page measured — see [`layout_for`]. The inspector is absent for the
-/// reason `shell.rs` gives.
+/// Its height is whatever the page measured — see [`layout_for`]. The inspector is
+/// [`open_inspector`]'s, made when `:devtools` asks; the divider's rectangle exists in the layout
+/// but nothing paints it yet — it shows as a band of chrome background between page and panel.
 const SURFACES: [SurfaceKind; 6] = [
     SurfaceKind::Page,
     SurfaceKind::Top,
@@ -163,6 +169,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
+        inspector: None,
         background: background_from_theme(),
     };
     if TERM.set(Mutex::new(term)).is_err() {
@@ -383,7 +390,7 @@ pub fn relayout() {
         let Ok(mut guard) = term.lock() else {
             return;
         };
-        let next = layout_for(guard.size, false);
+        let next = layout_for(guard.size, inspector_docked(&guard));
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
@@ -845,7 +852,8 @@ pub fn resized(size: PaneSize) {
             return;
         }
         term.size = size;
-        term.layout = layout_for(size, false);
+        let docked = inspector_docked(&term);
+        term.layout = layout_for(size, docked);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.
@@ -1032,57 +1040,221 @@ pub fn render_handler() -> Option<RenderHandler> {
 
 // The client the docked inspector is created with.
 //
-// **A render handler and nothing else, and the nothing else is the point.** `devtools.rs` passes
-// `None` for the inspector's client in a window, deliberately: bru's own client carries the keyboard
-// handler, and `j` in a DevTools console has to type a `j` rather than scroll the page behind it. A
-// windowless inspector cannot have `None` — with no render handler CEF has nowhere to paint and the
-// panel is a browser nobody can see — so it gets the one handler it needs and none of the ones it
-// must not have.
+// **A render handler and a life-span handler, and nothing else — the nothing else is the point.**
+// `devtools.rs` passes `None` for the inspector's client in a window, deliberately: bru's own
+// client carries the keyboard handler, and `j` in a DevTools console has to type a `j` rather than
+// scroll the page behind it. A windowless inspector cannot have `None` — with no render handler
+// CEF has nowhere to paint and the panel is a browser nobody can see. The life-span handler is
+// what registers the browser in `BruState` like every other, so `browser_with_id` can find it,
+// the quit counts it, and closing it is the ordinary close.
 //
 // The comment is out here because `wrap_client!` matches the struct itself, and a doc comment on it
 // expands to an attribute the macro has no rule for — the same note `csp.rs` leaves on `wrap_task!`.
 wrap_client! {
-    pub struct InspectorClient {}
+    pub struct InspectorClient {
+        state: crate::tabs::SharedState,
+    }
 
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
             render_handler()
         }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(crate::keys::life_span_handler(self.state.clone()))
+        }
     }
 }
 
-/// Where the inspector goes, and why it is not in the pane.
+/// Whether the layout owes the inspector its rectangle: one is open, or one is being created and
+/// `view_rect` is about to ask how big it is.
+fn inspector_docked(term: &TermState) -> bool {
+    term.inspector.is_some() || term.pending == Some(SurfaceKind::Inspector)
+}
+
+/// The docked inspector's browser, if `:devtools` has one open.
+pub fn inspector_id() -> Option<i32> {
+    let term = TERM.get()?;
+    let guard = term.lock().ok()?;
+    guard.inspector
+}
+
+/// Whether the keyboard is aimed at the inspector rather than the page.
 ///
-/// **Three roads tried, three measurements, all on 2026-08-26.**
-///
-/// 1. `show_dev_tools`'s `window_info`. `devtools.rs` opens by noting it is ignored for a browser
-///    inside a `BrowserView`; the obvious reading is that one outside would have it honoured. It is
-///    not: `has_dev_tools()` answered 1 and no frame ever arrived.
-/// 2. The same again, after finding that the claim registering the inspector's first frame was
-///    being cleared before that frame could arrive. Fixing that changed nothing — the first reading
-///    was right for the wrong reason.
-/// 3. `LifeSpanHandler::on_before_dev_tools_popup`, which is the shape the Views frontend docks
-///    through: CEF asking rather than being told. The callback fires with every field present, the
-///    window info is set windowless, the client carries a render handler, `use_default_window` is
-///    cleared — and CEF 151 makes a desktop window regardless.
-///
-/// The inspector's home is decided by the browser it inspects, and a windowless parent does not
-/// change that answer.
-///
-/// So `:devtools` opens a window beside the terminal, which is *useful* — it inspects the right
-/// page — and only surprising if nothing says so. This says so, once. The compositor keeps its
-/// `Divider` and `Inspector` rectangles, and `layout` knows how to put one on either side, for the
-/// day a road opens; nothing reserves space meanwhile, because a band of empty pane where an
-/// inspector is not is worse than no inspector.
-#[allow(dead_code)] // Kept for the day a terminal cannot dock one; see `on_before_dev_tools_popup`.
-pub fn note_inspector_window() {
-    if !is_active() {
-        return;
+/// **Focus follows the click, the way it does between windows.** The inspector's client carries no
+/// keyboard handler — that is what lets `j` in its console type a `j` — so while it holds the keys
+/// nothing reaches bru's bindings at all, exactly as with a focused DevTools window under a window
+/// manager. The way back is the same as there: click the page (or the page regains it when the
+/// panel closes).
+static INSPECTOR_FOCUS: AtomicBool = AtomicBool::new(false);
+
+pub fn inspector_focused() -> bool {
+    INSPECTOR_FOCUS.load(Ordering::Relaxed)
+}
+
+/// Aim the keyboard at the docked inspector. `false` when there is none to aim at.
+pub fn focus_inspector() -> bool {
+    let Some(identifier) = inspector_id() else {
+        return false;
+    };
+    INSPECTOR_FOCUS.store(true, Ordering::Relaxed);
+    if let Some(state) = crate::state::BruState::instance() {
+        let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+        if let Some(host) = browser.and_then(|browser| browser.host()) {
+            host.set_focus(1);
+        }
     }
-    crate::message::info(
-        "the inspector opens in a window of its own — CEF decides where DevTools lives. \
-         `--remote-debugging-port` is the way to inspect this page from anywhere else",
+    true
+}
+
+/// Open the inspector as one more windowless surface, on the URL the DevTools port handed out.
+///
+/// **The rectangle is reserved before the browser is made**, because CEF asks `view_rect` while
+/// making it and the answer has to be the inspector's rectangle, not a placeholder: `pending` is
+/// what routes that first question, and setting it is also what makes [`layout_for`] carve the
+/// space out. The surfaces whose rectangles moved — the page above all — are told before the
+/// creation, so the shrink and the new panel arrive as one reflow rather than two.
+pub fn open_inspector(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> {
+    let term = TERM.get().ok_or("the terminal frontend is not running")?;
+    let moved = {
+        let mut guard = term.lock().map_err(|_| "terminal state poisoned".to_string())?;
+        if guard.inspector.is_some() {
+            return Err("an inspector is already docked".to_string());
+        }
+        guard.pending = Some(SurfaceKind::Inspector);
+        let next = layout_for(guard.size, true);
+        let moved: Vec<(i32, SurfaceKind)> = guard
+            .of_browser
+            .iter()
+            .filter(|(_, kind)| next.rect_of(*kind) != guard.layout.rect_of(*kind))
+            .copied()
+            .collect();
+        guard.layout = next;
+        moved
+    };
+    resize_browsers(&moved);
+
+    let window_info = WindowInfo::default().set_as_windowless(0);
+    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+    let mut client = InspectorClient::new(state.clone());
+    let browser = browser_host_create_browser_sync(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&CefString::from(url)),
+        Some(&settings),
+        None,
+        None,
     );
+    let mut guard = term.lock().map_err(|_| "terminal state poisoned".to_string())?;
+    guard.pending = None;
+    let Some(browser) = browser else {
+        // The rectangle goes back to the page — a band of empty pane where an inspector is not is
+        // worse than no inspector.
+        let next = layout_for(guard.size, false);
+        let moved: Vec<(i32, SurfaceKind)> = guard
+            .of_browser
+            .iter()
+            .filter(|(_, kind)| next.rect_of(*kind) != guard.layout.rect_of(*kind))
+            .copied()
+            .collect();
+        guard.layout = next;
+        drop(guard);
+        resize_browsers(&moved);
+        return Err("CEF would not make a windowless browser for the inspector".to_string());
+    };
+    let identifier = browser.identifier();
+    guard.of_browser.push((identifier, SurfaceKind::Inspector));
+    guard.inspector = Some(identifier);
+    drop(guard);
+    Ok(())
+}
+
+/// Close the docked inspector and give its rectangle back. A no-op when none is open.
+pub fn close_inspector() {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let (identifier, moved) = {
+        let Ok(mut guard) = term.lock() else {
+            return;
+        };
+        let Some(identifier) = guard.inspector.take() else {
+            return;
+        };
+        guard.of_browser.retain(|(id, _)| *id != identifier);
+        guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
+        let next = layout_for(guard.size, false);
+        let moved: Vec<(i32, SurfaceKind)> = guard
+            .of_browser
+            .iter()
+            .filter(|(_, kind)| next.rect_of(*kind) != guard.layout.rect_of(*kind))
+            .copied()
+            .collect();
+        guard.layout = next;
+        (identifier, moved)
+    };
+    INSPECTOR_FOCUS.store(false, Ordering::Relaxed);
+    resize_browsers(&moved);
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        // Really closed, not hidden: this browser is bru's own windowless one, not the panel CEF
+        // made — the SIGSEGV `devtools.rs` documents belongs to that panel and not to this.
+        host.close_browser(1);
+    }
+    // The page takes the keyboard back, the way it does when a DevTools window closes.
+    let page = TERM
+        .get()
+        .and_then(|term| term.lock().ok())
+        .and_then(|guard| {
+            guard
+                .of_browser
+                .iter()
+                .find(|(_, kind)| *kind == SurfaceKind::Page)
+                .map(|(id, _)| *id)
+        });
+    if let Some(identifier) = page {
+        let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+        if let Some(host) = browser.and_then(|browser| browser.host()) {
+            host.set_focus(1);
+        }
+    }
+}
+
+/// Which surface is under a pointer position (in pane pixels), and the rectangle it fills.
+///
+/// The page and the inspector are the two surfaces a pointer means anything to; the chrome strips
+/// have nothing clickable in them. Answered together with the browser's identifier so the mouse
+/// task has one question to ask under one lock.
+pub fn pointer_target(x: i32, y: i32) -> Option<(i32, Rect, SurfaceKind)> {
+    let term = TERM.get()?;
+    let guard = term.lock().ok()?;
+    let inside = |rect: &Rect| {
+        x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+    };
+    if let Some(identifier) = guard.inspector {
+        let rect = guard.layout.rect_of(SurfaceKind::Inspector);
+        if inside(&rect) {
+            return Some((identifier, rect, SurfaceKind::Inspector));
+        }
+    }
+    let rect = guard.layout.rect_of(SurfaceKind::Page);
+    if inside(&rect) {
+        let identifier = guard
+            .of_browser
+            .iter()
+            .find(|(_, kind)| *kind == SurfaceKind::Page)
+            .map(|(id, _)| *id)?;
+        return Some((identifier, rect, SurfaceKind::Page));
+    }
+    None
+}
+
+/// A button went down on one of the pointer's surfaces: focus follows the click.
+pub fn note_click(kind: SurfaceKind) {
+    INSPECTOR_FOCUS.store(kind == SurfaceKind::Inspector, Ordering::Relaxed);
 }
 
 

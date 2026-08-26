@@ -198,15 +198,6 @@ wrap_task! {
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
-            // A click is always the page's. The chrome strips have nothing clickable in them —
-            // there is no tab to close with a pointer and no button on the status bar — and a
-            // click that fell through to one would be a press in a document with nothing to press.
-            let Some(host) = page_browser(&state).and_then(|browser| browser.host()) else {
-                return;
-            };
-            let Some(page) = crate::term_frontend::page_rect() else {
-                return;
-            };
             // SGR counts from 1 and reports in the pane's coordinates; CEF wants 0-based
             // coordinates inside the surface it is painting. **And the units are not always
             // pixels** — a terminal that does not know mode 1016 reports cells, and multiplying is
@@ -220,12 +211,33 @@ wrap_task! {
             // were the ones whose cell corner fell outside the link's box. The centre is the best
             // estimate of a point that is known only to be somewhere in the cell, and it halves the
             // worst case in both axes. With pixel reports the scale is 1 and this adds nothing.
-            let x = (self.x - 1) * scale_x + scale_x / 2 - page.x;
-            let y = (self.y - 1) * scale_y + scale_y / 2 - page.y;
-            if x < 0 || y < 0 || x >= page.width || y >= page.height {
+            let pane_x = (self.x - 1) * scale_x + scale_x / 2;
+            let pane_y = (self.y - 1) * scale_y + scale_y / 2;
+            // **The page's, or the docked inspector's — whichever is under the pointer.** The
+            // chrome strips have nothing clickable in them — there is no tab to close with a
+            // pointer and no button on the status bar — and a click that fell through to one would
+            // be a press in a document with nothing to press.
+            let Some((identifier, rect, kind)) =
+                crate::term_frontend::pointer_target(pane_x, pane_y)
+            else {
                 return;
-            }
+            };
+            let host = state
+                .lock()
+                .expect("state mutex poisoned")
+                .browser_with_id(identifier)
+                .and_then(|browser| browser.host());
+            let Some(host) = host else {
+                return;
+            };
+            let (x, y) = (pane_x - rect.x, pane_y - rect.y);
             let event = MouseEvent { x, y, modifiers: self.modifiers };
+            // A button going down decides where the keyboard aims — focus follows the click, the
+            // way it does between a page and a DevTools window under a window manager.
+            if self.pressed && !self.motion && !matches!(self.button, WHEEL_UP | WHEEL_DOWN) {
+                crate::term_frontend::note_click(kind);
+                host.set_focus(1);
+            }
 
             // **Pointing is its own event and most of them are only that.** Without it Chromium
             // never learns the pointer moved: no `:hover`, no cursor over a link, and a click on
@@ -315,6 +327,15 @@ fn route(state: &crate::tabs::SharedState, mode: crate::modes::Mode) -> Option<B
         crate::modes::Mode::Prompt | crate::modes::Mode::YesNo => {
             crate::ipc::panel_chrome_browser_for(0).or_else(|| page_browser(state))
         }
+        // The docked inspector, while a click (or `:devtools-focus`) has aimed the keyboard at it.
+        // Its client has no keyboard handler, so nothing here reaches bru's bindings — which is the
+        // point (`j` in a console types a `j`) and is also why the way back is a click on the page,
+        // exactly as with a DevTools window under a window manager.
+        _ if crate::term_frontend::inspector_focused() => crate::term_frontend::inspector_id()
+            .and_then(|id| {
+                state.lock().expect("state mutex poisoned").browser_with_id(id)
+            })
+            .or_else(|| page_browser(state)),
         _ => page_browser(state),
     }
 }

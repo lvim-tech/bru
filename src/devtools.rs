@@ -78,6 +78,14 @@ pub fn toggle(browser: &mut Browser, wanted: Option<Place>) {
     let Some(host) = browser.host() else {
         return;
     };
+    // --- src/term_frontend.rs ---------------------------------------------------------------
+    // A terminal pane docks through the DevTools port — the fourth road, after CEF closed the
+    // three that asked it to place the inspector. See the section header above `toggle_term`.
+    if crate::term_frontend::is_active() {
+        toggle_term(browser, wanted);
+        return;
+    }
+    // --- end src/term_frontend.rs -----------------------------------------------------------
     // **A docked inspector is hidden, never destroyed, and that is the whole of M2's answer.**
     //
     // `close_dev_tools` on a docked inspector ends the process. Measured 2026-08-08 across four
@@ -222,9 +230,13 @@ pub fn close(browser: &mut Browser) {
         }
     }
     // --- src/term_frontend.rs -------------------------------------------------------------------
-    // Hidden, not closed, for the reason this file's `toggle` gives at length: `close_dev_tools` on
-    // a docked inspector is the measured SIGSEGV. Taking its rectangle away is what "hidden" means
-    // in a terminal, and the browser behind it goes when its tab does.
+    // A terminal inspector is an ordinary windowless browser bru made itself, so — unlike the
+    // docked Views panel, whose `close_dev_tools` is the measured SIGSEGV — closing it really is
+    // closing it. A `:devtools window` panel from a terminal run is still CEF's and still falls
+    // through to `close_dev_tools` below.
+    if crate::term_frontend::is_active() {
+        crate::term_frontend::close_inspector();
+    }
     // --- end src/term_frontend.rs ---------------------------------------------------------------
     if host.has_dev_tools() != 0 {
         host.close_dev_tools();
@@ -1053,6 +1065,257 @@ pub fn docking() -> bool {
     answer
 }
 
+// -----------------------------------------------------------------------------------------------
+// The terminal's inspector: the fourth road, through the DevTools port
+//
+// Three roads to a docked terminal inspector were tried and measured closed on 2026-08-26 —
+// `show_dev_tools`'s window_info (ignored: `has_dev_tools()` said 1 and no frame ever arrived,
+// twice, the second time with the claim-clearing bug fixed), and `on_before_dev_tools_popup`
+// (fires with every field present, and CEF 151 makes a desktop window regardless). The record of
+// those lived on `term_frontend::note_inspector_window`; the conclusion stands: **the inspector
+// CEF creates lives where CEF decides**, and a windowless parent does not change the answer.
+//
+// The fourth road does not ask CEF to place anything. With `--remote-debugging-port` open,
+// `/json/list` names every page target and hands each a `devtoolsFrontendUrl` — the DevTools web
+// app, served by Chromium's own HTTP server on that port, already wired to the target's WebSocket.
+// That is an ordinary URL, and an ordinary URL can be loaded in an ordinary windowless browser,
+// which is exactly the thing the terminal frontend knows how to composite. CEF never learns an
+// inspector exists; it sees one more page.
+//
+// The costs are stated rather than hidden: the port is a boundary decision the *user* makes at
+// startup (`main.rs` writes down why loopback TCP is wider than the `--remote` socket), so
+// `:devtools` without the port refuses and says what is missing instead of opening one itself.
+// And the target is matched by URL, because the port's target list is the only mapping there is —
+// two tabs on the same URL inspect whichever the list names first.
+// -----------------------------------------------------------------------------------------------
+
+/// Where the DevTools HTTP endpoint is, recorded by `main` before CEF starts.
+enum DebugEndpoint {
+    /// `--remote-debugging-port=<n>`: the port is known from the argv.
+    Port(u16),
+    /// `--remote-debugging-port=0`: Chromium picks one and writes it to this file in the profile,
+    /// *after* it starts — so the file is read when the port is wanted, not when this is recorded.
+    ActivePortFile(std::path::PathBuf),
+}
+
+static DEBUG_ENDPOINT: Mutex<Option<DebugEndpoint>> = Mutex::new(None);
+
+/// Record what `--remote-debugging-port` said, and where the profile is for the `=0` form.
+///
+/// Called from `main` beside the startup notice, which is the one place that has both the switch
+/// value and the profile path in hand.
+pub fn note_debug_endpoint(port: &str, profile: Option<&std::path::Path>) {
+    let endpoint = match port.trim().parse::<u16>() {
+        Ok(0) => profile
+            .map(|profile| DebugEndpoint::ActivePortFile(profile.join("DevToolsActivePort"))),
+        Ok(port) => Some(DebugEndpoint::Port(port)),
+        Err(_) => None,
+    };
+    *DEBUG_ENDPOINT.lock().expect("devtools mutex poisoned") = endpoint;
+}
+
+/// The DevTools port this process is listening on, or `None` when it was not asked to listen.
+pub fn debug_port() -> Option<u16> {
+    let guard = DEBUG_ENDPOINT.lock().ok()?;
+    match guard.as_ref()? {
+        DebugEndpoint::Port(port) => Some(*port),
+        DebugEndpoint::ActivePortFile(path) => {
+            // First line of `DevToolsActivePort` is the port; the second is a browser-target path
+            // this has no use for.
+            let text = std::fs::read_to_string(path).ok()?;
+            text.lines().next()?.trim().parse().ok()
+        }
+    }
+}
+
+/// One HTTP GET against the loopback DevTools server, body only.
+///
+/// `std::net::TcpStream` and HTTP/1.0, deliberately: 1.0 rules out chunked transfer, the server is
+/// Chromium's own on 127.0.0.1, and a dependency for one request would be a dependency for one
+/// request. The timeouts bound a user command, not a hot path — `:devtools` blocks the UI thread
+/// for at most their sum, against a server in the same process.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(1000))
+            .ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
+    write!(stream, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    let status = head.split_whitespace().nth(1)?;
+    if status != "200" {
+        return None;
+    }
+    Some(body.to_string())
+}
+
+/// The `(url, devtoolsFrontendUrl)` of every target in a `/json/list` body.
+///
+/// A scanner, not a JSON library: the body is a flat array of flat objects whose interesting
+/// values are all strings, and the four escape rules a URL can carry are the whole grammar this
+/// needs. Depth is tracked so a string inside a nested value cannot be mistaken for a key, and an
+/// object missing either field contributes nothing rather than half a pair.
+fn targets_from_json(body: &str) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    let mut depth = 0usize;
+    let mut pending_key: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut frontend: Option<String> = None;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                let Some(text) = read_json_string(&mut chars) else {
+                    return targets; // An unterminated string: what was whole is the answer.
+                };
+                if depth == 2 {
+                    match key.take() {
+                        Some(k) if k == "url" => url = Some(text),
+                        Some(k) if k == "devtoolsFrontendUrl" => frontend = Some(text),
+                        Some(_) => {}
+                        None => pending_key = Some(text),
+                    }
+                }
+            }
+            ':' if depth == 2 => key = pending_key.take(),
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                if depth == 2 && c == '}' {
+                    if let (Some(url), Some(frontend)) = (url.take(), frontend.take()) {
+                        targets.push((url, frontend));
+                    }
+                    pending_key = None;
+                    key = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            ',' if depth == 2 => {
+                pending_key = None;
+                key = None;
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// The rest of a JSON string whose opening quote has been consumed, unescaped.
+fn read_json_string(chars: &mut std::str::Chars<'_>) -> Option<String> {
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let mut code = 0u32;
+                    for _ in 0..4 {
+                        code = code * 16 + chars.next()?.to_digit(16)?;
+                    }
+                    // A surrogate cannot be a `char`; URLs never carry one, and a replacement
+                    // character is the honest spelling of a value this cannot represent.
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                }
+                _ => return None,
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// The full frontend URL for the target whose page is `url`, or `None` with the reason told apart
+/// by the caller from the target count.
+fn frontend_url_for(targets: &[(String, String)], url: &str, port: u16) -> Option<String> {
+    let matched = targets
+        .iter()
+        .find(|(target, _)| target == url || target.trim_end_matches('/') == url.trim_end_matches('/'))
+        .map(|(_, frontend)| frontend)?;
+    if matched.starts_with("http://") || matched.starts_with("https://") {
+        return Some(matched.clone());
+    }
+    Some(format!("http://127.0.0.1:{port}{matched}"))
+}
+
+/// `:devtools` in a terminal pane: dock through the port, or say exactly what is missing.
+fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
+    if wanted == Some(Place::Window) {
+        // CEF's own window still exists and still inspects the right page; a person asking for it
+        // by name gets it, with the line that says where it went.
+        if let Some(host) = page.host() {
+            crate::message::info("the inspector opens in a window of its own, beside the terminal");
+            let settings = BrowserSettings::default();
+            host.show_dev_tools(None, None, Some(&settings), None);
+        }
+        return;
+    }
+    if crate::term_frontend::inspector_id().is_some() {
+        match wanted {
+            // A bare `:devtools` on an open panel is the toggle's other half.
+            None => crate::term_frontend::close_inspector(),
+            // A named position moves it — the same rectangle arithmetic, the other axis.
+            Some(place) if place != place_of(0) => {
+                set_place(0, Some(place));
+                crate::term_frontend::relayout();
+            }
+            // Already where it was asked to be: a position is a statement, not a flip.
+            Some(_) => {}
+        }
+        return;
+    }
+    let Some(port) = debug_port() else {
+        crate::message::error(
+            "devtools: a terminal pane docks the inspector through the DevTools port, and this \
+             bru was started without one. Start it as `bru --term --remote-debugging-port=0 <url>` \
+             (`main.rs` records what that port opens up before choosing it)",
+        );
+        return;
+    };
+    let url = page
+        .main_frame()
+        .map(|frame| CefString::from(&frame.url()).to_string())
+        .unwrap_or_default();
+    let Some(body) = http_get(port, "/json/list") else {
+        crate::message::error(&format!(
+            "devtools: 127.0.0.1:{port} did not answer /json/list — the port bru was started \
+             with is not answering"
+        ));
+        return;
+    };
+    let targets = targets_from_json(&body);
+    let Some(frontend) = frontend_url_for(&targets, &url, port) else {
+        crate::message::error(&format!(
+            "devtools: none of the {} targets on 127.0.0.1:{port} matches {url}",
+            targets.len()
+        ));
+        return;
+    };
+    set_place(0, Some(wanted.unwrap_or(Place::Bottom)));
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    match crate::term_frontend::open_inspector(&state, &frontend) {
+        Ok(()) => trace(&format!("term inspector opened on {frontend}")),
+        Err(why) => {
+            set_place(0, None);
+            crate::message::error(&format!("devtools: {why}"));
+        }
+    }
+}
+
 /// `devtools-focus` — bring the inspector forward, never close it.
 ///
 /// CEF has no "focus the DevTools window" call, and does not need one: "if the DevTools browser is
@@ -1060,9 +1323,17 @@ pub fn docking() -> bool {
 /// `devtools-focus` on a tab whose inspector was never opened therefore opens it, which is the
 /// friendlier of the two readings of a binding whose whole purpose is to get you there.
 pub fn focus(browser: &mut Browser) {
-    let Some(page) = for_page(browser) else {
+    let Some(mut page) = for_page(browser) else {
         return;
     };
+    if crate::term_frontend::is_active() {
+        // The docked panel takes the keys, the way clicking into it would; opening it first if
+        // there is none, which is the same friendlier reading the window path takes below.
+        if !crate::term_frontend::focus_inspector() {
+            toggle_term(&mut page, None);
+        }
+        return;
+    }
     let Some(host) = page.host() else {
         return;
     };
@@ -1076,19 +1347,91 @@ fn open(host: &BrowserHost) {
     // inspector bru's own key handler, and `j` in a DevTools console must type a `j`. The settings
     // are the defaults and `inspect_element_at` belongs to a context menu bru does not have.
     // --- src/term_frontend.rs -------------------------------------------------------------------
-    // A terminal tab is not inside a `BrowserView`, so the `window_info` this function's comment
-    // calls ignored is honoured there — and the inspector can be windowless like everything else in
-    // the pane. See `term_frontend::open_inspector`, including why it needs a client where this
-    // needs none.
-
-    // --- end src/term_frontend.rs ---------------------------------------------------------------
-    // --- src/term_frontend.rs -------------------------------------------------------------------
-    // A terminal run gets the same window; what it also gets is a line saying so, because a window
-    // appearing outside the pane is the one thing about `:devtools` there that is worth a word. The
-    // three roads to a docked inspector, and which of them this CEF closes, are recorded on
-    // `note_inspector_window`.
-    crate::term_frontend::note_inspector_window();
+    // A terminal run does not reach here through `:devtools` — `toggle_term` docks through the
+    // DevTools port instead, and prints its own line for the `window` placement. The measured
+    // record of the three roads CEF closes to a windowless inspector is in the section header
+    // above `toggle_term`.
     // --- end src/term_frontend.rs ---------------------------------------------------------------
     let settings = BrowserSettings::default();
     host.show_dev_tools(None, None, Some(&settings), None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape `/json/list` actually answers with, measured 2026-08-25: a flat array of flat
+    /// objects, every interesting value a string. The parser must take the two fields the terminal
+    /// dock needs and step over everything else — nested values included, because a `description`
+    /// is allowed to hold anything.
+    #[test]
+    fn the_target_list_yields_url_and_frontend_pairs() {
+        let body = r#"[ {
+            "description": "",
+            "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/AB12",
+            "id": "AB12",
+            "title": "Example Domain",
+            "type": "page",
+            "url": "https://example.org/",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/AB12"
+        }, {
+            "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/CD34",
+            "url": "bru://chrome/top.html"
+        } ]"#;
+        let targets = targets_from_json(body);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].0, "https://example.org/");
+        assert!(targets[0].1.ends_with("/devtools/page/AB12"));
+        assert_eq!(targets[1].0, "bru://chrome/top.html");
+    }
+
+    /// Escapes a URL can carry: Chromium writes `&` as `&` in some of its JSON, and a title
+    /// between the fields may hold anything at all.
+    #[test]
+    fn json_escapes_are_unescaped_and_junk_between_fields_is_stepped_over() {
+        let body = r#"[{"title":"a \"quoted\" title, with ] and } inside",
+            "url":"https://x/?a=1&b=2","devtoolsFrontendUrl":"/devtools/i.html"}]"#;
+        let targets = targets_from_json(body);
+        assert_eq!(targets, vec![("https://x/?a=1&b=2".to_string(), "/devtools/i.html".to_string())]);
+        // An object missing either field contributes nothing rather than half a pair.
+        assert!(targets_from_json(r#"[{"url":"https://x/"}]"#).is_empty());
+        assert!(targets_from_json("").is_empty());
+        assert!(targets_from_json(r#"[{"url":"unterminated"#).is_empty());
+    }
+
+    /// A nested object as a value must not shift which strings read as keys.
+    #[test]
+    fn a_nested_value_does_not_derail_the_scan() {
+        let body = r#"[{"extra":{"url":"https://wrong/"},"url":"https://right/",
+            "devtoolsFrontendUrl":"/devtools/i.html"}]"#;
+        let targets = targets_from_json(body);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "https://right/");
+    }
+
+    /// The match is by URL because the port's list is the only mapping there is; a relative
+    /// frontend URL is made absolute against the loopback port, an absolute one is believed.
+    #[test]
+    fn the_frontend_url_is_matched_by_page_url_and_made_absolute() {
+        let targets = vec![
+            ("bru://chrome/top.html".to_string(), "/devtools/a.html".to_string()),
+            ("https://example.org/".to_string(), "/devtools/b.html".to_string()),
+        ];
+        assert_eq!(
+            frontend_url_for(&targets, "https://example.org/", 9222),
+            Some("http://127.0.0.1:9222/devtools/b.html".to_string())
+        );
+        // The trailing slash is the one normalisation allowed: the two spellings are one page.
+        assert_eq!(
+            frontend_url_for(&targets, "https://example.org", 9222),
+            Some("http://127.0.0.1:9222/devtools/b.html".to_string())
+        );
+        assert_eq!(frontend_url_for(&targets, "https://elsewhere.org/", 9222), None);
+        let absolute =
+            vec![("https://x/".to_string(), "http://127.0.0.1:9222/devtools/c.html".to_string())];
+        assert_eq!(
+            frontend_url_for(&absolute, "https://x/", 9222),
+            Some("http://127.0.0.1:9222/devtools/c.html".to_string())
+        );
+    }
 }

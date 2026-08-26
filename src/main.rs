@@ -283,6 +283,14 @@ fn main() -> Result<(), &'static str> {
              browser, bru's own bru:// chrome pages included; every local account can reach \
              127.0.0.1"
         );
+        // The terminal frontend docks its inspector through this port (`devtools::toggle_term`),
+        // and this is the one place that has both the switch's value and — for the `=0` form,
+        // where Chromium picks the number and writes it to `DevToolsActivePort` — the profile
+        // directory that file lands in.
+        crate::devtools::note_debug_endpoint(
+            &debugging_port,
+            profile.as_ref().map(|profile| profile.path()),
+        );
     }
     // --- end src/remote.rs: the other door -----------------------------------------------------
 

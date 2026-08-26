@@ -4111,6 +4111,10 @@ pub fn apply(applied: &Applied) -> Result<(), String> {
         // --- src/devtools.rs ---------------------------------------------------------------------
         Backing::Devtools => {
             crate::devtools::apply_height_everywhere();
+            // The terminal's docked inspector is a rectangle the compositor computes from the same
+            // two settings; `relayout` re-runs that arithmetic and is a no-op when nothing moved
+            // or no terminal is running.
+            crate::term_frontend::relayout();
             return Ok(());
         }
         // --- end src/devtools.rs -----------------------------------------------------------------

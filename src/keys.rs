@@ -427,6 +427,15 @@ wrap_client! {
 
 // Browser lifetime. Without this nothing tells the message loop to stop, so closing the window
 // leaves the process running with no window. (The wrap_ macros take no doc comment on the struct.)
+/// The life-span handler alone, for a client that must not carry the keyboard.
+///
+/// The terminal's docked inspector needs its browser registered in `BruState` like every other —
+/// created, found by id, counted by the quit — without bru's keyboard handler in front of it,
+/// because `j` in a DevTools console has to type a `j`. See `term_frontend::InspectorClient`.
+pub fn life_span_handler(state: crate::tabs::SharedState) -> LifeSpanHandler {
+    BruLifeSpanHandler::new(state)
+}
+
 wrap_life_span_handler! {
     struct BruLifeSpanHandler {
         state: Arc<Mutex<BruState>>,
