@@ -564,6 +564,62 @@ fn measure(
 ///
 /// `pixels` is unchanged, `encode` is zero by construction — there is no base64 of a picture, only
 /// of a short name — and `write` is the copy into `/dev/shm` plus whatever kitty does with it.
+/// The same picture again, handed over as a path the terminal re-reads.
+///
+/// **Measured rather than assumed to be shared memory's equal.** The directory is tmpfs, so the
+/// write is a `memcpy` and the escape is the same sixty bytes — but "should be" is not a number, and
+/// a host that takes files may still be re-encoding every frame behind them.
+fn measure_file(
+    width: u32,
+    height: u32,
+    budget: std::time::Duration,
+    stdin: &mut std::io::Stdin,
+) -> Result<Cost, String> {
+    let mut out = std::io::stdout();
+    let mut cost = Cost {
+        width,
+        height,
+        frames: 0,
+        acked: 0,
+        pixels: <_>::default(),
+        encode: <_>::default(),
+        write: <_>::default(),
+    };
+    let Some(dir) = crate::term_paint::frame_dir() else {
+        return Ok(cost);
+    };
+    let started = Instant::now();
+    let mut phase = 0u32;
+    while started.elapsed() < budget && cost.frames < 120 {
+        let at = Instant::now();
+        let frame = test_frame(width, height, phase);
+        cost.pixels += at.elapsed();
+
+        let at = Instant::now();
+        let path = dir.join(format!("probe-frame-{}-{}", std::process::id(), phase % 3));
+        if std::fs::write(&path, &frame).is_err() {
+            break;
+        }
+        let _ = out.write_all(b"\x1b[H");
+        let escape = format!(
+            "\x1b_Ga=T,q=0,i=31,p=1,f=24,s={width},v={height},t=f;{}\x1b\\",
+            base64(path.to_string_lossy().as_bytes())
+        );
+        let _ = out.write_all(passthrough(&escape).as_bytes());
+        let _ = out.flush();
+        if read_ack(stdin) {
+            cost.acked += 1;
+        }
+        cost.write += at.elapsed();
+        cost.frames += 1;
+        phase += 1;
+    }
+    for slot in 0..3 {
+        let _ = std::fs::remove_file(dir.join(format!("probe-frame-{}-{slot}", std::process::id())));
+    }
+    Ok(cost)
+}
+
 fn measure_shm(
     width: u32,
     height: u32,
@@ -648,6 +704,14 @@ pub fn probe() -> Result<(), String> {
     let _ = out.flush();
     let shm = shm?;
 
+    // …and as a path, which is what a host that refuses shared memory is left with.
+    let file =
+        measure_file(pane.width, pane.height, std::time::Duration::from_millis(1500), &mut stdin);
+    let _ = delete_images(&mut out);
+    let _ = out.write_all(b"\x1b[H\x1b[2J");
+    let _ = out.flush();
+    let file = file?;
+
     // The screen belongs to the text again before a word of it is written.
     let _ = delete_images(&mut out);
     let _ = out.write_all(b"\x1b[H\x1b[2J\x1b[?25h");
@@ -709,8 +773,25 @@ pub fn probe() -> Result<(), String> {
         shm.acked,
         shm.frames
     );
+    if file.frames > 0 {
+        println!(
+            "  {:>11}  {:>8.0}ms  {:>8.0}ms  {:>8.0}ms  {:>7.1}  {:>3}/{:<3}   <- a file",
+            format!("{}x{}", file.width, file.height),
+            file.pixels.as_secs_f64() * 1000.0 / f64::from(file.frames.max(1)),
+            file.encode.as_secs_f64() * 1000.0 / f64::from(file.frames.max(1)),
+            file.per_frame() * 1000.0,
+            file.fps(),
+            file.acked,
+            file.frames
+        );
+    }
     println!();
-    if shm.acked == 0 {
+    if shm.acked == 0 && file.acked > 0 {
+        println!(
+            "shared memory: refused here. Frames go through a file instead, which costs the same \n\
+             write and the same short escape — bru asks this question at startup and picks it."
+        );
+    } else if shm.acked == 0 {
         println!(
             "shared memory: the terminal confirmed none of those, so `t=s` did not work here — the \n\
              row above is the cost of writing to /dev/shm for nobody. bru will send frames as \n\

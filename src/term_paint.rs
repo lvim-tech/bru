@@ -183,6 +183,37 @@ pub const IMAGE_ID_VIEW: u32 = 0xbe;
 /// the probe cannot disturb either of the two real images.
 pub const IMAGE_ID_PROBE: u32 = 0xbd;
 
+/// The image id the *file* transport question uses, distinct from the shared memory one so that two
+/// answers arriving together cannot be mistaken for each other.
+pub const IMAGE_ID_PROBE_FILE: u32 = 0xbc;
+
+/// How many frame files are cycled through.
+///
+/// **Rewriting the path the terminal was just handed is a race**, and the loser is a frame drawn
+/// half from one picture and half from the next. Three is the same reasoning as [`RETAINED_FRAMES`]:
+/// enough that the terminal is never reading the file being written, few enough that the cost is
+/// three frames of tmpfs.
+const FRAME_SLOTS: u64 = 3;
+
+/// Where frame files live: bru's own runtime directory, which is tmpfs, so a "file" here costs what
+/// shared memory costs. `None` when there is no `$XDG_RUNTIME_DIR` to put them in.
+pub(crate) fn frame_dir() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("bru");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Put one pixel in a file for the transport probe to offer the terminal.
+pub(crate) fn file_probe_publish() -> Option<std::path::PathBuf> {
+    let path = frame_dir()?.join(format!("probe-{}", std::process::id()));
+    std::fs::write(&path, [0u8; 3]).ok().map(|()| path)
+}
+
+/// Take the probe's file back.
+pub(crate) fn file_probe_release(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 /// Put one pixel in shared memory for the transport probe to offer the terminal.
 ///
 /// `None` when this machine has no usable `/dev/shm` at all — in which case there is nothing to ask
@@ -210,11 +241,9 @@ pub(crate) fn shm_probe_release(name: &str) {
 /// pane stays black at full speed. `Transport::Base64` used to be reachable only when `shm_publish`
 /// failed *locally*, which is a different question from whether the thing drawing the screen can
 /// open the object. Measured 2026-08-26 in zellij 0.46.0.
-pub(crate) fn shm_query_escape(name: &str, in_tmux: bool) -> String {
-    let escape = format!(
-        "\x1b_Gi={IMAGE_ID_PROBE},a=q,t=s,f=24,s=1,v=1;{}\x1b\\",
-        base64(name.as_bytes())
-    );
+pub(crate) fn medium_query_escape(medium: char, id: u32, name: &str, in_tmux: bool) -> String {
+    let escape =
+        format!("\x1b_Gi={id},a=q,t={medium},f=24,s=1,v=1;{}\x1b\\", base64(name.as_bytes()));
     passthrough(&escape, in_tmux)
 }
 
@@ -224,7 +253,7 @@ pub(crate) fn shm_query_escape(name: &str, in_tmux: bool) -> String {
 /// **Silence is not a refusal.** A terminal that answers nothing has told us nothing, and the
 /// transport that has been working since this frontend was written is the better guess than one
 /// chosen from an absence.
-pub(crate) fn shm_query_answer(bytes: &[u8]) -> Option<bool> {
+pub(crate) fn query_answer(bytes: &[u8], id: u32) -> Option<bool> {
     let mut at = 0;
     while let Some(start) = bytes[at..].windows(3).position(|w| w == b"\x1b_G") {
         let start = at + start + 3;
@@ -233,9 +262,7 @@ pub(crate) fn shm_query_answer(bytes: &[u8]) -> Option<bool> {
         let split = body.iter().position(|&b| b == b';');
         if let Some(split) = split {
             let (keys, payload) = (&body[..split], &body[split + 1..]);
-            if keys.windows(2).any(|w| w == b"i=")
-                && String::from_utf8_lossy(keys).contains(&format!("i={IMAGE_ID_PROBE}"))
-            {
+            if String::from_utf8_lossy(keys).contains(&format!("i={id}")) {
                 return Some(payload.starts_with(b"OK"));
             }
         }
@@ -497,6 +524,23 @@ fn shm_escape(
     )
 }
 
+/// Transmit a frame by handing over the *path* of a file the terminal opens and reads.
+///
+/// `t=f` is a plain file and the terminal does not remove it — which is what [`FRAME_SLOTS`] is for.
+fn file_escape(
+    path: &std::path::Path,
+    placement: &Placement,
+    width: u32,
+    height: u32,
+    place: Place,
+) -> String {
+    format!(
+        "\x1b_G{},t=f;{}\x1b\\",
+        common_keys(placement, width, height, place),
+        base64(path.to_string_lossy().as_bytes())
+    )
+}
+
 /// How many bytes of base64 go in one escape. The protocol's own limit is 4096.
 const CHUNK: usize = 4096;
 
@@ -740,6 +784,11 @@ fn shm_unlink(name: &str) {
 /// How the pixels travel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
+    /// A path the terminal re-reads, in tmpfs. The transport for hosts that refuse shared memory —
+    /// measured 2026-08-26, zellij 0.46.0 answers `ENOTSUPPORTED:shared memory transfer is not
+    /// supported` and takes a file quite happily. Costs a write and a short escape, like shared
+    /// memory and unlike base64.
+    File,
     /// A name in `/dev/shm`. 78 fps at a full pane, through tmux, measured.
     SharedMemory,
     /// The pixels down the pty. 8 fps at the same size, measured. See [`base64_escapes`].
@@ -765,6 +814,9 @@ pub struct Painter {
     sequence: u64,
     /// Shared memory names handed over and not yet taken back. See [`RETAINED_FRAMES`].
     handed_over: VecDeque<String>,
+    /// Where frame files go, and which slot the next one takes. See [`FRAME_SLOTS`].
+    frames: Option<std::path::PathBuf>,
+    frame_seq: u64,
 }
 
 impl Painter {
@@ -783,6 +835,8 @@ impl Painter {
             placed: None,
             sequence: 0,
             handed_over: VecDeque::new(),
+            frames: frame_dir(),
+            frame_seq: 0,
         }
     }
 
@@ -858,6 +912,11 @@ impl Painter {
             // beats discovering it again for every frame.
             self.transport = Transport::Base64;
         }
+        if self.transport == Transport::File && !self.send_file(out, rgb, width, height)? {
+            // Same reasoning as shared memory: a directory that cannot be written to is a fact
+            // about this machine, discovered once.
+            self.transport = Transport::Base64;
+        }
         if self.transport == Transport::Base64 {
             for escape in base64_escapes(&base64(rgb), &self.placement, width, height, self.place)
             {
@@ -887,6 +946,29 @@ impl Painter {
             }
         }
         out.flush()
+    }
+
+    /// `Ok(false)` when the frame could not be written to a file at all, which is the caller's cue
+    /// to fall back; a write error to the *terminal* is a real error and comes back as one.
+    fn send_file(
+        &mut self,
+        out: &mut impl Write,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> std::io::Result<bool> {
+        let Some(dir) = self.frames.as_ref() else {
+            return Ok(false);
+        };
+        let slot = self.frame_seq % FRAME_SLOTS;
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let path = dir.join(format!("frame-{}-{slot}", std::process::id()));
+        if std::fs::write(&path, rgb).is_err() {
+            return Ok(false);
+        }
+        let escape = file_escape(&path, &self.placement, width, height, self.place);
+        out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
+        Ok(true)
     }
 
     /// `Ok(false)` when shared memory itself was unavailable, which is the caller's cue to fall
@@ -937,6 +1019,11 @@ impl Drop for Painter {
     fn drop(&mut self) {
         for name in self.handed_over.drain(..) {
             shm_unlink(&name);
+        }
+        if let Some(dir) = self.frames.take() {
+            for slot in 0..FRAME_SLOTS {
+                let _ = std::fs::remove_file(dir.join(format!("frame-{}-{slot}", std::process::id())));
+            }
         }
     }
 }
@@ -1192,31 +1279,58 @@ mod tests {
 
     /// The division of labour: pixels every frame, placeholder cells only when the geometry moved.
     ///
+    /// The file transport, which is what a host that refuses shared memory is left with before
+    /// base64 — a path in tmpfs and the same sixty-byte escape.
+    #[test]
+    fn a_frame_can_be_handed_over_as_a_path() {
+        let placement = Placement::new(190, 1, 1, 40, 100);
+        let path = std::path::Path::new("/run/user/1000/bru/frame-7-0");
+        assert_eq!(
+            file_escape(path, &placement, 990, 1350, Place::Placeholders),
+            format!(
+                "\x1b_Ga=T,U=1,q=2,i=190,p=1,f=24,s=990,v=1350,c=100,r=40,t=f;{}\x1b\\",
+                base64(b"/run/user/1000/bru/frame-7-0")
+            )
+        );
+    }
+
+    /// **The two questions must not answer each other.** They are asked one after the other and a
+    /// slow terminal can still be replying to the first when the second goes out.
+    #[test]
+    fn each_transport_question_is_told_from_the_other() {
+        let both = b"\x1b_Gi=189;ENOTSUPPORTED:shared memory transfer is not supported\x1b\\\x1b_Gi=188;OK\x1b\\";
+        assert_eq!(query_answer(both, IMAGE_ID_PROBE), Some(false), "shared memory said no");
+        assert_eq!(query_answer(both, IMAGE_ID_PROBE_FILE), Some(true), "the file said yes");
+    }
+
     /// **The distinction the black pane turned on.** `OK` is a yes, anything else is a no, and
     /// nothing at all is neither — the three have to stay three.
     #[test]
     fn the_transport_question_can_be_answered_no() {
-        assert_eq!(shm_query_answer(b"\x1b_Gi=189;OK\x1b\\"), Some(true));
-        assert_eq!(shm_query_answer(b"\x1b_Gi=189;ENOENT:No such file\x1b\\"), Some(false));
-        assert_eq!(shm_query_answer(b"\x1b_Gi=189;EBADF:bad medium\x1b\\"), Some(false));
-        assert_eq!(shm_query_answer(b""), None, "silence is not a refusal");
-        assert_eq!(shm_query_answer(b"\x1b_Gi=190;OK\x1b\\"), None, "another image's answer");
+        assert_eq!(query_answer(b"\x1b_Gi=189;OK\x1b\\", IMAGE_ID_PROBE), Some(true));
+        assert_eq!(query_answer(b"\x1b_Gi=189;ENOENT:No such file\x1b\\", IMAGE_ID_PROBE), Some(false));
+        assert_eq!(query_answer(b"\x1b_Gi=189;EBADF:bad medium\x1b\\", IMAGE_ID_PROBE), Some(false));
+        assert_eq!(query_answer(b"", IMAGE_ID_PROBE), None, "silence is not a refusal");
+        assert_eq!(query_answer(b"\x1b_Gi=190;OK\x1b\\", IMAGE_ID_PROBE), None, "another image's answer");
         // The reply can arrive behind whatever else the terminal was saying.
-        assert_eq!(shm_query_answer(b"\x1b[0n\x1b_Gi=189;OK\x1b\\"), Some(true));
+        assert_eq!(query_answer(b"\x1b[0n\x1b_Gi=189;OK\x1b\\", IMAGE_ID_PROBE), Some(true));
     }
 
     /// The question transmits nothing and displays nothing — `a=q` is the whole point, because
     /// asking must not put a picture on a screen the caller has not finished setting up.
     #[test]
     fn the_transport_question_only_asks() {
-        let escape = shm_query_escape("/bru-probe-7", false);
+        let escape = medium_query_escape('s', IMAGE_ID_PROBE, "/bru-probe-7", false);
         assert_eq!(
             escape,
             format!("\x1b_Gi=189,a=q,t=s,f=24,s=1,v=1;{}\x1b\\", base64(b"/bru-probe-7"))
         );
         assert!(!escape.contains("a=T"), "a query, never a display");
         // …and under tmux it has to go around tmux like every other graphics escape.
-        assert!(shm_query_escape("/bru-probe-7", true).starts_with("\x1bPtmux;"));
+        assert!(
+            medium_query_escape('s', IMAGE_ID_PROBE, "/bru-probe-7", true)
+                .starts_with("\x1bPtmux;")
+        );
     }
 
     /// **The zellij case, in a test.** The escape must say `C=1` and must not say `U=1`, because a
