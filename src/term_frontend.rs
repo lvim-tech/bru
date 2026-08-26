@@ -1170,7 +1170,7 @@ wrap_client! {
         // and so on until the strip had no end. Measured 2026-08-26. The inspector is not a page
         // and nothing it asks for belongs in the tab strip, so its popups are refused and dropped.
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(InspectorLifeSpanHandler::new())
+            Some(InspectorLifeSpanHandler::new(self.state.clone()))
         }
 
         // Where the frontend is told it is undocked, before it is told what to connect to.
@@ -1181,7 +1181,9 @@ wrap_client! {
 }
 
 wrap_life_span_handler! {
-    pub struct InspectorLifeSpanHandler {}
+    pub struct InspectorLifeSpanHandler {
+        state: crate::tabs::SharedState,
+    }
 
     impl LifeSpanHandler {
         /// `1` is "cancel", and cancelling is the whole of it: nothing the inspector asks to open
@@ -1203,6 +1205,49 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             1
+        }
+
+        /// **Into `BruState.browsers`, or no click can find its host.** `MouseTask` and `KeyTask`
+        /// both reach a browser through `state.browser_with_id`, which searches the registry every
+        /// created browser passes through — and this handler, made to refuse popups, was skipping
+        /// the registration bru's own handler does. The route was right the whole way: the log
+        /// showed `inspector=Some(id) … (hit=true)` for every press in the panel, and the event
+        /// was dropped one line later, on a `browser_with_id` that had never heard of the browser
+        /// it was asked for. Measured 2026-08-26. Registered, the inspector is also a browser
+        /// `shut_down` can close and the quit can count.
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .on_after_created(browser);
+        }
+
+        /// Allow the close, the same answer bru's handler gives for every browser.
+        fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .do_close(browser)
+        }
+
+        /// **A browser that enters the registry has to leave it**, or the quit waits for a browser
+        /// that is already gone: `on_before_close` is where `BruState` removes it and, when it was
+        /// the last, ends the message loop.
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            // The frontend's own bookkeeping first: when the close did not come from
+            // `close_inspector` — the frontend's close box, a crashed panel — the pane would keep
+            // holding an inspector rectangle with no browser painting into it. A no-op for the
+            // ordinary close, which has already taken the identifier.
+            if let Some(browser) = browser.as_deref() {
+                note_inspector_closed(browser.identifier());
+            }
+            // The router's mandatory forward, before the state removal that may end the message
+            // loop — same order, same reason as bru's own handler in `keys.rs`.
+            crate::ipc::on_before_close(browser.as_deref().cloned().as_mut());
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .on_before_close(browser);
         }
     }
 }
@@ -1379,18 +1424,19 @@ pub fn open_inspector(state: &crate::tabs::SharedState, url: &str) -> Result<(),
     Ok(())
 }
 
-/// Close the docked inspector and give its rectangle back. A no-op when none is open.
-pub fn close_inspector() {
-    let Some(term) = TERM.get() else {
-        return;
-    };
+/// Take the inspector out of the frontend's bookkeeping and give its rectangle back: the pane's
+/// half of closing, shared by `close_inspector` and a close that arrives from the browser's own
+/// side. `only` narrows it to one identifier so a stale close cannot take a newer inspector's
+/// rectangle; `None` back means there was nothing to forget.
+fn forget_inspector(only: Option<i32>) -> Option<i32> {
+    let term = TERM.get()?;
     let (identifier, moved) = {
-        let Ok(mut guard) = term.lock() else {
-            return;
-        };
-        let Some(identifier) = guard.inspector.take() else {
-            return;
-        };
+        let mut guard = term.lock().ok()?;
+        let identifier = guard.inspector?;
+        if only.is_some_and(|id| id != identifier) {
+            return None;
+        }
+        guard.inspector = None;
         guard.of_browser.retain(|(id, _)| *id != identifier);
         guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
         let next = layout_for(guard.size, false);
@@ -1405,16 +1451,14 @@ pub fn close_inspector() {
     };
     INSPECTOR_FOCUS.store(false, Ordering::Relaxed);
     resize_browsers(&moved);
+    Some(identifier)
+}
+
+/// The page takes the keyboard back, the way it does when a DevTools window closes.
+fn refocus_page() {
     let Some(state) = crate::state::BruState::instance() else {
         return;
     };
-    let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
-    if let Some(host) = browser.and_then(|browser| browser.host()) {
-        // Really closed, not hidden: this browser is bru's own windowless one, not the panel CEF
-        // made — the SIGSEGV `devtools.rs` documents belongs to that panel and not to this.
-        host.close_browser(1);
-    }
-    // The page takes the keyboard back, the way it does when a DevTools window closes.
     let page = TERM
         .get()
         .and_then(|term| term.lock().ok())
@@ -1431,6 +1475,32 @@ pub fn close_inspector() {
             host.set_focus(1);
         }
     }
+}
+
+/// A docked inspector's browser is going away by its own doing — the frontend's close box, a
+/// crashed panel — rather than through `close_inspector`. Called from the life-span handler's
+/// `on_before_close`; a no-op when the ordinary close has already taken the identifier.
+fn note_inspector_closed(identifier: i32) {
+    if forget_inspector(Some(identifier)).is_some() {
+        refocus_page();
+    }
+}
+
+/// Close the docked inspector and give its rectangle back. A no-op when none is open.
+pub fn close_inspector() {
+    let Some(identifier) = forget_inspector(None) else {
+        return;
+    };
+    let Some(state) = crate::state::BruState::instance() else {
+        return;
+    };
+    let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        // Really closed, not hidden: this browser is bru's own windowless one, not the panel CEF
+        // made — the SIGSEGV `devtools.rs` documents belongs to that panel and not to this.
+        host.close_browser(1);
+    }
+    refocus_page();
 }
 
 /// Which surface is under a pointer position (in pane pixels), and the rectangle it fills.
