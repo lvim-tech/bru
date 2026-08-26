@@ -82,6 +82,8 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
+    /// Whether a docked inspector has painted at least once, and therefore has room.
+    inspector: bool,
     /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
     /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
@@ -152,6 +154,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
+        inspector: false,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -325,7 +328,16 @@ fn layout_for(size: PaneSize, inspector: bool) -> Layout {
         panel_height: crate::window::completion_height(0),
         // The same number the Views delegate answers with, so a height dragged in one frontend
         // means the same thing in the other.
-        inspector_height: if inspector { crate::devtools::height_for(0) } else { 0 },
+        // **The same numbers the Views delegate answers with**, so a size set in one frontend
+        // means the same thing in the other: `inspector_size` gives a height for a bottom dock and
+        // a width for a side one, and `place_of` is what says which.
+        inspector_height: if inspector {
+            let size = crate::devtools::inspector_size(0);
+            if crate::devtools::place_of(0).is_side() { size.width } else { size.height }
+        } else {
+            0
+        },
+        inspector_side: inspector && crate::devtools::place_of(0).is_side(),
     })
 }
 
@@ -343,7 +355,7 @@ pub fn relayout() {
         let Ok(mut guard) = term.lock() else {
             return;
         };
-        let next = layout_for(guard.size, false);
+        let next = layout_for(guard.size, guard.inspector);
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
@@ -760,7 +772,7 @@ pub fn resized(size: PaneSize) {
             return;
         }
         term.size = size;
-        term.layout = layout_for(size, false);
+        term.layout = layout_for(size, term.inspector);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.
@@ -963,6 +975,108 @@ wrap_client! {
 /// The compositor keeps its `Divider` and `Inspector` rectangles for the day this becomes possible;
 /// nothing reserves space for them meanwhile, because a band of empty pane where an inspector is
 /// not is worse than no inspector.
+/// Answer CEF's question about where the inspector goes.
+///
+/// Called from `LifeSpanHandler::on_before_dev_tools_popup`, which is asked **before** the DevTools
+/// browser exists — so this is the one moment at which it can be made windowless. Everything is left
+/// untouched in a windowed run, and the ordinary DevTools window is what happens.
+pub fn place_inspector(
+    window_info: Option<&mut WindowInfo>,
+    client: Option<&mut Option<Client>>,
+    settings: Option<&mut BrowserSettings>,
+    use_default_window: Option<&mut ::std::os::raw::c_int>,
+) {
+    if !is_active() {
+        return;
+    }
+    let (Some(window_info), Some(client)) = (window_info, client) else {
+        return;
+    };
+    *window_info = WindowInfo::default().set_as_windowless(0);
+    // A render handler and nothing else — see `InspectorClient`.
+    *client = Some(InspectorClient::new());
+    if let Some(settings) = settings {
+        settings.windowless_frame_rate = 60;
+    }
+    // **The whole point of the callback.** Left at 1, CEF makes its own window and the `window_info`
+    // above is decoration.
+    if let Some(use_default_window) = use_default_window {
+        *use_default_window = 0;
+    }
+    // The browser does not exist yet, so its identifier cannot be recorded here. Its first paint is
+    // what claims it, and until then this says what an unclaimed frame is.
+    if let Some(term) = TERM.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.pending = Some(SurfaceKind::Inspector);
+        }
+    }
+}
+
+/// The inspector has painted: give it room, and stop expecting it.
+///
+/// **Room on the first frame and not before.** An inspector that never paints must not shrink the
+/// page for a band that stays empty — which is what an earlier attempt did, and it was worse than
+/// having no inspector at all.
+fn inspector_arrived() {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let already = {
+        let Ok(mut guard) = term.lock() else {
+            return;
+        };
+        let already = guard.inspector;
+        guard.inspector = true;
+        guard.pending = None;
+        already
+    };
+    if !already {
+        relayout();
+    }
+}
+
+/// Put the inspector away: stop giving it room and stop drawing its last frame.
+pub fn close_inspector() {
+    let identifier = {
+        let Some(term) = TERM.get() else {
+            return;
+        };
+        let Ok(mut guard) = term.lock() else {
+            return;
+        };
+        guard.inspector = false;
+        guard.surfaces[index_of(SurfaceKind::Inspector)] = None;
+        let identifier = guard
+            .of_browser
+            .iter()
+            .find(|(_, kind)| *kind == SurfaceKind::Inspector)
+            .map(|(id, _)| *id);
+        guard.of_browser.retain(|(_, kind)| *kind != SurfaceKind::Inspector);
+        identifier
+    };
+    // **Closed, not hidden, and that is safe here where it is not in a window.** `devtools.rs`
+    // hides its docked panel because `close_dev_tools` on a `BrowserView` inside a window is a
+    // measured SIGSEGV — the browser treats the window as its host widget. A windowless inspector
+    // has no window and no view, so closing it is closing a browser.
+    if let Some(identifier) = identifier {
+        if let Some(state) = crate::state::BruState::instance() {
+            let browser = state.lock().expect("state mutex poisoned").browser_with_id(identifier);
+            if let Some(host) = browser.and_then(|browser| browser.host()) {
+                host.close_browser(1);
+            }
+        }
+    }
+    relayout();
+}
+
+/// Whether the inspector is showing.
+pub fn inspector_open() -> bool {
+    TERM.get()
+        .and_then(|term| term.lock().ok().map(|guard| guard.inspector))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)] // Kept for the day a terminal cannot dock one; see `on_before_dev_tools_popup`.
 pub fn note_inspector_window() {
     if !is_active() {
         return;
@@ -1091,6 +1205,16 @@ wrap_render_handler! {
             }
             let slot = index_of(kind);
             term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
+            if kind == SurfaceKind::Inspector && !term.inspector {
+                if crate::term_input::debug() {
+                    eprintln!("bru[term]: the inspector painted {width}x{height} into the pane");
+                }
+                // The lock is given up first: `inspector_arrived` relayouts, and relayout takes this
+                // same lock. See `layout_for` for what re-entering it cost the last time.
+                drop(term);
+                inspector_arrived();
+                return;
+            }
             present(&mut term);
         }
     }

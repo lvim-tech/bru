@@ -256,6 +256,11 @@ pub struct LayoutRequest {
     /// A docked inspector's height in logical pixels, zero when none is docked. The divider is
     /// added above it automatically — a docked inspector without its drag strip cannot be resized.
     pub inspector_height: i32,
+    /// **Docked to the right instead of under the page.** `inspector_height` then names the
+    /// inspector's *width*, because it is the same setting read against the other axis — which is
+    /// what `devtools::inspector_size` already does in a window. The divider becomes a vertical
+    /// strip between the page and the panel rather than a horizontal one above it.
+    pub inspector_side: bool,
 }
 
 impl Default for LayoutRequest {
@@ -268,6 +273,7 @@ impl Default for LayoutRequest {
             bottom_visible: true,
             panel_height: 0,
             inspector_height: 0,
+            inspector_side: false,
         }
     }
 }
@@ -288,6 +294,10 @@ pub struct Layout {
     pub bottom: Rect,
     /// The pane itself — the bounds every one of the above is clipped to.
     pub pane: Rect,
+    /// Whether the page, the divider and the inspector share one band rather than taking a row
+    /// each. Kept on the layout because [`Layout::tiles_exactly`] cannot tell the two apart from
+    /// the rectangles alone — a bottom dock with a zero-width page looks the same.
+    pub side: bool,
 }
 
 impl Layout {
@@ -320,6 +330,32 @@ impl Layout {
     /// are exactly the pane. Held by every path through [`layout`], including the ones that had to
     /// throw rows away to fit.
     pub fn tiles_exactly(&self) -> bool {
+        if self.side {
+            // Three rows, one of which is three rectangles side by side. The band is covered left
+            // to right and the rows stack, which is the same promise stated against two axes.
+            let band = [self.page, self.divider, self.inspector];
+            let mut x = self.pane.x;
+            for rect in band {
+                if rect.width < 0 || rect.x != x || rect.y != self.page.y {
+                    return false;
+                }
+                if rect.height != self.page.height {
+                    return false;
+                }
+                x = x.saturating_add(rect.width);
+            }
+            if x != self.pane.right() {
+                return false;
+            }
+            let mut y = self.pane.y;
+            for rect in [self.top, self.page, self.panel, self.bottom] {
+                if rect.height < 0 || rect.y != y {
+                    return false;
+                }
+                y = y.saturating_add(rect.height);
+            }
+            return y == self.pane.bottom();
+        }
         let mut y = self.pane.y;
         for (_, rect) in self.rows() {
             if rect.x != self.pane.x || rect.width != self.pane.width {
@@ -405,6 +441,46 @@ pub fn layout(request: &LayoutRequest) -> Layout {
     };
     let page = page_area - divider - inspector;
 
+    // **Side docking splits the page's row rather than taking a row of its own**, so the tiling
+    // invariant is unchanged: the same six rectangles, with three of them sharing one band. The
+    // strips above and below are full width either way — a status bar that stopped at the
+    // inspector's edge would be a status bar with a hole in it.
+    if request.inspector_side {
+        let band = page_area;
+        let wanted_divider = if request.inspector_height > 0 {
+            device(DIVIDER_HEIGHT, request.scale)
+        } else {
+            0
+        };
+        let wanted_inspector = device(request.inspector_height, request.scale);
+        let (divider_width, inspector_width) = if wanted_divider + wanted_inspector <= width {
+            (wanted_divider, wanted_inspector)
+        } else {
+            let divider = wanted_divider.min(width);
+            (divider, width - divider)
+        };
+        let page_width = width - divider_width - inspector_width;
+        // Written out rather than through a closure: the band's own `y` has to be read between
+        // two rows, and a closure that borrows `y` mutably is a closure nothing else may read it
+        // through.
+        let top_rect = Rect::new(0, 0, width, top);
+        let band_y = top;
+        let panel_y = band_y + band;
+        let panel_rect = Rect::new(0, panel_y, width, panel);
+        let bottom_rect = Rect::new(0, panel_y + panel, width, bottom);
+        let (top, panel, bottom) = (top_rect, panel_rect, bottom_rect);
+        return Layout {
+            top,
+            page: Rect::new(0, band_y, page_width, band),
+            divider: Rect::new(page_width, band_y, divider_width, band),
+            inspector: Rect::new(page_width + divider_width, band_y, inspector_width, band),
+            panel,
+            bottom,
+            pane,
+            side: true,
+        };
+    }
+
     let mut y = 0;
     let mut row = |rect_height: i32| {
         let rect = Rect::new(0, y, width, rect_height);
@@ -419,6 +495,7 @@ pub fn layout(request: &LayoutRequest) -> Layout {
         panel: row(panel),
         bottom: row(bottom),
         pane,
+        side: false,
     }
 }
 
@@ -1261,5 +1338,47 @@ mod tests {
         assert_eq!(frame.sub_rect_rgb(Rect::ZERO), Vec::<u8>::new());
         // A rectangle half off the frame answers only the half that is on it.
         assert_eq!(frame.sub_rect_rgb(Rect::new(3, 3, 4, 4)).len(), 3);
+    }
+
+    /// **A side dock splits the page's band and does not take a band of its own**, so the same six
+    /// rectangles still tile the pane. The strips above and below stay full width: a status bar
+    /// that stopped at the inspector's edge would be a status bar with a hole in it.
+    #[test]
+    fn an_inspector_docked_to_the_right_splits_the_page_row() {
+        let side = layout(&LayoutRequest {
+            width: 1000,
+            height: 600,
+            scale: 1.0,
+            top_visible: true,
+            bottom_visible: true,
+            panel_height: 0,
+            inspector_height: 300,
+            inspector_side: true,
+        });
+        assert_eq!(side.top.width, 1000, "the strip spans the pane");
+        assert_eq!(side.bottom.width, 1000);
+        // page | divider | inspector, left to right, sharing one band.
+        assert_eq!(side.page.y, side.inspector.y);
+        assert_eq!(side.page.height, side.inspector.height);
+        assert_eq!(side.page.right(), side.divider.x);
+        assert_eq!(side.divider.right(), side.inspector.x);
+        assert_eq!(side.inspector.right(), 1000);
+        assert_eq!(side.inspector.width, 300);
+        assert!(side.tiles_exactly(), "the pane is still covered exactly");
+
+        // The same numbers docked at the bottom take a row instead, and the page keeps the width.
+        let under = layout(&LayoutRequest { inspector_side: false, ..LayoutRequest {
+            width: 1000,
+            height: 600,
+            scale: 1.0,
+            top_visible: true,
+            bottom_visible: true,
+            panel_height: 0,
+            inspector_height: 300,
+            inspector_side: true,
+        } });
+        assert_eq!(under.page.width, 1000);
+        assert_eq!(under.inspector.height, 300);
+        assert!(under.tiles_exactly());
     }
 }

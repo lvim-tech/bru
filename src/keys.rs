@@ -433,6 +433,27 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        // --- src/term_frontend.rs -----------------------------------------------------------
+        // **Where the inspector goes, asked as a question rather than passed as a parameter.**
+        // `show_dev_tools`' `window_info` is ignored — measured twice on 2026-08-26, once with a
+        // windowless request that produced a desktop window anyway. This is the callback CEF asks
+        // *before* it makes the DevTools browser, and it is the same shape the Views frontend docks
+        // through (`on_popup_browser_view_created`): CEF hands over the decision instead of taking
+        // an argument. A terminal run answers it; a windowed one leaves every field alone and lets
+        // the ordinary path run.
+        fn on_before_dev_tools_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            use_default_window: Option<&mut ::std::os::raw::c_int>,
+        ) {
+            crate::term_frontend::place_inspector(window_info, client, settings, use_default_window);
+        }
+        // --- end src/term_frontend.rs -------------------------------------------------------
+
         // --- src/popups.rs ------------------------------------------------------------------
         // A page asking for a window. Without this the default runs, which is 0 — "go ahead" — and
         // CEF makes a top-level browser bru does not know exists: a `target="_blank"` link opened an
