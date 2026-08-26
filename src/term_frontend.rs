@@ -1539,26 +1539,30 @@ pub fn pointer_target(x: i32, y: i32, press: bool) -> Option<(i32, Rect, Surface
             );
         }
     }
-    if let Some(identifier) = guard.inspector {
-        let rect = guard.layout.rect_of(SurfaceKind::Inspector);
-        if inside(&rect) {
-            return Some((identifier, rect, SurfaceKind::Inspector));
-        }
-    }
-    let rect = guard.layout.rect_of(SurfaceKind::Page);
-    if inside(&rect) {
-        let identifier = guard
-            .of_browser
-            .iter()
-            .find(|(_, kind)| *kind == SurfaceKind::Page)
-            .map(|(id, _)| *id)?;
-        return Some((identifier, rect, SurfaceKind::Page));
-    }
-    None
+    // **Every surface, not just the two that were thought to be clickable.** This used to answer
+    // the inspector or the page and nothing else, on the reasoning that "the chrome strips have
+    // nothing clickable in them". That is untrue and was untrue when it was written:
+    // `chrome/top.js` carries a delegated click handler that sends `tab-select`, which is how a
+    // pointer picks a tab in a window. Measured 2026-08-26 by a user clicking tabs that did not
+    // answer.
+    //
+    // The rectangles tile the pane and do not overlap, so the first one that contains the point is
+    // the one under the pointer and the order of the search does not decide anything.
+    guard
+        .of_browser
+        .iter()
+        .map(|(identifier, kind)| (*identifier, guard.layout.rect_of(*kind), *kind))
+        .find(|(_, rect, _)| inside(rect))
 }
 
 /// A button went down on one of the pointer's surfaces: focus follows the click.
 pub fn note_click(kind: SurfaceKind) {
+    // A click on a chrome strip picks a tab; it does not move the keyboard there. bru's whole key
+    // model is that a strip's keys are redirected to the page (`keys.rs`, trap 11), and a pointer
+    // does not change that. Only the inspector and the page own a keyboard.
+    if !matches!(kind, SurfaceKind::Inspector | SurfaceKind::Page) {
+        return;
+    }
     INSPECTOR_FOCUS.store(kind == SurfaceKind::Inspector, Ordering::Relaxed);
 }
 
