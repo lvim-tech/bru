@@ -735,6 +735,9 @@ static LAST_SHAPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// How many size mismatches have been reported. Bounded for the reason every counter here is.
 static MISMATCH: AtomicI32 = AtomicI32::new(0);
 
+/// How many pointer routings have been reported. Bounded like every counter here.
+static POINTED: AtomicI32 = AtomicI32::new(0);
+
 /// What an empty part of the pane is painted with.
 ///
 /// The chrome's own background, so a gap where a surface has not painted yet reads as part of the
@@ -1441,6 +1444,28 @@ pub fn pointer_target(x: i32, y: i32) -> Option<(i32, Rect, SurfaceKind)> {
     let inside = |rect: &Rect| {
         x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
     };
+    if crate::term_input::debug() {
+        let seen = POINTED.fetch_add(1, Ordering::Relaxed);
+        if seen < 6 {
+            let inspector = guard.layout.rect_of(SurfaceKind::Inspector);
+            let page = guard.layout.rect_of(SurfaceKind::Page);
+            eprintln!(
+                "bru[term]: pointer at {x},{y}: inspector={:?} rect {}x{} at {},{} (hit={}); \
+                 page rect {}x{} at {},{} (hit={})",
+                guard.inspector,
+                inspector.width,
+                inspector.height,
+                inspector.x,
+                inspector.y,
+                inside(&inspector),
+                page.width,
+                page.height,
+                page.x,
+                page.y,
+                inside(&page),
+            );
+        }
+    }
     if let Some(identifier) = guard.inspector {
         let rect = guard.layout.rect_of(SurfaceKind::Inspector);
         if inside(&rect) {
