@@ -1166,7 +1166,15 @@ pub fn allow_origin_switch(raw: &[String]) -> Option<String> {
     if port == 0 {
         return None;
     }
-    Some(format!("http://127.0.0.1:{port}"))
+    // **The frontend's origin is `devtools://devtools`, not the port's.** It was the port's while
+    // the frontend was fetched over http — and that spelling gave the remote-debugging shell rather
+    // than the inspector a window gets, so the URL moved to `devtools://` and this had to move with
+    // it. Both are named: the http one still serves the frontend's own assets, and a spelling that
+    // allows only half of what is used is a spelling that fails on the half nobody tested.
+    //
+    // Naming these two widens nothing a person did not already open by choosing the port: they are
+    // the server's own frontend and the browser's own scheme, not a third party.
+    Some(format!("devtools://devtools,http://127.0.0.1:{port}"))
 }
 
 /// One HTTP GET against the loopback DevTools server, body only.
@@ -1354,8 +1362,22 @@ fn frontend_url_for(targets: &[Target], url: &str, port: u16) -> Option<String> 
             target.url == url || target.url.trim_end_matches('/') == url.trim_end_matches('/')
         })?;
     if let Some(id) = &matched.id {
+        // **`devtools://`, `can_dock=true`, and nothing else — each measured, 2026-08-26.**
+        //
+        //   http://…/devtools/inspector.html?ws=…        the remote-debugging shell: an address
+        //                                                bar, a screencast of the page, the panels
+        //                                                squeezed into a column
+        //   devtools://…/inspector.html?ws=…             the same shell — the scheme was not it
+        //   devtools://…/inspector.html?ws=…&can_dock=1  the frontend a window gets: every panel,
+        //                                                no screencast, no address bar
+        //
+        // `can_dock` is what tells the frontend it is a docked inspector rather than a remote one.
+        // Where it *thinks* it is docked is `currentDockState` in its own `localStorage`, not a URL
+        // parameter — see `term_frontend`, which sets it before the first connection so that the
+        // panels fill the rectangle instead of hiding in a corner of it.
         return Some(format!(
-            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{id}"
+            "devtools://devtools/bundled/inspector.html\
+             ?ws=127.0.0.1:{port}/devtools/page/{id}&can_dock=true"
         ));
     }
     let frontend = matched.frontend.as_ref()?;
@@ -1414,69 +1436,17 @@ fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
         .unwrap_or_default();
     set_place(0, Some(wanted.unwrap_or(Place::Bottom)));
 
-    // --- the native road, read out of the header rather than guessed at ---------------------------
-    // **`show_dev_tools`' `windowInfo` is honoured — unless DevTools is already open.** The header
-    // says both halves in one sentence: "If the DevTools browser is already open then it will be
-    // focused, in which case the windowInfo, client and settings parameters will be ignored. The
-    // windowInfo parameter will be ignored if this browser is wrapped in a cef_browser_view_t."
+    // **The native road is closed, and this is the fourth measurement of it.** `show_dev_tools`
+    // with a windowless `window_info` and a client of its own; the same again with the claim held
+    // until a frame could arrive; `on_before_dev_tools_popup`, which is the shape a window docks
+    // through; and finally the same after closing an already-open inspector, because the header
+    // says an open one makes every parameter ignored. Each opened a desktop window and painted
+    // nothing into the pane. The header's last word on it — "Only used with Chrome style" — is why:
+    // bru's browsers are Alloy.
     //
-    // A terminal tab is not wrapped in a `BrowserView`, so the second clause does not apply — and
-    // the first one was what three earlier attempts kept walking into. Each measured
-    // `has_dev_tools() == 1` *after* the call and read it as "created"; it means "there was already
-    // one, and everything you passed was thrown away". So the old one is closed first, and only
-    // then is a windowless one asked for. That is the road `terminal-browser` takes with Electron's
-    // `setDevToolsWebContents`, which CEF does not expose — this is the nearest thing it does.
-    //
-    // If it works, the inspector is the same frontend a window gets: no screencast, no address bar,
-    // every panel. If it does not, the port road below still docks one, with the remote-debugging
-    // shell that comes with attaching over a WebSocket.
-    if let Some(host) = page.host() {
-        if host.has_dev_tools() != 0 {
-            host.close_dev_tools();
-        }
-        let state = crate::state::BruState::instance();
-        if let Some(state) = state.as_ref() {
-            if crate::term_frontend::open_native_inspector(&host, state) {
-                trace("term inspector asked for natively");
-                // **A promise with a deadline.** `show_dev_tools` returns before its browser has
-                // painted, and a browser that never paints is indistinguishable from one that is
-                // slow — until the deadline passes. If nothing has arrived by then the claim is
-                // withdrawn and the port road runs, so a CEF that ignores the request costs a
-                // second and not the feature.
-                fall_back_if_silent(port, url);
-                return;
-            }
-        }
-    }
+    // `terminal-browser` docks its inspector with Electron's `setDevToolsWebContents`, which says
+    // "render DevTools into this surface I own". CEF exposes no such call. The port is the way in.
     ask_for_frontend(port, url);
-}
-
-/// Wait for the native inspector to paint; if it does not, dock one through the port instead.
-fn fall_back_if_silent(port: u16, url: String) {
-    let _ = std::thread::Builder::new().name("bru-devtools-wait".to_string()).spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let mut task = NativeVerdict::new(port, url);
-        post_task(ThreadId::UI, Some(&mut task));
-    });
-}
-
-wrap_task! {
-    struct NativeVerdict {
-        port: u16,
-        url: String,
-    }
-
-    impl Task {
-        fn execute(&self) {
-            if crate::term_frontend::has_native_inspector() {
-                trace("native inspector painted; the port road is not needed");
-                return;
-            }
-            crate::term_frontend::give_up_on_native();
-            trace("native inspector never painted; falling back to the port");
-            ask_for_frontend(self.port, self.url.clone());
-        }
-    }
 }
 
 /// Fetch the inspector's URL **off the UI thread**, then open it on the UI thread.
@@ -1651,7 +1621,9 @@ mod tests {
         };
         assert_eq!(
             allow_origin_switch(&args(&["--remote-debugging-port=9222", "https://x/"])),
-            Some("http://127.0.0.1:9222".to_string())
+            // Both spellings: the frontend loads from `devtools://devtools` and fetches its own
+            // assets from the port. Allowing one of the two fails on whichever half is untested.
+            Some("devtools://devtools,http://127.0.0.1:9222".to_string())
         );
         assert_eq!(allow_origin_switch(&args(&["--remote-debugging-port=0"])), None);
         assert_eq!(allow_origin_switch(&args(&["https://x/"])), None);
@@ -1679,8 +1651,10 @@ mod tests {
             Target { url: "bru://chrome/top.html".into(), id: Some("AA".into()), frontend: None },
             Target { url: "https://example.org/".into(), id: Some("BB".into()), frontend: None },
         ];
-        let local =
-            "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/BB";
+        // `devtools://` and `can_dock=true` are what make this the inspector a window gets rather
+        // than the remote-debugging shell — both measured, both recorded at `frontend_url_for`.
+        let local = "devtools://devtools/bundled/inspector.html\
+                     ?ws=127.0.0.1:9222/devtools/page/BB&can_dock=true";
         assert_eq!(frontend_url_for(&targets, "https://example.org/", 9222), Some(local.into()));
         // The trailing slash is the one normalisation allowed: the two spellings are one page.
         assert_eq!(frontend_url_for(&targets, "https://example.org", 9222), Some(local.into()));

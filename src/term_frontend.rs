@@ -85,6 +85,9 @@ struct TermState {
     pending: Option<SurfaceKind>,
     /// The popup layer's rectangle in the page's coordinates, while one is showing.
     popup: Option<Rect>,
+    /// Where the inspector browser is to be sent once its frontend has been prepared — see
+    /// `InspectorLoadHandler`. The id is `0` until the browser exists.
+    inspector_target: Option<(i32, String)>,
     /// The popup's own pixels. CEF paints it as a **second surface** with its own buffer and its own
     /// size, which is why it cannot share the page's slot: a `<select>` dropdown is 200x300 over a
     /// page that is 990x1200, and writing one into the other's buffer is not compositing, it is
@@ -169,6 +172,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         pending: None,
         popup: None,
         popup_pixels: None,
+        inspector_target: None,
         inspector: None,
         background: background_from_theme(),
     };
@@ -1160,6 +1164,73 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(crate::keys::life_span_handler(self.state.clone()))
         }
+
+        // Where the frontend is told it is undocked, before it is told what to connect to.
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(InspectorLoadHandler::new())
+        }
+    }
+}
+
+wrap_load_handler! {
+    pub struct InspectorLoadHandler {}
+
+    impl LoadHandler {
+        /// **The frontend is prepared on a page that has nothing to lose, then sent to work.**
+        ///
+        /// `can_dock=true` gives the inspector a window's frontend rather than the
+        /// remote-debugging shell — but *where* it thinks it is docked is `currentDockState` in its
+        /// own `localStorage`, and the default is `"right"`. A frontend that believes it is docked
+        /// to the right of a host window draws itself in the right quarter of its viewport and
+        /// leaves the rest empty, which in a terminal pane is three quarters of the inspector
+        /// missing. Measured 2026-08-26, with a photograph of each spelling.
+        ///
+        /// It cannot be set before the first load — the value belongs to the `devtools://` origin,
+        /// which only exists once something from it has loaded. So the browser is created on the
+        /// bare frontend, which connects to nothing; the value is written; and only then is the URL
+        /// with the WebSocket in it loaded. Setting it *after* connecting would need a reload, and a
+        /// reload drops the connection it just made.
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            // `cef::Frame` by name: this file's `Frame` is the compositor's picture.
+            frame: Option<&mut cef::Frame>,
+            _http_status_code: ::std::os::raw::c_int,
+        ) {
+            let (Some(browser), Some(frame)) = (browser, frame) else {
+                return;
+            };
+            if frame.is_main() != 1 {
+                return;
+            }
+            let Some(target) = take_inspector_target(browser.identifier()) else {
+                return;
+            };
+            frame.execute_java_script(
+                Some(&CefString::from(
+                    "try { localStorage.setItem('currentDockState', '\"undocked\"'); } catch (e) {}",
+                )),
+                None,
+                0,
+            );
+            frame.load_url(Some(&CefString::from(target.as_str())));
+        }
+    }
+}
+
+/// The URL an inspector browser is to be sent to once its frontend has been prepared.
+///
+/// Taken rather than read: the second load must not prepare and navigate again, which would be a
+/// browser that reloads itself for ever.
+fn take_inspector_target(identifier: i32) -> Option<String> {
+    let term = TERM.get()?;
+    let mut guard = term.lock().ok()?;
+    let (id, target) = guard.inspector_target.take()?;
+    if id == identifier || id == 0 {
+        Some(target)
+    } else {
+        guard.inspector_target = Some((id, target));
+        None
     }
 }
 
@@ -1204,66 +1275,6 @@ pub fn focus_inspector() -> bool {
     true
 }
 
-/// Open the inspector as one more windowless surface, on the URL the DevTools port handed out.
-///
-/// **The rectangle is reserved before the browser is made**, because CEF asks `view_rect` while
-/// making it and the answer has to be the inspector's rectangle, not a placeholder: `pending` is
-/// what routes that first question, and setting it is also what makes [`layout_for`] carve the
-/// space out. The surfaces whose rectangles moved — the page above all — are told before the
-/// creation, so the shrink and the new panel arrive as one reflow rather than two.
-/// Ask CEF for a windowless inspector, the way a window gets one.
-///
-/// **The claim is left standing until a frame arrives.** `show_dev_tools` returns before the browser
-/// it makes has painted, so clearing it here would drop the inspector's first frame at
-/// `surface_of` — which is exactly what an earlier attempt did, and why it read as CEF refusing.
-/// Whatever paints claims it; if nothing paints, `has_native_inspector` says so and the caller
-/// falls back to the port.
-///
-/// The room is given on that first frame and not before: a band of empty pane where an inspector is
-/// not is worse than no inspector.
-pub fn open_native_inspector(host: &BrowserHost, state: &crate::tabs::SharedState) -> bool {
-    let Some(term) = TERM.get() else {
-        return false;
-    };
-    {
-        let Ok(mut guard) = term.lock() else {
-            return false;
-        };
-        if guard.inspector.is_some() {
-            return false;
-        }
-        guard.pending = Some(SurfaceKind::Inspector);
-    }
-    let window_info = WindowInfo::default().set_as_windowless(0);
-    let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
-    let mut client = InspectorClient::new(state.clone());
-    host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), None);
-    if crate::term_input::debug() {
-        eprintln!("bru[term]: asked CEF for a windowless inspector natively");
-    }
-    // A paint may already have arrived — `show_dev_tools` can create the browser synchronously.
-    // Either way the claim stands until one does; `give_up_on_native` is what withdraws it.
-    true
-}
-
-/// Withdraw the native claim, so an unclaimed frame is not read as the inspector's.
-pub fn give_up_on_native() {
-    if let Some(term) = TERM.get() {
-        if let Ok(mut guard) = term.lock() {
-            if guard.inspector.is_none() && guard.pending == Some(SurfaceKind::Inspector) {
-                guard.pending = None;
-            }
-        }
-    }
-}
-
-/// Whether a native windowless inspector has painted.
-pub fn has_native_inspector() -> bool {
-    TERM.get()
-        .and_then(|term| term.lock().ok().map(|guard| guard.inspector.is_some()))
-        .unwrap_or(false)
-}
-
 pub fn open_inspector(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> {
     let term = TERM.get().ok_or("the terminal frontend is not running")?;
     let moved = {
@@ -1284,13 +1295,19 @@ pub fn open_inspector(state: &crate::tabs::SharedState, url: &str) -> Result<(),
     };
     resize_browsers(&moved);
 
+    // **Created on the bare frontend, not on the URL that carries the WebSocket.** The dock state
+    // has to be written before the frontend connects, and it can only be written once something
+    // from the `devtools://` origin has loaded — see `InspectorLoadHandler`.
+    if let Ok(mut guard) = term.lock() {
+        guard.inspector_target = Some((0, url.to_string()));
+    }
     let window_info = WindowInfo::default().set_as_windowless(0);
     let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     let mut client = InspectorClient::new(state.clone());
     let browser = browser_host_create_browser_sync(
         Some(&window_info),
         Some(&mut client),
-        Some(&CefString::from(url)),
+        Some(&CefString::from("devtools://devtools/bundled/inspector.html")),
         Some(&settings),
         None,
         None,
