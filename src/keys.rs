@@ -432,6 +432,7 @@ wrap_client! {
 /// The terminal's docked inspector needs its browser registered in `BruState` like every other —
 /// created, found by id, counted by the quit — without bru's keyboard handler in front of it,
 /// because `j` in a DevTools console has to type a `j`. See `term_frontend::InspectorClient`.
+#[allow(dead_code)] // The terminal inspector has one of its own; this is the page path's.
 pub fn life_span_handler(state: crate::tabs::SharedState) -> LifeSpanHandler {
     BruLifeSpanHandler::new(state)
 }

@@ -1161,13 +1161,45 @@ wrap_client! {
             render_handler()
         }
 
+        // **Not bru's, and that distinction was an endless row of tabs.** bru's handler answers a
+        // popup by cancelling it and opening a *tab* — right for a page, and a loop for this: the
+        // frontend's own navigation was taken for a popup, became a tab, whose frontend navigated,
+        // and so on until the strip had no end. Measured 2026-08-26. The inspector is not a page
+        // and nothing it asks for belongs in the tab strip, so its popups are refused and dropped.
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(crate::keys::life_span_handler(self.state.clone()))
+            Some(InspectorLifeSpanHandler::new())
         }
 
         // Where the frontend is told it is undocked, before it is told what to connect to.
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(InspectorLoadHandler::new())
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    pub struct InspectorLifeSpanHandler {}
+
+    impl LifeSpanHandler {
+        /// `1` is "cancel", and cancelling is the whole of it: nothing the inspector asks to open
+        /// is a page bru should show, and the frontend has no use for a window it did not get.
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            _target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            1
         }
     }
 }
