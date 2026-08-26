@@ -8,6 +8,11 @@ publish = false
 name = "bru"
 path = "src/main.rs"
 
+# `bru-term <url>` = `bru --term <url>`: an exec wrapper and nothing else — see src/bin/bru-term.rs.
+[[bin]]
+name = "bru-term"
+path = "src/bin/bru-term.rs"
+
 [dependencies]
 # From tauri-apps/cef-rs. The version tracks CEF itself: 151 is the Chromium
 # under Brave, which is the whole point of choosing CEF over WebKitGTK.

@@ -1156,7 +1156,12 @@ It buys reachability, not privacy: the remote machine sees every host bru asks f
 
 ```sh
 bru --term https://example.com/
+bru-term https://example.com/        # the same thing as one word
 ```
+
+`bru-term` is an exec wrapper and nothing else: it replaces itself with the `bru` beside it,
+`--term` prepended and every other argument passed through — so `bru-term
+--remote-debugging-port=9222 <url>` is the spelling that also gets a dockable `:devtools`.
 
 It is the same browser. The tab strip and the status bar are the same `bru://chrome` pages a window
 draws, every binding works because a key still arrives through `on_pre_key_event`, and the smooth

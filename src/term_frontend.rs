@@ -436,6 +436,40 @@ fn resize_browsers(browsers: &[(i32, SurfaceKind)]) {
             host.invalidate(PaintElementType::VIEW);
         }
     }
+    // **And once more, after the renderer has had time to lay the new size out.** The invalidate
+    // above answers with whatever the renderer has *committed*, and right after `was_resized`
+    // that is the old layout — for the panel growing from its zero-height rectangle, a document
+    // laid out one pixel tall, which is a tall panel with nothing in it. Reported 2026-08-26:
+    // the completion opened empty and filled in only when the next keystroke forced a fresh
+    // paint. Nothing here can be told when the renderer's own commit lands, so the frame is asked
+    // for again when it plausibly has — twice, cheap insurance against a slow layout — and a
+    // surface that was already right repaints identically for the cost of one frame.
+    let identifiers: Vec<i32> = browsers.iter().map(|(identifier, _)| *identifier).collect();
+    for delay_ms in [50i64, 250] {
+        let mut task = SettleTask::new(identifiers.clone());
+        post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    }
+}
+
+wrap_task! {
+    struct SettleTask {
+        identifiers: Vec<i32>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            for identifier in &self.identifiers {
+                let browser =
+                    state.lock().expect("state mutex poisoned").browser_with_id(*identifier);
+                if let Some(host) = browser.and_then(|browser| browser.host()) {
+                    host.invalidate(PaintElementType::VIEW);
+                }
+            }
+        }
+    }
 }
 
 /// Make one windowless browser for one surface.
@@ -752,6 +786,47 @@ fn surface_of(term: &TermState, browser: Option<&mut Browser>) -> Option<Surface
             .map(|(_, kind)| *kind)
             .or(term.pending),
         None => term.pending,
+    }
+}
+
+/// Whether a present is already on its way to the UI queue. See [`schedule_present`].
+static PRESENT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for one present, however many paints ask.
+///
+/// **One frame per batch of paints, not one per surface — reported 2026-08-26 as flickering.**
+/// With the completion open, a single keystroke repaints the panel, the page and the bottom strip,
+/// and presenting from inside each `on_paint` put three full frames on the terminal per key — the
+/// middle ones with a tall panel against a page still painted at its old height, which is a band
+/// of background that comes and goes at typing speed. CEF delivers those paints in the same pump
+/// of the UI loop; a task posted by the first of them runs after the rest have stored their
+/// pixels, so the frame that is transmitted is the one where the surfaces agree. It is also a
+/// third of the composites and transmits per keystroke.
+///
+/// The flag is cleared *before* the present, so a paint that lands mid-present schedules the next
+/// one instead of being folded into a picture that no longer holds it.
+fn schedule_present() {
+    if PRESENT_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut task = PresentTask::new();
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct PresentTask;
+
+    impl Task {
+        fn execute(&self) {
+            PRESENT_PENDING.store(false, Ordering::Release);
+            let Some(term) = TERM.get() else {
+                return;
+            };
+            let Ok(mut guard) = term.lock() else {
+                return;
+            };
+            present(&mut guard);
+        }
     }
 }
 
@@ -1357,7 +1432,8 @@ wrap_render_handler! {
             // `TermState::popup_pixels`.
             if type_.get_raw() == PaintElementType::POPUP.get_raw() {
                 term.popup_pixels = Some(Painted { bgra: bgra.to_vec(), width, height });
-                present(&mut term);
+                drop(term);
+                schedule_present();
                 return;
             }
             // **A browser met for the first time is recorded here**, and the inspector is why:
@@ -1383,7 +1459,8 @@ wrap_render_handler! {
             if term.layout.rect_of(kind).is_empty() {
                 return;
             }
-            present(&mut term);
+            drop(term);
+            schedule_present();
         }
     }
 }
