@@ -1180,6 +1180,13 @@ bru --term --user-data-dir=~/.local/share/bru/term https://example.com/
 Chromium's both, because stderr is the same terminal the page is drawn in. `tail -f` it in another
 pane.
 
+**The inspector opens in a window of its own.** CEF decides where DevTools lives — from the browser
+being inspected, not from what it is asked for — and does not take a windowless request for it. The
+window inspects the right page; `:devtools` says so when it opens one.
+
+**`BRU_DEBUG_TERM=1`** adds what the terminal negotiated and where the first keys and clicks went,
+to the log above. It is the first thing to reach for when a key or a click does not arrive.
+
 **Under tmux**, two things are tmux's to give:
 
 - `mouse on` makes tmux keep the mouse for its own pane handling, and bru never sees a click. Set
