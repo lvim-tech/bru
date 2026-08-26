@@ -1384,14 +1384,32 @@ fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
 /// else in bru crosses that line.
 fn ask_for_frontend(port: u16, url: String) {
     let _ = std::thread::Builder::new().name("bru-devtools".to_string()).spawn(move || {
-        let answer = http_get(port, "/json/list").and_then(|body| {
-            let targets = targets_from_json(&body);
-            frontend_url_for(&targets, &url, port)
-        });
-        let mut task = match answer {
-            Some(frontend) => OpenInspector::new(frontend, port, url),
-            None => OpenInspector::new(String::new(), port, url),
+        // **Three outcomes, three messages.** They were one message once, and one message across
+        // three causes is what turns a diagnosis into a guess: "not answering" was printed for a
+        // port that was answering perfectly.
+        let (frontend, why) = match http_get(port, "/json/list") {
+            None => (String::new(), format!("127.0.0.1:{port} did not answer /json/list")),
+            Some(body) => {
+                let targets = targets_from_json(&body);
+                trace(&format!(
+                    "/json/list answered {} bytes, {} targets: {:?}",
+                    body.len(),
+                    targets.len(),
+                    targets.iter().map(|target| target.url.as_str()).collect::<Vec<_>>()
+                ));
+                match frontend_url_for(&targets, &url, port) {
+                    Some(frontend) => (frontend, String::new()),
+                    None => (
+                        String::new(),
+                        format!(
+                            "none of the {} targets on 127.0.0.1:{port} matches {url}",
+                            targets.len()
+                        ),
+                    ),
+                }
+            }
         };
+        let mut task = OpenInspector::new(frontend, why);
         post_task(ThreadId::UI, Some(&mut task));
     });
 }
@@ -1399,21 +1417,18 @@ fn ask_for_frontend(port: u16, url: String) {
 wrap_task! {
     struct OpenInspector {
         frontend: String,
-        port: u16,
-        url: String,
+        why: String,
     }
 
     impl Task {
         fn execute(&self) {
             if self.frontend.is_empty() {
                 set_place(0, None);
-                crate::message::error(&format!(
-                    "devtools: 127.0.0.1:{} answered nothing that matches {} — is that the port \
-                     bru was started with?",
-                    self.port, self.url
-                ));
+                trace(&format!("term inspector not opened: {}", self.why));
+                crate::message::error(&format!("devtools: {}", self.why));
                 return;
             }
+            trace(&format!("term inspector frontend: {}", self.frontend));
             let Some(state) = crate::state::BruState::instance() else {
                 return;
             };
