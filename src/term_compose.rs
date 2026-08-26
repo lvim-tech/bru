@@ -737,43 +737,45 @@ pub struct Band {
     pub height: i32,
 }
 
-/// Cut the pane into bands along the layout's own boundaries, snapped to whole cell rows.
+/// How many cell rows one band covers.
 ///
-/// **Cell rows, because a picture is placed in cells.** The layout measures in pixels and its
-/// boundaries fall wherever the chrome's heights put them; a band that began mid-cell could not be
-/// placed at all. Snapping to the nearest row keeps every cut legal, and because the bands are
-/// slices of the *composed frame* rather than of the surfaces, a cut that lands a pixel or two off a
-/// surface's edge costs nothing — the pixels either side of it are already correct.
+/// The trade is granularity against count: one row per band would send the least on a keystroke and
+/// the most escapes on a full redraw. Two is where a single changed row still costs a fiftieth of
+/// the pane and a whole-pane repaint is still a couple of dozen pictures.
+const ROWS_PER_BAND: i32 = 2;
+
+/// Cut the pane into bands of whole cell rows.
 ///
-/// The bands tile the pane: the first begins at zero, each begins where the last ended, and the last
-/// ends at the pane's own height even when that is not a whole row.
-pub fn bands(layout: &Layout, cell_height: i32) -> Vec<Band> {
-    let height = layout.pane.height;
-    if height <= 0 {
+/// **A fixed grid, deliberately not the layout's own boundaries.** Cutting along the chrome's edges
+/// looked better — the status bar would get a band of exactly its own height — but those edges move:
+/// the completion table changes height on *every keystroke* in the command line, so the cuts moved,
+/// bands appeared and disappeared, and each one that stopped existing had to be deleted and drawn
+/// again. That is a blink, and measured 2026-08-27 it was a blink per keystroke.
+///
+/// A grid that depends only on the pane size does not move while the pane does not. A band is then
+/// only ever *replaced* — same id, same place, new pixels — which the terminal does with nothing
+/// blank in between. Bands change when the pane is resized, and at no other time.
+pub fn bands(pane_height: i32, cell_height: i32) -> Vec<Band> {
+    if pane_height <= 0 {
         return Vec::new();
     }
     if cell_height <= 0 {
-        return vec![Band { row: 0, rows: 1, y: 0, height }];
+        return vec![Band { row: 0, rows: 1, y: 0, height: pane_height }];
     }
-    let snap = |y: i32| ((y + cell_height / 2) / cell_height * cell_height).clamp(0, height);
-    let mut cuts: Vec<i32> = [layout.top, layout.page, layout.divider, layout.inspector, layout.panel, layout.bottom]
-        .iter()
-        .flat_map(|rect| [snap(rect.y), snap(rect.y.saturating_add(rect.height))])
-        .chain([0, height])
-        .collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    cuts.windows(2)
-        .map(|pair| {
-            let (y, next) = (pair[0], pair[1]);
-            Band {
-                row: y / cell_height,
-                rows: ((next - y) + cell_height - 1) / cell_height,
-                y,
-                height: next - y,
-            }
-        })
-        .collect()
+    let step = cell_height * ROWS_PER_BAND;
+    let mut bands = Vec::with_capacity((pane_height / step + 2) as usize);
+    let mut y = 0;
+    while y < pane_height {
+        let height = step.min(pane_height - y);
+        bands.push(Band {
+            row: y / cell_height,
+            rows: (height + cell_height - 1) / cell_height,
+            y,
+            height,
+        });
+        y += step;
+    }
+    bands
 }
 
 pub fn compose(frame: &mut Frame, layers: &[Layer<'_>]) -> Option<Rect> {
@@ -881,75 +883,52 @@ fn blit(frame: &mut Frame, layer: &Layer<'_>, dirty: Rect) -> Option<Rect> {
 mod band_tests {
     use super::*;
 
-    fn a_pane(height: i32, panel: i32) -> Layout {
-        layout(&LayoutRequest {
-            width: 990,
-            height,
-            scale: 1.0,
-            top_visible: true,
-            bottom_visible: true,
-            panel_height: panel,
-            inspector_height: 0,
-            inspector_side: false,
-        })
-    }
-
     /// **The invariant the picture depends on.** The bands tile the pane: no gap, no overlap, first
     /// at zero, last ending at the pane's own height. A gap is a stripe of nothing on screen.
     #[test]
     fn the_bands_tile_the_pane() {
-        for (height, panel) in [(1325, 0), (1325, 200), (1325, 137), (600, 0), (25, 0), (13, 0)] {
-            let layout = a_pane(height, panel);
-            let bands = bands(&layout, 25);
-            assert!(!bands.is_empty(), "{height}/{panel}: a pane with pixels has bands");
-            assert_eq!(bands[0].y, 0, "{height}/{panel}: the first band begins at the top");
+        for height in [1325, 1350, 600, 50, 25, 13, 1] {
+            let bands = bands(height, 25);
+            assert!(!bands.is_empty(), "{height}: a pane with pixels has bands");
+            assert_eq!(bands[0].y, 0, "{height}: the first band begins at the top");
             for pair in bands.windows(2) {
                 assert_eq!(
                     pair[0].y + pair[0].height,
                     pair[1].y,
-                    "{height}/{panel}: a gap or an overlap between bands"
+                    "{height}: a gap or an overlap between bands"
                 );
             }
             let last = bands[bands.len() - 1];
-            assert_eq!(last.y + last.height, height, "{height}/{panel}: the last band reaches the end");
+            assert_eq!(last.y + last.height, height, "{height}: the last band reaches the end");
         }
     }
 
-    /// Every cut but the last is a whole cell row, because a picture is placed in cells and a band
-    /// that began mid-cell could not be placed at all.
+    /// Every band begins on a cell row, because a picture is placed in cells and a band that began
+    /// mid-cell could not be placed at all.
     #[test]
     fn every_band_begins_on_a_cell_row() {
-        let bands = bands(&a_pane(1325, 137), 25);
-        for band in &bands {
+        for band in bands(1325, 25) {
             assert_eq!(band.y % 25, 0, "band at {} does not begin on a row", band.y);
             assert_eq!(band.row, band.y / 25);
             assert!(band.rows >= 1, "a band covers at least one row");
-            assert!(
-                band.rows * 25 >= band.height,
-                "a band's rows have to hold its pixels: {band:?}"
-            );
+            assert!(band.rows * 25 >= band.height, "a band's rows have to hold its pixels: {band:?}");
         }
     }
 
-    /// **The whole point, as a number.** A command line that grows costs the rows it changed, and
-    /// the bottom strip is one of them — not the pane.
+    /// **The property the blink cost.** The cuts depend on the pane and on nothing else, so a panel
+    /// that opens, grows and closes leaves every band exactly where it was.
     #[test]
-    fn the_bottom_strip_is_a_band_of_its_own() {
-        let bands = bands(&a_pane(1325, 0), 25);
-        let last = bands[bands.len() - 1];
-        assert!(
-            last.height <= 50,
-            "the status bar should not drag the page into its band: {last:?}"
-        );
-        assert!(bands.len() >= 3, "top, page and bottom are not one band: {bands:?}");
+    fn the_grid_does_not_move_while_the_pane_does_not() {
+        assert_eq!(bands(1325, 25), bands(1325, 25));
+        assert_ne!(bands(1325, 25), bands(1300, 25), "a resize is the one thing that moves them");
     }
 
-    /// A pane with no pixels has no bands, and a terminal that reports no cell height still gets
-    /// one band rather than a division by zero.
+    /// A pane with no pixels has no bands, and a terminal that reports no cell height still gets one
+    /// band rather than a division by zero.
     #[test]
     fn the_degenerate_panes_do_not_panic() {
-        assert!(bands(&a_pane(0, 0), 25).is_empty());
-        let whole = bands(&a_pane(1325, 0), 0);
+        assert!(bands(0, 25).is_empty());
+        let whole = bands(1325, 0);
         assert_eq!(whole.len(), 1);
         assert_eq!(whole[0].height, 1325);
     }

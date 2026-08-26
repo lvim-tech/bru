@@ -455,7 +455,6 @@ pub fn relayout() {
         // A frame of the wrong size is clipped to its rectangle and looks like a moment of
         // stretching; a missing one looks like a browser that has crashed.
         guard.layout = next;
-        forget_bands(&mut guard);
         moved
     };
     resize_browsers(&browsers);
@@ -952,7 +951,12 @@ fn present(term: &mut TermState) {
         return;
     }
     let composed = started.map(|at| at.elapsed());
-    let mut out = std::io::stdout();
+    // **The whole frame is built in memory and written once.** Every escape here is a self-contained
+    // command; one torn in half by a partial write, or interleaved with anything else that reaches
+    // this descriptor, arrives as a command with a mangled key — which is what
+    // `NVAL:invalid value for key 'q'` is, reported 2026-08-27. A single `write_all` cannot be
+    // interleaved with itself, and it is fewer syscalls than a picture per band besides.
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
     let _ = term.session.begin_sync(&mut out);
     // **Only the bands the damage touched.** The picture is one image per band, at a fixed place
     // and with a fixed id, so re-sending one says nothing about the others. A keystroke in the
@@ -964,7 +968,7 @@ fn present(term: &mut TermState) {
     let width = term.frame.width();
     let stride = (width as usize) * 3;
     let cols = term.size.cols;
-    let bands = crate::term_compose::bands(&term.layout, term.size.cell_height as i32);
+    let bands = crate::term_compose::bands(term.layout.pane.height, term.size.cell_height as i32);
     for (index, band) in bands.iter().enumerate() {
         if band.height <= 0 || band.y + band.height <= damaged.y || band.y >= damaged.y + damaged.height
         {
@@ -993,7 +997,8 @@ fn present(term: &mut TermState) {
     }
     term.bands_drawn = bands.len();
     let _ = term.session.end_sync(&mut out);
-    let _ = out.flush();
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&out).and_then(|()| stdout.flush());
     // **Where a frame's time actually goes, split at the one seam that matters.** Composing is
     // bru's own cost and is the same everywhere; the write is the terminal's, and a host that
     // decodes each frame and re-encodes it for the terminal underneath charges for it here. Every
@@ -1011,14 +1016,15 @@ fn present(term: &mut TermState) {
     }
 }
 
-/// Say that the cuts have moved, so every band goes out again on the next frame.
+/// Say that the bands have moved, so every one of them goes out again on the next frame.
 ///
-/// **It does not delete anything, and that is the point.** Deleting the images and letting the next
-/// frame put them back leaves the pane blank in between — and `relayout` runs on *every keystroke*
-/// in the command line, because the completion table changes height under it. Measured 2026-08-27:
-/// typing made the whole pane blink. Re-transmitting a band's id replaces it in place with nothing
-/// blank in between, so a moved band needs no deletion; only a band that has stopped existing does,
-/// and [`present`] takes those back itself.
+/// **Only a resize calls this.** The grid depends on the pane's size and on nothing else, so a panel
+/// that opens or an inspector that docks leaves every band exactly where it was — those change a
+/// band's *pixels*, which is what the damage rectangle is for. A relayout used to call this too, and
+/// since a relayout runs on every keystroke in the command line, that was a full repaint per key.
+///
+/// It deletes nothing: re-transmitting a band's id replaces it in place with nothing blank in
+/// between. Only a band that has stopped existing needs deleting, and [`present`] does that itself.
 fn forget_bands(term: &mut TermState) {
     term.redraw_all = true;
 }
