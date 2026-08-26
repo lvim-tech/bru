@@ -1206,14 +1206,22 @@ wrap_load_handler! {
             let Some(target) = take_inspector_target(browser.identifier()) else {
                 return;
             };
-            frame.execute_java_script(
-                Some(&CefString::from(
-                    "try { localStorage.setItem('currentDockState', '\"undocked\"'); } catch (e) {}",
-                )),
-                None,
-                0,
+            // **The navigation is inside the script, and that is the whole of the fix.**
+            // `execute_java_script` posts the script to the renderer and returns; a `load_url` on
+            // the line after it starts a navigation that outruns the write. Measured 2026-08-26:
+            // the value was set and the frontend still came up docked to the right, because it had
+            // already read the old one. Written and then navigated *in one script*, the order is
+            // the script's own and cannot be raced.
+            //
+            // The URL is a `devtools://` address bru built from a port number and a target id, and
+            // the quotes are escaped anyway: a string that reaches JavaScript unescaped is a string
+            // that decides what the script does.
+            let escaped = target.replace('\\', "\\\\").replace('\'', "\\'");
+            let script = format!(
+                "try {{ localStorage.setItem('currentDockState', '\"undocked\"'); }} \
+                 catch (e) {{}} location.replace('{escaped}');"
             );
-            frame.load_url(Some(&CefString::from(target.as_str())));
+            frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
         }
     }
 }
