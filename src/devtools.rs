@@ -1365,30 +1365,65 @@ fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
         .main_frame()
         .map(|frame| CefString::from(&frame.url()).to_string())
         .unwrap_or_default();
-    let Some(body) = http_get(port, "/json/list") else {
-        crate::message::error(&format!(
-            "devtools: 127.0.0.1:{port} did not answer /json/list — the port bru was started \
-             with is not answering"
-        ));
-        return;
-    };
-    let targets = targets_from_json(&body);
-    let Some(frontend) = frontend_url_for(&targets, &url, port) else {
-        crate::message::error(&format!(
-            "devtools: none of the {} targets on 127.0.0.1:{port} matches {url}",
-            targets.len()
-        ));
-        return;
-    };
     set_place(0, Some(wanted.unwrap_or(Place::Bottom)));
-    let Some(state) = crate::state::BruState::instance() else {
-        return;
-    };
-    match crate::term_frontend::open_inspector(&state, &frontend) {
-        Ok(()) => trace(&format!("term inspector opened on {frontend}")),
-        Err(why) => {
-            set_place(0, None);
-            crate::message::error(&format!("devtools: {why}"));
+    ask_for_frontend(port, url);
+}
+
+/// Fetch the inspector's URL **off the UI thread**, then open it on the UI thread.
+///
+/// **`/json/list` cannot be answered by the thread that is asking for it.** Chromium serves the
+/// DevTools HTTP endpoints from a thread of their own, but enumerating targets hops to the UI
+/// thread to do it — so a blocking `GET` made *from* the UI thread waits for a reply that only the
+/// waiting thread can produce. Measured 2026-08-26: the port was listening, the connection was
+/// accepted, and the read timed out two seconds later into "the port is not answering", which is
+/// the one thing that was not true.
+///
+/// Reading a socket on the UI thread is the wrong shape even where it works — a browser that stops
+/// painting because a request is slow is a browser that stutters for reasons no page explains — so
+/// the request goes to a thread and the answer comes back as a posted task, which is how everything
+/// else in bru crosses that line.
+fn ask_for_frontend(port: u16, url: String) {
+    let _ = std::thread::Builder::new().name("bru-devtools".to_string()).spawn(move || {
+        let answer = http_get(port, "/json/list").and_then(|body| {
+            let targets = targets_from_json(&body);
+            frontend_url_for(&targets, &url, port)
+        });
+        let mut task = match answer {
+            Some(frontend) => OpenInspector::new(frontend, port, url),
+            None => OpenInspector::new(String::new(), port, url),
+        };
+        post_task(ThreadId::UI, Some(&mut task));
+    });
+}
+
+wrap_task! {
+    struct OpenInspector {
+        frontend: String,
+        port: u16,
+        url: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if self.frontend.is_empty() {
+                set_place(0, None);
+                crate::message::error(&format!(
+                    "devtools: 127.0.0.1:{} answered nothing that matches {} — is that the port \
+                     bru was started with?",
+                    self.port, self.url
+                ));
+                return;
+            }
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            match crate::term_frontend::open_inspector(&state, &self.frontend) {
+                Ok(()) => trace(&format!("term inspector opened on {}", self.frontend)),
+                Err(why) => {
+                    set_place(0, None);
+                    crate::message::error(&format!("devtools: {why}"));
+                }
+            }
         }
     }
 }
