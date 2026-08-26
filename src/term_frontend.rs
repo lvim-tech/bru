@@ -986,6 +986,16 @@ pub fn place_inspector(
     settings: Option<&mut BrowserSettings>,
     use_default_window: Option<&mut ::std::os::raw::c_int>,
 ) {
+    if crate::term_input::debug() {
+        eprintln!(
+            "bru[term]: on_before_dev_tools_popup fired; active={} window_info={} client={} \
+             use_default_window={}",
+            is_active(),
+            window_info.is_some(),
+            client.is_some(),
+            use_default_window.is_some(),
+        );
+    }
     if !is_active() {
         return;
     }
@@ -1002,6 +1012,8 @@ pub fn place_inspector(
     // above is decoration.
     if let Some(use_default_window) = use_default_window {
         *use_default_window = 0;
+    } else if crate::term_input::debug() {
+        eprintln!("bru[term]: no use_default_window to clear — CEF will make its own window");
     }
     // The browser does not exist yet, so its identifier cannot be recorded here. Its first paint is
     // what claims it, and until then this says what an unclaimed frame is.
