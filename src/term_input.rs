@@ -113,6 +113,19 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
                 buffer.drain(..n);
                 post_mouse(mouse);
             }
+            // A mode 2048 report: the pane changed size, said in order with the bytes around it and
+            // with the pixels attached — which `SIGWINCH` cannot say. It goes to the session's own
+            // resize channel, where the signal's reports already arrive and where the two are
+            // deduplicated into one event per size.
+            Step::Resize(resize, n) => {
+                buffer.drain(..n);
+                crate::term_frontend::note_resize_report(
+                    resize.rows,
+                    resize.cols,
+                    resize.width,
+                    resize.height,
+                );
+            }
             // Focus changes, query replies, paste markers. Quietly, because they are not errors and
             // there will be many.
             Step::Ignored(n) | Step::Invalid(n) => {

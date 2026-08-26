@@ -434,24 +434,10 @@ pub(crate) fn parse_cell_size(reply: &str) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// `CSI 48 ; rows ; cols ; height ; width t` — an in-band resize report from mode 2048.
-///
-/// Returned as `(rows, cols, width, height)`: the grid in the order the escape carries it, then the
-/// pixels swapped into this module's order.
-#[allow(dead_code)] // Called by C-input once the reader thread exists.
-pub(crate) fn parse_in_band_resize(report: &str) -> Option<(u16, u16, u32, u32)> {
-    let params = csi_params(report, 't')?;
-    if *params.first()? != 48 || params.len() != 5 {
-        return None;
-    }
-    let rows = u16::try_from(params[1]).ok()?;
-    let cols = u16::try_from(params[2]).ok()?;
-    let (height, width) = (params[3], params[4]);
-    if rows == 0 || cols == 0 {
-        return None;
-    }
-    Some((rows, cols, width, height))
-}
+// The `CSI 48 … t` report itself is parsed in `term_keys.rs` (`Step::Resize`), because the byte
+// stream it arrives in is the keyboard's and the parser that owns how many bytes a sequence took
+// must be the one that reads it. What lives here is what to *do* with one — `size_from_in_band`
+// and `note_in_band_resize` — so there is exactly one parser and exactly one piece of arithmetic.
 
 // -----------------------------------------------------------------------------------------------
 // Pure: what the pane is, from whatever the three sources managed to say
@@ -1473,14 +1459,8 @@ mod tests {
         assert_eq!(parse_decrqm("\x1b[?2048$y"), None, "a mode with no state is not an answer");
     }
 
-    /// The in-band report is the one message that carries the grid and the pixels together, which is
-    /// what makes it worth having over `SIGWINCH`.
-    #[test]
-    fn an_in_band_resize_report_carries_the_grid_and_the_pixels() {
-        assert_eq!(parse_in_band_resize("\x1b[48;54;110;1350;990t"), Some((54, 110, 990, 1350)));
-        assert_eq!(parse_in_band_resize("\x1b[48;0;110;1350;990t"), None, "no rows, no pane");
-        assert_eq!(parse_in_band_resize("\x1b[4;1350;990t"), None, "not a resize report");
-    }
+    // The `CSI 48 … t` wire form is `term_keys.rs`'s to parse and to test — see the note above
+    // `size_from_in_band`.
 
     /// The numbers measured on this machine on 2026-08-25, with the ioctl answering as it does here.
     #[test]

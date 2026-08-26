@@ -223,6 +223,39 @@ pub struct TermMouse {
     pub motion: bool,
 }
 
+/// An in-band resize report: what mode 2048 says the pane has become.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermResize {
+    pub rows: u16,
+    pub cols: u16,
+    /// The pane's pixels. The escape's last two parameters are allowed to be zero, which means the
+    /// terminal is not saying — the size arithmetic falls back to the grid times the cell.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `CSI 48 ; rows ; cols ; height ; width t` — a mode 2048 report, exactly five fields.
+///
+/// **Height before width on the wire, `(width, height)` in the struct**, the same swap every `t`
+/// reply in `term_session.rs` makes: the standard's order is the opposite of everything else in
+/// the terminal path, and remembering that is this function's job and nobody else's. A report with
+/// no grid is no report — zero rows or columns describes a pane nothing can be laid out in.
+fn parse_resize_report(params: &[u8]) -> Option<TermResize> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut fields = text.split(';');
+    if fields.next()?.parse::<u32>().ok()? != 48 {
+        return None;
+    }
+    let rows: u16 = fields.next()?.parse().ok()?;
+    let cols: u16 = fields.next()?.parse().ok()?;
+    let height: u32 = fields.next()?.parse().ok()?;
+    let width: u32 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || rows == 0 || cols == 0 {
+        return None;
+    }
+    Some(TermResize { rows, cols, width, height })
+}
+
 /// `CSI < button ; x ; y M|m`.
 fn parse_sgr_mouse(params: &[u8], final_byte: u8) -> Option<TermMouse> {
     let text = std::str::from_utf8(params).ok()?;
@@ -268,6 +301,12 @@ pub enum Step {
     /// something to act on and a focus change is not; they arrive through the same `CSI <` door and
     /// were told apart nowhere until something wanted the clicks.
     Mouse(TermMouse, usize),
+    /// An in-band resize report (mode 2048), and the bytes it took. Separate from
+    /// [`Step::Ignored`] for the same reason the mouse is: the session asked the terminal for these
+    /// reports — they carry the pane's pixels *in order with the bytes around them*, which
+    /// `SIGWINCH` does not — and a report that is parsed and then dropped is a mode that was turned
+    /// on for nothing.
+    Resize(TermResize, usize),
     /// A complete, understood sequence that is not a key: a mouse report, a focus change, the reply
     /// to a query, a bracketed-paste marker. Drop these bytes and carry on — quietly, because they
     /// are not errors and there will be many.
@@ -285,7 +324,11 @@ impl Step {
     #[allow(dead_code)] // Waits for C3's read loop, which is the only thing that drains a buffer.
     pub fn consumed(&self) -> usize {
         match self {
-            Step::Key(_, n) | Step::Mouse(_, n) | Step::Ignored(n) | Step::Invalid(n) => *n,
+            Step::Key(_, n)
+            | Step::Mouse(_, n)
+            | Step::Resize(_, n)
+            | Step::Ignored(n)
+            | Step::Invalid(n) => *n,
             Step::Incomplete => 0,
         }
     }
@@ -359,6 +402,8 @@ fn parse_escape(input: &[u8], flush: bool, depth: u8) -> Step {
             // A mouse report does not become Alt-anything: the modifiers a click carries are in its
             // own button field, and a leading ESC before one is the prefix bytes, not a held key.
             Step::Mouse(m, n) => Step::Mouse(m, n + 1),
+            // Nor does a resize report — a pane has no modifiers.
+            Step::Resize(r, n) => Step::Resize(r, n + 1),
             Step::Ignored(n) => Step::Ignored(n + 1),
             Step::Invalid(n) => Step::Invalid(n + 1),
             Step::Incomplete => Step::Incomplete,
@@ -377,6 +422,7 @@ fn parse_escape(input: &[u8], flush: bool, depth: u8) -> Step {
         _ => match parse_legacy(&input[1..]) {
             Step::Key(k, n) => Step::Key(alt(k), n + 1),
             Step::Mouse(m, n) => Step::Mouse(m, n + 1),
+            Step::Resize(r, n) => Step::Resize(r, n + 1),
             Step::Ignored(n) => Step::Ignored(n + 1),
             Step::Invalid(n) => Step::Invalid(n + 1),
             Step::Incomplete => Step::Incomplete,
@@ -509,6 +555,16 @@ fn parse_csi_body(input: &[u8], start: usize) -> Step {
             Step::Ignored(consumed + 3)
         } else {
             Step::Incomplete
+        };
+    }
+
+    // A window report. The one this frontend asked for — mode 2048's `CSI 48 … t` — is an event to
+    // act on; every other `t` (a `14t`/`16t` answer arriving late, a report bru never requested) is
+    // a reply to drop. Parsed here because this is the parser that owns how many bytes it took.
+    if final_byte == b't' {
+        return match parse_resize_report(raw) {
+            Some(resize) => Step::Resize(resize, consumed),
+            None => Step::Ignored(consumed),
         };
     }
 
@@ -1644,7 +1700,7 @@ mod tests {
                     clicks.push(m);
                     buf = &buf[n..];
                 }
-                Step::Ignored(n) | Step::Invalid(n) => buf = &buf[n..],
+                Step::Resize(_, n) | Step::Ignored(n) | Step::Invalid(n) => buf = &buf[n..],
                 Step::Incomplete => break,
             }
         }
@@ -1655,6 +1711,31 @@ mod tests {
         assert!(clicks[0].pressed);
         let got: Vec<String> = got.into_iter().map(|s| s.unwrap_or_default()).collect();
         assert_eq!(got, ["g", "g", "<Ctrl+a>", "<Up>", "<F1>"]);
+    }
+
+    /// A mode 2048 report is an event, not noise: the grid in the escape's order, the pixels
+    /// swapped into `(width, height)`, and the whole sequence consumed.
+    #[test]
+    fn an_in_band_resize_report_is_a_step_of_its_own() {
+        let report = b"\x1b[48;54;110;1350;990t";
+        assert_eq!(
+            next_event(report),
+            Step::Resize(
+                TermResize { rows: 54, cols: 110, width: 990, height: 1350 },
+                report.len()
+            )
+        );
+        // The pixel fields are allowed to be zero — the terminal declining to say.
+        assert_eq!(
+            next_event(b"\x1b[48;54;110;0;0t"),
+            Step::Resize(TermResize { rows: 54, cols: 110, width: 0, height: 0 }, 16)
+        );
+        // No grid is no report, and any other `t` is a reply to drop — consumed either way.
+        assert_eq!(next_event(b"\x1b[48;0;110;1350;990t"), Step::Ignored(20));
+        assert_eq!(next_event(b"\x1b[4;1350;990t"), Step::Ignored(13));
+        assert_eq!(next_event(b"\x1b[48;54;110;1350;990;7t"), Step::Ignored(23), "six fields");
+        // Split across reads it waits like every other sequence.
+        assert_eq!(next_event(b"\x1b[48;54;1"), Step::Incomplete);
     }
 
     #[test]

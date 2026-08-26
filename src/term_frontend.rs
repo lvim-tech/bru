@@ -231,6 +231,25 @@ fn watch_size() {
     });
 }
 
+/// An in-band resize report (mode 2048) the input thread pulled off stdin.
+///
+/// **Routed through the session's channel rather than acted on here**, because that channel is
+/// where `SIGWINCH`'s reports already arrive and where the two are deduplicated against each
+/// other: a real resize under a terminal that speaks mode 2048 produces both, and the compositor
+/// must recompute a layout once per size, not once per notification. The mode was being switched
+/// on and its reports dropped as ignored sequences — a mode turned on for nothing, and the pixel
+/// numbers it carries (which the signal's `TIOCGWINSZ` round trip can lag behind mid-drag) thrown
+/// away with it.
+pub fn note_resize_report(rows: u16, cols: u16, width: u32, height: u32) {
+    let Some(term) = TERM.get() else {
+        return;
+    };
+    let Ok(guard) = term.lock() else {
+        return;
+    };
+    guard.session.note_in_band_resize(rows, cols, width, height);
+}
+
 /// Stop the browser, without touching a screen that has already been given back.
 ///
 /// **Not the spike's `quit_soon`, and the difference is one escape.** That one deletes the images
