@@ -1124,6 +1124,14 @@ wrap_render_handler! {
             }
             let slot = index_of(kind);
             term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
+            // **A surface with no rectangle cannot change the picture, so it must not cost one.**
+            // The panel is zero-height whenever nothing is open in it and CEF paints it a pixel
+            // tall anyway — measured 2026-08-26, `Panel painted 990x1 into a 990x0 rectangle`.
+            // Every one of those was composing the whole pane and transmitting it to say nothing.
+            // The frame is kept, because the rectangle may be given back at any moment.
+            if term.layout.rect_of(kind).is_empty() {
+                return;
+            }
             present(&mut term);
         }
     }
