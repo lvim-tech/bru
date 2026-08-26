@@ -391,6 +391,28 @@ pub fn relayout() {
             return;
         };
         let next = layout_for(guard.size, inspector_docked(&guard));
+        if crate::term_input::debug() {
+            let (was, now) =
+                (guard.layout.rect_of(SurfaceKind::Inspector), next.rect_of(SurfaceKind::Inspector));
+            eprintln!(
+                "bru[term]: relayout: place={:?} docked={} inspector {}x{} at {},{} -> {}x{} at \
+                 {},{} (page {}x{} -> {}x{})",
+                crate::devtools::place_of(0),
+                inspector_docked(&guard),
+                was.width,
+                was.height,
+                was.x,
+                was.y,
+                now.width,
+                now.height,
+                now.x,
+                now.y,
+                guard.layout.rect_of(SurfaceKind::Page).width,
+                guard.layout.rect_of(SurfaceKind::Page).height,
+                next.rect_of(SurfaceKind::Page).width,
+                next.rect_of(SurfaceKind::Page).height,
+            );
+        }
         if next.rect_of(SurfaceKind::Panel) == guard.layout.rect_of(SurfaceKind::Panel)
             && next.rect_of(SurfaceKind::Inspector) == guard.layout.rect_of(SurfaceKind::Inspector)
         {
