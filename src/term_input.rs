@@ -140,6 +140,13 @@ fn drain(buffer: &mut Vec<u8>, quiet: bool) {
 
 /// SGR's wheel buttons. The protocol reports a scroll as a press of button 64 or 65 rather than as
 /// a scroll of its own, which is why they are named here instead of read as buttons.
+/// `cef_event_flags_t`, the three that say a button is down. Chromium reads them from an event's
+/// modifiers to know what is being held, which is not the same question as which button an event is
+/// about.
+const EVENTFLAG_LEFT_MOUSE_BUTTON: u32 = 1 << 4;
+const EVENTFLAG_MIDDLE_MOUSE_BUTTON: u32 = 1 << 5;
+const EVENTFLAG_RIGHT_MOUSE_BUTTON: u32 = 1 << 6;
+
 const WHEEL_UP: u16 = 64;
 const WHEEL_DOWN: u16 = 65;
 
@@ -243,6 +250,18 @@ wrap_task! {
             // never learns the pointer moved: no `:hover`, no cursor over a link, and a click on
             // anything that waits for a `mousemove` first does nothing.
             if self.motion {
+                // **A drag is motion with a button held, and the flag has to be added here too.**
+                // SGR puts the held button in the low two bits of the same field the modifiers come
+                // from — `3` when nothing is held — and the parser turns the *modifier* bits into
+                // CEF flags and leaves the button alone. So a drag reached Chromium looking like a
+                // hover, and an interface that selects by dragging had nothing to select with.
+                let held = match self.button {
+                    0 => EVENTFLAG_LEFT_MOUSE_BUTTON,
+                    1 => EVENTFLAG_MIDDLE_MOUSE_BUTTON,
+                    2 => EVENTFLAG_RIGHT_MOUSE_BUTTON,
+                    _ => 0,
+                };
+                let event = MouseEvent { x, y, modifiers: self.modifiers | held };
                 host.send_mouse_move_event(Some(&event), 0);
                 return;
             }
@@ -259,13 +278,21 @@ wrap_task! {
                 return;
             }
 
-            let button = match self.button {
-                0 => MouseButtonType::LEFT,
-                1 => MouseButtonType::MIDDLE,
-                2 => MouseButtonType::RIGHT,
+            let (button, held) = match self.button {
+                0 => (MouseButtonType::LEFT, EVENTFLAG_LEFT_MOUSE_BUTTON),
+                1 => (MouseButtonType::MIDDLE, EVENTFLAG_MIDDLE_MOUSE_BUTTON),
+                2 => (MouseButtonType::RIGHT, EVENTFLAG_RIGHT_MOUSE_BUTTON),
                 // A button bru has no name for is a button bru does not press.
                 _ => return,
             };
+            // **The event says which button is down, and not only which button was pressed.**
+            // `send_mouse_click_event` names the button in its own argument, and Chromium *also*
+            // reads `EVENTFLAG_*_MOUSE_BUTTON` out of the event's modifiers to know what is being
+            // held. A page mostly forgives the omission; an interface built on pointer capture does
+            // not — measured 2026-08-26, with every click landing in the docked inspector at the
+            // right coordinates and nothing happening, because as far as Chromium could tell no
+            // button was ever down.
+            let event = MouseEvent { x, y, modifiers: self.modifiers | held };
             // The move first, so the page knows where the pointer is before it is told it was
             // pressed — a click delivered to a page that thinks the pointer is elsewhere hits
             // whatever was under the old position.
