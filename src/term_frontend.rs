@@ -360,11 +360,13 @@ pub fn relayout() {
             .filter(|(_, kind)| next.rect_of(*kind) != guard.layout.rect_of(*kind))
             .copied()
             .collect();
-        for (_, kind) in &moved {
-            // A surface whose rectangle changed has a last frame of the wrong shape. Dropping it
-            // means one frame of that surface missing rather than one frame of it stretched.
-            guard.surfaces[index_of(*kind)] = None;
-        }
+        // **The last frame is kept, even though its shape is now wrong.** Dropping it was the
+        // tidy-looking choice and it is what made the page vanish: nothing composites a surface
+        // that has no picture, the frame is wiped to the background, and a windowless browser does
+        // not paint again until something changes it — so the page came back only when it was
+        // scrolled. Measured 2026-08-26, along with the blinking that is the same thing at speed.
+        // A frame of the wrong size is clipped to its rectangle and looks like a moment of
+        // stretching; a missing one looks like a browser that has crashed.
         guard.layout = next;
         moved
     };
@@ -380,6 +382,11 @@ fn resize_browsers(browsers: &[(i32, SurfaceKind)]) {
         let browser = state.lock().expect("state mutex poisoned").browser_with_id(*identifier);
         if let Some(host) = browser.and_then(|browser| browser.host()) {
             host.was_resized();
+            // **And a frame, now.** `was_resized` tells a browser its size changed; whether that
+            // produces a paint is Chromium's business and its timing is not this module's to
+            // assume. Asking outright is what keeps the wrong-shaped frame that is being shown
+            // meanwhile from being shown for long.
+            host.invalidate(PaintElementType::VIEW);
         }
     }
 }
