@@ -378,6 +378,93 @@ pub(crate) fn unlink_shm(name: &str) {
 /// terminal sends when it cannot read the transport. Measured 2026-08-26 in zellij 0.46.0: 61 of 61
 /// frames "acknowledged" at 206 fps into a pane that stayed black, because every one of those was
 /// the terminal saying no. A number that cannot say no is not a measurement.
+/// The payload of the next graphics reply, or `None` if the terminal said nothing.
+///
+/// The reply is `ESC _ G <keys> ; <payload> ESC \\`, and the payload is the whole of the answer:
+/// `OK`, or a reason such as `ENOENT:...`.
+fn read_reply(stdin: &mut std::io::Stdin) -> Option<String> {
+    let mut byte = [0u8; 1];
+    let mut after_escape = false;
+    let mut body = Vec::with_capacity(64);
+    for _ in 0..8192 {
+        match stdin.read(&mut byte) {
+            Ok(1) => {
+                if after_escape && byte[0] == b'\\' {
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    return Some(body.rsplit(';').next().unwrap_or("").trim().to_string());
+                }
+                after_escape = byte[0] == 0x1b;
+                if !after_escape {
+                    body.push(byte[0]);
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Ask the terminal, for every way of handing over a frame, whether it would take one.
+///
+/// **`a=q` transmits nothing and displays nothing.** It is the one question in the protocol that can
+/// be asked before a single pixel is committed to, and it is how `pixel-core` in zenbu-labs'
+/// terminal-browser picks its transport — file, then shared memory, then inline. bru guessed
+/// instead, and a guess that is wrong is a black pane at full speed.
+///
+/// Both pixel formats are asked because they are not the same question: bru sends 24-bit RGB and
+/// every other kitty client in reach sends 32-bit RGBA, and a host that re-encodes rather than
+/// relays may well implement only one of them.
+fn capabilities(
+    out: &mut impl Write,
+    stdin: &mut std::io::Stdin,
+) -> Vec<(&'static str, &'static str, String)> {
+    let mut rows = Vec::new();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let mut id = 300u32;
+    for (medium, transport) in [('d', "direct"), ('s', "shared memory"), ('f', "file")] {
+        for (bits, format) in [(24u32, "RGB"), (32u32, "RGBA")] {
+            id += 1;
+            let pixel = vec![0u8; (bits / 8) as usize];
+            let name = format!("/bru-cap-{}-{id}", std::process::id());
+            let mut cleanup: Option<Box<dyn FnOnce()>> = None;
+            let payload = match medium {
+                'd' => Some(base64(&pixel)),
+                's' => crate::term_paint::shm_stash(&name, &pixel).then(|| {
+                    let taken = name.clone();
+                    cleanup = Some(Box::new(move || crate::term_paint::shm_probe_release(&taken)));
+                    base64(name.as_bytes())
+                }),
+                _ => runtime.as_ref().and_then(|dir| {
+                    let path = dir.join(format!("bru{}", name));
+                    std::fs::write(&path, &pixel).ok().map(|()| {
+                        let taken = path.clone();
+                        cleanup = Some(Box::new(move || {
+                            let _ = std::fs::remove_file(&taken);
+                        }));
+                        base64(path.to_string_lossy().as_bytes())
+                    })
+                }),
+            };
+            let Some(payload) = payload else {
+                rows.push((transport, format, "could not be offered at all".to_string()));
+                continue;
+            };
+            let escape =
+                format!("\x1b_Gi={id},a=q,t={medium},f={bits},s=1,v=1;{payload}\x1b\\");
+            let asked = out.write_all(passthrough(&escape).as_bytes()).and_then(|()| out.flush());
+            let answer = match asked {
+                Ok(()) => read_reply(stdin).unwrap_or_else(|| "no answer".to_string()),
+                Err(e) => format!("could not be asked: {e}"),
+            };
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+            rows.push((transport, format, answer));
+        }
+    }
+    rows
+}
+
 fn read_ack(stdin: &mut std::io::Stdin) -> bool {
     let mut byte = [0u8; 1];
     let mut after_escape = false;
@@ -536,6 +623,11 @@ pub fn probe() -> Result<(), String> {
     let _ = out.write_all(b"\x1b[?25l\x1b[H\x1b[2J");
     let _ = out.flush();
 
+    // **Asked first, while the screen is still empty.** Nothing here draws, so the answers cost a
+    // few milliseconds and are the only part of this report that survives a terminal which cannot
+    // display anything at all.
+    let offered = capabilities(&mut out, &mut stdin);
+
     let mut measured = Vec::new();
     for divisor in [4u32, 2, 1] {
         let (width, height) = (pane.width / divisor, pane.height / divisor);
@@ -566,6 +658,18 @@ pub fn probe() -> Result<(), String> {
         "pane: {}x{} px, {}x{} cells, via {}",
         pane.width, pane.height, pane.cols, pane.rows, pane.source
     );
+    println!();
+    println!("  {:>14}  {:>6}  the terminal's own answer", "transport", "format");
+    for (transport, format, answer) in &offered {
+        println!("  {transport:>14}  {format:>6}  {answer}");
+    }
+    if offered.iter().all(|(_, _, answer)| answer != "OK") {
+        println!();
+        println!(
+            "not one of those was accepted. Whatever is drawing this pane takes no frame bru \n\
+             knows how to hand it, and the rows below are the cost of talking to nobody."
+        );
+    }
     if in_tmux() {
         println!(
             "tmux: yes — base64 frames carry a passthrough wrapper per 4 KB chunk. Whether shared \n\

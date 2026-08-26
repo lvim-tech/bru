@@ -192,6 +192,11 @@ pub(crate) fn shm_probe_publish() -> Option<String> {
     shm_publish(&name, &[0u8; 3]).ok().map(|()| name)
 }
 
+/// Put arbitrary bytes in shared memory under a caller's name, for the capability table.
+pub(crate) fn shm_stash(name: &str, bytes: &[u8]) -> bool {
+    shm_publish(name, bytes).is_ok()
+}
+
 /// Take the probe's object back. Harmless if the terminal already consumed it.
 pub(crate) fn shm_probe_release(name: &str) {
     shm_unlink(name);
