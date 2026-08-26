@@ -336,9 +336,78 @@ fn passthrough(payload: &str, in_tmux: bool) -> String {
 /// pane had focus, typing `Gi=1;OKGi=1;OK…` into a shell two panes away. Whoever cannot read the
 /// answer does not get to ask the question. kitty's own documentation for Unicode placeholders says
 /// the same thing for its own reason: a response would confuse the host application.
-fn common_keys(placement: &Placement, width: u32, height: u32) -> String {
+/// How the terminal is told *where* the picture goes.
+///
+/// **Two mechanisms, because one of them is not universal.** Unicode placeholders were chosen for
+/// this module because they take the cursor out of the question entirely — the cells are text the
+/// host repaints by itself, which is the whole reason a picture survives a tmux redraw. But a
+/// placeholder is only a picture if the thing drawing the screen implements them, and a host that
+/// does not will *accept every frame and show none of it*.
+///
+/// Measured 2026-08-26, in zellij 0.46.0: `--term-probe` reported 206 fps over shared memory with
+/// **every frame acknowledged**, and the pane stayed black. The acknowledgement is `OK` for the
+/// graphics command — it says the image was received and the shared memory was read, and says
+/// nothing at all about anything being drawn. zellij intercepts graphics and re-emits them rather
+/// than relaying the escape the way tmux does, and it does not implement placeholder cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// `U=1` plus a rectangle of placeholder cells. Survives a host repaint; needs the host to
+    /// implement the placeholder protocol.
+    Placeholders,
+    /// `C=1` with the cursor moved to the rectangle's top-left cell first. Works anywhere the
+    /// graphics protocol works at all, because it asks the terminal for nothing but a picture at
+    /// the cursor.
+    AtCursor,
+}
+
+/// Which mechanism this host can be drawn on.
+pub fn place_for_host() -> Place {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    place_for(set("TMUX"), set("ZELLIJ"))
+}
+
+/// [`place_for_host`] as a function of its inputs, so it can be tested.
+///
+/// **tmux is answered first and cursor placement is not on the table there.** Under tmux the cursor
+/// belongs to tmux: the graphics escape goes *around* it through DCS passthrough and arrives at a
+/// terminal whose cursor is wherever tmux last left it, so "at the cursor" names a position nobody
+/// agrees on. Placeholders exist for exactly that case.
+///
+/// Everything that is not a named exception keeps placeholders, which is the path this frontend has
+/// been running on since it was written. This is a list of hosts known to need the other one, not a
+/// guess about hosts in general.
+fn place_for(in_tmux: bool, in_zellij: bool) -> Place {
+    if in_tmux {
+        return Place::Placeholders;
+    }
+    if in_zellij {
+        return Place::AtCursor;
+    }
+    Place::Placeholders
+}
+
+/// Move the cursor to a placement's top-left cell, saving whatever the session had.
+///
+/// DECSC/DECRC rather than a second absolute move, because the cursor is the session's and this
+/// module does not know where it was. See [`placeholder_block`], which brackets itself the same way
+/// and for the same reason.
+fn at_cursor_prologue(placement: &Placement) -> String {
+    format!("\x1b7\x1b[{};{}H", placement.row, placement.col)
+}
+
+/// Put the cursor back. The other half of [`at_cursor_prologue`].
+const AT_CURSOR_EPILOGUE: &str = "\x1b8";
+
+fn common_keys(placement: &Placement, width: u32, height: u32, place: Place) -> String {
+    // `C=1` and `U=1` sit in the same slot and are the whole difference between the two mechanisms:
+    // one says "this image belongs to placeholder cells", the other "draw it here and do not move
+    // the cursor". Everything after them is the same picture either way.
+    let mode = match place {
+        Place::Placeholders => "U=1",
+        Place::AtCursor => "C=1",
+    };
     format!(
-        "a=T,U=1,q=2,i={},p={},f=24,s={width},v={height},c={},r={}",
+        "a=T,{mode},q=2,i={},p={},f=24,s={width},v={height},c={},r={}",
         placement.image_id, placement.placement_id, placement.cols, placement.rows
     )
 }
@@ -349,8 +418,18 @@ fn common_keys(placement: &Placement, width: u32, height: u32) -> String {
 /// it and unlinks it. The payload of a graphics escape is always base64, the name included. This is
 /// the whole frame in about sixty bytes on the wire, which is why it is 9.7x base64 and why nothing
 /// in this module compresses anything.
-fn shm_escape(name: &str, placement: &Placement, width: u32, height: u32) -> String {
-    format!("\x1b_G{},t=s;{}\x1b\\", common_keys(placement, width, height), base64(name.as_bytes()))
+fn shm_escape(
+    name: &str,
+    placement: &Placement,
+    width: u32,
+    height: u32,
+    place: Place,
+) -> String {
+    format!(
+        "\x1b_G{},t=s;{}\x1b\\",
+        common_keys(placement, width, height, place),
+        base64(name.as_bytes())
+    )
 }
 
 /// How many bytes of base64 go in one escape. The protocol's own limit is 4096.
@@ -367,7 +446,13 @@ const CHUNK: usize = 4096;
 /// shape kitty documents. `q=2` is repeated on every chunk rather than trusted to stick to the
 /// command, because the cost of the extra four bytes is four bytes and the cost of being wrong is
 /// keystrokes in somebody else's pane.
-fn base64_escapes(encoded: &str, placement: &Placement, width: u32, height: u32) -> Vec<String> {
+fn base64_escapes(
+    encoded: &str,
+    placement: &Placement,
+    width: u32,
+    height: u32,
+    place: Place,
+) -> Vec<String> {
     if encoded.is_empty() {
         return Vec::new();
     }
@@ -377,7 +462,7 @@ fn base64_escapes(encoded: &str, placement: &Placement, width: u32, height: u32)
         let end = (sent + CHUNK).min(encoded.len());
         let more = i32::from(end < encoded.len());
         let keys = if sent == 0 {
-            format!("{},m={more}", common_keys(placement, width, height))
+            format!("{},m={more}", common_keys(placement, width, height, place))
         } else {
             format!("q=2,m={more}")
         };
@@ -607,6 +692,7 @@ pub struct Painter {
     placement: Placement,
     style: Style,
     in_tmux: bool,
+    place: Place,
     transport: Transport,
     /// The geometry the placeholder cells on the screen were written for, or `None` when there are
     /// none — after a clear, a resize, or a caller saying the host repainted over them.
@@ -617,11 +703,12 @@ pub struct Painter {
 }
 
 impl Painter {
-    pub fn new(placement: Placement, in_tmux: bool) -> Painter {
+    pub fn new(placement: Placement, in_tmux: bool, place: Place) -> Painter {
         Painter {
             placement,
             style: Style::Explicit,
             in_tmux,
+            place,
             transport: Transport::SharedMemory,
             placed: None,
             sequence: 0,
@@ -686,6 +773,13 @@ impl Painter {
         }
         let rgb = &rgb[..expected];
 
+        // **The cursor move and the picture are one write, not two.** Between the move and the
+        // escape there is a cursor sitting somewhere the session did not put it, and anything else
+        // that draws in that gap draws in the wrong place. Bracketed with DECSC/DECRC so the
+        // session's cursor comes back untouched.
+        if self.place == Place::AtCursor {
+            out.write_all(at_cursor_prologue(&self.placement).as_bytes())?;
+        }
         if self.transport == Transport::SharedMemory
             && !self.send_shared_memory(out, rgb, width, height)?
         {
@@ -695,12 +789,19 @@ impl Painter {
             self.transport = Transport::Base64;
         }
         if self.transport == Transport::Base64 {
-            for escape in base64_escapes(&base64(rgb), &self.placement, width, height) {
+            for escape in base64_escapes(&base64(rgb), &self.placement, width, height, self.place)
+            {
                 out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
             }
         }
+        if self.place == Place::AtCursor {
+            out.write_all(AT_CURSOR_EPILOGUE.as_bytes())?;
+        }
 
-        if self.placed != Some(self.placement) {
+        // Placeholder cells are the other mechanism's half of the job; at the cursor there is
+        // nothing to write and nothing that can be clobbered, because the picture is not standing
+        // in for any text.
+        if self.place == Place::Placeholders && self.placed != Some(self.placement) {
             match placeholder_block(&self.placement, self.style) {
                 Some(block) => {
                     // Text, so **not** wrapped for passthrough: tmux is meant to read this.
@@ -734,7 +835,7 @@ impl Painter {
         if shm_publish(&name, rgb).is_err() {
             return Ok(false);
         }
-        let escape = shm_escape(&name, &self.placement, width, height);
+        let escape = shm_escape(&name, &self.placement, width, height, self.place);
         let result = out.write_all(passthrough(&escape, self.in_tmux).as_bytes());
         self.handed_over.push_back(name);
         while self.handed_over.len() > RETAINED_FRAMES {
@@ -934,7 +1035,7 @@ mod tests {
     #[test]
     fn the_shared_memory_escape_sends_the_name_and_asks_for_no_answer() {
         let placement = Placement::new(190, 1, 1, 40, 100);
-        let escape = shm_escape("/bru-7-1", &placement, 990, 1350);
+        let escape = shm_escape("/bru-7-1", &placement, 990, 1350, Place::Placeholders);
         assert_eq!(
             escape,
             format!(
@@ -949,10 +1050,10 @@ mod tests {
     #[test]
     fn base64_frames_are_chunked_with_the_geometry_on_the_first_one_only() {
         let placement = Placement::new(190, 1, 1, 2, 2);
-        assert!(base64_escapes("", &placement, 1, 1).is_empty());
+        assert!(base64_escapes("", &placement, 1, 1, Place::Placeholders).is_empty());
 
         let encoded = "A".repeat(CHUNK + 1);
-        let escapes = base64_escapes(&encoded, &placement, 4, 4);
+        let escapes = base64_escapes(&encoded, &placement, 4, 4, Place::Placeholders);
         assert_eq!(escapes.len(), 2);
         assert!(escapes[0].starts_with("\x1b_Ga=T,U=1,q=2,i=190,p=1,f=24,s=4,v=4,c=2,r=2,m=1;"));
         assert_eq!(escapes[1], "\x1b_Gq=2,m=0;A\x1b\\");
@@ -1012,7 +1113,7 @@ mod tests {
     /// the only thing between a wrong number and a picture made of whatever was next in memory.
     #[test]
     fn a_short_frame_is_refused_rather_than_read_past() {
-        let mut painter = Painter::new(Placement::new(190, 1, 1, 2, 2), false);
+        let mut painter = Painter::new(Placement::new(190, 1, 1, 2, 2), false, Place::Placeholders);
         let mut out = Vec::new();
         let error = painter.paint(&mut out, &[0u8; 11], 2, 2).expect_err("4 pixels need 12 bytes");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -1021,10 +1122,61 @@ mod tests {
 
     /// The division of labour: pixels every frame, placeholder cells only when the geometry moved.
     ///
+    /// **The zellij case, in a test.** The escape must say `C=1` and must not say `U=1`, because a
+    /// host that ignores placeholders draws a picture from the first and nothing at all from the
+    /// second — and acknowledges both.
+    #[test]
+    fn placing_at_the_cursor_asks_for_a_picture_and_not_for_cells() {
+        let placement = Placement::new(190, 7, 3, 40, 100);
+        let escape = shm_escape("/bru-7-1", &placement, 990, 1350, Place::AtCursor);
+        assert_eq!(
+            escape,
+            format!(
+                "\x1b_Ga=T,C=1,q=2,i=190,p=1,f=24,s=990,v=1350,c=100,r=40,t=s;{}\x1b\\",
+                base64(b"/bru-7-1")
+            )
+        );
+        assert!(!escape.contains("U=1"), "a placeholder key here is the bug this exists for");
+    }
+
+    /// The cursor is the session's. It is moved to the rectangle, the picture is drawn, and it goes
+    /// back — and no placeholder cell is ever written, because nothing is standing in for text.
+    #[test]
+    fn the_cursor_is_borrowed_for_the_picture_and_given_back() {
+        let mut painter = Painter::new(Placement::new(42, 7, 3, 1, 1), false, Place::AtCursor);
+        painter.transport = Transport::Base64;
+        let frame = [0u8; 3];
+
+        let mut out = Vec::new();
+        painter.paint(&mut out, &frame, 1, 1).expect("a frame");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.starts_with("\x1b7\x1b[7;3H"), "saved, then moved to the rectangle");
+        assert!(out.ends_with("\x1b8"), "and put back");
+        assert!(out.contains("\x1b_Ga=T,C=1,q=2,i=42"), "the pixels, in between");
+        assert!(!out.contains(PLACEHOLDER), "no cells at the cursor, ever");
+
+        // And the second frame is the same, where the placeholder path would have gone quiet.
+        let mut second = Vec::new();
+        painter.paint(&mut second, &frame, 1, 1).expect("a frame");
+        let second = String::from_utf8(second).expect("utf-8");
+        assert!(second.starts_with("\x1b7\x1b[7;3H") && second.ends_with("\x1b8"));
+    }
+
+    /// **tmux is answered before zellij and that ordering is the content of the function.** Under
+    /// tmux the escape goes around tmux to a terminal whose cursor tmux owns, so "at the cursor"
+    /// names a position nobody agrees on; placeholders are what that case has.
+    #[test]
+    fn the_host_chooses_the_mechanism() {
+        assert_eq!(place_for(false, false), Place::Placeholders, "plain kitty, as before");
+        assert_eq!(place_for(true, false), Place::Placeholders, "tmux");
+        assert_eq!(place_for(false, true), Place::AtCursor, "zellij");
+        assert_eq!(place_for(true, true), Place::Placeholders, "tmux inside zellij is still tmux");
+    }
+
     /// The transport is forced to base64 here so the test needs no `/dev/shm` and no terminal.
     #[test]
     fn the_placeholder_cells_are_written_once_and_the_pixels_every_time() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false);
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders);
         painter.transport = Transport::Base64;
         let frame = [0u8; 3];
 
@@ -1050,7 +1202,7 @@ mod tests {
     /// Moving the picture re-writes the cells; setting the same placement twice does not.
     #[test]
     fn moving_the_picture_writes_the_cells_again() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false);
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), false, Place::Placeholders);
         painter.transport = Transport::Base64;
         let frame = [0u8; 3];
         let mut sink = Vec::new();
@@ -1066,7 +1218,7 @@ mod tests {
     /// The pane is not the only thing in the terminal: what is transmitted must be given back.
     #[test]
     fn clearing_frees_the_image_the_terminal_is_holding() {
-        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), true);
+        let mut painter = Painter::new(Placement::new(42, 1, 1, 1, 1), true, Place::Placeholders);
         let mut out = Vec::new();
         painter.clear(&mut out).expect("a write to a Vec");
         let out = String::from_utf8(out).expect("utf-8");

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::term_compose::{Frame, Layer, Layout, LayoutRequest, Rect, Surface, SurfaceKind, layout};
-use crate::term_paint::{IMAGE_ID_VIEW, Painter, Placement};
+use crate::term_paint::{IMAGE_ID_VIEW, Painter, Placement, place_for_host};
 use crate::term_session::{PaneSize, TerminalSession};
 
 /// `--term`: draw this browser into the terminal it was started from.
@@ -159,7 +159,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     let frame = Frame::new(layout.pane.width, layout.pane.height)
         .ok_or("the pane is too small to draw a browser in")?;
     let placement = Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols);
-    let painter = Painter::new(placement, session.in_tmux());
+    let painter = Painter::new(placement, session.in_tmux(), place_for_host());
 
     let term = TermState {
         session,
@@ -188,7 +188,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         if let Some(guard) = guard {
             eprintln!(
                 "bru[term]: pane {}x{} px, {}x{} cells ({}x{} per cell) via {:?}; tmux={}; \
-                 kitty-keyboard={:?}; mouse-pixels={}",
+                 kitty-keyboard={:?}; mouse-pixels={}; place={:?}",
                 guard.size.width,
                 guard.size.height,
                 guard.size.cols,
@@ -199,6 +199,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
                 guard.session.in_tmux(),
                 guard.session.kitty_flags_before(),
                 guard.session.mouse_in_pixels(),
+                place_for_host(),
             );
         }
     }
