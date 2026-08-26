@@ -628,6 +628,9 @@ pub fn set_pointer_shape(cursor: CursorType) {
 /// so comparing pointers compares the names without a lock or an allocation.
 static LAST_SHAPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many size mismatches have been reported. Bounded for the reason every counter here is.
+static MISMATCH: AtomicI32 = AtomicI32::new(0);
+
 /// What an empty part of the pane is painted with.
 ///
 /// The chrome's own background, so a gap where a surface has not painted yet reads as part of the
@@ -711,6 +714,20 @@ fn present(term: &mut TermState) {
             continue;
         };
         let rect = term.layout.rect_of(*kind);
+        // **A surface painted at a size that is not its rectangle is drawn clipped or small**, and
+        // that is what a stale frame looks like on screen. It is legal for one frame after a
+        // resize and a bug if it lasts; saying so is the difference between the two.
+        if (painted.width as i32 != rect.width || painted.height as i32 != rect.height)
+            && crate::term_input::debug()
+        {
+            let seen = MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seen < 8 {
+                eprintln!(
+                    "bru[term]: {kind:?} painted {}x{} into a {}x{} rectangle at {},{}",
+                    painted.width, painted.height, rect.width, rect.height, rect.x, rect.y
+                );
+            }
+        }
         layers.push(Layer {
             surface,
             x: rect.x,
@@ -975,54 +992,15 @@ wrap_client! {
 /// The compositor keeps its `Divider` and `Inspector` rectangles for the day this becomes possible;
 /// nothing reserves space for them meanwhile, because a band of empty pane where an inspector is
 /// not is worse than no inspector.
-/// Answer CEF's question about where the inspector goes.
-///
-/// Called from `LifeSpanHandler::on_before_dev_tools_popup`, which is asked **before** the DevTools
-/// browser exists — so this is the one moment at which it can be made windowless. Everything is left
-/// untouched in a windowed run, and the ordinary DevTools window is what happens.
-pub fn place_inspector(
-    window_info: Option<&mut WindowInfo>,
-    client: Option<&mut Option<Client>>,
-    settings: Option<&mut BrowserSettings>,
-    use_default_window: Option<&mut ::std::os::raw::c_int>,
-) {
-    if crate::term_input::debug() {
-        eprintln!(
-            "bru[term]: on_before_dev_tools_popup fired; active={} window_info={} client={} \
-             use_default_window={}",
-            is_active(),
-            window_info.is_some(),
-            client.is_some(),
-            use_default_window.is_some(),
-        );
-    }
-    if !is_active() {
-        return;
-    }
-    let (Some(window_info), Some(client)) = (window_info, client) else {
-        return;
-    };
-    *window_info = WindowInfo::default().set_as_windowless(0);
-    // A render handler and nothing else — see `InspectorClient`.
-    *client = Some(InspectorClient::new());
-    if let Some(settings) = settings {
-        settings.windowless_frame_rate = 60;
-    }
-    // **The whole point of the callback.** Left at 1, CEF makes its own window and the `window_info`
-    // above is decoration.
-    if let Some(use_default_window) = use_default_window {
-        *use_default_window = 0;
-    } else if crate::term_input::debug() {
-        eprintln!("bru[term]: no use_default_window to clear — CEF will make its own window");
-    }
-    // The browser does not exist yet, so its identifier cannot be recorded here. Its first paint is
-    // what claims it, and until then this says what an unclaimed frame is.
-    if let Some(term) = TERM.get() {
-        if let Ok(mut guard) = term.lock() {
-            guard.pending = Some(SurfaceKind::Inspector);
-        }
-    }
-}
+// **`on_before_dev_tools_popup` is not the road either, and this is the third measurement of it.**
+//
+// The callback fires (`active=true`, every field present), the window info is set windowless, the
+// client carries a render handler and `use_default_window` is cleared — and CEF 151 makes a desktop
+// window anyway, with no frame ever reaching the render handler. Measured 2026-08-26. Taken with the
+// two before it: `show_dev_tools`'s `window_info` is ignored, and so is the callback's.
+//
+// So the inspector is opened the way anything else is opened — as an ordinary windowless browser on
+// a URL — and the URL comes from the DevTools protocol. See `inspector_url`.
 
 /// The inspector has painted: give it room, and stop expecting it.
 ///
