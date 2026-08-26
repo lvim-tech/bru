@@ -106,6 +106,12 @@ struct TermState {
     /// changes when a person changes it; [`refresh_background`] is on that path, and nothing else
     /// moves this.
     background: [u8; 3],
+    /// Every band must be sent on the next frame, whatever the damage says.
+    ///
+    /// **Set whenever the bands themselves changed.** After [`forget_bands`] the terminal is holding
+    /// no picture at all, and a small damage rectangle would put one band back onto an otherwise
+    /// empty pane.
+    redraw_all: bool,
 }
 
 /// A surface's last frame, kept because a repaint of one surface has to redraw all of them.
@@ -176,6 +182,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         inspector_target: None,
         inspector: None,
         background: background_from_theme(),
+        redraw_all: true,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -444,6 +451,7 @@ pub fn relayout() {
         // A frame of the wrong size is clipped to its rectangle and looks like a moment of
         // stretching; a missing one looks like a browser that has crashed.
         guard.layout = next;
+        forget_bands(&mut guard);
         moved
     };
     resize_browsers(&browsers);
@@ -936,18 +944,42 @@ fn present(term: &mut TermState) {
     }
     let started = crate::term_input::debug().then(std::time::Instant::now);
     let damaged = crate::term_compose::compose(&mut term.frame, &layers);
-    if damaged.is_none() {
+    if damaged.is_none() && !term.redraw_all {
         return;
     }
     let composed = started.map(|at| at.elapsed());
     let mut out = std::io::stdout();
     let _ = term.session.begin_sync(&mut out);
-    let _ = term.painter.paint(
-        &mut out,
-        term.frame.rgb(),
-        term.frame.width() as u32,
-        term.frame.height() as u32,
-    );
+    // **Only the bands the damage touched.** The picture is one image per band, at a fixed place
+    // and with a fixed id, so re-sending one says nothing about the others. A keystroke in the
+    // command line changes the bottom row and costs that row — measured 2026-08-27, a full pane
+    // costs zellij enough per frame to fall behind a typist, and a small pane does not.
+    let damaged =
+        if term.redraw_all { term.layout.pane } else { damaged.unwrap_or(term.layout.pane) };
+    term.redraw_all = false;
+    let width = term.frame.width();
+    let stride = (width as usize) * 3;
+    let cols = term.size.cols;
+    let bands = crate::term_compose::bands(&term.layout, term.size.cell_height as i32);
+    for (index, band) in bands.iter().enumerate() {
+        if band.height <= 0 || band.y + band.height <= damaged.y || band.y >= damaged.y + damaged.height
+        {
+            continue;
+        }
+        let (Ok(row), Ok(rows), Ok(id)) = (
+            u16::try_from(band.row + 1),
+            u16::try_from(band.rows),
+            u32::try_from(index).map(|index| crate::term_paint::IMAGE_ID_BAND + index),
+        ) else {
+            continue;
+        };
+        let (start, end) = ((band.y as usize) * stride, ((band.y + band.height) as usize) * stride);
+        let Some(pixels) = term.frame.rgb().get(start..end) else {
+            continue;
+        };
+        let placement = Placement::new(id, row, 1, rows, cols);
+        let _ = term.painter.paint_at(&mut out, pixels, width as u32, band.height as u32, &placement);
+    }
     let _ = term.session.end_sync(&mut out);
     let _ = out.flush();
     // **Where a frame's time actually goes, split at the one seam that matters.** Composing is
@@ -967,6 +999,19 @@ fn present(term: &mut TermState) {
     }
 }
 
+/// Take every band image back, because where the bands *are* has changed.
+///
+/// **A band's id is bound to its position and to nothing else.** When the cuts move — a panel opens,
+/// the inspector docks, the pane is resized — the picture would otherwise keep whatever bands the
+/// old layout left behind, drawn at places no band occupies any more. Deleting them all costs one
+/// escape each and the next frame draws every one that is still wanted.
+fn forget_bands(term: &mut TermState) {
+    let mut out = std::io::stdout();
+    let _ = term.painter.clear(&mut out);
+    let _ = out.flush();
+    term.redraw_all = true;
+}
+
 /// A new pane size: re-lay everything out and tell every browser.
 pub fn resized(size: PaneSize) {
     let Some(term) = TERM.get() else {
@@ -980,6 +1025,7 @@ pub fn resized(size: PaneSize) {
         term.size = size;
         let docked = inspector_docked(&term);
         term.layout = layout_for(size, docked);
+        forget_bands(&mut term);
         match Frame::new(term.layout.pane.width, term.layout.pane.height) {
             // A frame is remade rather than reinterpreted: a new stride over old bytes is a torn
             // copy of the last picture, which looks like a rendering bug and is not one.

@@ -720,6 +720,62 @@ impl Frame {
 /// should not, and it is computed from what survived clipping rather than from what was asked for:
 /// a popup entirely off the page and a dirty rect entirely off its surface both write nothing, and
 /// a present tick for either would be a screenful of escape sequences carrying no news.
+/// One horizontal slice of the pane, whole cell rows tall.
+///
+/// **Horizontal, and that is the whole reason this shape is the one.** A band spans the full width,
+/// so its pixels are a *contiguous* run of [`Frame::rgb`] — sending one costs a slice and no copy.
+/// A vertical split would need a row-by-row gather for every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Band {
+    /// First cell row, counted from zero.
+    pub row: i32,
+    /// How many cell rows the band covers.
+    pub rows: i32,
+    /// First pixel row.
+    pub y: i32,
+    /// How many pixel rows.
+    pub height: i32,
+}
+
+/// Cut the pane into bands along the layout's own boundaries, snapped to whole cell rows.
+///
+/// **Cell rows, because a picture is placed in cells.** The layout measures in pixels and its
+/// boundaries fall wherever the chrome's heights put them; a band that began mid-cell could not be
+/// placed at all. Snapping to the nearest row keeps every cut legal, and because the bands are
+/// slices of the *composed frame* rather than of the surfaces, a cut that lands a pixel or two off a
+/// surface's edge costs nothing — the pixels either side of it are already correct.
+///
+/// The bands tile the pane: the first begins at zero, each begins where the last ended, and the last
+/// ends at the pane's own height even when that is not a whole row.
+pub fn bands(layout: &Layout, cell_height: i32) -> Vec<Band> {
+    let height = layout.pane.height;
+    if height <= 0 {
+        return Vec::new();
+    }
+    if cell_height <= 0 {
+        return vec![Band { row: 0, rows: 1, y: 0, height }];
+    }
+    let snap = |y: i32| ((y + cell_height / 2) / cell_height * cell_height).clamp(0, height);
+    let mut cuts: Vec<i32> = [layout.top, layout.page, layout.divider, layout.inspector, layout.panel, layout.bottom]
+        .iter()
+        .flat_map(|rect| [snap(rect.y), snap(rect.y.saturating_add(rect.height))])
+        .chain([0, height])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|pair| {
+            let (y, next) = (pair[0], pair[1]);
+            Band {
+                row: y / cell_height,
+                rows: ((next - y) + cell_height - 1) / cell_height,
+                y,
+                height: next - y,
+            }
+        })
+        .collect()
+}
+
 pub fn compose(frame: &mut Frame, layers: &[Layer<'_>]) -> Option<Rect> {
     let mut damage: Option<Rect> = None;
     for layer in layers {
@@ -819,6 +875,84 @@ fn blit(frame: &mut Frame, layer: &Layer<'_>, dirty: Rect) -> Option<Rect> {
         }
     }
     Some(destination)
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    fn a_pane(height: i32, panel: i32) -> Layout {
+        layout(&LayoutRequest {
+            width: 990,
+            height,
+            scale: 1.0,
+            top_visible: true,
+            bottom_visible: true,
+            panel_height: panel,
+            inspector_height: 0,
+            inspector_side: false,
+        })
+    }
+
+    /// **The invariant the picture depends on.** The bands tile the pane: no gap, no overlap, first
+    /// at zero, last ending at the pane's own height. A gap is a stripe of nothing on screen.
+    #[test]
+    fn the_bands_tile_the_pane() {
+        for (height, panel) in [(1325, 0), (1325, 200), (1325, 137), (600, 0), (25, 0), (13, 0)] {
+            let layout = a_pane(height, panel);
+            let bands = bands(&layout, 25);
+            assert!(!bands.is_empty(), "{height}/{panel}: a pane with pixels has bands");
+            assert_eq!(bands[0].y, 0, "{height}/{panel}: the first band begins at the top");
+            for pair in bands.windows(2) {
+                assert_eq!(
+                    pair[0].y + pair[0].height,
+                    pair[1].y,
+                    "{height}/{panel}: a gap or an overlap between bands"
+                );
+            }
+            let last = bands[bands.len() - 1];
+            assert_eq!(last.y + last.height, height, "{height}/{panel}: the last band reaches the end");
+        }
+    }
+
+    /// Every cut but the last is a whole cell row, because a picture is placed in cells and a band
+    /// that began mid-cell could not be placed at all.
+    #[test]
+    fn every_band_begins_on_a_cell_row() {
+        let bands = bands(&a_pane(1325, 137), 25);
+        for band in &bands {
+            assert_eq!(band.y % 25, 0, "band at {} does not begin on a row", band.y);
+            assert_eq!(band.row, band.y / 25);
+            assert!(band.rows >= 1, "a band covers at least one row");
+            assert!(
+                band.rows * 25 >= band.height,
+                "a band's rows have to hold its pixels: {band:?}"
+            );
+        }
+    }
+
+    /// **The whole point, as a number.** A command line that grows costs the rows it changed, and
+    /// the bottom strip is one of them — not the pane.
+    #[test]
+    fn the_bottom_strip_is_a_band_of_its_own() {
+        let bands = bands(&a_pane(1325, 0), 25);
+        let last = bands[bands.len() - 1];
+        assert!(
+            last.height <= 50,
+            "the status bar should not drag the page into its band: {last:?}"
+        );
+        assert!(bands.len() >= 3, "top, page and bottom are not one band: {bands:?}");
+    }
+
+    /// A pane with no pixels has no bands, and a terminal that reports no cell height still gets
+    /// one band rather than a division by zero.
+    #[test]
+    fn the_degenerate_panes_do_not_panic() {
+        assert!(bands(&a_pane(0, 0), 25).is_empty());
+        let whole = bands(&a_pane(1325, 0), 0);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].height, 1325);
+    }
 }
 
 #[cfg(test)]

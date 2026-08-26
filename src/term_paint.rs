@@ -275,6 +275,13 @@ pub(crate) fn query_answer(bytes: &[u8], id: u32) -> Option<bool> {
 /// not replace each other.
 pub const IMAGE_ID_POPUP: u32 = 0xbf;
 
+/// The first band's image id; the others follow it. See `term_compose::bands`.
+///
+/// **One id per band and it never moves.** That is the whole mechanism: a band is replaced in place
+/// by re-transmitting its id, and every other band on the screen is untouched because nothing was
+/// said about it.
+pub const IMAGE_ID_BAND: u32 = 0xc0;
+
 /// Where a picture goes, in cells, and which image it is.
 ///
 /// `row` and `col` are **1-based screen coordinates**, because that is what `CSI row;col H` takes
@@ -808,15 +815,19 @@ pub struct Painter {
     in_tmux: bool,
     place: Place,
     transport: Transport,
-    /// The geometry the placeholder cells on the screen were written for, or `None` when there are
-    /// none — after a clear, a resize, or a caller saying the host repainted over them.
-    placed: Option<Placement>,
+    /// The geometries whose placeholder cells are on the screen. **A list, because the picture is
+    /// now several images**: one band's cells being written says nothing about another's. Emptied by
+    /// a clear, a resize, or a caller saying the host repainted over them.
+    placed: Vec<Placement>,
     sequence: u64,
     /// Shared memory names handed over and not yet taken back. See [`RETAINED_FRAMES`].
     handed_over: VecDeque<String>,
     /// Where frame files go, and which slot the next one takes. See [`FRAME_SLOTS`].
     frames: Option<std::path::PathBuf>,
     frame_seq: u64,
+    /// Every image id this painter has handed pixels for, so [`Painter::clear`] can take them all
+    /// back. Small and bounded: one per band.
+    drawn: Vec<u32>,
 }
 
 impl Painter {
@@ -832,11 +843,12 @@ impl Painter {
             in_tmux,
             place,
             transport,
-            placed: None,
+            placed: Vec::new(),
             sequence: 0,
             handed_over: VecDeque::new(),
             frames: frame_dir(),
             frame_seq: 0,
+            drawn: Vec::new(),
         }
     }
 
@@ -850,7 +862,7 @@ impl Painter {
     pub fn set_placement(&mut self, placement: Placement) {
         if placement != self.placement {
             self.placement = placement;
-            self.placed = None;
+            self.placed.clear();
         }
     }
 
@@ -861,7 +873,7 @@ impl Painter {
     /// screen switch or another program's output erases them like any other text, and from the
     /// inside that is indistinguishable from nothing having happened. Whoever owns the screen knows.
     pub fn invalidate_placement(&mut self) {
-        self.placed = None;
+        self.placed.clear();
     }
 
     /// One frame: the pixels, and the placeholder cells if they are not already on the screen.
@@ -883,6 +895,24 @@ impl Painter {
         width: u32,
         height: u32,
     ) -> std::io::Result<()> {
+        let placement = self.placement;
+        self.paint_at(out, rgb, width, height, &placement)
+    }
+
+    /// One picture, at a placement of the caller's choosing.
+    ///
+    /// **This is what makes a band cheap.** The pane is drawn as several images with stable ids at
+    /// stable positions, so a keystroke in the command line re-sends the row it changed and not the
+    /// whole pane. Each id is replaced in place; none of them moves, which is the property a single
+    /// image cannot have — kitty has no way to patch a sub-rectangle of one under `a=t`.
+    pub fn paint_at(
+        &mut self,
+        out: &mut impl Write,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        placement: &Placement,
+    ) -> std::io::Result<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(3))
@@ -896,30 +926,34 @@ impl Painter {
             ));
         }
         let rgb = &rgb[..expected];
+        if !self.drawn.contains(&placement.image_id) {
+            self.drawn.push(placement.image_id);
+        }
 
         // **The cursor move and the picture are one write, not two.** Between the move and the
         // escape there is a cursor sitting somewhere the session did not put it, and anything else
         // that draws in that gap draws in the wrong place. Bracketed with DECSC/DECRC so the
         // session's cursor comes back untouched.
         if self.place == Place::AtCursor {
-            out.write_all(at_cursor_prologue(&self.placement).as_bytes())?;
+            out.write_all(at_cursor_prologue(placement).as_bytes())?;
         }
         if self.transport == Transport::SharedMemory
-            && !self.send_shared_memory(out, rgb, width, height)?
+            && !self.send_shared_memory(out, rgb, width, height, placement)?
         {
             // Shared memory is not a configuration, it is a thing that either worked or did not —
             // no `/dev/shm` at all, a full one, a sandbox. Falling back once and staying fallen back
             // beats discovering it again for every frame.
             self.transport = Transport::Base64;
         }
-        if self.transport == Transport::File && !self.send_file(out, rgb, width, height)? {
+        if self.transport == Transport::File
+            && !self.send_file(out, rgb, width, height, placement)?
+        {
             // Same reasoning as shared memory: a directory that cannot be written to is a fact
             // about this machine, discovered once.
             self.transport = Transport::Base64;
         }
         if self.transport == Transport::Base64 {
-            for escape in base64_escapes(&base64(rgb), &self.placement, width, height, self.place)
-            {
+            for escape in base64_escapes(&base64(rgb), placement, width, height, self.place) {
                 out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
             }
         }
@@ -930,12 +964,12 @@ impl Painter {
         // Placeholder cells are the other mechanism's half of the job; at the cursor there is
         // nothing to write and nothing that can be clobbered, because the picture is not standing
         // in for any text.
-        if self.place == Place::Placeholders && self.placed != Some(self.placement) {
-            match placeholder_block(&self.placement, self.style) {
+        if self.place == Place::Placeholders && !self.placed.contains(placement) {
+            match placeholder_block(placement, self.style) {
                 Some(block) => {
                     // Text, so **not** wrapped for passthrough: tmux is meant to read this.
                     out.write_all(block.as_bytes())?;
-                    self.placed = Some(self.placement);
+                    self.placed.push(*placement);
                 }
                 None => {
                     return Err(std::io::Error::new(
@@ -956,17 +990,22 @@ impl Painter {
         rgb: &[u8],
         width: u32,
         height: u32,
+        placement: &Placement,
     ) -> std::io::Result<bool> {
         let Some(dir) = self.frames.as_ref() else {
             return Ok(false);
         };
+        // **Keyed by image, not just by slot.** Several bands are handed over within one frame; a
+        // slot shared between them would be the next band overwriting the file the terminal was
+        // given for the last one.
         let slot = self.frame_seq % FRAME_SLOTS;
         self.frame_seq = self.frame_seq.wrapping_add(1);
-        let path = dir.join(format!("frame-{}-{slot}", std::process::id()));
+        let path =
+            dir.join(format!("frame-{}-{}-{slot}", std::process::id(), placement.image_id));
         if std::fs::write(&path, rgb).is_err() {
             return Ok(false);
         }
-        let escape = file_escape(&path, &self.placement, width, height, self.place);
+        let escape = file_escape(&path, placement, width, height, self.place);
         out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
         Ok(true)
     }
@@ -979,6 +1018,7 @@ impl Painter {
         rgb: &[u8],
         width: u32,
         height: u32,
+        placement: &Placement,
     ) -> std::io::Result<bool> {
         self.sequence = self.sequence.wrapping_add(1);
         // The name has to be unique for as long as the object is: the pid keeps it out of another
@@ -987,7 +1027,7 @@ impl Painter {
         if shm_publish(&name, rgb).is_err() {
             return Ok(false);
         }
-        let escape = shm_escape(&name, &self.placement, width, height, self.place);
+        let escape = shm_escape(&name, placement, width, height, self.place);
         let result = out.write_all(passthrough(&escape, self.in_tmux).as_bytes());
         self.handed_over.push_back(name);
         while self.handed_over.len() > RETAINED_FRAMES {
@@ -1005,10 +1045,21 @@ impl Painter {
     /// application's screen, and erasing text is the session's job. What this does is release the
     /// pixels kitty is storing, so that a browser that has stopped is not also a picture the
     /// terminal is still holding.
+    /// **Every image, not just the one this painter was made with.** The picture is several bands
+    /// and each is an image the terminal is holding pixels for; deleting one of them would leave the
+    /// rest on screen with nothing drawing them.
     pub fn clear(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        let escape = delete_escape(self.placement.image_id);
-        out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
-        self.placed = None;
+        let mut ids: Vec<u32> = self.placed.iter().map(|placement| placement.image_id).collect();
+        ids.push(self.placement.image_id);
+        ids.extend(self.drawn.iter().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            let escape = delete_escape(id);
+            out.write_all(passthrough(&escape, self.in_tmux).as_bytes())?;
+        }
+        self.placed.clear();
+        self.drawn.clear();
         out.flush()
     }
 }
@@ -1415,12 +1466,12 @@ mod tests {
         let frame = [0u8; 3];
         let mut sink = Vec::new();
         painter.paint(&mut sink, &frame, 1, 1).expect("a frame");
-        assert_eq!(painter.placed, Some(painter.placement));
+        assert_eq!(painter.placed, vec![painter.placement]);
 
         painter.set_placement(Placement::new(42, 1, 1, 1, 1));
-        assert_eq!(painter.placed, Some(painter.placement), "the same place is not a move");
+        assert_eq!(painter.placed, vec![painter.placement], "the same place is not a move");
         painter.set_placement(Placement::new(42, 2, 1, 1, 1));
-        assert_eq!(painter.placed, None, "a different one is");
+        assert!(painter.placed.is_empty(), "a different one is");
     }
 
     /// The pane is not the only thing in the terminal: what is transmitted must be given back.
@@ -1432,7 +1483,7 @@ mod tests {
         let out = String::from_utf8(out).expect("utf-8");
         assert!(out.starts_with("\x1bPtmux;"), "a graphics escape goes around tmux, not through it");
         assert!(out.contains("a=d,d=I,i=42"));
-        assert_eq!(painter.placed, None);
+        assert!(painter.placed.is_empty());
     }
 
     /// A shared memory object written and read back, which is the one thing here that needs a
