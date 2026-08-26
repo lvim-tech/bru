@@ -927,8 +927,18 @@ impl TerminalSession {
         write(MOUSE_ON).map_err(unwind)?;
         modes.mouse = true;
         publish_leave(modes);
-        write(MOUSE_PIXELS_QUERY).map_err(unwind)?;
-        let (pixels_reply, _) = split_reply(read_answers(tty), b'y');
+        // **With a `CSI 5n` behind it, like every other query round.** Alone, the DECRQM reply ends
+        // in `y` and `read_answers` stops only on `n` — so every startup paid one full `VTIME`
+        // timeout here waiting for an answer that had already arrived. The status report is what
+        // ends the read the moment the terminal is done talking.
+        write(&format!("{MOUSE_PIXELS_QUERY}\x1b[5n")).map_err(unwind)?;
+        // **And the leftover is keystrokes, the same as the first rounds'.** This round's residue
+        // used to be dropped, which re-opened — for the milliseconds this query takes — exactly the
+        // hole `pushback` exists to close: a key typed while the terminal was being asked questions
+        // vanished. Everything that was not the reply joins the pushback.
+        let (pixels_reply, mouse_leftover) = split_reply(read_answers(tty), b'y');
+        let mut pushback = leftover;
+        pushback.extend_from_slice(&mouse_leftover);
         let mouse_pixels = pixels_reply
             .as_deref()
             .and_then(parse_decrqm)
@@ -966,7 +976,7 @@ impl TerminalSession {
             size,
             kitty_flags_before,
             mouse_pixels,
-            pushback: leftover,
+            pushback,
             last_size,
             resize_tx,
             resize_rx: Some(resize_rx),
