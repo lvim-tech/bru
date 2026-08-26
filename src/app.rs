@@ -174,6 +174,24 @@ wrap_app! {
             }
             // --- end src/ssh.rs -----------------------------------------------------------
 
+            // --- src/devtools.rs ----------------------------------------------------------
+            // **The DevTools frontend's own origin, allow-listed, or the terminal dock is a
+            // panel that boots and never connects.** Chromium 111+ refuses DevTools WebSocket
+            // upgrades from any http(s) origin not named in `--remote-allow-origins` — measured
+            // on 2026-08-26 and written up at `devtools::allow_origin_switch`, with why naming
+            // the server's own origin widens nothing. A user who passed the switch themselves
+            // has made the decision, and theirs stands.
+            let raw: Vec<String> = std::env::args().collect();
+            if command_line.has_switch(Some(&CefString::from("remote-allow-origins"))) != 1 {
+                if let Some(origin) = crate::devtools::allow_origin_switch(&raw) {
+                    command_line.append_switch_with_value(
+                        Some(&CefString::from("remote-allow-origins")),
+                        Some(&CefString::from(origin.as_str())),
+                    );
+                }
+            }
+            // --- end src/devtools.rs ------------------------------------------------------
+
             // **WebAuthn's conditional UI eats the first Escape after a hint lands in a login
             // field, in the browser process, before bru is ever given the key.** Reported by the
             // user 2026-08-09 on `https://accounts.google.com/`: Escape took two presses to leave

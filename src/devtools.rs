@@ -1128,6 +1128,47 @@ pub fn debug_port() -> Option<u16> {
     }
 }
 
+/// The port when it was named on the command line, `None` for the `=0` form.
+///
+/// The distinction matters because of [`allow_origin_switch`]: the frontend's WebSocket is only
+/// accepted from an origin allow-listed *before Chromium starts*, and an origin can only be
+/// written down in advance when the port can.
+fn fixed_debug_port() -> Option<u16> {
+    match DEBUG_ENDPOINT.lock().ok()?.as_ref()? {
+        DebugEndpoint::Port(port) => Some(*port),
+        DebugEndpoint::ActivePortFile(_) => None,
+    }
+}
+
+/// The `--remote-allow-origins` value bru adds for its own DevTools frontend, or `None`.
+///
+/// **Measured 2026-08-26, and it is the difference between a dock and a dead panel.** The bundled
+/// frontend loads from `http://127.0.0.1:<port>` and booted completely — all twelve panels — but
+/// its WebSocket back to the same server was refused: `new WebSocket(...)` from that page answered
+/// `error` while a raw upgrade with no `Origin` header on the same URL answered `101`. Chromium
+/// (111+) rejects DevTools WebSocket upgrades from any http(s) origin that is not allow-listed,
+/// and the allowlist is a startup switch. So bru allow-lists exactly one origin: the server's own.
+/// The only pages that origin serves are the DevTools frontend's, so this widens the boundary
+/// `main.rs` documents by nothing — a hostile page runs on *its* origin, not this one.
+///
+/// `None` for `=0`, where the origin cannot be known before Chromium picks the port — which is why
+/// `toggle_term` asks for a fixed port by name.
+pub fn allow_origin_switch(raw: &[String]) -> Option<String> {
+    // The raw argv with `--socket=`'s rule — only before `--remote`, where a switch is a switch.
+    let before = raw.iter().position(|arg| arg == "--remote").unwrap_or(raw.len());
+    let port = raw
+        .get(..before)?
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--remote-debugging-port="))?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
 /// One HTTP GET against the loopback DevTools server, body only.
 ///
 /// `std::net::TcpStream` and HTTP/1.0, deliberately: 1.0 rules out chunked transfer, the server is
@@ -1303,12 +1344,21 @@ fn toggle_term(page: &mut Browser, wanted: Option<Place>) {
         }
         return;
     }
-    let Some(port) = debug_port() else {
-        crate::message::error(
+    let Some(port) = fixed_debug_port() else {
+        // The two refusals are one condition — no *fixed* port — but they are not one situation,
+        // and the message says which one the user is in. `=0` gets the frontend served and then
+        // its WebSocket refused, because the origin allowlist is written before Chromium picks
+        // the number; see `allow_origin_switch`.
+        let message = if debug_port().is_some() {
+            "devtools: the port was started as `=0`, and the frontend's WebSocket origin can only \
+             be allow-listed for a port named in advance. Start bru with a fixed port instead: \
+             `bru --term --remote-debugging-port=9222 <url>`"
+        } else {
             "devtools: a terminal pane docks the inspector through the DevTools port, and this \
-             bru was started without one. Start it as `bru --term --remote-debugging-port=0 <url>` \
-             (`main.rs` records what that port opens up before choosing it)",
-        );
+             bru was started without one. Start it as `bru --term --remote-debugging-port=9222 \
+             <url>` (`main.rs` records what that port opens up before choosing it)"
+        };
+        crate::message::error(message);
         return;
     };
     let url = page
@@ -1429,6 +1479,27 @@ mod tests {
         assert!(targets_from_json(r#"[{"url":"https://x/"}]"#).is_empty());
         assert!(targets_from_json("").is_empty());
         assert!(targets_from_json(r#"[{"url":"unterminated"#).is_empty());
+    }
+
+    /// The origin bru allow-lists is the debug server's own, exactly when the port is named in
+    /// advance — and an `--remote-debugging-port` after `--remote` is part of a message, not a
+    /// switch, by the same rule every other raw-argv reader follows.
+    #[test]
+    fn the_allowed_origin_is_the_ports_own_and_only_for_a_fixed_port() {
+        let args = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("bru".to_string()).chain(rest.iter().map(|a| a.to_string())).collect()
+        };
+        assert_eq!(
+            allow_origin_switch(&args(&["--remote-debugging-port=9222", "https://x/"])),
+            Some("http://127.0.0.1:9222".to_string())
+        );
+        assert_eq!(allow_origin_switch(&args(&["--remote-debugging-port=0"])), None);
+        assert_eq!(allow_origin_switch(&args(&["https://x/"])), None);
+        assert_eq!(
+            allow_origin_switch(&args(&["--remote", ":open", "--remote-debugging-port=9222"])),
+            None
+        );
+        assert_eq!(allow_origin_switch(&args(&["--remote-debugging-port=junk"])), None);
     }
 
     /// A nested object as a value must not shift which strings read as keys.
