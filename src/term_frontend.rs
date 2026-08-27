@@ -109,6 +109,15 @@ struct TermState {
     /// How many bands the terminal is holding pixels for, so that a layout with fewer of them can
     /// take the surplus back.
     bands_drawn: usize,
+    /// The part of the pane whose pixels have changed since the last frame went out.
+    ///
+    /// **Not what `compose` reports.** The frame is wiped and rebuilt on every present — it has to
+    /// be, or a surface that shrank leaves its old pixels behind — so compose paints every layer
+    /// every time and says the whole pane was touched. That is true of the *frame* and false of the
+    /// *picture*: the bytes outside this rectangle are identical to the ones the terminal already
+    /// holds, and sending them again is the difference between a band and a pane. Fed by
+    /// [`on_paint`], which knows exactly which surface arrived.
+    dirty: Option<Rect>,
     /// Every band must be sent on the next frame, whatever the damage says.
     ///
     /// **Set whenever the bands themselves changed.** After [`forget_bands`] the terminal is holding
@@ -192,6 +201,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         background: background_from_theme(),
         redraw_all: true,
         bands_drawn: 0,
+        dirty: None,
     };
     if TERM.set(Mutex::new(term)).is_err() {
         return Err("the terminal frontend is already running".to_string());
@@ -482,6 +492,10 @@ pub fn relayout() {
         // scrolled. Measured 2026-08-26, along with the blinking that is the same thing at speed.
         // A frame of the wrong size is clipped to its rectangle and looks like a moment of
         // stretching; a missing one looks like a browser that has crashed.
+        for (_, kind) in &moved {
+            let rect = guard.layout.rect_of(*kind).union(&next.rect_of(*kind));
+            mark_dirty(&mut guard, rect);
+        }
         guard.layout = next;
         moved
     };
@@ -990,9 +1004,13 @@ fn present(term: &mut TermState) {
     // and with a fixed id, so re-sending one says nothing about the others. A keystroke in the
     // command line changes the bottom row and costs that row — measured 2026-08-27, a full pane
     // costs zellij enough per frame to fall behind a typist, and a small pane does not.
-    let damaged =
-        if term.redraw_all { term.layout.pane } else { damaged.unwrap_or(term.layout.pane) };
+    let damaged = if term.redraw_all {
+        term.layout.pane
+    } else {
+        term.dirty.unwrap_or(term.layout.pane)
+    };
     term.redraw_all = false;
+    term.dirty = None;
     let width = term.frame.width();
     let stride = (width as usize) * 3;
     let cols = term.size.cols;
@@ -1042,6 +1060,17 @@ fn present(term: &mut TermState) {
             );
         }
     }
+}
+
+/// Add a rectangle to what the next frame must re-send.
+fn mark_dirty(term: &mut TermState, rect: Rect) {
+    if rect.width <= 0 || rect.height <= 0 {
+        return;
+    }
+    term.dirty = Some(match term.dirty {
+        Some(so_far) => so_far.union(&rect),
+        None => rect,
+    });
 }
 
 /// Say that the bands have moved, so every one of them goes out again on the next frame.
@@ -1743,12 +1772,15 @@ wrap_render_handler! {
                 return;
             };
             if let Ok(mut term) = term.lock() {
-                term.popup = Some(Rect {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                });
+                // Where it was and where it is going, both: the page underneath the old rectangle
+                // has to be put back, and no surface reports that.
+                let next = Rect { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+                let changed = match term.popup {
+                    Some(was) => was.union(&next),
+                    None => next,
+                };
+                mark_dirty(&mut term, changed);
+                term.popup = Some(next);
             }
         }
 
@@ -1760,6 +1792,9 @@ wrap_render_handler! {
                 if show == 0 {
                     // The rectangle and the pixels go together: a popup that has been hidden must
                     // not leave its last frame behind to be composited over the next page.
+                    if let Some(was) = term.popup {
+                        mark_dirty(&mut term, was);
+                    }
                     term.popup = None;
                     term.popup_pixels = None;
                 }
@@ -1795,6 +1830,9 @@ wrap_render_handler! {
             // The popup layer is a surface of its own, kept apart from the page's — see
             // `TermState::popup_pixels`.
             if type_.get_raw() == PaintElementType::POPUP.get_raw() {
+                if let Some(rect) = term.popup {
+                    mark_dirty(&mut term, rect);
+                }
                 term.popup_pixels = Some(Painted { bgra: bgra.to_vec(), width, height });
                 drop(term);
                 schedule_present();
@@ -1815,6 +1853,8 @@ wrap_render_handler! {
             }
             let slot = index_of(kind);
             term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
+            let rect = term.layout.rect_of(kind);
+            mark_dirty(&mut term, rect);
             // **A surface with no rectangle cannot change the picture, so it must not cost one.**
             // The panel is zero-height whenever nothing is open in it and CEF paints it a pixel
             // tall anyway — measured 2026-08-26, `Panel painted 990x1 into a 990x0 rectangle`.
