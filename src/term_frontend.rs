@@ -1015,6 +1015,7 @@ fn present(term: &mut TermState) {
     let stride = (width as usize) * 3;
     let cols = term.size.cols;
     let bands = crate::term_compose::bands(term.layout.pane.height, term.size.cell_height as i32);
+    let mut sent = 0usize;
     for (index, band) in bands.iter().enumerate() {
         if band.height <= 0 || band.y + band.height <= damaged.y || band.y >= damaged.y + damaged.height
         {
@@ -1053,10 +1054,16 @@ fn present(term: &mut TermState) {
         let seen = PRESENTS.fetch_add(1, Ordering::Relaxed);
         if seen % 30 == 0 {
             eprintln!(
-                "bru[term]: present {seen}: composed in {}ms, written in {}ms ({:?})",
+                "bru[term]: present {seen}: composed in {}ms, written in {}ms ({:?}); \
+                 {sent}/{} bands, dirty {}x{} at {},{}",
                 composed.as_millis(),
                 at.elapsed().saturating_sub(composed).as_millis(),
-                term.painter.transport()
+                term.painter.transport(),
+                bands.len(),
+                damaged.width,
+                damaged.height,
+                damaged.x,
+                damaged.y
             );
         }
     }
