@@ -142,13 +142,18 @@ pub fn is_active() -> bool {
 /// Its height is whatever the page measured — see [`layout_for`]. The inspector is
 /// [`open_inspector`]'s, made when `:devtools` asks; the divider's rectangle exists in the layout
 /// but nothing paints it yet — it shows as a band of chrome background between page and panel.
+/// The surfaces, **in the order they are composited** — the last one is on top.
+///
+/// The panel is last because it lies over whatever is above the status bar (see `layout_for`), and
+/// that may be the docked inspector rather than the page. Anything composited after it would be
+/// drawn over a completion table the person is reading.
 const SURFACES: [SurfaceKind; 6] = [
     SurfaceKind::Page,
+    SurfaceKind::Divider,
+    SurfaceKind::Inspector,
     SurfaceKind::Top,
     SurfaceKind::Bottom,
     SurfaceKind::Panel,
-    SurfaceKind::Divider,
-    SurfaceKind::Inspector,
 ];
 
 /// The surfaces made when the frontend starts. The other two are made when `:devtools` asks.
@@ -361,7 +366,20 @@ pub fn divert_diagnostics() {
 /// command line, the completion's new height reached `relayout`, and the browser stopped. Measured
 /// 2026-08-26. Every value this needs is now handed to it by someone holding the lock already.
 fn layout_for(size: PaneSize, inspector: bool) -> Layout {
-    layout(&LayoutRequest {
+    // **The completion panel lies over the page; it does not take a row from it.**
+    //
+    // Laying it out as a row of its own is what a window does, and in a window it costs nothing:
+    // the box layout moves a widget. Here it resizes a *browser*, and a resized browser is
+    // Chromium re-laying out the whole document — on every keystroke in the command line, because
+    // the completion table changes height under every one of them. Measured 2026-08-27:
+    // `page 1998x961 -> 1998x1180 -> 1998x1261` in the space of three keys, and typing that could
+    // not keep up with a typist.
+    //
+    // So the layout is asked for a pane with no panel at all, and the panel is then placed over the
+    // band directly above the status bar. The page keeps one size for as long as the pane does, and
+    // the only browser that learns anything when the table grows is the panel itself.
+    let panel_height = crate::window::completion_height(0).max(0);
+    let mut laid_out = layout(&LayoutRequest {
         // The session measures in `u32` because a pixel count cannot be negative; the compositor
         // works in `i32` because a rectangle's corner can be. `try_into` rather than `as`: a pane
         // wider than `i32::MAX` is not a pane, and silently wrapping it would lay out a frame at a
@@ -378,7 +396,7 @@ fn layout_for(size: PaneSize, inspector: bool) -> Layout {
         // `prompt.offsetHeight + completion.offsetHeight` after it has drawn both, and that is what
         // sizes the panel in a window too (`window.rs`'s `preferred_size`). A height reported after
         // the draw cannot disagree with what was drawn; one guessed before it can.
-        panel_height: crate::window::completion_height(0),
+        panel_height: 0,
         // The same number the Views delegate answers with, so a height dragged in one frontend
         // means the same thing in the other.
         // **The same numbers the Views delegate answers with**, so a size set in one frontend
@@ -391,7 +409,17 @@ fn layout_for(size: PaneSize, inspector: bool) -> Layout {
             0
         },
         inspector_side: inspector && crate::devtools::place_of(0).is_side(),
-    })
+    });
+    // Never taller than the room between the strips: a panel that ate the tab strip would be a
+    // panel with nothing above it to have been opened from.
+    let room = (laid_out.bottom.y - laid_out.top.height).max(0);
+    let height = panel_height.min(room);
+    laid_out.panel = if height > 0 {
+        Rect::new(0, laid_out.bottom.y - height, laid_out.pane.width, height)
+    } else {
+        Rect::new(0, laid_out.bottom.y, laid_out.pane.width, 0)
+    };
+    laid_out
 }
 
 /// Lay the surfaces out again at the same pane size, because something above changed height.
@@ -1633,11 +1661,28 @@ pub fn pointer_target(x: i32, y: i32, press: bool) -> Option<(i32, Rect, Surface
     //
     // The rectangles tile the pane and do not overlap, so the first one that contains the point is
     // the one under the pointer and the order of the search does not decide anything.
-    guard
-        .of_browser
-        .iter()
-        .map(|(identifier, kind)| (*identifier, guard.layout.rect_of(*kind), *kind))
-        .find(|(_, rect, _)| inside(rect))
+    // **Topmost first, because the surfaces overlap now.** The completion panel lies over the page
+    // (see `layout_for`), so a click inside it is inside the page's rectangle too, and the order of
+    // registration — which is what `of_browser` is in — would answer the page.
+    const BY_DEPTH: [SurfaceKind; 6] = [
+        SurfaceKind::Panel,
+        SurfaceKind::Bottom,
+        SurfaceKind::Top,
+        SurfaceKind::Inspector,
+        SurfaceKind::Divider,
+        SurfaceKind::Page,
+    ];
+    BY_DEPTH.iter().find_map(|kind| {
+        let rect = guard.layout.rect_of(*kind);
+        if rect.width <= 0 || rect.height <= 0 || !inside(&rect) {
+            return None;
+        }
+        guard
+            .of_browser
+            .iter()
+            .find(|(_, registered)| registered == kind)
+            .map(|(identifier, _)| (*identifier, rect, *kind))
+    })
 }
 
 /// A button went down on one of the pointer's surfaces: focus follows the click.
