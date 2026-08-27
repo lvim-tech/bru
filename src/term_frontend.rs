@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::term_compose::{Frame, Layer, Layout, LayoutRequest, Rect, Surface, SurfaceKind, layout};
-use crate::term_paint::{IMAGE_ID_VIEW, Painter, Placement, place_for_host};
+use crate::term_paint::{Painter, Placement, image_id_view, place_for_host};
 use crate::term_session::{PaneSize, TerminalSession};
 
 /// `--term`: draw this browser into the terminal it was started from.
@@ -181,7 +181,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     let layout = layout_for(size, false);
     let frame = Frame::new(layout.pane.width, layout.pane.height)
         .ok_or("the pane is too small to draw a browser in")?;
-    let placement = Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols);
+    let placement = Placement::new(image_id_view(), 1, 1, size.rows, size.cols);
     let painter =
         Painter::new(placement, session.in_tmux(), place_for_host(), session.transport());
 
@@ -1034,7 +1034,7 @@ fn present(term: &mut TermState) {
         let (Ok(row), Ok(rows), Ok(id)) = (
             u16::try_from(band.row + 1),
             u16::try_from(band.rows),
-            u32::try_from(index).map(|index| crate::term_paint::IMAGE_ID_BAND + index),
+            u32::try_from(index).map(crate::term_paint::image_id_band),
         ) else {
             continue;
         };
@@ -1051,7 +1051,7 @@ fn present(term: &mut TermState) {
     // here, inside the synchronised update, so nothing is ever seen missing.
     for index in bands.len()..term.bands_drawn {
         if let Ok(index) = u32::try_from(index) {
-            let _ = term.painter.forget(&mut out, crate::term_paint::IMAGE_ID_BAND + index);
+            let _ = term.painter.forget(&mut out, crate::term_paint::image_id_band(index));
         }
     }
     term.bands_drawn = bands.len();
@@ -1126,7 +1126,7 @@ pub fn resized(size: PaneSize) {
             None => return,
         }
         term.painter
-            .set_placement(Placement::new(IMAGE_ID_VIEW, 1, 1, size.rows, size.cols));
+            .set_placement(Placement::new(image_id_view(), 1, 1, size.rows, size.cols));
         term.of_browser.clone()
     };
     resize_browsers(&browsers);

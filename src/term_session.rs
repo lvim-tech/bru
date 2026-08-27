@@ -963,7 +963,7 @@ impl TerminalSession {
             verdict
         };
         let shared = crate::term_paint::shm_probe_publish().and_then(|name| {
-            let verdict = ask('s', crate::term_paint::IMAGE_ID_PROBE, &name);
+            let verdict = ask('s', crate::term_paint::image_id_probe_shm(), &name);
             crate::term_paint::shm_probe_release(&name);
             verdict
         });
@@ -974,7 +974,7 @@ impl TerminalSession {
         } else {
             let file = crate::term_paint::file_probe_publish().and_then(|path| {
                 let verdict =
-                    ask('f', crate::term_paint::IMAGE_ID_PROBE_FILE, &path.to_string_lossy());
+                    ask('f', crate::term_paint::image_id_probe_file(), &path.to_string_lossy());
                 crate::term_paint::file_probe_release(&path);
                 verdict
             });

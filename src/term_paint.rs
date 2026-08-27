@@ -149,7 +149,7 @@ fn diacritic_number(ch: char) -> Option<usize> {
 /// `\x1b[38;5;42m` for image id 42.
 ///
 /// Above eight bits there is no choice but true colour, so the caller is expected to keep bru's ids
-/// small (see [`IMAGE_ID_VIEW`]). The top byte of a 32-bit id never travels in the colour at all —
+/// small (see [`image_id_view`]). The top byte of a 32-bit id never travels in the colour at all —
 /// it is a third diacritic, see [`most_significant_byte_diacritic`].
 fn foreground_for_id(id: u32) -> String {
     let low = id & 0x00ff_ffff;
@@ -178,14 +178,37 @@ fn most_significant_byte_diacritic(id: u32) -> Option<char> {
 /// is no way to reserve one; the protocol offers image *numbers* (`I=`) which the terminal answers
 /// with an id it chose, and reading that answer is exactly what a presenter that cannot listen
 /// must not do. This is a considered guess and is labelled as one.
-pub const IMAGE_ID_VIEW: u32 = 0xbe;
+pub fn image_id_view() -> u32 {
+    image_id(0)
+}
+
+/// An image id of this process's own, for one of the pictures it draws.
+///
+/// **kitty stores images globally, by id, for the whole terminal — not per window.** Two terminal
+/// brus in two panes of one kitty, both calling their sixth band 198, are two programs transmitting
+/// *the same image*: whichever sends last decides what both windows show. Measured 2026-08-27, with
+/// one pane's page drawn into a pane it was not running in — which is what "the whole browser got
+/// confused" looks like from outside.
+///
+/// The pid goes in the high bits and the slot in the low eight, which keeps the whole id inside 24
+/// bits — the width a placeholder cell can spell in a foreground colour, so the tmux path is never
+/// handed an id it cannot write. Two brus can still collide if their pids are 16384 apart *and*
+/// they share a terminal; that is a far smaller coincidence than sharing a constant, which was a
+/// certainty.
+fn image_id(slot: u32) -> u32 {
+    ((std::process::id() & 0x3fff) << 8) | (slot & 0xff)
+}
 /// The image the transport probe hands over, which is never displayed. Its own id so that failing
 /// the probe cannot disturb either of the two real images.
-pub const IMAGE_ID_PROBE: u32 = 0xbd;
+pub(crate) fn image_id_probe_shm() -> u32 {
+    image_id(2)
+}
 
 /// The image id the *file* transport question uses, distinct from the shared memory one so that two
 /// answers arriving together cannot be mistaken for each other.
-pub const IMAGE_ID_PROBE_FILE: u32 = 0xbc;
+pub(crate) fn image_id_probe_file() -> u32 {
+    image_id(3)
+}
 
 /// How many frame files are cycled through.
 ///
@@ -273,14 +296,18 @@ pub(crate) fn query_answer(bytes: &[u8], id: u32) -> Option<bool> {
 
 /// The popup layer (a `<select>` dropdown), which composes over the view. Its own id so the two do
 /// not replace each other.
-pub const IMAGE_ID_POPUP: u32 = 0xbf;
+pub fn image_id_popup() -> u32 {
+    image_id(1)
+}
 
 /// The first band's image id; the others follow it. See `term_compose::bands`.
 ///
 /// **One id per band and it never moves.** That is the whole mechanism: a band is replaced in place
 /// by re-transmitting its id, and every other band on the screen is untouched because nothing was
 /// said about it.
-pub const IMAGE_ID_BAND: u32 = 0xc0;
+pub fn image_id_band(index: u32) -> u32 {
+    image_id(16 + index)
+}
 
 /// Where a picture goes, in cells, and which image it is.
 ///
@@ -1137,7 +1164,7 @@ mod tests {
     #[test]
     fn an_image_id_that_fits_in_a_byte_travels_as_a_palette_index() {
         assert_eq!(foreground_for_id(42), "\x1b[38;5;42m");
-        assert_eq!(foreground_for_id(IMAGE_ID_VIEW), "\x1b[38;5;190m");
+        assert_eq!(foreground_for_id(0xbe), "\x1b[38;5;190m");
         // Above a byte there is nothing else to use, quantising tmux or not.
         assert_eq!(foreground_for_id(0x01_0203), "\x1b[38;2;1;2;3m");
         // The top byte is never in the colour — it is a third diacritic.
@@ -1341,8 +1368,6 @@ mod tests {
         assert!(out.is_empty(), "nothing is written for a frame that was not accepted");
     }
 
-    /// The division of labour: pixels every frame, placeholder cells only when the geometry moved.
-    ///
     /// The file transport, which is what a host that refuses shared memory is left with before
     /// base64 — a path in tmpfs and the same sixty-byte escape.
     #[test]
@@ -1362,40 +1387,73 @@ mod tests {
     /// slow terminal can still be replying to the first when the second goes out.
     #[test]
     fn each_transport_question_is_told_from_the_other() {
-        let both = b"\x1b_Gi=189;ENOTSUPPORTED:shared memory transfer is not supported\x1b\\\x1b_Gi=188;OK\x1b\\";
-        assert_eq!(query_answer(both, IMAGE_ID_PROBE), Some(false), "shared memory said no");
-        assert_eq!(query_answer(both, IMAGE_ID_PROBE_FILE), Some(true), "the file said yes");
+        let both = format!(
+            "\x1b_Gi={};ENOTSUPPORTED:shared memory transfer is not supported\x1b\\\x1b_Gi={};OK\x1b\\",
+            image_id_probe_shm(),
+            image_id_probe_file()
+        );
+        let both = both.as_bytes();
+        assert_eq!(query_answer(both, image_id_probe_shm()), Some(false), "shared memory said no");
+        assert_eq!(query_answer(both, image_id_probe_file()), Some(true), "the file said yes");
+    }
+
+    /// **The ids belong to this process.** kitty keeps images for the whole terminal under one set
+    /// of numbers, so two brus sharing a constant share a picture — see [`image_id`].
+    #[test]
+    fn the_image_ids_are_this_process_and_not_a_constant() {
+        let ids = [image_id_view(), image_id_popup(), image_id_probe_shm(), image_id_probe_file()];
+        for id in ids {
+            assert!(id > 0xff, "an id that fits in a byte is a constant by another name: {id}");
+            assert!(id < (1 << 24), "a placeholder cell spells 24 bits and no more: {id}");
+        }
+        let mut seen: Vec<u32> = ids.to_vec();
+        seen.extend((0..27).map(image_id_band));
+        let unique: std::collections::BTreeSet<u32> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), seen.len(), "two pictures cannot share an id");
+        assert_eq!(image_id_band(1) - image_id_band(0), 1, "the bands run in order");
     }
 
     /// **The distinction the black pane turned on.** `OK` is a yes, anything else is a no, and
     /// nothing at all is neither — the three have to stay three.
     #[test]
     fn the_transport_question_can_be_answered_no() {
-        assert_eq!(query_answer(b"\x1b_Gi=189;OK\x1b\\", IMAGE_ID_PROBE), Some(true));
-        assert_eq!(query_answer(b"\x1b_Gi=189;ENOENT:No such file\x1b\\", IMAGE_ID_PROBE), Some(false));
-        assert_eq!(query_answer(b"\x1b_Gi=189;EBADF:bad medium\x1b\\", IMAGE_ID_PROBE), Some(false));
-        assert_eq!(query_answer(b"", IMAGE_ID_PROBE), None, "silence is not a refusal");
-        assert_eq!(query_answer(b"\x1b_Gi=190;OK\x1b\\", IMAGE_ID_PROBE), None, "another image's answer");
+        let reply = |body: &str| format!("\x1b_Gi={};{body}\x1b\\", image_id_probe_shm());
+        let ask = image_id_probe_shm();
+        assert_eq!(query_answer(reply("OK").as_bytes(), ask), Some(true));
+        assert_eq!(query_answer(reply("ENOENT:No such file").as_bytes(), ask), Some(false));
+        assert_eq!(query_answer(reply("EBADF:bad medium").as_bytes(), ask), Some(false));
+        assert_eq!(query_answer(b"", ask), None, "silence is not a refusal");
+        let other = format!("\x1b_Gi={};OK\x1b\\", image_id_probe_file());
+        assert_eq!(query_answer(other.as_bytes(), ask), None, "another image's answer");
         // The reply can arrive behind whatever else the terminal was saying.
-        assert_eq!(query_answer(b"\x1b[0n\x1b_Gi=189;OK\x1b\\", IMAGE_ID_PROBE), Some(true));
+        let behind = format!("\x1b[0n{}", reply("OK"));
+        assert_eq!(query_answer(behind.as_bytes(), ask), Some(true));
     }
 
     /// The question transmits nothing and displays nothing — `a=q` is the whole point, because
     /// asking must not put a picture on a screen the caller has not finished setting up.
     #[test]
     fn the_transport_question_only_asks() {
-        let escape = medium_query_escape('s', IMAGE_ID_PROBE, "/bru-probe-7", false);
+        let escape = medium_query_escape('s', image_id_probe_shm(), "/bru-probe-7", false);
         assert_eq!(
             escape,
-            format!("\x1b_Gi=189,a=q,t=s,f=24,s=1,v=1;{}\x1b\\", base64(b"/bru-probe-7"))
+            format!(
+                "\x1b_Gi={},a=q,t=s,f=24,s=1,v=1;{}\x1b\\",
+                image_id_probe_shm(),
+                base64(b"/bru-probe-7")
+            )
         );
         assert!(!escape.contains("a=T"), "a query, never a display");
         // …and under tmux it has to go around tmux like every other graphics escape.
         assert!(
-            medium_query_escape('s', IMAGE_ID_PROBE, "/bru-probe-7", true)
+            medium_query_escape('s', image_id_probe_shm(), "/bru-probe-7", true)
                 .starts_with("\x1bPtmux;")
         );
     }
+
+
+
+
 
     /// **The zellij case, in a test.** The escape must say `C=1` and must not say `U=1`, because a
     /// host that ignores placeholders draws a picture from the first and nothing at all from the
