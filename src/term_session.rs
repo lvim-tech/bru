@@ -1094,6 +1094,33 @@ impl TerminalSession {
         out.flush()
     }
 
+    /// Read and throw away anything the terminal still has to say, before it is handed back.
+    ///
+    /// **A reply nobody reads is a reply the shell reads.** bru asks for silence on every frame
+    /// (`q=2`), but a terminal that could not parse a command answers anyway — it has to, because
+    /// the quiet flag it could not read is part of the command it could not read. That answer
+    /// arrives on the same stdin the key reader owned, and if bru has already gone, the next thing
+    /// holding the terminal gets it: `NVAL:invalid\svalue\sfor\skey\s'q'` printed at a shell
+    /// prompt, reported 2026-08-27.
+    ///
+    /// Bounded twice over — by the read count and by `VTIME`, which is still in force here — so a
+    /// terminal that says nothing costs one timeout and one that will not stop costs no more than
+    /// this loop.
+    pub(crate) fn drain_replies(&self) {
+        let mut chunk = [0u8; 256];
+        for _ in 0..16 {
+            // SAFETY: reading into a buffer this function owns, from the terminal descriptor this
+            // session has held since `enter` established it is a tty. `VMIN 0`/`VTIME` make this
+            // return 0 on a timeout rather than block.
+            let read = unsafe {
+                libc::read(self.tty, chunk.as_mut_ptr().cast::<libc::c_void>(), chunk.len())
+            };
+            if read <= 0 {
+                break;
+            }
+        }
+    }
+
     /// Put the terminal back now, before the object goes away. Idempotent; `Drop` calls it too.
     pub(crate) fn leave(&mut self) {
         self.shut_down();

@@ -1275,7 +1275,10 @@ pub fn leave() {
     let Ok(mut term) = term.lock() else {
         return;
     };
-    let mut out = std::io::stdout();
+    // **One buffer and one write, as in `present`.** Two writers on this descriptor, or one write
+    // torn in half, is a graphics command arriving with a mangled key — and a mangled key is the
+    // one thing a terminal answers even when it was told to be quiet.
+    let mut out: Vec<u8> = Vec::with_capacity(512);
     // The presenter takes back its own image by id. That is the tidy half.
     let _ = term.painter.clear(&mut out);
     // **And then everything, by hand, because the tidy half was not enough.** Measured 2026-08-25:
@@ -1290,7 +1293,10 @@ pub fn leave() {
     // screen is cleared before it is handed back, so nothing is left holding cells that used to
     // mean a picture.
     let _ = out.write_all(b"\x1b[H\x1b[2J");
-    let _ = out.flush();
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&out).and_then(|()| stdout.flush());
+    // Whatever the terminal has to say about any of that, it says to bru and not to the shell.
+    term.session.drain_replies();
     term.session.leave();
 }
 
