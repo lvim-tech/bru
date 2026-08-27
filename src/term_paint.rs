@@ -747,6 +747,13 @@ fn damage_bounds(rects: &[Rect], width: u32, height: u32) -> Option<Rect> {
 /// of grace and costs three frames of `/dev/shm` — 12 MB at a full pane, against a default
 /// `/dev/shm` of half of RAM. Unlinking a name that is already gone fails harmlessly, which is why
 /// the tidy-up is unconditional and unchecked.
+///
+/// **Three generations *per image*, not three names.** The picture is several bands now, and a
+/// frame hands over one object for each of them; counting names instead of generations gave a
+/// twenty-seven-band pane about a ninth of a frame of grace, and every object was unlinked before
+/// kitty had opened it. Nothing drew in kitty or in tmux, and zellij was untouched — because zellij
+/// refuses shared memory and gets files, whose slots were already counted per image. Reported
+/// 2026-08-27; the note above had the number and not the multiplier.
 const RETAINED_FRAMES: usize = 3;
 
 /// Put `bytes` in a fresh POSIX shared memory object under `name`.
@@ -1071,7 +1078,8 @@ impl Painter {
         let escape = shm_escape(&name, placement, width, height, self.place);
         let result = out.write_all(passthrough(&escape, self.in_tmux).as_bytes());
         self.handed_over.push_back(name);
-        while self.handed_over.len() > RETAINED_FRAMES {
+        let keep = RETAINED_FRAMES * self.drawn.len().max(1);
+        while self.handed_over.len() > keep {
             if let Some(old) = self.handed_over.pop_front() {
                 shm_unlink(&old);
             }
@@ -1573,6 +1581,24 @@ mod tests {
         assert!(out.starts_with("\x1bPtmux;"), "a graphics escape goes around tmux, not through it");
         assert!(out.contains("a=d,d=I,i=42"));
         assert!(painter.placed.is_empty());
+    }
+
+    /// **The regression that made bru draw nothing outside zellij.** A frame hands over one object
+    /// per band; keeping a fixed three of them meant unlinking the object the terminal had just been
+    /// given and had not yet opened.
+    #[test]
+    fn every_image_keeps_its_own_generations_of_shared_memory() {
+        let mut painter =
+            Painter::new(Placement::new(0x20, 1, 1, 1, 1), false, Place::AtCursor, Transport::Base64);
+        // Four bands, drawn once each, is four images in flight.
+        for slot in 0..4 {
+            painter.drawn.push(0x30 + slot);
+        }
+        let keep = RETAINED_FRAMES * painter.drawn.len();
+        assert_eq!(keep, 12, "three generations each, not three names between them");
+        // …and with nothing drawn yet the old behaviour is what is left.
+        painter.drawn.clear();
+        assert_eq!(RETAINED_FRAMES * painter.drawn.len().max(1), RETAINED_FRAMES);
     }
 
     /// A shared memory object written and read back, which is the one thing here that needs a
