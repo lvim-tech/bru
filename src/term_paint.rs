@@ -187,16 +187,30 @@ pub fn image_id_view() -> u32 {
 /// **kitty stores images globally, by id, for the whole terminal — not per window.** Two terminal
 /// brus in two panes of one kitty, both calling their sixth band 198, are two programs transmitting
 /// *the same image*: whichever sends last decides what both windows show. Measured 2026-08-27, with
-/// one pane's page drawn into a pane it was not running in — which is what "the whole browser got
-/// confused" looks like from outside.
+/// one pane's page drawn into a pane it was not running in.
 ///
-/// The pid goes in the high bits and the slot in the low eight, which keeps the whole id inside 24
-/// bits — the width a placeholder cell can spell in a foreground colour, so the tmux path is never
-/// handed an id it cannot write. Two brus can still collide if their pids are 16384 apart *and*
-/// they share a terminal; that is a far smaller coincidence than sharing a constant, which was a
-/// certainty.
+/// **The process goes in the top byte and the picture in the low one, and that split is the whole
+/// of this function.** The first attempt put the pid in the *low* twenty-four bits, which broke
+/// every terminal but zellij within the hour: those bits ride in the placeholder cell's foreground
+/// colour, and above eight of them there is no choice but true colour — which tmux quantises to the
+/// nearest palette entry unless it believes the terminal underneath has `RGB`. A quantised colour is
+/// a corrupted *identifier*, and the cell then names an image that does not exist. See
+/// [`foreground_for_id`], which said so before this was written.
+///
+/// Bits 24..32 do not travel in the colour at all. They are the third diacritic
+/// ([`most_significant_byte_diacritic`]) — text, which tmux forwards because forwarding text is what
+/// tmux is. So the discriminator goes there, the id itself stays a palette index, and both halves
+/// use machinery that was already here.
+///
+/// Two brus collide if their pids are 256 apart *and* they share a terminal. That is the same order
+/// of coincidence as before and far better than a shared constant, which was a certainty.
 fn image_id(slot: u32) -> u32 {
-    ((std::process::id() & 0x3fff) << 8) | (slot & 0xff)
+    // Never zero: a zero top byte is the protocol's default and would say "no third diacritic",
+    // which is exactly the id a bru with a pid ending in 256's multiple must not claim.
+    let tag = (std::process::id() & 0xff).max(1);
+    // High in the byte, because kitty's ids are a namespace shared with every other client in that
+    // terminal and the well-behaved ones count from the bottom.
+    (tag << 24) | (0x20 + (slot & 0x7f))
 }
 /// The image the transport probe hands over, which is never displayed. Its own id so that failing
 /// the probe cannot disturb either of the two real images.
@@ -1397,17 +1411,21 @@ mod tests {
         assert_eq!(query_answer(both, image_id_probe_file()), Some(true), "the file said yes");
     }
 
-    /// **The ids belong to this process.** kitty keeps images for the whole terminal under one set
-    /// of numbers, so two brus sharing a constant share a picture — see [`image_id`].
+    /// **The ids belong to this process, and the half that says so is not the half that travels in
+    /// a colour.** The low byte has to stay a palette index or tmux quantises the identifier; the
+    /// process tag rides in the third diacritic, which is text and passes through.
     #[test]
-    fn the_image_ids_are_this_process_and_not_a_constant() {
+    fn the_image_ids_are_this_process_without_leaving_the_palette() {
         let ids = [image_id_view(), image_id_popup(), image_id_probe_shm(), image_id_probe_file()];
-        for id in ids {
-            assert!(id > 0xff, "an id that fits in a byte is a constant by another name: {id}");
-            assert!(id < (1 << 24), "a placeholder cell spells 24 bits and no more: {id}");
-        }
         let mut seen: Vec<u32> = ids.to_vec();
         seen.extend((0..27).map(image_id_band));
+        for id in &seen {
+            assert!(id & 0x00ff_ffff <= 0xff, "the colour has to stay a palette index: {id}");
+            assert!(id >> 24 != 0, "the process tag is what keeps two brus apart: {id}");
+            // …and that is exactly what the two carriers do with it.
+            assert!(foreground_for_id(*id).starts_with("\x1b[38;5;"), "palette, not true colour");
+            assert!(most_significant_byte_diacritic(*id).is_some(), "the tag is spellable");
+        }
         let unique: std::collections::BTreeSet<u32> = seen.iter().copied().collect();
         assert_eq!(unique.len(), seen.len(), "two pictures cannot share an id");
         assert_eq!(image_id_band(1) - image_id_band(0), 1, "the bands run in order");
