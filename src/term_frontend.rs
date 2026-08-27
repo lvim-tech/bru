@@ -1458,10 +1458,29 @@ wrap_load_handler! {
             // the quotes are escaped anyway: a string that reaches JavaScript unescaped is a string
             // that decides what the script does.
             let escaped = target.replace('\\', "\\\\").replace('\'', "\\'");
+            // **Both stores, because `localStorage` is only one of them and no longer the one that
+            // wins.** The frontend keeps its settings through the host — `setPreference` goes to
+            // Chromium's own DevTools preferences — and reads `localStorage` as the older fallback.
+            // Writing only the fallback worked until something wrote a preference, and from then on
+            // the preference decided: the inspector came up believing it was docked to the side and
+            // drew itself in a column, whatever bru's own dock place was. Reported 2026-08-27 for
+            // `bottom` and for `right` alike, which is what says it is not about the place.
+            //
+            // Both writes are in the same script as the navigation, so the renderer sends them
+            // before the load — the ordering that the note below is about.
             let script = format!(
                 "try {{ localStorage.setItem('currentDockState', '\"undocked\"'); }} \
-                 catch (e) {{}} location.replace('{escaped}');"
+                 catch (e) {{}} \
+                 try {{ InspectorFrontendHost.setPreference('currentDockState', '\"undocked\"'); }} \
+                 catch (e) {{}} \
+                 location.replace('{escaped}');"
             );
+            if crate::term_input::debug() {
+                eprintln!(
+                    "bru[term]: inspector {}: dock state written, going to {target}",
+                    browser.identifier()
+                );
+            }
             frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
         }
     }
