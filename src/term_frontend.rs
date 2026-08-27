@@ -924,6 +924,17 @@ wrap_task! {
 /// sub-rectangle, and kitty has no such thing under `a=t` (checked against the protocol, not
 /// assumed). At 78 fps for a full pane over shared memory there is nothing to buy by trying.
 fn present(term: &mut TermState) {
+    // **What this frame is for, decided before a pixel is touched.** Everything below — the wipe,
+    // the clip on every layer, and which bands go out — is that rectangle. Composing the whole pane
+    // to send a row of it was 4 ms a frame of pure waste; the fill alone is a pass over 4 MB.
+    let target = if term.redraw_all {
+        term.layout.pane
+    } else {
+        match term.dirty {
+            Some(rect) => rect,
+            None => return,
+        }
+    };
     let mut layers: Vec<Layer<'_>> = Vec::new();
     let held: Vec<(SurfaceKind, &Painted)> = SURFACES
         .iter()
@@ -953,13 +964,11 @@ fn present(term: &mut TermState) {
                 );
             }
         }
-        layers.push(Layer {
-            surface,
-            x: rect.x,
-            y: rect.y,
-            clip: rect,
-            dirty: None,
-        });
+        let clip = rect.intersect(&target);
+        if clip.is_empty() {
+            continue;
+        }
+        layers.push(Layer { surface, x: rect.x, y: rect.y, clip, dirty: None });
     }
     if layers.is_empty() {
         return;
@@ -970,7 +979,7 @@ fn present(term: &mut TermState) {
     // over itself three times as it grew, each earlier and shorter render still legible under the
     // current one. Filling costs one pass over 4 MB against a frame that already costs a composite
     // and a transmit, and it is the difference between a picture and a palimpsest.
-    term.frame.fill(term.layout.pane, term.background);
+    term.frame.fill(target, term.background);
     // **The popup goes on last, because it goes on top.** `compose` treats the order of the layers
     // as the z-order, and a `<select>` dropdown that drew under its own page would be a menu you
     // could see the edge of and never read.
@@ -982,7 +991,12 @@ fn present(term: &mut TermState) {
             return None;
         };
         let surface = Surface::new(&painted.bgra, width, height)?;
-        Some(crate::term_compose::popup_layer(surface, rect, term.layout.rect_of(SurfaceKind::Page)))
+        let mut layer =
+            crate::term_compose::popup_layer(surface, rect, term.layout.rect_of(SurfaceKind::Page));
+        // The popup is clipped to this frame's rectangle like every other layer, or it would write
+        // outside the rows that are about to be sent and those pixels would never leave.
+        layer.clip = layer.clip.intersect(&target);
+        if layer.clip.is_empty() { None } else { Some(layer) }
     });
     if let Some(layer) = popup_layer {
         layers.push(layer);
@@ -1004,11 +1018,7 @@ fn present(term: &mut TermState) {
     // and with a fixed id, so re-sending one says nothing about the others. A keystroke in the
     // command line changes the bottom row and costs that row — measured 2026-08-27, a full pane
     // costs zellij enough per frame to fall behind a typist, and a small pane does not.
-    let damaged = if term.redraw_all {
-        term.layout.pane
-    } else {
-        term.dirty.unwrap_or(term.layout.pane)
-    };
+    let damaged = target;
     term.redraw_all = false;
     term.dirty = None;
     let width = term.frame.width();
@@ -1033,7 +1043,9 @@ fn present(term: &mut TermState) {
             continue;
         };
         let placement = Placement::new(id, row, 1, rows, cols);
-        let _ = term.painter.paint_at(&mut out, pixels, width as u32, band.height as u32, &placement);
+        let _ =
+            term.painter.paint_at(&mut out, pixels, width as u32, band.height as u32, &placement);
+        sent += 1;
     }
     // The bands that existed last time and do not now — the layout left fewer of them. Taken back
     // here, inside the synchronised update, so nothing is ever seen missing.
