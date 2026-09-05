@@ -160,7 +160,46 @@ pub fn user_of(entry: &str) -> &str {
 ///
 /// An IP address matches by equality only. Without that, host `1.2.3.4` would "end with `.3.4`"
 /// and match an entry segment named `3.4`.
-pub fn entry_matches(entry: &str, host: &str) -> Option<usize> {
+/// Split an authority into its host and its port: `host`, `host:port`, `[::1]`, `[::1]:8443`.
+///
+/// One reader for both sides of the lookup — a URL's authority and a store entry's segment — so
+/// the address bar and the store can never disagree about where the host ends. The brackets are
+/// the reason it is worth sharing: splitting `[::1]:8443` on the first colon answers `[`.
+fn split_authority(authority: &str) -> Option<(&str, Option<&str>)> {
+    match authority.strip_prefix('[') {
+        // `inside.len() + 2` is the address plus its two brackets: the host keeps them, because
+        // that is how it is written everywhere else.
+        Some(rest) => {
+            let (inside, after) = rest.split_once(']')?;
+            Some((authority.get(..inside.len() + 2)?, after.strip_prefix(':')))
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => Some((host, Some(port))),
+            None => Some((authority, None)),
+        },
+    }
+}
+
+/// Whether one segment's host part names `host`, by the segment/dot-suffix rule above.
+fn host_matches(segment: &str, host: &str, numeric: bool) -> bool {
+    if segment.is_empty() {
+        // A segment that is only a port (`:3000`). Without this the suffix rule below strips an
+        // empty suffix, finds the whole host in front of it, and answers yes for every host there
+        // is.
+        return false;
+    }
+    if segment == host {
+        return true;
+    }
+    if numeric {
+        return false;
+    }
+    host.strip_suffix(segment)
+        .and_then(|before| before.strip_suffix('.'))
+        .is_some()
+}
+
+pub fn entry_matches(entry: &str, host: &str, port: Option<&str>) -> Option<usize> {
     let host = host.trim().to_ascii_lowercase();
     if host.is_empty() {
         return None;
@@ -172,24 +211,34 @@ pub fn entry_matches(entry: &str, host: &str) -> Option<usize> {
         .filter(|segment| !segment.is_empty())
         .filter_map(|segment| {
             let segment = segment.to_ascii_lowercase();
-            if segment == host {
-                return Some(segment.len());
+            let (seg_host, seg_port) = split_authority(&segment)?;
+            // A segment that spells a port answers for that port and no other. It has to be
+            // decided here, before the numeric rule below, or `127.0.0.1:3000` would fall into
+            // "an IP matches by equality only" and never be found.
+            if let Some(seg_port) = seg_port {
+                if Some(seg_port) != port {
+                    return None;
+                }
             }
-            if numeric {
-                return None;
-            }
-            host.strip_suffix(&segment)
-                .and_then(|before| before.strip_suffix('.'))
-                .map(|_| segment.len())
+            // The rank is the WHOLE segment, port included, which is what puts a
+            // `localhost:3000` entry ahead of a plain `localhost` one on a page that is on 3000:
+            // it is longer, and the ordering already prefers the longer match.
+            host_matches(seg_host, &host, numeric).then_some(segment.len())
         })
         .max()
 }
 
-/// Every entry for a host, most specific first, then alphabetically so two runs agree.
-pub fn entries_for<'a>(entries: &'a [String], host: &str) -> Vec<&'a str> {
+/// Every entry for an origin, most specific first, then alphabetically so two runs agree.
+///
+/// `port` is the port the page is actually on, `None` when the URL leaves it to the scheme's
+/// default. An entry without a port in it answers whatever the page's port is — a credential is
+/// issued for a host, and `abv.bg` is the same account on 443 and on 8443. An entry WITH one
+/// answers only for that port, which is what makes a store usable on localhost, where every
+/// service shares the host and the port is the only thing telling them apart.
+pub fn entries_for<'a>(entries: &'a [String], host: &str, port: Option<&str>) -> Vec<&'a str> {
     let mut matched: Vec<(usize, &str)> = entries
         .iter()
-        .filter_map(|entry| entry_matches(entry, host).map(|rank| (rank, entry.as_str())))
+        .filter_map(|entry| entry_matches(entry, host, port).map(|rank| (rank, entry.as_str())))
         .collect();
     matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     matched.into_iter().map(|(_, entry)| entry).collect()
@@ -279,18 +328,10 @@ impl Origin {
         let authority = after.split(['/', '?', '#']).next()?;
         // Everything up to the last `@` is credentials, not the host.
         let authority = authority.rsplit('@').next()?;
-        // `[::1]:8443` — the colons inside the brackets are the address, and splitting on the first
-        // one would answer `[`. The previous host-only reader did exactly that.
-        let (host, port) = match authority.strip_prefix('[') {
-            Some(rest) => {
-                let (inside, after) = rest.split_once(']')?;
-                (format!("[{inside}]"), after.strip_prefix(':'))
-            }
-            None => match authority.split_once(':') {
-                Some((host, port)) => (host.to_string(), Some(port)),
-                None => (authority.to_string(), None),
-            },
-        };
+        // `[::1]:8443` — the colons inside the brackets are the address, and splitting on the
+        // first one would answer `[`. The previous host-only reader did exactly that. The same
+        // reader parses a store entry's segment, so the two can never disagree.
+        let (host, port) = split_authority(authority)?;
         if scheme.is_empty() || host.is_empty() || host == "[]" {
             return None;
         }
@@ -438,22 +479,95 @@ mod tests {
     #[test]
     fn an_entry_answers_for_a_host_and_its_subdomains_only() {
         let entry = "websites/abv.bg/biserstoilov@abv.bg";
-        assert!(entry_matches(entry, "abv.bg").is_some(), "the host itself");
-        assert!(entry_matches(entry, "www.abv.bg").is_some(), "and a subdomain of it");
-        assert!(entry_matches(entry, "ABV.BG").is_some(), "case is not part of a host");
+        assert!(entry_matches(entry, "abv.bg", None).is_some(), "the host itself");
+        assert!(entry_matches(entry, "www.abv.bg", None).is_some(), "and a subdomain of it");
+        assert!(entry_matches(entry, "ABV.BG", None).is_some(), "case is not part of a host");
 
         // The dot is the boundary. Without it, `notabv.bg` ends with `abv.bg` as text.
-        assert!(entry_matches(entry, "notabv.bg").is_none());
+        assert!(entry_matches(entry, "notabv.bg", None).is_none());
         // The other direction is not a match: an entry for a subdomain does not answer for the
         // domain, because the credentials may not be the same.
-        assert!(entry_matches("websites/www.abv.bg/me", "abv.bg").is_none());
+        assert!(entry_matches("websites/www.abv.bg/me", "abv.bg", None).is_none());
         // An entry that names no host answers for none.
-        assert!(entry_matches("personal/router", "abv.bg").is_none());
+        assert!(entry_matches("personal/router", "abv.bg", None).is_none());
 
         // **The IP guard.** `1.2.3.4` ends with `.3.4`, so without it an entry segment named `3.4`
         // would answer for it.
-        assert!(entry_matches("hosts/3.4/me", "1.2.3.4").is_none());
-        assert!(entry_matches("hosts/1.2.3.4/me", "1.2.3.4").is_some());
+        assert!(entry_matches("hosts/3.4/me", "1.2.3.4", None).is_none());
+        assert!(entry_matches("hosts/1.2.3.4/me", "1.2.3.4", None).is_some());
+    }
+
+    /// The port, for every host and every port — not a localhost special case.
+    #[test]
+    fn an_entry_that_names_a_port_answers_for_that_port_only() {
+        // The case that started it: Grafana on localhost:3000, where the host says nothing at all
+        // about which service you are looking at.
+        let entry = "website/localhost:3000/admin";
+        assert!(entry_matches(entry, "localhost", Some("3000")).is_some());
+        assert!(entry_matches(entry, "localhost", Some("8080")).is_none(), "another service");
+        assert!(entry_matches(entry, "localhost", None).is_none(), "the scheme default is not 3000");
+
+        // Nothing here is about localhost or about those numbers. Any host, any port.
+        for (host, port) in [
+            ("example.com", "8443"),
+            ("grafana.internal", "3000"),
+            ("dev.box", "1"),
+            ("staging.example.org", "65535"),
+        ] {
+            let entry = format!("websites/{host}:{port}/me");
+            assert!(entry_matches(&entry, host, Some(port)).is_some(), "{entry}");
+            assert!(entry_matches(&entry, host, Some("9999")).is_none(), "{entry} on the wrong port");
+            assert!(entry_matches(&entry, host, None).is_none(), "{entry} with no port");
+        }
+
+        // An IP with a port: the port has to be read BEFORE the "an IP matches by equality only"
+        // rule, or the segment never gets that far.
+        assert!(entry_matches("hosts/127.0.0.1:3000/me", "127.0.0.1", Some("3000")).is_some());
+        assert!(entry_matches("hosts/127.0.0.1:3000/me", "127.0.0.1", Some("3001")).is_none());
+        // And IPv6, where the colons inside the brackets are the address.
+        assert!(entry_matches("hosts/[::1]:8443/me", "[::1]", Some("8443")).is_some());
+        assert!(entry_matches("hosts/[::1]:8443/me", "[::1]", Some("80")).is_none());
+        assert!(entry_matches("hosts/[::1]/me", "[::1]", Some("8443")).is_some(), "no port, any port");
+
+        // The subdomain rule is not lost by naming a port.
+        assert!(entry_matches("websites/abv.bg:8443/me", "www.abv.bg", Some("8443")).is_some());
+
+        // A segment that is only a port names no host and answers for none. Without the guard the
+        // empty host part strips an empty suffix and matches everything.
+        assert!(entry_matches("websites/:3000/me", "localhost", Some("3000")).is_none());
+        assert!(entry_matches("websites/:3000/me", "abv.bg", Some("3000")).is_none());
+    }
+
+    /// An entry without a port keeps answering for every port — a credential is issued for a host.
+    #[test]
+    fn an_entry_without_a_port_still_answers_for_any_of_them() {
+        let entry = "websites/abv.bg/me";
+        assert!(entry_matches(entry, "abv.bg", None).is_some());
+        assert!(entry_matches(entry, "abv.bg", Some("443")).is_some());
+        assert!(entry_matches(entry, "abv.bg", Some("8443")).is_some());
+    }
+
+    /// Both kinds in one store: the one written for this port is offered first.
+    #[test]
+    fn the_entry_written_for_this_port_is_offered_first() {
+        let entries = vec![
+            "websites/localhost/me".to_string(),
+            "websites/localhost:3000/admin".to_string(),
+            "websites/localhost:8080/other".to_string(),
+        ];
+        assert_eq!(
+            entries_for(&entries, "localhost", Some("3000")),
+            vec!["websites/localhost:3000/admin", "websites/localhost/me"],
+        );
+        assert_eq!(
+            entries_for(&entries, "localhost", Some("8080")),
+            vec!["websites/localhost:8080/other", "websites/localhost/me"],
+        );
+        // On a port nobody wrote an entry for, only the host-wide one is left.
+        assert_eq!(
+            entries_for(&entries, "localhost", Some("9000")),
+            vec!["websites/localhost/me"],
+        );
     }
 
     /// Specificity, which is what makes a subdomain's own entry win over the domain's.
@@ -465,11 +579,11 @@ mod tests {
             "a/unrelated/me".to_string(),
         ];
         assert_eq!(
-            entries_for(&entries, "mail.google.com"),
+            entries_for(&entries, "mail.google.com", None),
             vec!["a/mail.google.com/me", "a/google.com/me"],
         );
-        assert_eq!(entries_for(&entries, "google.com"), vec!["a/google.com/me"]);
-        assert!(entries_for(&entries, "example.org").is_empty());
+        assert_eq!(entries_for(&entries, "google.com", None), vec!["a/google.com/me"]);
+        assert!(entries_for(&entries, "example.org", None).is_empty());
     }
 
     /// The walk, against a store built for the test. Each assertion is one rule of `pass`'s layout.
@@ -772,7 +886,10 @@ wrap_task! {
                 }
             };
             let matched: Vec<String> =
-                entries_for(entries, &self.origin.host).into_iter().map(str::to_string).collect();
+                    entries_for(entries, &self.origin.host, self.origin.port.as_deref())
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
             if let Ok(mut slot) = CANDIDATES.lock() {
                 *slot = Some(if matched.is_empty() { entries.clone() } else { matched.clone() });
             }
