@@ -1494,6 +1494,36 @@ fn to_view(x: i32, y: i32, factor: f64) -> (i32, i32) {
 }
 
 fn set_zoom_percent(browser: &mut Browser, percent: u32) {
+    // **Nothing under `bru://` zooms, and the reason is that Chromium keys zoom by *host*.**
+    //
+    // Every document bru serves itself — both strips, the panel, and every page from
+    // `bru://chrome/help` to `bru://chrome/dial` — is the single host `chrome`. Chromium stores one
+    // zoom level per host, in `<profile>/Default/Preferences` under
+    // `partition.per_host_zoom_levels`, and applies it to every view on that host at once. So
+    // zooming the dial did not zoom the dial: it zoomed the *tab strip and the status bar with it*,
+    // wrote itself to disk, and survived the restart.
+    //
+    // Measured 2026-09-09 on this machine's profile. After `-` on the dial:
+    // `"chrome": { "zoom_level": -1.5778829311823859 }`, which is 1.2^-1.578 = 75% — both strips
+    // drew at three quarters. `+` on another tab could not undo it, because that wrote a different
+    // host; `+` back on the dial moved everything to 110% together.
+    //
+    // Refusing here is the whole fix and it costs one thing: bru's own pages do not zoom. That is
+    // the honest trade, because they are already sized by a setting that is theirs —
+    // `fonts.default_size`, which `chrome.rs::user_css` serves to all of them. Making them zoom
+    // independently means giving the strips a different host from the pages, which is ~90 spellings
+    // of `bru://chrome` across twenty files plus the security check in `ipc.rs`; that is a change to
+    // make deliberately, not as a side effect of a zoom key.
+    let page_is_brus_own = browser
+        .main_frame()
+        .map(|frame| CefString::from(&frame.url()).to_string())
+        .is_some_and(|url| url.starts_with("bru://"));
+    if page_is_brus_own {
+        crate::message::warning(
+            "zoom: bru's own pages do not zoom — they follow the fonts.default_size setting",
+        );
+        return;
+    }
     let Some(host) = browser.host() else {
         return;
     };
@@ -1516,6 +1546,10 @@ fn set_zoom_percent(browser: &mut Browser, percent: u32) {
     }
     // --- end unhardcoded -----------------------------------------------------------------------
     host.set_zoom_level((percent as f64 / 100.0).ln() / 1.2f64.ln());
+    // **Said, because nothing else says it.** The status bar has no zoom field, `:zoom` was silent
+    // and a session does not record the level, so the only way to know where a page had got to was
+    // to look at it. One line in the bar is what `:zoom`, `+` and `-` now leave behind.
+    crate::message::info(&format!("{percent}%"));
 }
 
 /// `zoom-in`/`zoom-out`: `offset` places along qutebrowser's list of levels, stopping at the ends

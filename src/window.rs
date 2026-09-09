@@ -1409,6 +1409,28 @@ wrap_browser_view_delegate! {
                 .lock()
                 .expect("state mutex poisoned")
                 .note_chrome_browser(self.window_id, browser.identifier());
+
+            // --- src/exec.rs: the chrome does not zoom ----------------------------------------
+            // **Pinned to 100% on every strip, on every start, and this heals a profile that has
+            // already been zoomed.** Chromium stores a zoom level *per host*, in
+            // `<profile>/Default/Preferences` under `partition.per_host_zoom_levels`. Every
+            // `bru://chrome` document — both strips and the panel — is the single host `chrome`,
+            // so one stray zoom moves all of them together and outlives the run.
+            //
+            // Measured 2026-09-09 on this machine's profile, after `-` was pressed with the
+            // command line focused: `"chrome": { "zoom_level": -1.5778829311823859 }`, which is
+            // 1.2^-1.578 = 75%. Both strips drew at three quarters and `+` could not undo it —
+            // by then the focus was back on the page, so `zoom-in` moved the page's host instead.
+            //
+            // **Measured not to be enough, and kept anyway.** Chromium applies the stored host
+            // level when the document commits, which is after this callback — the file proved it:
+            // `last_modified` on the `chrome` entry never moved. The reset that sticks is in
+            // `ipc.rs`, on the `ready` query the strip sends once its document is up. This one
+            // costs nothing and covers the window between creation and commit.
+            if let Some(host) = browser.host() {
+                host.set_zoom_level(0.0);
+            }
+            // --- end src/exec.rs: the chrome does not zoom ------------------------------------
         }
 
         fn browser_runtime_style(&self) -> RuntimeStyle {

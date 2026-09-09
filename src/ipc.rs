@@ -300,6 +300,33 @@ impl BrowserSideHandler for BruQueryHandler {
                     fail(&callback, -8, "a chrome view that belongs to no window");
                     return true;
                 };
+
+                // --- src/exec.rs: the chrome does not zoom ------------------------------------
+                // **Host `chrome` back to 100%, here and not at browser creation.**
+                //
+                // Chromium stores one zoom level per *host* and every `bru://chrome` document is
+                // the host `chrome` — both strips, the panel, and every page bru serves. So a zoom
+                // that landed on that host moved all of them together and was written to
+                // `<profile>/Default/Preferences`, where it outlived the run.
+                //
+                // `exec::set_zoom_percent` now refuses a `bru://` page, which stops it happening
+                // again — and on its own would have been a trap: a profile already carrying a level
+                // could never be zoomed back, because the command that would do it is the one being
+                // refused. This is the half that clears it. Measured 2026-09-09: the same reset in
+                // `BruChromeViewDelegate::on_browser_created` did nothing, and the file said so —
+                // `last_modified` never moved — because Chromium applies the stored host level when
+                // the document commits, which is after that callback. A `ready` query is the
+                // document telling bru it is up, so by here the commit has happened and the write
+                // sticks.
+                //
+                // Every start, not once: it costs one call per strip load and it means a profile
+                // that picked up a level from an older build heals itself on the next run.
+                if let Some(browser) = browser.as_ref() {
+                    if let Some(host) = browser.host() {
+                        host.set_zoom_level(0.0);
+                    }
+                }
+                // --- end src/exec.rs: the chrome does not zoom --------------------------------
                 let response = match view.as_str() {
                     "top" => {
                         with_window(window, |entry| entry.frames.top = Some(frame));
