@@ -313,6 +313,15 @@ pub const COMMANDS: &[Doc] = &[
                the page.",
         example: "cookies" },
 
+    Doc { names: &["dial"], args: "", flags: &["-b/--bg"],
+        what: "Open the dial — the sites you keep, in groups, as tiles. Set it as your start page \
+               with start_page = bru://chrome/dial.",
+        example: "dial" },
+    Doc { names: &["dial-add"], args: "[title] [-g <group>]", flags: &["-g/--group"],
+        what: "Put the showing tab on the dial. With no title the tab's own is used; adding a URL \
+               that is already there updates it instead of duplicating it.",
+        example: "dial-add -g work" },
+
     Doc { names: &["yank"], args: "[url|pretty-url|title|domain|selection|inline <text>]",
         flags: &["-s/--sel"],
         what: "Copy something about the page to the clipboard, or with -s to the primary selection.",
@@ -1428,7 +1437,8 @@ mod tests {
         // 173 since `config-write`, which is `config-diff`'s Lua into a file and, with
         // `--defaults`, every setting and binding bru ships. Raise this with the command.
         // 174 since `password-fill`. Raise this with the command.
-        assert_eq!(source.len(), 174, "the scrape found a different number of commands");
+        // 176 since `dial` and `dial-add`.
+        assert_eq!(source.len(), 176, "the scrape found a different number of commands");
         // And the depth rule did its job: these are argument values written as literals inside an
         // arm body, and a regex over the same file would have listed all four as commands.
         for value in ["up", "links", "pretty-url", "next-category"] {
@@ -1543,6 +1553,8 @@ mod tests {
                 Command::BookmarkList { .. } => "BookmarkList",
                 Command::History { .. } => "History",
                 Command::Cookies { .. } => "Cookies",
+                Command::Dial { .. } => "Dial",
+                Command::DialAdd { .. } => "DialAdd",
                 Command::Yank { .. } => "Yank",
                 Command::Search { .. } => "Search",
                 Command::SearchNext => "SearchNext",
@@ -1695,6 +1707,7 @@ mod tests {
         "ConfigListRemove", "ConfigSource", "ConfigEdit", "Bind", "Unbind", "DevToolsClose",
         "CompletionItemFocus", "CompletionItemDel", "CompletionItemYank", "PromptAccept",
         "PromptDir", "PromptItemFocus", "PromptOpenDownload", "PromptYank", "PromptFileselectExternal",
+        "Dial", "DialAdd",
         "AdblockUpdate", "AdblockToggle", "AdblockInfo", "GreasemonkeyReload", "ViewSource",
         "Print", "DevTools", "DevToolsFocus", "Message", "MacroRecord", "MacroRun", "Save",
         "CmdRepeatLast", "SettingsPage", "TabSelect", "TabTake", "WindowOnly", "Screenshot",

@@ -34,6 +34,9 @@ const PROMPT_JS: &[u8] = include_bytes!("../chrome/prompt.js");
 // --- src/cookies.rs --------------------------------------------------------
 const COOKIES_JS: &[u8] = include_bytes!("../chrome/cookies.js");
 // --- end src/cookies.rs ----------------------------------------------------
+// --- src/dial.rs -----------------------------------------------------------
+const DIAL_JS: &[u8] = include_bytes!("../chrome/dial.js");
+// --- end src/dial.rs -------------------------------------------------------
 
 /// The theme bru ships with, used until themer has written one to `~/.config/bru/theme.css`.
 ///
@@ -124,6 +127,13 @@ fn asset(url: &str) -> Option<(&'static str, Vec<u8>)> {
         "/history" | "/history.html" => Some(("text/html", crate::history::history_page().into_bytes())),
         "/bookmarks" | "/bookmarks.html" => Some(("text/html", crate::history::marks_page().into_bytes())),
 // --- end src/history.rs ----------------------------------------------------
+// --- src/dial.rs -----------------------------------------------------------
+        // The start page, when somebody sets it as one. Generated per request from `Data`'s tiles,
+        // for the same reason `/help` is — and *not* a shell like `/cookies`, because these rows
+        // are already in memory and this is the first page a launch draws. See src/dial.rs.
+        "/dial" | "/dial.html" => Some(("text/html", crate::dial::page().into_bytes())),
+        "/dial.js" => Some(("text/javascript", DIAL_JS.to_vec())),
+// --- end src/dial.rs -------------------------------------------------------
 // --- src/settingspage.rs ---------------------------------------------------
         // What a bare `:set` opens. Generated per request from `settings::SETTINGS` and from what
         // Chromium answers, for the same reason `/help` is. See src/settingspage.rs.

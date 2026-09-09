@@ -596,7 +596,9 @@ fn escape_attr(s: &str) -> String {
 /// The row still *shows* the string in its text cells: printing a URL is harmless, following it is
 /// not, and a poisoned row that renders as `#` while displaying what it holds is a row the reader
 /// can see and delete.
-fn safe_href(url: &str) -> String {
+/// `pub` because `src/dial.rs` draws user-held URLs too, and a filter whose whole property is
+/// that it is an allowlist must not be copied into a second file where one copy can be widened.
+pub fn safe_href(url: &str) -> String {
     // **Normalise the way the parser will, then allow rather than refuse.**
     //
     // The first version of this refused a denylist of schemes after `trim_start` and

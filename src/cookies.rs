@@ -352,10 +352,14 @@ fn list_json(rows: &[CookieRow], filter: &str, undo: usize) -> String {
 
 /// Read `"keys": ["a", "b", …]` out of a flat request object.
 ///
-/// `ipc.rs::json_field` reads a string and stops; this is the one array bru's chrome sends. It is a
-/// reader for exactly the shape `JSON.stringify` produces from an array of strings and nothing
-/// else: anything it does not recognise yields an empty list, which deletes nothing. Failing that
-/// way round is the whole reason it is written by hand rather than made permissive.
+/// `ipc.rs::json_field` reads a string and stops; this reads the arrays bru's chrome sends — this
+/// page's `keys`, and `bru://chrome/dial`'s `urls`. It is a reader for exactly the shape
+/// `JSON.stringify` produces from an array of strings and nothing else: anything it does not
+/// recognise yields an empty list, which deletes nothing. Failing that way round is the whole
+/// reason it is written by hand rather than made permissive.
+///
+/// It stays here rather than moving to `ipc.rs` with `json_field` because this is where its tests
+/// are and where the shape it refuses was argued for; `dial.rs` calls it by name.
 pub fn json_string_array(src: &str, key: &str) -> Vec<String> {
     let needle = format!("\"{key}\"");
     let Some(at) = src.find(&needle) else {

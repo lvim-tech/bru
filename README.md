@@ -13,7 +13,7 @@ Everything else follows from keeping that true.
 
 - **qutebrowser's vocabulary.** The default bindings are transcribed from `configdata.yml`, so `f`
   hints, `o` opens, `d` closes a tab, `gg` and `G` jump, `:` is the command line.
-  **291 default bindings, 174 commands, 72 settings.**
+  **292 default bindings, 176 commands, 72 settings.**
 - **One binary.** No embedded runtime to install, no Python, no Qt. CEF is a prebuilt Chromium
   distribution — nothing here compiles a browser engine.
 - **Its own data.** `~/.local/share/bru/` holds history, quickmarks, bookmarks, sessions and the
@@ -611,6 +611,8 @@ one vocabulary, three doors. Arguments in `<>` are required and `[]` optional.
 | `bookmark-list` | — | `--jump`, `-b/--bg` | Open the page that lists the bookmarks and quickmarks. |
 | `bookmark-load` | `<url>` | `-t/--tab`, `-b/--bg`, `-w/--window`, `-d/--delete` | Open a bookmark, and with -d delete it as it opens. |
 | `bookmarks-reload` | — | — | Re-read the bookmarks file from disk. |
+| `dial` | — | `-b/--bg` | Open the dial — the sites you keep, in groups, as tiles. |
+| `dial-add` | `[title]` | `-g/--group <name>` | Put the showing tab on the dial. |
 | `session-save` | `[name]` | `-f/--force` | Write the open windows and tabs to a session file. |
 | `session-load` | `<name>` | `-c/--clear`, `--history` |  |
 | `session-delete` | `<name>` | — | Delete a session file. |

@@ -37,6 +37,7 @@ mod data;
 mod downloads;
 mod editor;
 mod devtools;
+mod dial;
 // --- plugin events ------------------------------------------------------------------------------
 mod events;
 // --- end plugin events --------------------------------------------------------------------------

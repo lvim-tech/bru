@@ -190,6 +190,15 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     ("normal", "ad", "download-cancel"),
     ("normal", "cd", "download-clear"),
     ("normal", "gf", "view-source"),
+// --- src/dial.rs -----------------------------------------------------------
+    // `gh` for the dial, which `:dial` opens in a tab. "go home" is the mnemonic
+    // and the dial is what `start_page` is usually set to, so the two agree.
+    //
+    // It is free and it is the only free `g` key whose letter means anything
+    // here: `gd` is `download`, `gD` is `tab-give`, `go`/`gO` are the address
+    // bar and `ga` is a new tab. qutebrowser binds nothing to `gh`.
+    ("normal", "gh", "dial"),
+// --- end src/dial.rs -------------------------------------------------------
     ("normal", "gt", "cmd-set-text -s :tab-select"),
     ("normal", "<Ctrl-Tab>", "tab-focus last"),
     ("normal", "<Ctrl-Shift-Tab>", "nop"),
@@ -1543,9 +1552,10 @@ mod tests {
         // **289** since `<Ctrl-p>` in insert mode, which is `:password-fill` — the first binding in
         // this table that is not transcribed from `configdata.yml`, because the command it names is
         // not qutebrowser's either.
-        // **291** since `<Ctrl-Shift-V>` and `<Shift-Ins>` paste the clipboard / primary into the
+        // **292** since `gh` opens the dial. Raise this with the binding.
+        // 291 since `<Ctrl-Shift-V>` and `<Shift-Ins>` paste the clipboard / primary into the
         // command line — two more bindings that are bru's own, for the same reason `<Ctrl-p>` is.
-        assert_eq!(total, 291, "the default table is not the one transcribed from configdata.yml");
+        assert_eq!(total, 292, "the default table is not the one transcribed from configdata.yml");
         assert!(unimplemented > 0 && unimplemented < total);
     }
 
@@ -1559,7 +1569,7 @@ mod tests {
         // `Y`, `H`/`J`/`K`/`L` and `G` are the shifted spellings of keys the same mode also binds
         // unshifted — twenty-nine rows that collapse to twenty-eight if the Shift bit is ever lost.
         // **177: 172 plus the five inspector keys that came back.**
-        assert_eq!(bindings.len(Mode::Normal), 177);
+        assert_eq!(bindings.len(Mode::Normal), 178);
         // **Five**, the fourth of qutebrowser's plus `<Ctrl-p>` for `:password-fill` — the one
         // binding in this table that is bru's own, because the command it names is bru's own.
         assert_eq!(bindings.len(Mode::Insert), 5);
@@ -1862,7 +1872,7 @@ mod tests {
             "a syntax error means nothing in the file ran, so J is still the default"
         );
         assert_eq!(config.bindings.command_for(Mode::Normal, "j"), Some("scroll down"));
-        assert_eq!(config.bindings.len(Mode::Normal), 177);
+        assert_eq!(config.bindings.len(Mode::Normal), 178);
     }
 
     #[test]

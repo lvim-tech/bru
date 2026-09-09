@@ -1276,14 +1276,18 @@ body[data-view="cookies"] {
 
 /* The controls sit together on one row so that Tab from the filter box lands
    on the two buttons in the order they are read in. */
-#controls {
+/* Scoped to `#cookies`, like every other rule in this block. Unscoped, these
+   four reached bru://chrome/dial, whose own bar is also a `#controls` — its
+   `display: flex` collapsed the dial's add form, its Undo and its help line
+   onto one row. Measured 2026-09-09 in a preview of the rendered page. */
+#cookies #controls {
     display: flex;
     gap: 0.5rem;
     align-items: center;
     margin: 0 0 0.75rem;
 }
 
-#filter {
+#cookies #filter {
     flex: 1;
     min-width: 0;
     padding: 0.3rem 0.5rem;
@@ -1294,12 +1298,12 @@ body[data-view="cookies"] {
     border-radius: 2px;
 }
 
-#filter:focus {
+#cookies #filter:focus {
     outline: none;
     border-color: var(--completion-item-selected-border-top);
 }
 
-#controls button {
+#cookies #controls button {
     padding: 0.3rem 0.7rem;
     font: inherit;
     background: var(--completion-even-bg);
@@ -1309,14 +1313,14 @@ body[data-view="cookies"] {
     cursor: pointer;
 }
 
-#controls button:disabled { opacity: 0.4; cursor: default; }
+#cookies #controls button:disabled { opacity: 0.4; cursor: default; }
 
-#controls button:focus { outline: 1px solid var(--completion-item-selected-border-top); }
+#cookies #controls button:focus { outline: 1px solid var(--completion-item-selected-border-top); }
 
 /* Armed, i.e. one more press deletes everything on the screen. It borrows the
    error colours the theme already carries for the message line, because that
    is the vocabulary this desktop already reads as "this one bites". */
-#controls button.armed {
+#cookies #controls button.armed {
     background: var(--messages-error-bg);
     color: var(--messages-error-fg);
     border-color: var(--messages-error-border);
@@ -1405,3 +1409,349 @@ body[data-view="cookies"] {
 #cookies .path   { width: 12ch; flex: none; overflow: hidden; white-space: nowrap; }
 #cookies .flags  { width: 17ch; flex: none; white-space: nowrap; color: var(--completion-category-fg); }
 #cookies .expiry { width: 11ch; flex: none; text-align: right; white-space: nowrap; color: var(--ui-fg-dim); }
+
+/* ------------------------------------------------- bru://chrome/dial
+ *
+ * A tab, and usually the start page, so it scrolls and its text can be
+ * selected — the same two overrides body[data-view="help"] and
+ * body[data-view="cookies"] make, for the same reason.
+ *
+ * Markup src/dial.rs renders (this page's tiles are NOT built by JavaScript —
+ * see the module comment there):
+ *
+ *   <section class="group">
+ *     <h2>работа</h2>
+ *     <div class="tiles">
+ *       <div class="tile a3" data-url="…" draggable="true">
+ *         <a class="go" href="…"><span class="icon">G<img class="favicon"></span
+ *           ><span class="name">GitHub</span><span class="host">github.com</span></a>
+ *         <button class="edit">✎</button><button class="del">×</button>
+ *       </div>
+ *
+ * Not one colour is written here — see the top of this file. The colour test in
+ * src/chrome.rs reads this block too, which is why the page links this
+ * stylesheet instead of carrying a <style> of its own, and it is the whole
+ * mechanism behind "the dial is styled by lvim-colorscheme": theme.css is
+ * rewritten by themer and re-read on every request.
+ */
+
+body[data-view="dial"] {
+    height: auto;
+    overflow: auto;
+    user-select: text;
+    background: var(--bg);
+    /* --completion-fg and not --fg. body[data-view="cookies"] carries the
+       measurement: --fg is made for reading code in an editor and clears only
+       2.31:1 against --bg, where interface text needs 4.5. This page is
+       interface. */
+    color: var(--completion-fg);
+}
+
+#dial {
+    max-width: 76rem;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 4rem;
+}
+
+#dial h2 {
+    margin: 2rem 0 0.75rem;
+    font-size: 0.8rem;
+    font-weight: normal;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--completion-category-fg);
+    border-bottom: 1px solid var(--raised);
+    padding-bottom: 0.3rem;
+}
+
+/* The first section is the ungrouped run and has no heading — see
+   dial::grouped. Without this it would sit 2rem below the top of the page for
+   no visible reason. */
+#dial section.group:first-child > .tiles { margin-top: 0; }
+#dial section.group:first-child h2 { margin-top: 0; }
+
+/* auto-fill and not auto-fit: a dial with three tiles should show three tiles
+   at their own width, not three tiles stretched across the window. */
+#dial .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+    gap: 0.6rem;
+}
+
+/* `--raised` and not `--completion-even-bg`. Measured on the shipped
+   EverforestDark: --completion-even-bg is #232929 and --bg is #232929 — the
+   same colour, because those variables dress the completion popup, which sits
+   on its own darker ground. A tile is a card on the page background, and the
+   theme already has the vocabulary for that: --raised (#2e3939) and
+   --raised-more (#354545). --completion-border is #212626, darker than the
+   page, so it was a border nobody could see either. */
+#dial .tile {
+    position: relative;
+    border: 1px solid var(--raised-more);
+    background: var(--raised);
+    overflow: hidden;
+}
+
+#dial .tile:hover { background: var(--raised-more); }
+
+/* The accent is the left edge, which is the one place a colour can carry a
+   whole tile without competing with the text on it. The nine are the theme's
+   own; dial::accent_of picks by a hash of the host, so a tile keeps its colour
+   when its neighbours change. */
+#dial .tile { border-left: 3px solid var(--comment); }
+#dial .tile.a0 { border-left-color: var(--blue); }
+#dial .tile.a1 { border-left-color: var(--cyan); }
+#dial .tile.a2 { border-left-color: var(--green); }
+#dial .tile.a3 { border-left-color: var(--magenta); }
+#dial .tile.a4 { border-left-color: var(--orange); }
+#dial .tile.a5 { border-left-color: var(--purple); }
+#dial .tile.a6 { border-left-color: var(--red); }
+#dial .tile.a7 { border-left-color: var(--teal); }
+#dial .tile.a8 { border-left-color: var(--yellow); }
+
+#dial .tile .go {
+    display: grid;
+    grid-template-columns: 2.2rem 1fr;
+    grid-template-rows: auto auto;
+    gap: 0 0.6rem;
+    align-items: center;
+    padding: 0.7rem 0.8rem;
+    text-decoration: none;
+    color: inherit;
+}
+
+/* The letter, and the favicon that covers it when bru has one. Both occupy the
+   same cell: the letter is always rendered, because favicon.rs's map is memory
+   and a browser that has just started knows no icons — and this is the first
+   page a start draws. */
+#dial .icon {
+    position: relative;
+    grid-row: 1 / span 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.2rem;
+    height: 2.2rem;
+    border-radius: 4px;
+    font-size: 1.1rem;
+    background: var(--bg-dark);
+    color: var(--completion-category-fg);
+}
+
+#dial .icon .favicon {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 1.1rem;
+    height: 1.1rem;
+    background: var(--bg-dark);
+}
+
+#dial .name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--completion-match-fg);
+}
+
+#dial .host {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.85em;
+    color: var(--ui-fg-dim);
+}
+
+/* The two controls sit in the corner and appear on hover — but `f` hints them
+   whether or not they are visible, and a keyboard browser is hinted at far more
+   often than it is hovered. So they are transparent rather than display:none:
+   an element with no box is an element hints.js cannot place a label on.
+   They are a 1.6rem square rather than the glyph plus 0.15rem of padding they
+   were, which measured 17x18px at 100% zoom. Page zoom scales everything
+   uniformly — measured, at 50% every box on this page is exactly half — so a
+   control that is barely a target at 100% is not a target at all at 50%, and
+   `:zoom-out` on a start page full of tiles is the normal thing to do with it.
+   CSS cannot opt out of page zoom; the only answer is to start bigger. */
+/* One flex group rather than two absolutely-placed buttons. "Sit together" is
+   then a single `gap` instead of two `right` offsets that have to be kept in
+   step with the button width by hand — the arrangement the first version had,
+   where changing the size silently changed the space between them. */
+#dial .tile .acts {
+    position: absolute;
+    top: 0.2rem;
+    right: 0.2rem;
+    display: flex;
+    /* Zero, and the boxes below are only as wide as the mark in them. They were
+       1.5rem squares touching at 0.05rem, which put the two glyphs 24.8px apart
+       centre to centre — the boxes were adjacent and the marks were not. */
+    gap: 0;
+    opacity: 0;
+}
+
+#dial .tile .edit,
+#dial .tile .del {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.15rem;
+    height: 1.4rem;
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: pointer;
+    line-height: 0;
+    color: var(--ui-fg-dim);
+}
+
+/* The marks are SVG, sized here rather than in the markup so the two cannot
+   drift apart — see PENCIL and CROSS in src/dial.rs for why they are drawn
+   instead of typed. */
+#dial .tile .acts svg {
+    width: 0.95rem;
+    height: 0.95rem;
+    display: block;
+}
+
+#dial .tile:hover .acts,
+#dial .tile:focus-within .acts { opacity: 1; }
+
+#dial .tile .del:hover { color: var(--messages-error-fg); }
+#dial .tile .edit:hover { color: var(--completion-match-fg); }
+
+#dial .tile.dragging { opacity: 0.45; }
+
+/* The tile the form at the bottom is currently about. It keeps its accent and
+   takes the hover surface, so "which one am I editing" is answered on the tile
+   rather than only by the URL in a field further down the page. */
+#dial .tile.editing {
+    background: var(--raised-more);
+    border-color: var(--completion-item-selected-border-top);
+}
+
+#dial #add input {
+    min-width: 0;
+    border: 1px solid var(--raised-more);
+    border-radius: 3px;
+    padding: 0.2rem 0.4rem;
+    font: inherit;
+    background: var(--bg-dark);
+    color: var(--completion-fg);
+}
+
+/* --ui-fg-dim and not --completion-item-selected-border-bottom, which is what
+   this was and which is `var(--bg-light)` on the shipped theme: rgb(39,46,46)
+   against the rgb(53,69,69) of an unfocused field. Focusing an input made its
+   outline *fainter* than its neighbours'. Measured 2026-09-09. The same
+   variable is used by `#cookies #filter:focus` above and has the same problem
+   there; left alone, because that is a different page and nobody has looked
+   at it. */
+#dial #add input:focus {
+    outline: none;
+    border-color: var(--ui-fg-dim);
+}
+
+/* The placeholder — `https://`, `name`, `group`.
+   Without this rule it is Chromium's own built-in default, measured
+   rgb(117, 117, 117): a neutral grey with no green in it at all, sitting in a
+   palette where every other quiet thing is green-tinted, which is what made it
+   read as muddy beside the rest of the form.
+   The number is what took three goes. Chromium's own default was 3.41:1 against
+   the field's --bg-dark, which is the ratio a placeholder normally sits at —
+   the complaint was its *hue*, not its lightness. --raised-more, the border
+   colour, is 1.56:1 and disappeared; --comment is 2.28:1 and is still under it.
+   So the colour is mixed from the theme's own dim text toward the field it sits
+   in, which lands on the ratio that was right to begin with, in the palette's
+   green rather than in Chromium's neutral grey.
+   The mixing is `opacity` and not `color-mix`, and not by preference:
+   `chrome_css_carries_not_one_colour` refuses `color-mix(` in this file. The
+   two are the same arithmetic — a colour at 72% over the field's background is
+   what a 72% mix toward that background is — and opacity is a property rather
+   than a colour, so the guard stays exactly as strict as it was. */
+#dial #add input::placeholder {
+    color: var(--ui-fg-dim);
+    opacity: 0.72;
+}
+
+
+#dial #add button,
+#dial #undo {
+    border: 1px solid var(--raised-more);
+    border-radius: 3px;
+    padding: 0.2rem 0.6rem;
+    font: inherit;
+    cursor: pointer;
+    background: var(--raised);
+    color: var(--completion-fg);
+}
+
+#dial #add button:hover,
+#dial #undo:hover { background: var(--raised-more); }
+
+#dial .empty {
+    margin: 0 0 1.5rem;
+    color: var(--ui-fg-dim);
+}
+
+/* `#dial #controls` and not a bare `#controls`: bru://chrome/cookies has a
+   `<div id="controls">` of its own, and an unscoped rule here would reach it. */
+#dial #controls {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    /* --completion-category-border-top is #232929, which is --bg. See the note
+       on `#dial .tile` for why these variables read as invisible here. */
+    border-top: 1px solid var(--raised);
+}
+
+#dial #add {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+}
+
+/* All three the same width. The URL is the longest value of the three and the
+   first version gave it twice the room, which made a row of three fields look
+   like one field and two afterthoughts. Equal is what a form of three equal
+   questions should look like; a long URL scrolls inside its box. */
+#dial #add #add-url,
+#dial #add #add-title,
+#dial #add #add-group { flex: 1 1 12rem; }
+
+/* The help line, and everything in it — `kbd`, `code` — inherits this rather
+   than carrying an accent of its own.
+   Four settings, and the measurements are why it landed here. It began in
+   --completion-match-fg (#d07b41) and --completion-category-fg (#af9e6b): two
+   browns that made a one-line hint the most coloured thing on the page. Then
+   the body colour at 0.72 opacity, 4.55:1. Then --raised-more, the colour of
+   the borders around it — 1.47:1, and at that ratio the line is not quiet, it
+   is gone.
+   --ui-fg-dim is 4.85:1 and is the theme's own name for dim interface text.
+   It is also what `.host` and `.empty` on this page already use, so the three
+   quiet things on the dial are now one colour instead of three. --comment
+   (#535d4e, 2.14:1) is the step back down if this reads as too present. */
+#dial .summary {
+    margin: 0.75rem 0 0;
+    color: var(--ui-fg-dim);
+}
+
+#dial .summary kbd {
+    padding: 0 0.3em;
+    border: 1px solid var(--raised-more);
+    border-radius: 2px;
+    color: inherit;
+}
+
+#dial .summary code { color: inherit; }
+
+/* The one mark that appears in prose rather than on a tile. Same SVG, sized to
+   the line it sits in so it does not push the row taller. */
+#dial .summary kbd.mark {
+    padding: 0 0.25em;
+    line-height: 0;
+}
+
+#dial .summary kbd.mark svg {
+    width: 0.85em;
+    height: 0.85em;
+    vertical-align: -0.15em;
+}

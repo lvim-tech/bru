@@ -168,12 +168,24 @@ fn page_origin(browser: &mut Browser) -> Option<String> {
     origin_of(&url)
 }
 
+/// The icon bru has for an origin, if it has downloaded one this session.
+///
+/// **`bru://chrome/dial` reads this to draw its tiles, and the honest limit is that the map is
+/// memory.** It is filled by `on_favicon_urlchange` as pages are visited and it does not survive
+/// the process — so a freshly started browser knows no icons, and the dial is the first page that
+/// start draws. That is why a tile always renders a letter underneath: see `dial::tile_html`.
+pub fn icon_for(origin: &str) -> Option<String> {
+    icons().lock().ok()?.get(origin).cloned()
+}
+
 /// `https://User@Example.COM:443/a?b#c` → `https://example.com`.
 ///
 /// Only http and https have favicons worth caching: `bru://` is the chrome's own, and a `data:` or
 /// `file:` page has no origin to share an icon with. JavaScript answers `"null"` for those, and a
 /// key that can never be looked up is worse than no key.
-fn origin_of(url: &str) -> Option<String> {
+/// `pub` so that `dial.rs` keys its lookup with the *same* function that filed the icon. Two
+/// spellings of an origin is an icon that is never found, and the module comment above says so.
+pub fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {

@@ -585,6 +585,13 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
         }
 // --- end src/cookies.rs ----------------------------------------------------
 
+// --- src/dial.rs -----------------------------------------------------------
+        Command::Dial { bg } => crate::dial::show(state, browser, *bg),
+        Command::DialAdd { group, title } => {
+            crate::dial::add(state, group.as_deref(), title.as_deref())
+        }
+// --- end src/dial.rs -------------------------------------------------------
+
 // --- src/settings.rs -------------------------------------------------------
         // `:set` and the 24 `config-cycle` bindings. The `-u` pattern still holds `{url:host}` at
         // this point — `commands::parse` ran at startup, when there was no page to ask — so it is
@@ -1150,6 +1157,8 @@ pub fn is_live(command: &Command) -> bool {
         // key table 1:1 with qutebrowser's — so this raises no binding count. It is live all the
         // same: `:cookies` opens the page and the page deletes.
         Command::Cookies { .. } => true,
+        // Both act: one navigates, the other writes the dial file.
+        Command::Dial { .. } | Command::DialAdd { .. } => true,
 // --- end src/cookies.rs ----------------------------------------------------
 
 // --- src/clip.rs -----------------------------------------------------------
@@ -1861,7 +1870,7 @@ mod tests {
         // thought not to draw; 281 since the twelve `t**` rows went with the two settings they
         // named — the only two falls in this number. 286 since five of the inspector's keys came
         // back, once the docked positions turned out to be drawable after all.
-        assert_eq!(DEFAULT_BINDINGS.len(), 291);
+        assert_eq!(DEFAULT_BINDINGS.len(), 292);
         // The number this project measures itself by: how many of qutebrowser's own default keys
         // do something when pressed.
         //
@@ -1922,9 +1931,10 @@ mod tests {
         // since the rows left and returned to the table.
         //
         // Raise this when a milestone raises the number, never to make a failing build pass.
-        // **291** since command mode got `<Ctrl-Shift-V>` / `<Shift-Ins>` to paste the clipboard /
+        // **292** since `gh` opens the dial, which is live from the day it is bound.
+        // 291 since command mode got `<Ctrl-Shift-V>` / `<Shift-Ins>` to paste the clipboard /
         // primary into the line — both run `cmd-set-text`, which was already live.
-        assert_eq!(live, 291, "the live-binding count moved");
+        assert_eq!(live, 292, "the live-binding count moved");
     }
 
 // --- src/help.rs -----------------------------------------------------------
@@ -1958,8 +1968,9 @@ mod tests {
         assert!(waiting.is_empty(), "bound and waiting for a milestone: {waiting:?}");
         // Every one of them acts: the twelve that only explained themselves are gone, and the five
         // inspector keys that came back name commands that all draw something.
-        // **291** with the two command-mode paste bindings, which run `cmd-set-text` — live already.
-        assert_eq!(live, 291);
+        // **292** with `gh`, which runs `dial` — live already.
+        // 291 with the two command-mode paste bindings, which run `cmd-set-text` — live already.
+        assert_eq!(live, 292);
     }
 // --- end src/help.rs -------------------------------------------------------
 

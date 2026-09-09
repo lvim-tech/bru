@@ -195,6 +195,21 @@ pub enum Command {
     Cookies { filter: Option<String>, bg: bool },
 // --- end src/cookies.rs ----------------------------------------------------
 
+// --- src/dial.rs -----------------------------------------------------------
+    /// `dial [-b]` — open `bru://chrome/dial`, the tiles.
+    ///
+    /// A noun naming what the page shows, like `:cookies` and `:history` beside it, and a new tab
+    /// for the same reason those are. As a `start_page` the page is reached by navigation and this
+    /// command is never involved.
+    Dial { bg: bool },
+    /// `dial-add [-g <group>] [title]` — put the showing tab on the dial.
+    ///
+    /// The shape of `:bookmark-add`, and it is a command rather than a button **because the dial is
+    /// the page you would be pressing the button on** — see the head of `src/dial.rs`. The title is
+    /// the rest of the line, so it may hold spaces; with none given the tab's own title is used.
+    DialAdd { group: Option<String>, title: Option<String> },
+// --- end src/dial.rs -------------------------------------------------------
+
 // --- src/clip.rs -----------------------------------------------------------
     /// `yank [what] [-s]` — `yy`, `yY`, `yt`, `yT`, `yd`, `yD`, `yp`, `yP`, `ym`, `yM`.
     ///
@@ -1527,6 +1542,31 @@ fn parse_one(s: &str) -> Result<Command, ParseError> {
             }
         }
 // --- end src/cookies.rs ----------------------------------------------------
+
+// --- src/dial.rs -----------------------------------------------------------
+        "dial" => Command::Dial { bg: Args::new(&tokens[1..]).any(&["b", "bg"]) },
+
+        // `jseval`'s shape, and for `jseval`'s two reasons. **maxsplit=0**, because the title is
+        // the rest of the line and a name with a space in it is the normal case here rather than
+        // the mistyped one — so `Flagged::maxsplit0` reads the flags and `tail_after_flags` takes
+        // the tail verbatim from the original string. **And `-g` takes a word**, which is the
+        // difference `Flagged` exists for: with plain `Args`, `:dial-add -g работа GitHub` would
+        // have made the title "работа GitHub" and lost the group.
+        //
+        // `Flagged::maxsplit0` collects no positionals at all — it stops at the first non-flag —
+        // which is why the title comes from `tail_after_flags` and not from `args.arg(0)`.
+        "dial-add" => {
+            let args = Flagged::maxsplit0(&tokens[1..], &["g", "group"])?;
+            let title = tail_after_flags(s, &["g", "group"]).trim().to_string();
+            Command::DialAdd {
+                group: args
+                    .value("g")
+                    .or_else(|| args.value("group"))
+                    .map(str::to_string),
+                title: Some(title).filter(|title| !title.is_empty()),
+            }
+        }
+// --- end src/dial.rs -------------------------------------------------------
 
         // maxsplit=0: `cmd-set-text :open -t` prefills the command line with `:open -t`, so the
         // `-t` belongs to the text and not to cmd-set-text.

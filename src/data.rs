@@ -65,6 +65,31 @@ pub struct Bookmark {
     pub title: String,
 }
 
+// --- src/dial.rs ---------------------------------------------------------------------------
+/// One tile of `bru://chrome/dial`: which group it is under, what it is called, where it goes.
+///
+/// **Stored `group<TAB>title<TAB>url` per line**, and the TAB is the whole reason this is not
+/// spelled like a quickmark. `read_quickmarks` splits on the last space, which works there because
+/// the line has two fields and a URL holds no spaces. Here there are three, and *two* of them are
+/// free text the user typed — a group and a title. `работа GitHub Inc https://…` has no unambiguous
+/// reading with a space as the separator, and guessing one would drop a word from somebody's title
+/// without saying so. Nothing in a group, a title or a URL is a literal TAB, and a line that does
+/// not hold exactly two of them is refused rather than half-read — see [`read_dial`].
+///
+/// The *file order is the page order*. There is no sort and no index column: reordering a tile
+/// moves the line, which is the same thing `:dial` shows and the same thing a person editing the
+/// file by hand would expect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialEntry {
+    /// The heading the tile sits under. May be empty, which is the ungrouped run the page draws
+    /// first and without a heading.
+    pub group: String,
+    /// What the tile says. Never empty — [`Data::dial_add`] falls back to the URL's host.
+    pub title: String,
+    pub url: String,
+}
+// --- end src/dial.rs -----------------------------------------------------------------------
+
 /// One row of `History`, the visit log — what `bru://chrome/history` lists.
 ///
 /// The completion reads `CompletionHistory` instead and gets one row per *site*; this is one row per
@@ -108,6 +133,11 @@ pub enum DataError {
     NoSuchQuickmark(String),
     /// A quickmark or bookmark with an empty name or URL — qutebrowser rejects both.
     Empty(&'static str),
+// --- src/dial.rs ---------------------------------------------------------------------------
+    /// A dial tile was pointed at an address another tile already holds. The URL is the key, so
+    /// the two would be one tile — and which of the two names survived would be an accident.
+    AlreadyOnTheDial(String),
+// --- end src/dial.rs -----------------------------------------------------------------------
 }
 
 impl fmt::Display for DataError {
@@ -118,6 +148,7 @@ impl fmt::Display for DataError {
             DataError::NoDataDir => write!(f, "neither XDG_DATA_HOME nor HOME is set"),
             DataError::NoSuchQuickmark(name) => write!(f, "quickmark '{name}' does not exist"),
             DataError::Empty(what) => write!(f, "cannot save a mark with an empty {what}"),
+            DataError::AlreadyOnTheDial(url) => write!(f, "{url} is already on the dial"),
         }
     }
 }
@@ -181,6 +212,11 @@ pub struct Data {
     /// three orders of magnitude more work than reading a `Vec`.
     quickmarks: Vec<Quickmark>,
     bookmarks: Vec<Bookmark>,
+    /// The dial's tiles, in file order, which is page order. Same arrangement as the two above and
+    /// for the same reason: it is read to draw a page, not to answer a keystroke, but it is small
+    /// enough that keeping it in memory costs nothing and re-reading it per request would be a file
+    /// system call on the IO thread inside a scheme handler.
+    dial: Vec<DialEntry>,
     /// The last URL recorded, so a page that reports itself twice — a title arriving after the
     /// address, a same-document navigation — does not become two visits. qutebrowser's
     /// `WebHistory._last_url`, `browser/history.py`.
@@ -222,7 +258,8 @@ impl Data {
 
         let quickmarks = read_quickmarks(&dir.join("quickmarks"))?;
         let bookmarks = read_bookmarks(&dir.join("bookmarks"))?;
-        Ok(Data { dir: dir.to_path_buf(), conn, quickmarks, bookmarks, last_url: None, private })
+        let dial = read_dial(&dir.join("dial"))?;
+        Ok(Data { dir: dir.to_path_buf(), conn, quickmarks, bookmarks, dial, last_url: None, private })
     }
 
     /// The directory this `Data` owns. Only tests want it today; `:history-clear` and an import
@@ -532,6 +569,156 @@ impl Data {
         Ok(true)
     }
 
+// --- src/dial.rs ---------------------------------------------------------------------------
+    // -- the dial ------------------------------------------------------------------------------
+    //
+    // **The URL is the primary key**, as it is for a bookmark. Two tiles for the same address in
+    // two groups is a thing somebody does by accident and never on purpose, and keying on the URL
+    // is what lets the page name a tile in a request without inventing an id that would have to
+    // survive the file being edited by hand.
+
+    /// Every tile, in file order, which is the order the page draws them in.
+    pub fn dial(&self) -> &[DialEntry] {
+        &self.dial
+    }
+
+    /// `:dial-add`, and the page's own add form.
+    ///
+    /// An existing URL has its title and group *updated* rather than duplicated, and `false` comes
+    /// back — the shape [`Data::bookmark_add`] uses with `toggle` off, and for the same reason:
+    /// pressing the key again on a page whose title has changed should refresh the tile, not fail
+    /// and not make a second one.
+    ///
+    /// An empty title falls back to the URL. The caller is expected to have a better one — the tab
+    /// title, or the host — but `DialEntry::title` is documented as never empty and the guarantee
+    /// belongs where the field is written, not in every caller.
+    pub fn dial_add(&mut self, url: &str, title: &str, group: &str) -> Result<bool> {
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(DataError::Empty("URL"));
+        }
+        let title = match title.trim() {
+            "" => url,
+            title => title,
+        };
+        let added = match self.dial.iter_mut().find(|tile| tile.url == url) {
+            Some(existing) => {
+                existing.title = title.to_string();
+                existing.group = group.trim().to_string();
+                false
+            }
+            None => {
+                self.dial.push(DialEntry {
+                    group: group.trim().to_string(),
+                    title: title.to_string(),
+                    url: url.to_string(),
+                });
+                true
+            }
+        };
+        self.write_dial()?;
+        Ok(added)
+    }
+
+    /// Remove one tile, answering **where it was and what it held**.
+    ///
+    /// The position and the whole record come back rather than a bare `bool` because the page's
+    /// `Undo` puts the tile back where it was, and a tile restored to the end of the file would be
+    /// a different dial from the one that was there a moment ago. `cookies.rs` stashes full records
+    /// for the same reason; the index is the part a cookie does not need and a tile does, because
+    /// here the order is the user's own arrangement.
+    pub fn dial_del(&mut self, url: &str) -> Result<Option<(usize, DialEntry)>> {
+        let Some(at) = self.dial.iter().position(|tile| tile.url == url) else {
+            return Ok(None);
+        };
+        let tile = self.dial.remove(at);
+        self.write_dial()?;
+        Ok(Some((at, tile)))
+    }
+
+    /// Put a tile back at `at`, which is what the page's `Undo` sends. An index past the end lands
+    /// at the end rather than panicking: the file may have been edited between the delete and the
+    /// undo, and losing the position is better than losing the tile.
+    pub fn dial_insert(&mut self, at: usize, tile: DialEntry) -> Result<()> {
+        let at = at.min(self.dial.len());
+        self.dial.insert(at, tile);
+        self.write_dial()
+    }
+
+    /// Change what a tile is, **including where it points**, keeping its place.
+    ///
+    /// The URL is the key, so a new one makes this a different tile — but it is the *same tile to
+    /// the person editing it*, who pointed a name they already arranged at a new address. So the
+    /// entry is replaced in place rather than removed and appended: a tile that jumped to the end
+    /// of the dial because its address was corrected would be the arrangement destroying itself.
+    ///
+    /// An empty title keeps the one there is; the page sends no title when only the group changed,
+    /// which is what a drag between groups does.
+    ///
+    /// Pointing a tile at an address another tile already holds is **refused**. Two tiles with one
+    /// key are one tile, and which of the two names survived would be an accident of order.
+    pub fn dial_retarget(
+        &mut self,
+        url: &str,
+        new_url: &str,
+        title: &str,
+        group: &str,
+    ) -> Result<bool> {
+        let new_url = new_url.trim();
+        if new_url.is_empty() {
+            return Err(DataError::Empty("URL"));
+        }
+        let Some(at) = self.dial.iter().position(|tile| tile.url == url) else {
+            return Ok(false);
+        };
+        if new_url != url && self.dial.iter().any(|tile| tile.url == new_url) {
+            return Err(DataError::AlreadyOnTheDial(new_url.to_string()));
+        }
+        let title = match title.trim() {
+            "" => self.dial[at].title.clone(),
+            title => title.to_string(),
+        };
+        self.dial[at] = DialEntry {
+            group: group.trim().to_string(),
+            title,
+            url: new_url.to_string(),
+        };
+        self.write_dial()?;
+        Ok(true)
+    }
+
+    /// Rearrange the whole dial to the order `urls` gives.
+    ///
+    /// **The page sends the full order rather than "move this one to index N".** A drag produces
+    /// one arrangement, not a sequence of moves, and an operation that carries the whole answer is
+    /// idempotent: sending it twice leaves the same file, and a request that crossed with a
+    /// `:dial-add` cannot silently reorder around a tile it never knew about — see the retain
+    /// below, which keeps every tile `urls` does not name, in their old relative order, at the end.
+    pub fn dial_reorder(&mut self, urls: &[String]) -> Result<()> {
+        let mut remaining = std::mem::take(&mut self.dial);
+        let mut ordered: Vec<DialEntry> = Vec::with_capacity(remaining.len());
+        for url in urls {
+            if let Some(at) = remaining.iter().position(|tile| &tile.url == url) {
+                ordered.push(remaining.remove(at));
+            }
+        }
+        // Whatever the page did not name — a tile added since it loaded, or one it dropped from the
+        // list by mistake. Keeping them is the difference between a reorder and a silent delete.
+        ordered.append(&mut remaining);
+        self.dial = ordered;
+        self.write_dial()
+    }
+
+    fn write_dial(&self) -> Result<()> {
+        let body: String = self
+            .dial
+            .iter()
+            .map(|tile| format!("{}\t{}\t{}\n", tile.group, tile.title, tile.url))
+            .collect();
+        write_atomically(&self.dir.join("dial"), &body)
+    }
+// --- end src/dial.rs -----------------------------------------------------------------------
+
     fn write_quickmarks(&self) -> Result<()> {
         let body: String = self.quickmarks.iter().map(|q| format!("{} {}\n", q.name, q.url)).collect();
         write_atomically(&self.dir.join("quickmarks"), &body)
@@ -674,6 +861,54 @@ fn read_bookmarks(path: &Path) -> Result<Vec<Bookmark>> {
         .filter(|b| !b.url.is_empty())
         .collect())
 }
+
+// --- src/dial.rs ---------------------------------------------------------------------------
+/// `group<TAB>title<TAB>url` per line. Blank lines and `#` comments are skipped, as the two mark
+/// readers above skip them.
+///
+/// **A line without exactly two tabs is dropped, and so is one with an empty URL.** The two readers
+/// above are permissive — a bookmark line with no space is a bookmark with no title — and that is
+/// right for them, because there is exactly one place the missing field could go. Here there are
+/// three fields and dropping one shifts the rest: `GitHub<TAB>https://github.com` read leniently
+/// becomes the group "GitHub" with the URL as its title and no address at all. A tile that quietly
+/// turns into a heading is worse than a tile that is not there, so the line is refused.
+///
+/// The group may be empty — that is the ungrouped run the page draws first — and an empty title is
+/// filled from the URL, matching what [`Data::dial_add`] guarantees for the field.
+fn read_dial(path: &Path) -> Result<Vec<DialEntry>> {
+    let Some(text) = read_if_present(path)? else {
+        return Ok(Vec::new());
+    };
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.trim_end_matches(['\r', '\n']).split('\t');
+            let group = fields.next()?;
+            let title = fields.next()?;
+            let url = fields.next()?;
+            // A fourth field means the line is not what this format says it is. Refusing beats
+            // guessing which of the four the URL was.
+            if fields.next().is_some() {
+                return None;
+            }
+            let url = url.trim();
+            if url.is_empty() {
+                return None;
+            }
+            let title = match title.trim() {
+                "" => url,
+                title => title,
+            };
+            Some(DialEntry {
+                group: group.trim().to_string(),
+                title: title.to_string(),
+                url: url.to_string(),
+            })
+        })
+        .collect())
+}
+// --- end src/dial.rs -----------------------------------------------------------------------
 
 /// `None` for a file that is not there — the first run, which is not an error. Anything else is.
 fn read_if_present(path: &Path) -> Result<Option<String>> {
@@ -1307,4 +1542,241 @@ mod tests {
         // into a scan, not to fail on a loaded build machine.
         assert!(worst < std::time::Duration::from_millis(50), "the completion query took {worst:?} at 9,000 rows");
     }
+
+// --- src/dial.rs ---------------------------------------------------------------------------
+
+    #[test]
+    fn the_dial_round_trips_through_its_own_tab_separated_file() {
+        let t = TempData::new("dial");
+        {
+            let mut data = t.open();
+            assert!(data.dial_add("https://github.com", "GitHub", "работа").unwrap());
+            assert!(data.dial_add("https://crates.io", "crates.io", "работа").unwrap());
+            // The two fields a space would have made ambiguous, both holding spaces.
+            assert!(data.dial_add("https://news.ycombinator.com", "Hacker News", "четене и още").unwrap());
+        }
+
+        let text = std::fs::read_to_string(t.dir.join("dial")).unwrap();
+        assert_eq!(
+            text,
+            "работа\tGitHub\thttps://github.com\n\
+             работа\tcrates.io\thttps://crates.io\n\
+             четене и още\tHacker News\thttps://news.ycombinator.com\n"
+        );
+
+        let data = t.open();
+        assert_eq!(data.dial().len(), 3);
+        assert_eq!(data.dial()[2].group, "четене и още");
+        assert_eq!(data.dial()[2].title, "Hacker News");
+        assert_eq!(data.dial()[2].url, "https://news.ycombinator.com");
+    }
+
+    /// The whole argument for the TAB, as a test: a title and a group that both hold spaces come
+    /// back as themselves. Read with `split(' ')` this line has six fields and no honest reading.
+    #[test]
+    fn a_title_and_a_group_may_hold_spaces() {
+        let t = TempData::new("dial-spaces");
+        {
+            let mut data = t.open();
+            data.dial_add("https://example.com", "GitHub Inc — the site", "по работа").unwrap();
+        }
+        let data = t.open();
+        assert_eq!(data.dial()[0].title, "GitHub Inc — the site");
+        assert_eq!(data.dial()[0].group, "по работа");
+    }
+
+    /// A malformed line is dropped and its neighbours are not. See `read_dial` for why this is
+    /// refusal rather than the leniency `read_bookmarks` allows itself.
+    #[test]
+    fn a_line_with_the_wrong_number_of_fields_is_dropped_and_the_rest_are_read() {
+        let t = TempData::new("dial-malformed");
+        t.open(); // create the directory
+        std::fs::write(
+            t.dir.join("dial"),
+            "# коментар\n\
+             \n\
+             работа\tGitHub\thttps://github.com\n\
+             GitHub\thttps://github.com\n\
+             a\tb\tc\td\n\
+             \t\t\n\
+             \tбез група\thttps://example.com\n",
+        )
+        .unwrap();
+
+        let data = t.open();
+        let urls: Vec<&str> = data.dial().iter().map(|tile| tile.url.as_str()).collect();
+        assert_eq!(urls, ["https://github.com", "https://example.com"]);
+        // An empty group is the ungrouped run, not a reason to drop the tile.
+        assert_eq!(data.dial()[1].group, "");
+        assert_eq!(data.dial()[1].title, "без група");
+    }
+
+    #[test]
+    fn adding_a_url_that_is_already_a_tile_updates_it_rather_than_duplicating_it() {
+        let t = TempData::new("dial-again");
+        let mut data = t.open();
+        assert!(data.dial_add("https://github.com", "GitHub", "работа").unwrap());
+        assert!(!data.dial_add("https://github.com", "GitHub · Кодът", "код").unwrap());
+        assert_eq!(data.dial().len(), 1);
+        assert_eq!(data.dial()[0].title, "GitHub · Кодът");
+        assert_eq!(data.dial()[0].group, "код");
+    }
+
+    #[test]
+    fn a_tile_with_no_title_falls_back_to_its_url() {
+        let t = TempData::new("dial-untitled");
+        let mut data = t.open();
+        data.dial_add("https://example.com", "   ", "").unwrap();
+        assert_eq!(data.dial()[0].title, "https://example.com");
+        assert!(matches!(data.dial_add("", "x", ""), Err(DataError::Empty("URL"))));
+    }
+
+    /// Delete answers where the tile was, and undo puts it back there — not at the end. The order
+    /// is the user's own arrangement, so restoring it to the wrong place is a different dial.
+    #[test]
+    fn deleting_a_tile_answers_its_place_and_undo_restores_it_there() {
+        let t = TempData::new("dial-undo");
+        let mut data = t.open();
+        data.dial_add("https://a.example", "A", "g").unwrap();
+        data.dial_add("https://b.example", "B", "g").unwrap();
+        data.dial_add("https://c.example", "C", "g").unwrap();
+
+        let (at, tile) = data.dial_del("https://b.example").unwrap().expect("B is a tile");
+        assert_eq!(at, 1);
+        assert_eq!(tile.title, "B");
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["A", "C"]);
+
+        data.dial_insert(at, tile).unwrap();
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["A", "B", "C"]);
+
+        assert!(data.dial_del("https://nope.example").unwrap().is_none());
+    }
+
+    /// An index past the end lands at the end. The file may have been edited between the delete and
+    /// the undo, and losing the position beats losing the tile.
+    #[test]
+    fn undo_past_the_end_appends_rather_than_panicking() {
+        let t = TempData::new("dial-undo-past-end");
+        let mut data = t.open();
+        data.dial_add("https://a.example", "A", "").unwrap();
+        data.dial_insert(
+            99,
+            DialEntry { group: String::new(), title: "Z".into(), url: "https://z.example".into() },
+        )
+        .unwrap();
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["A", "Z"]);
+    }
+
+    /// The address-unchanged case: a rename, and a move between groups. This is what a drag sends
+    /// and what `✎` sends when only the name was touched.
+    #[test]
+    fn editing_a_tile_renames_it_and_moves_it_between_groups() {
+        let t = TempData::new("dial-edit");
+        let mut data = t.open();
+        let a = "https://a.example";
+        data.dial_add(a, "A", "старата").unwrap();
+
+        assert!(data.dial_retarget(a, a, "Ново име", "новата").unwrap());
+        assert_eq!(data.dial()[0].title, "Ново име");
+        assert_eq!(data.dial()[0].group, "новата");
+
+        // An empty title keeps the one there is — a drag between groups sends no title.
+        assert!(data.dial_retarget(a, a, "", "").unwrap());
+        assert_eq!(data.dial()[0].title, "Ново име");
+        assert_eq!(data.dial()[0].group, "");
+
+        assert!(!data.dial_retarget("https://nope.example", "https://nope.example", "x", "y").unwrap());
+    }
+
+    /// The point of `dial_retarget`: an address can be corrected and the tile **stays where it
+    /// is**. A tile that jumped to the end of the dial because its URL was fixed would be the
+    /// arrangement destroying itself.
+    #[test]
+    fn retargeting_a_tile_keeps_its_place_in_the_dial() {
+        let t = TempData::new("dial-retarget");
+        let mut data = t.open();
+        data.dial_add("https://a.example", "A", "g").unwrap();
+        data.dial_add("https://b.example", "B", "g").unwrap();
+        data.dial_add("https://c.example", "C", "g").unwrap();
+
+        assert!(data.dial_retarget("https://b.example", "https://b2.example", "", "g").unwrap());
+        let urls: Vec<&str> = data.dial().iter().map(|tile| tile.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example", "https://b2.example", "https://c.example"]);
+        // An empty title keeps the one that was there — the address changed, not the name.
+        assert_eq!(data.dial()[1].title, "B");
+
+        // And it survives the file.
+        drop(data);
+        let data = t.open();
+        assert_eq!(data.dial()[1].url, "https://b2.example");
+        assert_eq!(data.dial()[1].title, "B");
+    }
+
+    /// Two tiles with one address would be one tile, and which name survived would be an accident
+    /// of order. Refused, and the dial is left exactly as it was.
+    #[test]
+    fn pointing_a_tile_at_an_address_another_tile_holds_is_refused() {
+        let t = TempData::new("dial-retarget-clash");
+        let mut data = t.open();
+        data.dial_add("https://a.example", "A", "g").unwrap();
+        data.dial_add("https://b.example", "B", "g").unwrap();
+
+        let clash = data.dial_retarget("https://b.example", "https://a.example", "B", "g");
+        assert!(matches!(clash, Err(DataError::AlreadyOnTheDial(_))));
+        assert_eq!(data.dial().len(), 2);
+        assert_eq!(data.dial()[1].url, "https://b.example");
+
+        // Retargeting a tile at the address it already has is a plain edit, not a clash.
+        assert!(data.dial_retarget("https://b.example", "https://b.example", "Ново", "друга").unwrap());
+        assert_eq!(data.dial()[1].title, "Ново");
+        assert_eq!(data.dial()[1].group, "друга");
+
+        // An empty address is refused the way `dial_add` refuses one.
+        assert!(matches!(
+            data.dial_retarget("https://b.example", "  ", "x", "g"),
+            Err(DataError::Empty("URL"))
+        ));
+        // And a tile that is not there answers false rather than erroring.
+        assert!(!data.dial_retarget("https://nope.example", "https://x.example", "", "").unwrap());
+    }
+
+    /// The page sends the whole order. A tile it did not name — one added since it loaded — is kept
+    /// rather than dropped, which is the difference between a reorder and a silent delete.
+    #[test]
+    fn reordering_takes_the_whole_order_and_keeps_what_the_page_did_not_name() {
+        let t = TempData::new("dial-reorder");
+        let mut data = t.open();
+        for (title, url) in [("A", "https://a.example"), ("B", "https://b.example"), ("C", "https://c.example")] {
+            data.dial_add(url, title, "g").unwrap();
+        }
+
+        data.dial_reorder(&["https://c.example".into(), "https://a.example".into()]).unwrap();
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["C", "A", "B"]);
+
+        // Idempotent: a drag produces an arrangement, and sending it twice is the same arrangement.
+        let order: Vec<String> = data.dial().iter().map(|t| t.url.clone()).collect();
+        data.dial_reorder(&order).unwrap();
+        data.dial_reorder(&order).unwrap();
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["C", "A", "B"]);
+
+        // A URL that is not a tile names nothing and changes nothing.
+        data.dial_reorder(&["https://ghost.example".into()]).unwrap();
+        assert_eq!(data.dial().len(), 3);
+    }
+
+    /// The file order is the page order, across a restart.
+    #[test]
+    fn the_file_order_survives_a_reopen() {
+        let t = TempData::new("dial-order-persists");
+        {
+            let mut data = t.open();
+            for (title, url) in [("A", "https://a.example"), ("B", "https://b.example")] {
+                data.dial_add(url, title, "").unwrap();
+            }
+            data.dial_reorder(&["https://b.example".into(), "https://a.example".into()]).unwrap();
+        }
+        let data = t.open();
+        assert_eq!(data.dial().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["B", "A"]);
+    }
+// --- end src/dial.rs -----------------------------------------------------------------------
 }

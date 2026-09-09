@@ -446,6 +446,15 @@ impl BrowserSideHandler for BruQueryHandler {
             }
             // --- end src/cookies.rs -------------------------------------------------------------
 
+            // --- src/dial.rs --------------------------------------------------------------------
+            // `bru://chrome/dial` changing its own tiles. Below the `bru://` check like the cookie
+            // arm above it, and unlike that one it answers immediately: the tiles are in `Data` and
+            // the write is one `rename(2)`, so there is nothing asynchronous to wait for.
+            Some("dial") => {
+                crate::dial::on_page_query(request, &callback);
+            }
+            // --- end src/dial.rs ----------------------------------------------------------------
+
             // A round trip with no side effect, for proving the router is wired end to end.
             Some("echo") => {
                 succeed(&callback, &json_field(request, "text").unwrap_or_default());
@@ -1438,7 +1447,7 @@ fn log(message: &str) {
 /// Read one string field out of a flat JSON object. The only producer is the chrome's own
 /// `JSON.stringify`, so this does not need to be a parser — and a JSON dependency for six keys
 /// would be a dependency to audit.
-fn json_field(src: &str, key: &str) -> Option<String> {
+pub fn json_field(src: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let mut rest = src;
     loop {
