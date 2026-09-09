@@ -1803,6 +1803,46 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::GlobalOnly,
         backing: Backing::Scrollbar,
     },
+// --- src/selection.rs ---------------------------------------------------------------------------
+    // `Backing::Scrollbar` for all four, and the name is the one thing that does not fit: the
+    // backing is "bru's stylesheet in the page", which is the pipeline `scrollbar.rs` owns and
+    // which `selection.rs` rides — see the comment in `scrollbar::rules`. A `Backing::Selection`
+    // would push the same rules down the same channel under a second name.
+    Def {
+        // Off leaves whatever the page does, which is Chromium's blue where a site says nothing.
+        name: "selection.style",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // **True by default, and that is the whole feature.** bru's rule goes in before the page's
+        // own `<head>` with no `!important`, so a site that styles its own selection wins and a
+        // site that does not gets the theme's. False adds `!important` and bru wins everywhere.
+        name: "selection.page_overrides",
+        kind: Kind::Bool,
+        default: Some("true"),
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        // Unset means the theme's `--statusbar-caret-selection-bg`. See `selection.rs` for the
+        // measurement behind that pair.
+        name: "selection.bg",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+    Def {
+        name: "selection.fg",
+        kind: Kind::Text,
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Scrollbar,
+    },
+// --- end src/selection.rs -----------------------------------------------------------------------
     Def {
         // **bru's own name — qutebrowser has no scrollbar setting at all.** It cannot: Qt draws
         // QtWebEngine's scrollbar and a page stylesheet has no say over it. bru's is drawn by
@@ -4789,7 +4829,11 @@ mod tests {
         // **Seventy-two**, +1 for `session.auto_restore`. Split from `session.auto_save` at the
         // user's request: saving is insurance and restoring is a habit, and one setting cannot
         // say "record every exit, but start clean".
-        assert_eq!(SETTINGS.len(), 72);
+        // **Seventy-six**, +4 for the `selection.*` block: `style`, `page_overrides`, `bg` and
+        // `fg`. They colour a text selection on every page from the theme, and only where the site
+        // has no `::selection` of its own — see `src/selection.rs` for which two colours and the
+        // measurement behind them.
+        assert_eq!(SETTINGS.len(), 76);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
         for def in SETTINGS {

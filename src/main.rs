@@ -78,6 +78,7 @@ mod spawn;
 mod ssh;
 // How a window is drawn, and everything only that answer owns. The terminal frontend's seam.
 mod shell;
+mod selection;
 mod session;
 mod settings;
 mod settingspage;

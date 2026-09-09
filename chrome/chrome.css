@@ -42,6 +42,27 @@ body {
     padding: 0;
 }
 
+/* Selected text ---------------------------------------------------- src/selection.rs
+ *
+ * The same two colours `selection.rs` puts on every *web* page, applied here to
+ * bru's own documents — the strips, the panel and every `bru://chrome/…` page.
+ *
+ * **It has to be written twice, and that is not duplication by accident.**
+ * `scrollbar::styleable` refuses a `bru://` frame on purpose: bru's own chrome
+ * links this stylesheet, so injecting a second copy into it would be one
+ * document carrying the same rules from two places. The scrollbar has lived
+ * with exactly that split since it was written — five `::-webkit-scrollbar`
+ * rules here, and the same five injected out there — and this is the third
+ * declaration under the same arrangement.
+ *
+ * Which two colours, and why, is measured in `src/selection.rs`. No
+ * `!important`: a bru page that wanted its own selection could still say so,
+ * the same way a site can. */
+::selection {
+    background: var(--statusbar-caret-selection-bg);
+    color: var(--statusbar-caret-selection-fg);
+}
+
 
 /* The panel ------------------------------------------------------- src/window.rs
  *

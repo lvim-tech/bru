@@ -475,7 +475,9 @@ mod tests {
         // **+1 `true`**: `plugins.enabled`, which bru answers itself and ships on. This number
         // moves with every bru-backed boolean, and 11 is what it was before this branch.
         // --- end lua runtime -----------------------------------------------------------------
-        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 13);
+        // **+2**: `selection.style` and `selection.page_overrides`, both shipped on. See
+        // `src/selection.rs`.
+        assert_eq!(html.matches("<td class=\"state\">true</td>").count(), 15);
     }
 
     // --- unhardcoded -----------------------------------------------------------------------

@@ -13,11 +13,11 @@ Everything else follows from keeping that true.
 
 - **qutebrowser's vocabulary.** The default bindings are transcribed from `configdata.yml`, so `f`
   hints, `o` opens, `d` closes a tab, `gg` and `G` jump, `:` is the command line.
-  **292 default bindings, 176 commands, 72 settings.**
+  **292 default bindings, 176 commands, 76 settings.**
 - **One binary.** No embedded runtime to install, no Python, no Qt. CEF is a prebuilt Chromium
   distribution — nothing here compiles a browser engine.
-- **Its own data.** `~/.local/share/bru/` holds history, quickmarks, bookmarks, sessions and the
-  filter lists. bru neither reads nor writes any other browser's files.
+- **Its own data.** `~/.local/share/bru/` holds history, quickmarks, bookmarks, the dial, sessions
+  and the filter lists. bru neither reads nor writes any other browser's files.
 - **Configured in Lua**, and only where you say so. Every setting has a default compiled in, so a
   bru with no configuration at all is fully configured; `~/.config/bru/config.lua` holds overrides.
   Lua rather than a data format because a setting is allowed to be a *function* — a tab title can be
@@ -691,6 +691,89 @@ one vocabulary, three doors. Arguments in `<>` are required and `[]` optional.
 | `spawn` | `<command> [arguments…]` | `-u/--userscript`, `-d/--detach`, `-o/--output`, `-m/--output-messages`, `-v/--verbose` |  |
 
 
+## Selected text
+
+A text selection on any page is drawn in the theme's colours — **unless the site has colours of its
+own**, in which case the site wins.
+
+There is no detection behind that. bru's rule goes into the document as the first child of `<html>`,
+before the page's own `<head>` is parsed, with no `!important` anywhere; a site rule of equal
+specificity therefore comes later in document order and wins. That is the same mechanism, and the
+same setting, as the page scrollbar.
+
+| | |
+|---|---|
+| `selection.page_overrides` `true` | the site wins where it has an opinion — the default |
+| `selection.page_overrides` `false` | `!important` on both declarations; bru wins everywhere |
+| `selection.style` `false` | bru says nothing; you get Chromium's blue |
+| `selection.bg`, `selection.fg` | your own two colours instead of the theme's |
+
+The colours are `--statusbar-caret-selection-bg` and `-fg`, which is the theme's own name for a
+selection and what the status bar already draws in caret mode. They were chosen by measurement
+rather than by eye, because a selection has to be visible on **every** site:
+
+| pair | text on the selection | seen on a white page | on a dark page |
+|---|---|---|---|
+| **the caret pair** (`#bb755e` on `#232929`) | **4.10:1** | **3.61:1** | **4.36:1** |
+| the hint pair (`#c3ab58` on `#232929`) | 6.54:1 | 2.26:1 | 6.95:1 |
+| `--blue` on white | 5.24:1 | 5.24:1 | 3.00:1 |
+
+The hint pair reads better on its own and is nearly invisible against a white page, which is most of
+the web.
+
+bru's own pages — the dial, `bru://chrome/help`, the strips — get the same two colours from
+`chrome.css` rather than from the injected rule, because they link that stylesheet already and
+injecting into them would be one document carrying the same rules twice. It is the arrangement the
+page scrollbar has always had.
+
+## The dial
+
+`bru://chrome/dial` is a start page: the sites you keep, in groups, as tiles.
+
+```lua
+-- ~/.config/bru/config.lua
+bru.set("start_page", "bru://chrome/dial")
+```
+
+`:dial` opens it in a tab, and `:dial-add` puts the page you are on onto it — the shape `M` has for
+bookmarks. It is a command rather than a button on the page **because the page is the page you would
+be pressing the button on**: a dial cannot know what you were looking at before it. The form at the
+bottom takes an address you are not on.
+
+On the page: `f` hints every tile and every control, `×` removes a tile, `✎` renames it or moves it
+to another group, and a tile can be dragged. A removed tile can be put back — `Undo` appears when
+there is something to undo, and it holds for as long as the browser runs.
+
+### The file
+
+`~/.local/share/bru/dial`, beside `quickmarks` and `bookmarks`, and editable by hand:
+
+```
+работа	GitHub	https://github.com
+работа	crates.io	https://crates.io
+четене	Hacker News	https://news.ycombinator.com
+	Начало	https://example.com
+```
+
+`group<TAB>title<TAB>url`. **Tabs, not spaces**, because two of the three fields are free text — with
+a space, `работа GitHub Inc https://…` has no unambiguous reading. A line that does not hold exactly
+two tabs is skipped rather than half-read; `#` comments and blank lines are skipped too.
+
+The **file order is the page order**, and groups take a heading in the order they first appear —
+nothing is sorted, because the arrangement is yours. An empty group is the run drawn first, without a
+heading.
+
+### Colour
+
+The tiles are painted from `theme.css` like the rest of the chrome, so a dial follows
+lvim-colorscheme with everything else — `themer` rewrites that file and a reload is enough. Each tile
+takes one of the theme's nine accents, chosen by a hash of its host, so a tile keeps its colour when
+its neighbours change. Not one colour is written in bru's own stylesheet, and a test fails the build
+if one ever is.
+
+A tile draws the site's favicon when bru has downloaded one, and the first letter of its name when it
+has not — which is the normal case on a browser that has just started, since the icon cache is memory.
+
 ## Blocking
 
 Brave's own ad-blocking engine, linked directly rather than through a binding — the same engine
@@ -1063,6 +1146,10 @@ Flags come before the file: `:config-write --defaults ~/bru-defaults.lua`.
 | `scrollbar.track` | *(none — leaving it unset is what it means)* |
 | `scrollbar.style` | `true` |
 | `scrollbar.page_overrides` | `true` |
+| `selection.style` | `true` |
+| `selection.page_overrides` | `true` |
+| `selection.bg` | *unset — the theme's* |
+| `selection.fg` | *unset — the theme's* |
 | `editor.command` | *(none — leaving it unset is what it means)* |
 | `downloads.location.directory` | *(none — leaving it unset is what it means)* |
 | `downloads.location.prompt` | `true` |

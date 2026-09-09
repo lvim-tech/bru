@@ -208,11 +208,23 @@ const KEEPER_JS: &str = include_str!("../chrome/userstyle.js");
 /// `Value::Fn` lives in the browser process's `mlua` state and there is no such state here. None of
 /// these four settings can hold a function.
 fn rules() -> String {
-    if !crate::settings::is_on("scrollbar.style") {
-        return String::new();
-    }
     let theme = String::from_utf8_lossy(&crate::chrome::theme_css()).into_owned();
-    css_with(&theme, crate::settings::is_on("scrollbar.page_overrides"), &Look::in_force())
+    // --- src/selection.rs ---------------------------------------------------------------------
+    // **This stylesheet is bru's, not the scrollbar's**, and `selection.rs` says at length why it
+    // rides here rather than opening a second channel: everything below this line — `PUSHED`,
+    // `SET_RULES`, `ASK`, the keeper, `renderer_on_context_created` — is written for *bru's CSS
+    // inside somebody else's page*, and none of it is about scrollbars.
+    //
+    // The two halves are switched on independently, so `scrollbar.style false` still leaves the
+    // selection coloured and vice versa; the theme is read once for both, because a page load
+    // re-reads `~/.config/bru/theme.css` and there is no reason to do it twice.
+    let scrollbar = if crate::settings::is_on("scrollbar.style") {
+        css_with(&theme, crate::settings::is_on("scrollbar.page_overrides"), &Look::in_force())
+    } else {
+        String::new()
+    };
+    format!("{scrollbar}{}", crate::selection::css(&theme))
+    // --- end src/selection.rs -----------------------------------------------------------------
 }
 
 // --- the renderer -----------------------------------------------------------------------------
