@@ -2550,6 +2550,32 @@ mod tests {
 // --- end src/find.rs + src/navigate.rs ------------------------------------------------------------
 
 // --- src/completers.rs ---------------------------------------------------------------------
+    /// **The arrows carry `--history`, and the rule decides which way they go.**
+    ///
+    /// They were briefly bound straight to `command-history-prev`/`next`, which gave the history
+    /// its key back and took the completion's away: typing an address showed suggestions the
+    /// arrows could no longer pick from. Both behaviours belong on one key and
+    /// `completers::arrows_walk_history` is where they are told apart — `arrow_tests` there is the
+    /// half of this that decides, and this is the half that keeps the keys pointed at it.
+    #[test]
+    fn the_arrows_carry_the_history_flag() {
+        let bound = |keys: &str| {
+            DEFAULT_BINDINGS
+                .iter()
+                .find(|(mode, k, _)| *mode == "command" && *k == keys)
+                .unwrap_or_else(|| panic!("no command-mode binding for {keys}"))
+                .2
+        };
+        assert_eq!(bound("<Up>"), "completion-item-focus --history prev");
+        assert_eq!(bound("<Down>"), "completion-item-focus --history next");
+        // The history's own two keys are unconditional and answer whatever the panel is showing.
+        assert_eq!(bound("<Ctrl-P>"), "command-history-prev");
+        assert_eq!(bound("<Ctrl-N>"), "command-history-next");
+        // And the completion's own two, which never carried the flag.
+        assert_eq!(bound("<Tab>"), "completion-item-focus next");
+        assert_eq!(bound("<Shift-Tab>"), "completion-item-focus prev");
+    }
+
     /// The ten command-mode bindings the completion turned on, named one by one — a total is not
     /// enough to notice that `<Tab>` went live and `<Shift-Tab>` did not.
     #[test]

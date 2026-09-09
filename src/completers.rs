@@ -1249,24 +1249,49 @@ pub fn run_command(command: &Command) -> bool {
 /// keys of its own — `<Ctrl-P>` and `<Ctrl-N>`, bound in `config.rs` beside these two — and they
 /// are the ones a shell user reaches for anyway. When the completion has no rows at all the arrows
 /// fall through to the history, because then there is nothing else for them to do.
-fn arrows_walk_history(completion_is_empty: bool) -> bool {
-    completion_is_empty
+/// **Two ways to reach the history, and the first one is why this grew a second argument.**
+///
+/// The rule was `completion_is_empty` alone, and it was never true in the case people actually
+/// meant: opening `:` lists every command bru has, so the panel always has rows and `<Up>` never
+/// once reached the history. Reported as "Up does not give me my last command", correctly.
+///
+/// So: **nothing typed yet — the line is bare `:` — is the history.** That is the moment there is
+/// no query to complete and the only useful thing an arrow can do is recall. From the first
+/// character on, the panel is answering what you are typing and the arrows belong to it, which is
+/// what the paragraph above this one was written to protect: an address with suggestions under it
+/// has to be pickable with the arrows, and that was the second thing reported.
+///
+/// A panel with no rows at all still falls through to the history, because then there is nothing
+/// else for the arrows to do either way.
+///
+/// `<Ctrl-P>`/`<Ctrl-N>` are bound to the history unconditionally and are unaffected by any of it.
+fn arrows_walk_history(line_is_bare: bool, completion_is_empty: bool) -> bool {
+    line_is_bare || completion_is_empty
 }
 
 #[cfg(test)]
 mod arrow_tests {
-    /// **A panel that is open takes the arrows**, whatever else is true. Nothing about the command
-    /// history, the text on the line or whether it was recalled comes into it — that is the point,
-    /// and the two regressions this pins were both "the same key did something else today".
+    /// **A panel that is answering something you typed takes the arrows.** This is what lets an
+    /// address be picked out of its suggestions, and it is the half that was lost when the arrows
+    /// were bound straight to the history.
     #[test]
-    fn an_open_panel_takes_the_arrows() {
-        assert!(!super::arrows_walk_history(false));
+    fn a_panel_answering_typed_text_takes_the_arrows() {
+        assert!(!super::arrows_walk_history(false, false));
+    }
+
+    /// **A bare `:` is the history**, whatever the panel is showing — and it is always showing
+    /// something, because an empty line lists every command bru has. This is the case that was
+    /// unreachable before, and the one people mean by "give me my last command".
+    #[test]
+    fn a_bare_prefix_is_the_history_even_with_a_full_panel() {
+        assert!(super::arrows_walk_history(true, false));
     }
 
     /// With no rows there is nothing to move in, so the history is the only thing left to do.
     #[test]
     fn with_no_rows_they_fall_through_to_the_history() {
-        assert!(super::arrows_walk_history(true));
+        assert!(super::arrows_walk_history(false, true));
+        assert!(super::arrows_walk_history(true, true));
     }
 }
 
@@ -1279,8 +1304,12 @@ pub fn focus(which: FocusWhich, history: bool) {
 
     // `--history` is `<Up>` and `<Down>`. Where they go is [`arrows_walk_history`]'s decision.
     if history {
+        // "Nothing typed" is the prefix and nothing else — `text` carries the leading `:`, `/` or
+        // `?`. `: ` counts as bare too: a space after the prefix is qutebrowser's "run this without
+        // recording it", not a query.
+        let bare = text.chars().skip(1).all(char::is_whitespace);
         let empty = live().lock().map(|live| live.cats.is_empty()).unwrap_or(true);
-        if arrows_walk_history(empty) {
+        if arrows_walk_history(bare, empty) {
             let name = match which {
                 FocusWhich::Next => "command-history-next",
                 FocusWhich::Prev => "command-history-prev",

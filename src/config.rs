@@ -326,8 +326,19 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, &str)] = &[
     // -- command -------------------------------------------------------------------------------
     ("command", "<Ctrl-P>", "command-history-prev"),
     ("command", "<Ctrl-N>", "command-history-next"),
+// --- src/cmdline.rs: the arrows --------------------------------------------------------------
+    // `--history` means "the history when there is nothing to complete", and what counts as
+    // nothing is `completers::arrows_walk_history`: a bare `:` with nothing typed after it, or a
+    // panel with no rows.
+    //
+    // They were briefly bound straight to `command-history-prev`/`next`, because the old rule
+    // (panel empty *only*) could never fire — opening `:` lists every command, so the panel is
+    // never empty and `<Up>` never reached the history. That fixed one report and caused the next:
+    // typing an address showed suggestions the arrows could no longer pick from. The rule is the
+    // right place for this, not the binding.
     ("command", "<Up>", "completion-item-focus --history prev"),
     ("command", "<Down>", "completion-item-focus --history next"),
+// --- end src/cmdline.rs: the arrows ------------------------------------------------------------
     ("command", "<Shift-Tab>", "completion-item-focus prev"),
     ("command", "<Tab>", "completion-item-focus next"),
     ("command", "<Ctrl-Tab>", "completion-item-focus next-category"),
