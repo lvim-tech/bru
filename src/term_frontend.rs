@@ -1151,6 +1151,10 @@ pub fn shut_down() {
     // those alive, `BruState::on_before_close` never saw its list empty, the message loop never
     // ended, and a `:quit` with two tabs was a browser that hangs instead of one that saves its
     // cookies. The state's registry is the one list every created browser passes through.
+    // A terminal has no window to have been asked, so the quit says for itself that everything is
+    // going — or every tab would be answered as a page closing itself, and the quit would wait on
+    // browsers that had been told "bru will close you". See `BruState::do_close`.
+    state.lock().expect("state mutex poisoned").note_closing_all();
     let browsers: Vec<i32> = state.lock().expect("state mutex poisoned").browser_ids();
     let mut closed = false;
     for identifier in browsers {

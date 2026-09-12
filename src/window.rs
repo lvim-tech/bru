@@ -1128,6 +1128,13 @@ wrap_window_delegate! {
             // in the first place. `on_quitting` runs once however many windows pass through.
             crate::lifetime::on_quitting(&self.state);
             // --- end src/lifetime.rs --------------------------------------------------------
+            // **Said before any browser is asked**, because asking is what reaches `do_close`: a
+            // tab in a window that is closing may go, and one in a window that is not is a page
+            // that called `window.close()` and must take only itself. See `BruState::do_close`.
+            self.state
+                .lock()
+                .expect("state mutex poisoned")
+                .note_window_closing(self.window_id);
             // Ask every browser first: each may need to run beforeunload handlers. try_close_browser
             // both answers and starts the close, so all three have to be asked — short-circuiting on
             // the first 0 would leave the others open.

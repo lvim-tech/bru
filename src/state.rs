@@ -116,6 +116,12 @@ pub struct BruState {
     /// window is one entry however many tabs it had, so `U` brings the whole window back
     /// (`commands.py:831-861`, `windowundo.undo_last_window_close`).
     pub(crate) closed_windows: Vec<Vec<String>>,
+    /// Windows whose close has been asked for — by bru, or by the window manager's close button —
+    /// so every browser in them may go when CEF asks. See [`BruState::do_close`].
+    closing_windows: Vec<u32>,
+    /// Everything is going, with no window to have asked: the terminal's quit, which closes every
+    /// browser directly because a terminal has no window. See [`BruState::do_close`].
+    closing_all: bool,
     /// The binding tries, one per mode, built once at startup from the compiled-in qutebrowser
     /// defaults and whatever `config.lua` changed. `None` until then — and permanently so in the
     /// renderer and GPU processes, which construct this struct and never fill it in.
@@ -151,6 +157,8 @@ impl BruState {
                 next_window_id: 0,
                 closed: Vec::new(),
                 closed_windows: Vec::new(),
+                closing_windows: Vec::new(),
+                closing_all: false,
                 parsers: None,
                 bindings: None,
             })
@@ -800,11 +808,70 @@ impl BruState {
         self.browsers.push(browser);
     }
 
-    /// Allow the close. Returning 1 here would mean "I will close it myself later", which is the
-    /// windowless path bru does not use.
-    pub fn do_close(&mut self, _browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+    /// Whether CEF may go ahead and close this browser the way it would by default.
+    ///
+    /// **A page that closes itself must close its tab, not bru.** `window.close()` reaches here
+    /// from the renderer, and for a browser that lives in a CEF Views window CEF's default — the
+    /// answer 0 — is to close the *window* that hosts it: every tab in it, then the last browser,
+    /// then the message loop. `tabs.rs` has known this since 2026-08-06, which is why `d` takes a
+    /// tab's view out of the window instead of closing its browser; nothing had told this function.
+    /// Reported 2026-09-12: signing in to claude.ai with Google killed bru three times in a
+    /// minute, each time the second the sign-in tab reached `accounts.google.com/gsi/transform` —
+    /// the page that hands the result back and calls `window.close()`. No core dump, because it
+    /// was not a crash; it was bru doing as it was told.
+    ///
+    /// So a tab closing while its window is not is answered 1 — "bru will close it" — and closed
+    /// by the same code as `d`, one turn of the loop later. That code takes the tab out of the
+    /// list before its browser goes, so when CEF asks again on the way out the browser is no
+    /// longer a tab and gets 0, which is what every close that bru or the window manager starts
+    /// gets too: a window whose close was asked for (`note_window_closing`, from `can_close`), the
+    /// terminal's quit (`note_closing_all`), the chrome strips, the inspector.
+    pub fn do_close(&mut self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
-        0
+        let Some(identifier) = browser.map(|browser| browser.identifier()) else {
+            return 0;
+        };
+        if !self.closes_only_its_tab(identifier) {
+            return 0;
+        }
+        crate::tabs::schedule_close_by_page(identifier);
+        1
+    }
+
+    /// [`BruState::do_close`]'s question, without a `Browser` in it so that a test can ask it: is
+    /// this a tab whose window is *not* closing — a page that has closed itself?
+    fn closes_only_its_tab(&self, identifier: i32) -> bool {
+        if self.closing_all {
+            return false;
+        }
+        match self.tab_of_browser(identifier) {
+            Some((window, _)) => !self.closing_windows.contains(&window),
+            // A chrome strip, the inspector, a tab already taken out of the list by `d`: none of
+            // them is a page closing a tab bru still shows.
+            None => false,
+        }
+    }
+
+    /// A window is about to close as a whole, so its browsers may go when CEF asks.
+    pub fn note_window_closing(&mut self, window: u32) {
+        if !self.closing_windows.contains(&window) {
+            self.closing_windows.push(window);
+        }
+    }
+
+    /// Every browser is about to go — the terminal's quit, which has no window to ask.
+    pub fn note_closing_all(&mut self) {
+        self.closing_all = true;
+    }
+
+    /// Which window and which tab a browser is, for a close the page asked for.
+    pub fn tab_of_browser(&self, identifier: i32) -> Option<(u32, usize)> {
+        self.windows.iter().find_map(|slot| {
+            slot.tabs
+                .iter()
+                .position(|tab| tab.browser_id == Some(identifier))
+                .map(|index| (slot.id, index))
+        })
     }
 
     /// A browser is gone for good. When the last one goes, so does the message loop — without this
@@ -1010,6 +1077,8 @@ mod tests {
             next_window_id: 0,
             closed: Vec::new(),
             closed_windows: Vec::new(),
+            closing_windows: Vec::new(),
+            closing_all: false,
             parsers: None,
             bindings: None,
         };
@@ -1019,6 +1088,44 @@ mod tests {
         // `open_window_slot` makes each new window current; start from the first, as a session does.
         state.current = 0;
         state
+    }
+
+    /// **The sign-in that killed bru.** A page calling `window.close()` in one tab of a window
+    /// that is not closing takes that tab and nothing else; everything that closes a *window* —
+    /// its close button, `:quit`, the last tab going, the terminal's quit — lets every browser in
+    /// it go as before. See `BruState::do_close`.
+    #[test]
+    fn a_page_closing_itself_takes_its_tab_and_not_the_window() {
+        let mut state = bare(2);
+        state.push_term_tab_in(0, 10);
+        state.push_term_tab_in(0, 11);
+        state.push_term_tab_in(1, 20);
+
+        assert!(state.closes_only_its_tab(11), "a page in an open window closes only itself");
+        assert!(!state.closes_only_its_tab(99), "a browser that is not a tab is CEF's to close");
+
+        // Its window closing is a different thing, and it is per window.
+        state.note_window_closing(0);
+        assert!(!state.closes_only_its_tab(10), "the window is going, and its tabs with it");
+        assert!(!state.closes_only_its_tab(11));
+        assert!(state.closes_only_its_tab(20), "the other window is not closing");
+
+        // The terminal's quit has no window to ask, and says so for everything.
+        state.note_closing_all();
+        assert!(!state.closes_only_its_tab(20));
+    }
+
+    /// Once `d`'s path has taken the tab out of the list, CEF asking again on the way out is
+    /// answered as a browser that is no longer a tab — which is what lets it actually go.
+    #[test]
+    fn a_tab_already_taken_is_no_longer_answered_as_one() {
+        let mut state = bare(1);
+        state.push_term_tab_in(0, 10);
+        state.push_term_tab_in(0, 11);
+        assert_eq!(state.tab_of_browser(11), Some((0, 1)));
+        state.slot_mut(0).expect("a window").tabs.remove(1);
+        assert_eq!(state.tab_of_browser(11), None);
+        assert!(!state.closes_only_its_tab(11));
     }
 
     /// A window closing in the background must not move which window is current.

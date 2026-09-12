@@ -1496,6 +1496,50 @@ pub fn focus(state: &SharedState, window_id: u32) {
 
 /// Select a tab on the next turn of the UI loop.
 ///
+/// Close the tab whose page asked to be closed — `window.close()` — the way `d` closes one.
+///
+/// Posted from `BruState::do_close`, which is inside a CEF callback with the state locked and so
+/// can do nothing but say "not like that". Here, one turn later, the tab is made the showing one in
+/// its own window and closed by [`close_current`], so there is exactly one way a tab leaves bru:
+/// its view out of the window, its entry out of the list, its browser going when the last
+/// reference does. Forced, because a pinned tab that closes itself has asked for it by name.
+///
+/// A tab that is already gone by the time this runs — closed by `d` in the meantime, or its window
+/// closed — is nothing to do.
+pub fn schedule_close_by_page(identifier: i32) {
+    let mut task = CloseByPage::new(identifier);
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+wrap_task! {
+    struct CloseByPage {
+        identifier: i32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            let Some(state) = BruState::instance() else {
+                return;
+            };
+            let found = {
+                let mut guard = state.lock().expect("state mutex poisoned");
+                let found = guard.tab_of_browser(self.identifier);
+                // `close_current` acts on the current window; make it this tab's.
+                if found.is_some() {
+                    guard.focus_window_of_browser(self.identifier);
+                }
+                found
+            };
+            let Some((window, index)) = found else {
+                return;
+            };
+            select_in(&state, window, index);
+            close_current(&state, true);
+        }
+    }
+}
+
 /// The one caller is a click on the tab strip, which arrives inside the message router's query
 /// handler — and CEF-NOTES trap 12 forbids touching a browser from there: `select` focuses a view,
 /// the router holds `browser_query_info_map` across the handler, and `on_before_browse` wants that
