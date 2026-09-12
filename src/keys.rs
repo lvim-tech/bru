@@ -447,35 +447,47 @@ wrap_life_span_handler! {
         // A page asking for a window. Without this the default runs, which is 0 — "go ahead" — and
         // CEF makes a top-level browser bru does not know exists: a `target="_blank"` link opened an
         // operating-system window instead of a tab, against DESIGN.md's "one window, many tabs".
-        // `popups.rs` owns the decision and returns 1, which cancels the popup.
+        // `popups.rs` owns the decision and returns 1, which cancels the popup — for everything
+        // but a `window.open` with features, which since 2026-09-12 is allowed with a client of
+        // its own, so that the page gets the handle a sign-in needs. `client` is that slot;
+        // `window_info` is left alone because CEF ignores it for a Views-hosted opener.
         //
-        // `on_before_popup_aborted` (bindings 20774) is deliberately not implemented: it fires only
-        // for a popup that *was* allowed and then failed to be created, and this returns 1 for every
-        // one of them, so it cannot be reached. There is no pending-popup state here to clear either
-        // — the decision leaves the callback as a posted task and keeps nothing keyed by popup_id.
+        // `on_before_popup_aborted` (bindings 20774) fires only for a popup that *was* allowed and
+        // then failed to be created — reachable now, and the pending size `popups.rs` keeps by
+        // popup_id is what it clears.
         fn on_before_popup(
             &self,
             browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
-            _popup_id: ::std::os::raw::c_int,
+            popup_id: ::std::os::raw::c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
             popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
+            client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             crate::popups::on_before_popup(
                 browser,
+                popup_id,
                 target_url,
                 target_disposition,
                 user_gesture,
                 popup_features,
+                client,
             )
+        }
+
+        fn on_before_popup_aborted(
+            &self,
+            browser: Option<&mut Browser>,
+            popup_id: ::std::os::raw::c_int,
+        ) {
+            crate::popups::on_before_popup_aborted(browser, popup_id);
         }
         // --- end src/popups.rs --------------------------------------------------------------
 

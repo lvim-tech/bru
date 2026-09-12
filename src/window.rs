@@ -268,6 +268,11 @@ pub fn close_all(state: &SharedState) {
     for window in windows {
         window.close();
     }
+    // --- src/popups.rs --------------------------------------------------------------------------
+    // A sign-in dialog open at `:quit` is a browser in none of the windows above, and the loop
+    // stops only when the last browser has gone.
+    crate::popups::close_all();
+    // --- end src/popups.rs ----------------------------------------------------------------------
 }
 
 // --- src/completers.rs ---------------------------------------------------------------------
@@ -811,7 +816,7 @@ pub fn apply_chrome_layout_everywhere() {
 /// borrowed form, which does survive; the buffer is deliberately leaked, because CEF owns the
 /// string once it has it and frees it through the dtor recorded inside. Four small strings, once
 /// per window.
-fn handover(text: &str) -> CefString {
+pub(crate) fn handover(text: &str) -> CefString {
     let owned = CefString::from(text);
     let raw: *const sys::_cef_string_utf16_t = (&owned).into();
     let borrowed = CefString::from(raw);
@@ -821,7 +826,7 @@ fn handover(text: &str) -> CefString {
 
 /// What the toplevel is called when no tab has a title yet — at startup, and on a page that sets
 /// none. It is also the suffix of every other title.
-const APP_NAME: &str = "bru";
+pub(crate) const APP_NAME: &str = "bru";
 
 /// Put the showing tab's title on the window.
 ///
@@ -1069,10 +1074,19 @@ wrap_window_delegate! {
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
             // The slot goes with the window, and the URLs it held go onto the closed-window stack
             // for `U`. Before the views are dropped, while the tabs are still listed.
-            self.state
-                .lock()
-                .expect("state mutex poisoned")
-                .forget_window(self.window_id);
+            let last = {
+                let mut guard = self.state.lock().expect("state mutex poisoned");
+                guard.forget_window(self.window_id);
+                guard.window_count() == 0
+            };
+            // --- src/popups.rs --------------------------------------------------------------
+            // The last of bru's windows going takes the popups with it: a sign-in dialog left
+            // behind would be a floating window with no browser to report to, and the one thing
+            // keeping the process alive. Posted, since this is a callback of a window mid-close.
+            if last {
+                crate::popups::schedule_close_all();
+            }
+            // --- end src/popups.rs ----------------------------------------------------------
             crate::ipc::forget_window(self.window_id);
             forget_completion_height(self.window_id);
             // --- tabs and statusbar --------------------------------------------------------
@@ -1170,8 +1184,9 @@ wrap_window_delegate! {
 // BrowserView but potentially multiple Alloy style BrowserViews." Chrome style is the default, so
 // the first attempt at the three-view layout drew only the tab strip — the page and the status line
 // were created, added and never painted. Alloy is what bru wants anyway: the content layer with
-// none of Chrome's own UI, which DESIGN.md rules out.
-const VIEW_STYLE: RuntimeStyle = RuntimeStyle::ALLOY;
+// none of Chrome's own UI, which DESIGN.md rules out. `popups.rs` answers it for a popup's view
+// too, for the same reason.
+pub(crate) const VIEW_STYLE: RuntimeStyle = RuntimeStyle::ALLOY;
 
 wrap_browser_view_delegate! {
     // The empty-struct shorthand the other wrap_ macros accept is not a rule this one has; it needs
@@ -1217,8 +1232,10 @@ wrap_browser_view_delegate! {
         // yourself and return true (1). Otherwise return false (0) and a default cef_window_t will
         // be created for the popup."
         //
-        // Anything that is not an inspector keeps CEF's own answer. bru has no docked place for a
-        // page popup, and returning 1 without adding the view would lose it.
+        // Anything that is not an inspector is a page popup — `window.open` with features, which
+        // `popups.rs` now allows so that the page gets its handle — and is handed to `popups.rs`,
+        // which gives it a window of its own. Until 2026-09-12 both hooks answered CEF's default for
+        // it, which was never reached: every page popup was cancelled before it got this far.
         // **A delegate for the inspector, which is what makes it a panel rather than a guest.**
         // CEF asks the parent view's delegate what delegate the popup should have; without one the
         // popup view has no `preferred_size` to give a BoxLayout and no `on_browser_destroyed` to
@@ -1227,7 +1244,7 @@ wrap_browser_view_delegate! {
         // killed the process outright — a silent exit, no panic, three times out of three.
         fn delegate_for_popup_browser_view(
             &self,
-            _browser_view: Option<&mut BrowserView>,
+            browser_view: Option<&mut BrowserView>,
             _settings: Option<&BrowserSettings>,
             _client: Option<&mut Client>,
             is_devtools: ::std::os::raw::c_int,
@@ -1235,7 +1252,18 @@ wrap_browser_view_delegate! {
             crate::devtools::trace(&format!(
                 "delegate_for_popup: entered, is_devtools={is_devtools}"
             ));
-            if is_devtools == 0 || !crate::devtools::docking() {
+            // --- src/popups.rs ---------------------------------------------------------------
+            // `browser_view` is this tab's, the opener's; its browser id is what `popups.rs` keyed
+            // the requested size on.
+            if is_devtools == 0 {
+                let opener = browser_view
+                    .and_then(|view| view.browser())
+                    .map(|browser| browser.identifier())
+                    .unwrap_or(-1);
+                return Some(crate::popups::view_delegate(&self.state, opener));
+            }
+            // --- end src/popups.rs -----------------------------------------------------------
+            if !crate::devtools::docking() {
                 crate::devtools::trace("delegate_for_popup: declining");
                 return None;
             }
@@ -1255,9 +1283,13 @@ wrap_browser_view_delegate! {
             let Some(view) = popup_browser_view else {
                 return 0;
             };
+            // --- src/popups.rs ---------------------------------------------------------------
+            // A page popup gets a top-level window of its own — see "The popup window" at the
+            // head of `popups.rs`. It is not a tab of this window and is not added to it.
             if is_devtools == 0 {
-                return 0;
+                return i32::from(crate::popups::place(view));
             }
+            // --- end src/popups.rs -----------------------------------------------------------
             let placed = crate::devtools::on_popup_view(&self.state, self.window_id, view);
             crate::devtools::trace(&format!("on_popup_created: placed={placed}"));
             i32::from(placed)
