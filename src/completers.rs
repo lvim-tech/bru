@@ -640,6 +640,8 @@ fn takes(kind: crate::settings::Kind) -> String {
         Kind::Dict(shape) if shape.open_keys => "a dictionary, any key".to_string(),
         Kind::Dict(_) => "a dictionary, fixed keys".to_string(),
         Kind::List(_) => "a list".to_string(),
+        Kind::DictList(shape) if shape.open_keys => "named lists, any name".to_string(),
+        Kind::DictList(_) => "named lists, fixed names".to_string(),
         Kind::Int(shape) => format!("a whole number, {} to {} {}", shape.min, shape.max, shape.unit),
         Kind::Chars => "at least two different characters, no spaces".to_string(),
         // `Kind::Text`, and anything added after this was written.
@@ -688,7 +690,7 @@ fn setting_values(option: Option<&str>, already: &[&str], pattern: &str) -> Vec<
     let Some(def) = option.and_then(crate::settings::def) else {
         return Vec::new();
     };
-    if matches!(def.kind, Kind::Dict(_) | Kind::List(_)) {
+    if matches!(def.kind, Kind::Dict(_) | Kind::List(_) | Kind::DictList(_)) {
         return Vec::new();
     }
 
@@ -795,7 +797,11 @@ fn build_which(which: Which, pattern: &str) -> Vec<Category> {
                 .iter()
                 .filter(|def| match only {
                     Only::Any => true,
-                    Only::Dicts => matches!(def.kind, crate::settings::Kind::Dict(_)),
+                    // `:config-dict-add` takes a dictionary of lists too — a group and an entry.
+                    Only::Dicts => matches!(
+                        def.kind,
+                        crate::settings::Kind::Dict(_) | crate::settings::Kind::DictList(_)
+                    ),
                     Only::Lists => matches!(def.kind, crate::settings::Kind::List(_)),
                 })
                 .map(|def| {
@@ -2028,7 +2034,9 @@ mod tests {
     fn the_dict_and_list_commands_are_offered_only_the_options_they_work_on() {
         let dicts = build_which(Which::Setting(Only::Dicts), "");
         let names: Vec<&str> = dicts[0].items.iter().map(|i| i.cols[0].as_str()).collect();
-        assert_eq!(names, ["statusbar.mode.labels", "url.searchengines"]);
+        // `hints.selectors` too: `:config-dict-add hints.selectors <group> <selector>` is how one
+        // is added from the command line.
+        assert_eq!(names, ["statusbar.mode.labels", "url.searchengines", "hints.selectors"]);
         assert_eq!(dicts.len(), 1);
 
         let lists = build_which(Which::Setting(Only::Lists), "");

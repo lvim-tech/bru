@@ -19,7 +19,20 @@
     // `hints.selectors["links"]`, configdata.yml:1838. qutebrowser's `:navigate prev/next` asks for
     // exactly this group (`webelem.css_selector('links', baseurl)`), so an <a> with no href — a
     // named anchor — is not a candidate, and neither is a button.
-    var SELECTOR = 'a[href], area[href], link[href], [role="link"][href]';
+    //
+    // **The group is handed in, not written here.** The marker below is replaced by `navigate.rs`
+    // with `hints.selectors["links"]` as a JavaScript array before this is evaluated — the setting
+    // is the one table, so an entry a `config.lua` adds to `links` is a candidate here too, exactly
+    // as qutebrowser's `:navigate` reads the same group. An entry Chromium cannot parse is dropped
+    // on its own rather than taking the whole list down with it (see `usable` in `hints.js`).
+    var SELECTOR = __BRU_LINKS__.filter(function (selector) {
+        try {
+            document.createDocumentFragment().querySelector(selector);
+            return true;
+        } catch (exc) {
+            return false;
+        }
+    }).join(", ");
 
     // A ceiling on the payload. A prev/next link is near the top or the bottom of a document and
     // both ends are inside 500 links on any page worth paging through; a comment thread with
@@ -56,7 +69,7 @@
     }
 
     var out = [];
-    var elems = document.querySelectorAll(SELECTOR);
+    var elems = SELECTOR ? document.querySelectorAll(SELECTOR) : [];
     for (var i = 0; i < elems.length && out.length < MAX_LINKS; i++) {
         var elem = elems[i];
         var href = resolve(elem);

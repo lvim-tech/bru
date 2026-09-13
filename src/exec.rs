@@ -457,6 +457,7 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
                 HintGroup::Media => crate::hints::Group::Media,
                 HintGroup::Url => crate::hints::Group::Url,
                 HintGroup::Inputs => crate::hints::Group::Inputs,
+                HintGroup::Named(name) => crate::hints::Group::Named(name.clone()),
             };
             let target = match target {
                 HintTarget::Normal => crate::hints::Target::Normal,

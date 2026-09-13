@@ -657,7 +657,7 @@ pub enum ScrollDirection {
 /// A parallel of `crate::hints::Group`, which is the same set. The two are kept apart because this
 /// file is about what a command *string* means and knows nothing about CEF; `exec.rs` maps between
 /// them in one match, the way it already does for [`ScrollDirection`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HintGroup {
     All,
     Links,
@@ -665,6 +665,13 @@ pub enum HintGroup {
     Media,
     Url,
     Inputs,
+    // --- hints.selectors -----------------------------------------------------------------------
+    /// A group `hints.selectors` does not ship — one a `config.lua` added, `:hint motion`. Whether
+    /// it exists is the setting's to say and is asked when the command runs, as qutebrowser asks
+    /// (`hints.py`, "Undefined hinting group"): a binding parsed before the config has loaded must
+    /// not be refused for naming a group the config is about to add.
+    Named(String),
+    // --- end hints.selectors -------------------------------------------------------------------
 }
 
 // --- src/clip.rs -----------------------------------------------------------
@@ -777,8 +784,10 @@ pub enum CaretMove {
 // --- end src/caret.rs --------------------------------------------------------------------------
 
 impl HintGroup {
-    /// The six keys of `hints.selectors`' default. A name that is not one of them is a group only
-    /// a `config.lua` could have added, and bru has no `hints.selectors` setting to add it in.
+    /// The six keys of `hints.selectors`' default, and any other name as a group of the user's.
+    ///
+    /// Only a name that cannot be a group is refused here — empty, or one starting with `-`, which
+    /// is a flag that was not recognised rather than a group called "-x".
     fn parse(name: &str) -> Option<HintGroup> {
         Some(match name {
             "all" => HintGroup::All,
@@ -787,7 +796,8 @@ impl HintGroup {
             "media" => HintGroup::Media,
             "url" => HintGroup::Url,
             "inputs" => HintGroup::Inputs,
-            _ => return None,
+            other if other.is_empty() || other.starts_with('-') => return None,
+            other => HintGroup::Named(other.to_string()),
         })
     }
 }
@@ -3452,7 +3462,6 @@ mod tests {
             "hint all right-click",
             "hint --mode number links",
             "hint links yank --add-history",
-            "hint whatever",
         ] {
             assert_eq!(
                 parse(cmd).unwrap(),
@@ -3460,6 +3469,23 @@ mod tests {
                 "{cmd:?} should not be mistaken for something bru implements"
             );
         }
+        // --- hints.selectors -------------------------------------------------------------------
+        // **A name that is not one of bru's six is a group of the user's**, and whether it exists
+        // is `hints.selectors`' to say when the command runs — a binding parsed before config.lua
+        // has loaded must not be refused for naming a group the config is about to add. Before
+        // the setting existed there was nowhere to add one, and this was `Unimplemented`.
+        assert_eq!(
+            parse("hint whatever").unwrap(),
+            hint(HintGroup::Named("whatever".to_string()), HintTarget::Normal)
+        );
+        assert_eq!(
+            parse("hint motion tab").unwrap(),
+            hint(HintGroup::Named("motion".to_string()), HintTarget::TabBg)
+        );
+        // …and a word that cannot be a group is not taken for one.
+        assert_eq!(HintGroup::parse(""), None);
+        assert_eq!(HintGroup::parse("-x"), None);
+        // --- end hints.selectors ---------------------------------------------------------------
     }
 
 // --- src/history.rs --------------------------------------------------------

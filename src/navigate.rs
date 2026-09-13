@@ -488,9 +488,38 @@ fn request_links(browser: &mut Browser, prev: bool, tab: bool, bg: bool, window:
     };
     if let Some(arguments) = message.argument_list() {
         arguments.set_string(0, Some(&CefString::from(sequence.to_string().as_str())));
+        // --- hints.selectors -------------------------------------------------------------------
+        // The `links` group, from here: the setting lives in this process, and the render process
+        // that evaluates `navigate.js` has only bru's compiled-in defaults.
+        arguments.set_string(1, Some(&CefString::from(links_group().as_str())));
+        // --- end hints.selectors ---------------------------------------------------------------
     }
     frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
 }
+
+// --- hints.selectors -----------------------------------------------------------------------------
+/// `hints.selectors["links"]` as a JavaScript array literal — what `navigate.js`'s `__BRU_LINKS__`
+/// becomes. Escaped as `hints.rs` escapes a group: a selector is text a person typed.
+fn links_group() -> String {
+    let groups = crate::settings::dict_list_of("hints.selectors");
+    let entries: Vec<String> = groups
+        .get("links")
+        .map(|links| {
+            links
+                .iter()
+                .map(|selector| format!("\"{}\"", crate::ipc::json_escape(selector)))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("[{}]", entries.join(","))
+}
+
+/// `navigate.js` with its group put in. The marker is replaced once and must be there to replace,
+/// which a test holds the script to.
+fn with_links(group: &str) -> String {
+    NAVIGATE_JS.replacen("__BRU_LINKS__", group, 1)
+}
+// --- end hints.selectors -------------------------------------------------------------------------
 
 /// Renderer side. Called from `ipc::renderer_on_process_message_received`; true when the message was
 /// ours. **Nothing here may touch `BruState`** — this runs in the render process, where that struct
@@ -510,7 +539,17 @@ pub fn renderer_on_query(frame: Option<&Frame>, message: Option<&ProcessMessage>
         .map(|arguments| CefString::from(&arguments.string(0)).to_string())
         .unwrap_or_default();
 
-    let links = evaluate(frame, NAVIGATE_JS).unwrap_or_default();
+    // --- hints.selectors -----------------------------------------------------------------------
+    // Sent by the browser process; bru's own `links` when it was not, which is only a browser
+    // process that predates the argument.
+    let group = message
+        .argument_list()
+        .map(|arguments| CefString::from(&arguments.string(1)).to_string())
+        .filter(|group| !group.is_empty())
+        .unwrap_or_else(links_group);
+    let code = with_links(&group);
+    let links = evaluate(frame, &code).unwrap_or_default();
+    // --- end hints.selectors -------------------------------------------------------------------
 
     let Some(mut reply) = process_message_create(Some(&CefString::from(REPORT))) else {
         return true;
@@ -688,6 +727,24 @@ fn debug(message: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    // --- hints.selectors ---------------------------------------------------------------------------
+    /// `:navigate`'s candidates are `hints.selectors["links"]`, put into the script — the marker is
+    /// there exactly once and nothing of it is left after.
+    #[test]
+    fn the_links_group_is_put_into_the_script() {
+        assert_eq!(NAVIGATE_JS.matches("__BRU_LINKS__").count(), 1);
+        let code = with_links(&links_group());
+        assert!(!code.contains("__BRU_LINKS__"));
+        assert!(
+            code.contains(
+                r#"var SELECTOR = ["a[href]","area[href]","link[href]","[role=\"link\"][href]"].filter("#
+            ),
+            "the links group, escaped for a script"
+        );
+    }
+    // --- end hints.selectors -----------------------------------------------------------------------
+
     use super::*;
 
     fn link(tag: &str, rel: &str, class: &str, text: &str, href: &str) -> Link {

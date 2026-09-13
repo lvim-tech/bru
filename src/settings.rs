@@ -44,6 +44,11 @@ pub enum Kind {
     Dict(&'static DictShape),
     /// An ordered list of text, with bru's own entries compiled in. See [`ListShape`].
     List(&'static ListShape),
+    // --- hints.selectors -----------------------------------------------------------------------
+    /// A map from a name to an ordered list of text — qutebrowser's `Dict[String, List[String]]`.
+    /// See [`DictListShape`].
+    DictList(&'static DictListShape),
+    // --- end hints.selectors -------------------------------------------------------------------
     // --- unhardcoded -------------------------------------------------------------------------
     /// A whole number inside a range bru names. See [`IntShape`].
     ///
@@ -200,6 +205,76 @@ impl DictShape {
     }
 }
 
+// --- hints.selectors ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------
+// Dictionaries of lists
+// -----------------------------------------------------------------------------------------------
+
+/// The shape of a [`Kind::DictList`] setting: named lists, bru's own compiled in.
+///
+/// **It exists because qutebrowser's `hints.selectors` is one** (`configdata.yml:1803`,
+/// `Dict[String, List[String]]`) and neither kind above can hold it. A [`Kind::Dict`] maps a name to
+/// one string, and a CSS selector list is not one string — selectors have commas in them, so no
+/// separator would survive the first `a, button`. A [`Kind::List`] is one list with no names, and
+/// the names are the point: `:hint links` is a different *query* from `:hint all`, not the same one
+/// filtered, and a user's own group is how `:hint motion` labels only a UI library's controls.
+///
+/// ## An override appends to a group, and a new name is a new group
+///
+/// The two rules above, composed: `config.lua` is a patch, so
+/// `bru.set("hints.selectors", { all = { ".mine" } })` puts one selector at the end of bru's `all`
+/// and leaves the other twenty-nine where they are — qutebrowser's own spelling of the same thing is
+/// `c.hints.selectors["all"].append(".mine")`. A name bru does not ship is a group of the user's,
+/// which [`DictListShape::open_keys`] allows.
+#[derive(PartialEq, Eq, Debug)]
+pub struct DictListShape {
+    /// The groups bru ships, each with its entries in order.
+    pub defaults: &'static [(&'static str, &'static [&'static str])],
+    /// Whether a name bru does not ship may be added as a group of its own.
+    pub open_keys: bool,
+    /// What an entry of any group has to be.
+    pub value: ListValue,
+}
+
+impl DictListShape {
+    /// The groups bru ships, as the map a [`Value::DictList`] holds.
+    pub fn default_map(&self) -> BTreeMap<String, Vec<String>> {
+        self.defaults
+            .iter()
+            .map(|(key, entries)| {
+                (key.to_string(), entries.iter().map(|entry| entry.to_string()).collect())
+            })
+            .collect()
+    }
+
+    /// bru's own entries for a group, if it ships that group.
+    fn default_for(&self, key: &str) -> Option<&'static [&'static str]> {
+        self.defaults.iter().find(|(known, _)| *known == key).map(|(_, entries)| *entries)
+    }
+
+    /// Whether a group of this name may exist.
+    fn check_name(&self, name: &str, key: &str) -> Result<(), String> {
+        if key.trim().is_empty() {
+            return Err(format!("{name}: a group name cannot be empty"));
+        }
+        if !self.open_keys && self.default_for(key).is_none() {
+            return Err(format!(
+                "{name}: {key:?} is not one of {}",
+                self.defaults.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether one entry may go into one group, and why not when it may not.
+    fn check(&self, name: &str, key: &str, value: &str) -> Result<(), String> {
+        self.check_name(name, key)?;
+        // The entry rules are a list's: one checker, whichever kind the entry arrived in.
+        ListShape { defaults: &[], value: self.value }.check(&format!("{name}[{key}]"), value)
+    }
+}
+// --- end hints.selectors -----------------------------------------------------------------------
+
 // -----------------------------------------------------------------------------------------------
 // Lists
 // -----------------------------------------------------------------------------------------------
@@ -262,6 +337,17 @@ pub enum ListValue {
     /// deduplicates numerically, so `133` and `133%` cannot become two levels.
     Percent,
     // --- end unhardcoded -----------------------------------------------------------------------
+    // --- hints.selectors -----------------------------------------------------------------------
+    /// A CSS selector, as `querySelectorAll` takes it — `hints.selectors`' entries.
+    ///
+    /// **Only the shape is checked here, and on purpose.** A selector is valid when a browser's
+    /// selector parser says so, and the only one in reach is in the page; a Rust copy of the CSS
+    /// grammar would be a second opinion that disagrees with Chromium at the edges, which is where
+    /// people write selectors. So this refuses what cannot be a selector at all — an empty entry, a
+    /// whole rule with braces in it, pasted from a stylesheet — and `chrome/hints.js` tries each of
+    /// the rest on its own, drops one Chromium refuses, and says which.
+    CssSelector,
+    // --- end hints.selectors -------------------------------------------------------------------
 }
 
 impl ListShape {
@@ -342,6 +428,18 @@ impl ListShape {
                      percent, with or without the % sign"
                 )),
             },
+            // --- hints.selectors ---------------------------------------------------------------
+            ListValue::CssSelector => {
+                if value.contains('{') || value.contains('}') {
+                    Err(format!(
+                        "{name}: {value:?} has braces in it — that is a CSS rule, and an entry is \
+                         only the selector in front of one"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            // --- end hints.selectors -----------------------------------------------------------
             // --- end unhardcoded ---------------------------------------------------------------
         }
     }
@@ -513,6 +611,91 @@ impl IntShape {
     }
 }
 
+// --- hints.selectors ---------------------------------------------------------------------------
+/// `hints.selectors`, configdata.yml:1803 — every group, in qutebrowser's order and spelling.
+///
+/// **Moved here from `chrome/hints.js`, whole, and not copied.** Those lists are the accumulated
+/// answer to "what is clickable", and there has to be exactly one of them: the page script is now
+/// handed the group it is to collect rather than keeping a table of its own, so a selector added in
+/// `config.lua` and one bru ships reach the page by the same road.
+///
+/// Open, because a group of the user's own is half of what qutebrowser's setting is for —
+/// `:hint motion` labelling one UI library's controls and nothing else.
+static HINT_SELECTORS: DictListShape = DictListShape {
+    defaults: &[
+        ("all", &[
+            "a",
+            "area",
+            "textarea",
+            "select",
+            "input:not([type=\"hidden\"])",
+            "button",
+            "frame",
+            "iframe",
+            "img",
+            "link",
+            "summary",
+            "[contenteditable]:not([contenteditable=\"false\"])",
+            "[onclick]",
+            "[onmousedown]",
+            "[role=\"link\"]",
+            "[role=\"option\"]",
+            "[role=\"button\"]",
+            "[role=\"tab\"]",
+            "[role=\"checkbox\"]",
+            "[role=\"switch\"]",
+            "[role=\"menuitem\"]",
+            "[role=\"menuitemcheckbox\"]",
+            "[role=\"menuitemradio\"]",
+            "[role=\"treeitem\"]",
+            "[aria-haspopup]",
+            "[ng-click]",
+            "[ngClick]",
+            "[data-ng-click]",
+            "[x-ng-click]",
+            "[tabindex]:not([tabindex=\"-1\"])",
+        ]),
+        ("links", &[
+            "a[href]",
+            "area[href]",
+            "link[href]",
+            "[role=\"link\"][href]",
+        ]),
+        ("images", &[
+            "img",
+        ]),
+        ("media", &[
+            "audio",
+            "img",
+            "video",
+        ]),
+        ("url", &[
+            "[src]",
+            "[href]",
+        ]),
+        ("inputs", &[
+            "input[type=\"text\"]",
+            "input[type=\"date\"]",
+            "input[type=\"datetime-local\"]",
+            "input[type=\"email\"]",
+            "input[type=\"month\"]",
+            "input[type=\"number\"]",
+            "input[type=\"password\"]",
+            "input[type=\"search\"]",
+            "input[type=\"tel\"]",
+            "input[type=\"time\"]",
+            "input[type=\"url\"]",
+            "input[type=\"week\"]",
+            "input:not([type])",
+            "[contenteditable]:not([contenteditable=\"false\"])",
+            "textarea",
+        ]),
+    ],
+    open_keys: true,
+    value: ListValue::CssSelector,
+};
+// --- end hints.selectors -----------------------------------------------------------------------
+
 /// `hints.min_chars` — how many characters the shortest label may be.
 ///
 /// qutebrowser's `minval: 1` (`configdata.yml:1751`) and no maximum. bru caps at 5 because the
@@ -668,6 +851,11 @@ pub enum Value {
     /// A whole list, bru's defaults with the user's additions appended. Complete for the same
     /// reason a `Dict` is: what reads it wants the list, not a diff and a merge.
     List(Vec<String>),
+    // --- hints.selectors -----------------------------------------------------------------------
+    /// A whole map of lists, bru's groups with the user's entries appended to each and the user's
+    /// own groups beside them. Complete for the reason a `Dict` and a `List` are.
+    DictList(BTreeMap<String, Vec<String>>),
+    // --- end hints.selectors -------------------------------------------------------------------
     // --- setting functions ---------------------------------------------------------------------
     /// **A Lua function**, called when the value is wanted. Only a [`Kind::TextOrFn`] setting can
     /// hold one.
@@ -700,6 +888,12 @@ impl std::fmt::Display for Value {
             // print is not this — see `Settings::describe`, which gives a dict a line per pair.
             Value::Dict(map) => write!(f, "{} entries", map.len()),
             Value::List(entries) => write!(f, "{} entries", entries.len()),
+            Value::DictList(map) => write!(
+                f,
+                "{} groups, {} entries",
+                map.len(),
+                map.values().map(Vec::len).sum::<usize>()
+            ),
             // --- setting functions ---------------------------------------------------------------
             // `<function config.lua:12>`, and the reasoning is [`crate::lua::FnRef`]'s `Display`:
             // there is no value to print, because the value is what the function answers and that
@@ -1768,6 +1962,19 @@ pub const SETTINGS: &[Def] = &[
         scopes: Scopes::GlobalOnly,
         backing: Backing::Read,
     },
+    // --- hints.selectors -----------------------------------------------------------------------
+    Def {
+        // `hints.selectors`, configdata.yml:1803. Same name, same six groups, same entries; a
+        // `Dict[String, List[String]]` there and a [`Kind::DictList`] here, the kind added for it.
+        // `config.lua` appends to a group or adds one: `bru.set("hints.selectors", { all =
+        // { "[data-x]" }, motion = { … } })`.
+        name: "hints.selectors",
+        kind: Kind::DictList(&HINT_SELECTORS),
+        default: None,
+        scopes: Scopes::GlobalOnly,
+        backing: Backing::Read,
+    },
+    // --- end hints.selectors -------------------------------------------------------------------
     // --- src/scrollbar.rs -----------------------------------------------------------------------
     Def {
         // How wide the bar is, and how tall a horizontal one is. Twelve sits between Chromium's
@@ -2143,6 +2350,43 @@ fn describe_dict(def: &'static Def, map: &BTreeMap<String, String>) -> String {
     out
 }
 
+// --- hints.selectors ---------------------------------------------------------------------------
+/// **What `:set` prints for a dictionary of lists** — [`describe_list`]'s line per entry, grouped,
+/// with the group in the name so that every line reads alone: `hints.selectors[all][3] = select`.
+fn describe_dict_list(def: &'static Def, map: &BTreeMap<String, Vec<String>>) -> String {
+    let shape = match def.kind {
+        Kind::DictList(shape) => shape,
+        _ => return format!("{} is not a dictionary of lists", def.name),
+    };
+    let added: usize = map
+        .iter()
+        .map(|(key, entries)| {
+            let own = shape.default_for(key).unwrap_or(&[]);
+            entries.iter().filter(|entry| !own.contains(&entry.as_str())).count()
+        })
+        .sum();
+    let mut out = format!(
+        "{} — {} groups, {} entries, {added} added to bru's own",
+        def.name,
+        map.len(),
+        map.values().map(Vec::len).sum::<usize>()
+    );
+    for (key, entries) in map {
+        let own = shape.default_for(key);
+        if own.is_none() {
+            out.push_str(&format!("\n  {}[{key}]   (a group of yours)", def.name));
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            out.push_str(&format!("\n  {}[{key}][{index}] = {entry}", def.name));
+            if own.is_some_and(|own| !own.contains(&entry.as_str())) {
+                out.push_str("   (added)");
+            }
+        }
+    }
+    out
+}
+// --- end hints.selectors -----------------------------------------------------------------------
+
 // --- config commands ---------------------------------------------------------------------------
 /// **What `:set` prints for a list** — [`describe_dict`]'s shape, one line per entry.
 ///
@@ -2194,6 +2438,28 @@ pub fn list_of(name: &str) -> Vec<String> {
 }
 // --- end config commands -----------------------------------------------------------------------
 
+// --- hints.selectors ---------------------------------------------------------------------------
+/// Every group of a dictionary-of-lists setting, bru's with the user's entries appended and the
+/// user's own groups beside them. Empty for a setting that is not one.
+pub fn dict_list_of(name: &str) -> BTreeMap<String, Vec<String>> {
+    let Some(def) = def(name) else { return BTreeMap::new() };
+    let Kind::DictList(shape) = def.kind else {
+        return BTreeMap::new();
+    };
+    match with_live(|settings| settings.get(name, None).ok().flatten()) {
+        Some(Value::DictList(map)) => map,
+        // Before `install`, or in a unit test: bru's own are still the truth.
+        _ => shape.default_map(),
+    }
+}
+
+/// Whether a setting is a dictionary of lists — what `config.rs` asks to tell `{ a = { … } }` from
+/// a dictionary of strings, because a Lua table does not say which it is.
+pub fn is_dict_list(name: &str) -> bool {
+    matches!(def(name).map(|def| def.kind), Some(Kind::DictList(_)))
+}
+// --- end hints.selectors -----------------------------------------------------------------------
+
 /// The value of a setting bru answers itself, rather than reading back from Chromium.
 ///
 /// `None` for the content settings, whose truth is Chromium's and is read there — see
@@ -2241,7 +2507,7 @@ pub fn value_of(name: &str) -> Option<String> {
         // A dictionary has no one-line value. Nothing asks `value_of` for one — `bar_json` reads
         // `dict_of` and the settings page prints a row per pair — and the count is the honest
         // answer for anywhere that insists on a scalar. A list is the same.
-        Some(value @ (Value::Dict(_) | Value::List(_))) => value.to_string(),
+        Some(value @ (Value::Dict(_) | Value::List(_) | Value::DictList(_))) => value.to_string(),
         // --- setting functions -------------------------------------------------------------------
         // **What `bru://chrome/settings` prints for a function**, and it is not the value.
         //
@@ -2413,6 +2679,17 @@ impl Def {
                  rather than replacing them.",
                 self.name
             )),
+            // --- hints.selectors -----------------------------------------------------------
+            // The same refusal again: a whole map of lists has even less of a one-token spelling
+            // than a map or a list, and the two commands that already exist say what to do.
+            Kind::DictList(_) => Err(format!(
+                "{0} is a dictionary of lists — add one entry to a group with \
+                 `:config-dict-add {0} <group> <entry>`, remove a group of your own with \
+                 `:config-dict-remove {0} <group>`, or write a Lua table in config.lua: \
+                 `bru.set(\"{0}\", {{ all = {{ \".my-button\" }} }})`.",
+                self.name
+            )),
+            // --- end hints.selectors -------------------------------------------------------
             // The same refusal, for the same reason — see the dict arm above. An override appends,
             // so a text form would be a way of writing an append one token wide, which is what
             // `:config-list-add` already is and says more clearly.
@@ -2503,6 +2780,9 @@ impl Def {
         if let Kind::List(shape) = self.kind {
             return Some(Value::List(shape.default_list()));
         }
+        if let Kind::DictList(shape) = self.kind {
+            return Some(Value::DictList(shape.default_map()));
+        }
         let default = self.default?;
         self.parse(default).ok()
     }
@@ -2512,6 +2792,15 @@ impl Def {
     fn dict_shape(&self, command: &str) -> Result<&'static DictShape, String> {
         match self.kind {
             Kind::Dict(shape) => Ok(shape),
+            // --- hints.selectors ---------------------------------------------------------------
+            // Not a dict in the sense this function answers, but not "not a dict" either: the two
+            // commands that take one are routed to their dictionary-of-lists twins before they get
+            // here (see `Settings::dict_add`), so reaching this arm is a caller that skipped that.
+            Kind::DictList(_) => Err(format!(
+                ":{command} on {} goes through its dictionary-of-lists form — this is a bug in bru",
+                self.name
+            )),
+            // --- end hints.selectors -----------------------------------------------------------
             _ => Err(format!(
                 ":{command} can only be used for dicts, and {} is not one",
                 self.name
@@ -2792,6 +3081,9 @@ impl Applied {
         if let Value::List(entries) = &self.value {
             return describe_list(self.def, entries);
         }
+        if let Value::DictList(map) = &self.value {
+            return describe_dict_list(self.def, map);
+        }
         let mut out = format!("{} = {}", self.def.name, self.value);
         if let Some(pattern) = &self.pattern {
             out.push_str(&format!(" for {}", pattern.describe()));
@@ -2928,6 +3220,9 @@ impl Settings {
         replace: bool,
     ) -> Result<Applied, String> {
         let def = def(key).ok_or_else(|| unknown(key))?;
+        if let Kind::DictList(shape) = def.kind {
+            return self.dict_list_add(def, shape, entry, value, replace);
+        }
         let shape = def.dict_shape("config-dict-add")?;
         shape.check(def.name, entry, value)?;
         let mut map = self.dict_map(def);
@@ -2950,6 +3245,9 @@ impl Settings {
     /// is refused rather than obeyed, because the pill would then have nothing to draw.
     pub fn dict_remove(&mut self, key: &str, entry: &str) -> Result<Applied, String> {
         let def = def(key).ok_or_else(|| unknown(key))?;
+        if let Kind::DictList(shape) = def.kind {
+            return self.dict_list_remove(def, shape, entry);
+        }
         let shape = def.dict_shape("config-dict-remove")?;
         let mut map = self.dict_map(def);
         if !map.contains_key(entry) {
@@ -2968,6 +3266,116 @@ impl Settings {
         self.values.insert((None, def.name), value.clone());
         Ok(Applied { def, value, pattern: None })
     }
+
+// --- hints.selectors ---------------------------------------------------------------------------
+    /// `bru.set(key, { group = { … }, … })` for a **dictionary of lists** — each group's entries
+    /// appended to that group, a name bru does not ship made a group of its own.
+    ///
+    /// The merge is [`Settings::set_list`]'s, one group at a time, and every entry of every group is
+    /// checked before any is stored, for the reason `set_dict` gives: the whole table is one Lua
+    /// statement.
+    pub fn set_dict_list(
+        &mut self,
+        key: &str,
+        groups: &[(String, Vec<String>)],
+    ) -> Result<Applied, String> {
+        let def = def(key).ok_or_else(|| unknown(key))?;
+        let Kind::DictList(shape) = def.kind else {
+            return Err(format!("{} is not a dictionary of lists", def.name));
+        };
+        for (group, entries) in groups {
+            for entry in entries {
+                shape.check(def.name, group, entry)?;
+            }
+            // An empty table for a name is not nothing: it names a group, and a group of the
+            // user's with no selectors in it is still a thing `:hint <group>` should find.
+            if entries.is_empty() {
+                shape.check_name(def.name, group)?;
+            }
+        }
+        let mut map = self.dict_list_map(def);
+        for (group, entries) in groups {
+            let held = map.entry(group.trim().to_string()).or_default();
+            for entry in entries {
+                let entry = entry.trim().to_string();
+                if !held.contains(&entry) {
+                    held.push(entry);
+                }
+            }
+        }
+        let value = Value::DictList(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-dict-add <option> <group> <entry> [--replace]` on a dictionary of lists: one entry,
+    /// appended to one group — or, with `--replace`, the group made that one entry.
+    ///
+    /// `--replace` keeps the meaning it has on a dict, "this key now holds this and only this",
+    /// which on a group is the one way to take bru's own selectors out of it from the command line.
+    fn dict_list_add(
+        &mut self,
+        def: &'static Def,
+        shape: &'static DictListShape,
+        group: &str,
+        entry: &str,
+        replace: bool,
+    ) -> Result<Applied, String> {
+        shape.check(def.name, group, entry)?;
+        let entry = entry.trim().to_string();
+        let mut map = self.dict_list_map(def);
+        let held = map.entry(group.trim().to_string()).or_default();
+        if replace {
+            *held = vec![entry];
+        } else if held.contains(&entry) {
+            return Err(format!("{entry} is already in {}[{group}]", def.name));
+        } else {
+            held.push(entry);
+        }
+        let value = Value::DictList(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// `:config-dict-remove <option> <group>` on a dictionary of lists: a group of the user's goes.
+    ///
+    /// One of bru's own is refused rather than obeyed — `all` is what `f` asks for, and a group that
+    /// stopped existing would be every hint command naming it failing at once. Its added entries
+    /// can be taken back with `--replace` on `:config-dict-add`, or by editing config.lua.
+    fn dict_list_remove(
+        &mut self,
+        def: &'static Def,
+        shape: &'static DictListShape,
+        group: &str,
+    ) -> Result<Applied, String> {
+        let mut map = self.dict_list_map(def);
+        if !map.contains_key(group) {
+            return Err(format!("{group} is not in {}", def.name));
+        }
+        if shape.default_for(group).is_some() {
+            return Err(format!(
+                "{}: {group:?} is one of bru's own groups and cannot be removed — hint commands \
+                 name it. Use `:config-dict-add {} {group} <entry> --replace` to change what it holds.",
+                def.name, def.name
+            ));
+        }
+        map.remove(group);
+        let value = Value::DictList(map);
+        self.values.insert((None, def.name), value.clone());
+        Ok(Applied { def, value, pattern: None })
+    }
+
+    /// The map as it stands: whatever has been stored, or bru's groups when nothing has.
+    fn dict_list_map(&self, def: &'static Def) -> BTreeMap<String, Vec<String>> {
+        match self.values.get(&(None, def.name)) {
+            Some(Value::DictList(map)) => map.clone(),
+            _ => match def.kind {
+                Kind::DictList(shape) => shape.default_map(),
+                _ => BTreeMap::new(),
+            },
+        }
+    }
+// --- end hints.selectors -----------------------------------------------------------------------
 
 // --- config commands ---------------------------------------------------------------------------
     /// `bru.set(key, { … })` for a **list** setting — a Lua array, **appended** to what the list
@@ -3152,6 +3560,42 @@ impl Settings {
                         ));
                     }
                 }
+                // --- hints.selectors -----------------------------------------------------------
+                // A group at a time, and only what is not bru's: the additions to bru's groups, the
+                // user's own groups whole. The one thing Lua cannot say is an entry of bru's that
+                // was taken away (`--replace`), and that is said as a comment, as for the others.
+                Kind::DictList(shape) => {
+                    let map = self.dict_list_map(def);
+                    let mut groups: Vec<String> = Vec::new();
+                    for (key, entries) in &map {
+                        let own = shape.default_for(key).unwrap_or(&[]);
+                        let added: Vec<String> = entries
+                            .iter()
+                            .filter(|entry| !own.contains(&entry.as_str()))
+                            .map(|entry| lua_string(entry))
+                            .collect();
+                        for entry in own {
+                            if !entries.iter().any(|held| held == entry) {
+                                out.push(format!(
+                                    "-- taken out at runtime, and config.lua cannot say so: \
+                                     {}[{key}] no longer holds {entry}",
+                                    def.name
+                                ));
+                            }
+                        }
+                        if !added.is_empty() || (shape.default_for(key).is_none()) {
+                            groups.push(format!("[{}] = {{ {} }}", lua_string(key), added.join(", ")));
+                        }
+                    }
+                    if !groups.is_empty() {
+                        out.push(format!(
+                            "bru.set({}, {{ {} }})",
+                            lua_string(def.name),
+                            groups.join(", ")
+                        ));
+                    }
+                }
+                // --- end hints.selectors -------------------------------------------------------
                 _ => {
                     for (pattern, name) in self.values.keys() {
                         if *name != def.name {
@@ -3247,6 +3691,12 @@ impl Settings {
                 def.name
             ));
         }
+        if matches!(def.kind, Kind::DictList(_)) {
+            return Err(format!(
+                "{} is a dictionary of lists; config-cycle walks the values of a single option",
+                def.name
+            ));
+        }
         // --- unhardcoded -----------------------------------------------------------------------
         // **What `config-cycle` with no values does for a number**: it says what to type instead.
         // A `Kind::Bool` has two values and a `Kind::Choice` has its list, so both can be walked
@@ -3320,6 +3770,9 @@ impl Settings {
         }
         if let Some(Value::List(entries)) = &value {
             return Ok(describe_list(def, entries));
+        }
+        if let Some(Value::DictList(map)) = &value {
+            return Ok(describe_dict_list(def, map));
         }
         // --- setting functions -------------------------------------------------------------------
         // **What `:set tabs.title.format` prints for a function.** `value_of`'s argument for not
@@ -3976,6 +4429,24 @@ pub fn defaults_lua() -> Vec<String> {
                     format!("{{ {} }}", items.join(", "))
                 }
             }
+            // --- hints.selectors -----------------------------------------------------------
+            Kind::DictList(shape) => {
+                let groups: Vec<String> = shape
+                    .defaults
+                    .iter()
+                    .map(|(key, entries)| {
+                        let items: Vec<String> =
+                            entries.iter().map(|entry| lua_string(entry)).collect();
+                        format!("[{}] = {{ {} }}", lua_string(key), items.join(", "))
+                    })
+                    .collect();
+                if groups.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{ {} }}", groups.join(", "))
+                }
+            }
+            // --- end hints.selectors -------------------------------------------------------
             // A boolean and a number are Lua literals; everything else is a string. Writing `true`
             // as `"true"` would produce a file that sets the wrong type the moment a line is
             // un-commented, which is exactly the failure a reference file must not have.
@@ -4257,7 +4728,7 @@ fn content_value(kind: ContentKind, value: &Value) -> Option<ContentSettingValue
         // one are `Backing::Chrome` and `Backing::Read`, so nothing here can be reached with one —
         // and if something ever could, calling a user's Lua to decide what to write into Chromium's
         // content-settings map is a decision, not a coercion. `None` says so.
-        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::Fn(_) => None,
+        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::DictList(_) | Value::Fn(_) => None,
         // --- end setting functions -----------------------------------------------------------------
     }
 }
@@ -4293,7 +4764,7 @@ fn write_preference(pref: PrefKind, value: &Value) -> Result<(), String> {
         // A function is in the same arm, and the wording covers it: none of the three preferences
         // bru drives is a `Kind::TextOrFn`, so this is unreachable, and saying so is better than a
         // coercion that would put `<function config.lua:12>` into Chromium's profile as text.
-        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::Fn(_) => {
+        Value::Int(_) | Value::Dict(_) | Value::List(_) | Value::DictList(_) | Value::Fn(_) => {
         // --- end setting functions -----------------------------------------------------------------
             return Err(format!(
                 "{}: a preference bru drives is a boolean or a string, not a number, a table or a \
@@ -4833,9 +5304,22 @@ mod tests {
         // `fg`. They colour a text selection on every page from the theme, and only where the site
         // has no `::selection` of its own — see `src/selection.rs` for which two colours and the
         // measurement behind them.
-        assert_eq!(SETTINGS.len(), 76);
+        // **Seventy-seven**, +1 for `hints.selectors` — qutebrowser's own name, groups and entries
+        // (`configdata.yml:1803`), and the first [`Kind::DictList`], the kind added for it. It is
+        // what lets a UI library's generated controls be hinted: see `src/hints.rs`.
+        assert_eq!(SETTINGS.len(), 77);
         // Every dictionary's own defaults have to pass its own check, for the same reason: a
         // shipped pair that the setting would refuse is a default nobody could type back.
+        for def in SETTINGS {
+            let Kind::DictList(shape) = def.kind else { continue };
+            for (key, entries) in shape.defaults {
+                for entry in *entries {
+                    shape
+                        .check(def.name, key, entry)
+                        .unwrap_or_else(|e| panic!("{} ships {key}/{entry:?}, which it refuses: {e}", def.name));
+                }
+            }
+        }
         for def in SETTINGS {
             let Kind::Dict(shape) = def.kind else { continue };
             for (key, value) in shape.defaults {
@@ -5513,6 +5997,98 @@ mod tests {
         let error = settings.list_remove(name, "https://nowhere/").unwrap_err();
         assert!(error.contains("is not in"), "{error}");
     }
+
+    // --- hints.selectors -------------------------------------------------------------------------
+    /// **The merge, asserted for the new kind** — a list's append, one group at a time, and a name
+    /// bru does not ship made a group. A replace would pass every other test and show up only as a
+    /// `f` that hints nothing but one UI library's buttons.
+    #[test]
+    fn a_dict_list_override_appends_to_a_group_and_a_new_name_is_a_group() {
+        let mut settings = Settings::default();
+        let name = "hints.selectors";
+        let def = def(name).unwrap();
+        let before = settings.dict_list_map(def);
+        assert_eq!(before.len(), 6, "bru's six groups before anything is set");
+        let all_before = before["all"].len();
+
+        settings
+            .set_dict_list(
+                name,
+                &[
+                    ("all".to_string(), vec![r#"[class*="drop-down-preview-area"]"#.to_string()]),
+                    (
+                        "motion".to_string(),
+                        vec![".motion-drop-down".to_string(), "[data-motion-cp-button]".to_string()],
+                    ),
+                ],
+            )
+            .unwrap();
+        let map = settings.dict_list_map(def);
+        assert_eq!(map["all"].len(), all_before + 1, "bru's thirty are still there");
+        assert_eq!(map["all"].last().unwrap(), r#"[class*="drop-down-preview-area"]"#, "and it is last");
+        assert_eq!(map["motion"], [".motion-drop-down", "[data-motion-cp-button]"], "in order");
+        assert_eq!(map["links"], before["links"], "a group the table did not name is untouched");
+
+        // An entry already there is not appended twice.
+        settings.set_dict_list(name, &[("all".to_string(), vec!["a".to_string()])]).unwrap();
+        assert_eq!(settings.dict_list_map(def)["all"].len(), all_before + 1);
+
+        // One bad entry and nothing is stored — the whole table is one Lua statement.
+        let error = settings
+            .set_dict_list(
+                name,
+                &[("all".to_string(), vec![".fine".to_string(), "a { color: red }".to_string()])],
+            )
+            .unwrap_err();
+        assert!(error.contains("braces"), "{error}");
+        assert!(!settings.dict_list_map(def)["all"].contains(&".fine".to_string()));
+    }
+
+    /// `:config-dict-add` / `:config-dict-remove` on a dictionary of lists: an entry into a group,
+    /// `--replace` for the one way to take bru's own out of it, and only a group of the user's may
+    /// go — `all` is what `f` asks for.
+    #[test]
+    fn the_dict_commands_reach_a_dict_list_by_group() {
+        let mut settings = Settings::default();
+        let name = "hints.selectors";
+        settings.dict_add(name, "motion", ".motion-drop-down", false).unwrap();
+        let error = settings.dict_add(name, "motion", ".motion-drop-down", false).unwrap_err();
+        assert!(error.contains("already in"), "{error}");
+
+        settings.dict_add(name, "all", "a", true).unwrap();
+        assert_eq!(settings.dict_list_map(def(name).unwrap())["all"], ["a"], "--replace");
+
+        let error = settings.dict_remove(name, "all").unwrap_err();
+        assert!(error.contains("cannot be removed"), "{error}");
+        settings.dict_remove(name, "motion").unwrap();
+        assert!(!settings.dict_list_map(def(name).unwrap()).contains_key("motion"));
+        assert!(settings.dict_remove(name, "motion").unwrap_err().contains("is not in"));
+
+        // A whole map of lists has no one-token spelling, and the refusal says what does.
+        let error = settings.set("hints.selectors", "a").unwrap_err();
+        assert!(error.contains(":config-dict-add hints.selectors"), "{error}");
+    }
+
+    /// `:config-diff` prints only what is not bru's, as the Lua that would put it back — and a
+    /// value it had no arm for used to print as `bru.set(name, "7 groups, 32 entries")`.
+    #[test]
+    fn config_diff_prints_a_dict_list_as_lua_that_would_put_it_back() {
+        let mut settings = Settings::default();
+        assert!(!settings.diff().iter().any(|line| line.contains("hints.selectors")));
+        settings
+            .set_dict_list(
+                "hints.selectors",
+                &[
+                    ("all".to_string(), vec![".x".to_string()]),
+                    ("motion".to_string(), vec![".m".to_string()]),
+                ],
+            )
+            .unwrap();
+        let diff = settings.diff();
+        let line = diff.iter().find(|line| line.contains("hints.selectors")).unwrap();
+        assert_eq!(line, r#"bru.set("hints.selectors", { ["all"] = { ".x" }, ["motion"] = { ".m" } })"#);
+    }
+    // --- end hints.selectors ---------------------------------------------------------------------
 
     #[test]
     fn a_list_refuses_what_bru_could_not_fetch_and_is_not_a_scalar() {

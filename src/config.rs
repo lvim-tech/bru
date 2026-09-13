@@ -842,6 +842,16 @@ fn apply_lua(config: Config, source: &str, chunk_name: &str) -> Config {
                         let values = lua_table_sequence(&key, &table)?;
                         config.settings.set_list(&key, &values).map(|_| ())
                     }
+                    // --- hints.selectors ---------------------------------------------------
+                    // A table of arrays — `{ all = { ".a" }, motion = { ".b", ".c" } }` — for
+                    // the one kind whose values are lists. Asked of the setting for the same
+                    // reason as above: `{}` is a dictionary, a list and a dictionary of lists
+                    // at once.
+                    mlua::Value::Table(table) if crate::settings::is_dict_list(&key) => {
+                        let groups = lua_table_of_sequences(&key, &table)?;
+                        config.settings.set_dict_list(&key, &groups).map(|_| ())
+                    }
+                    // --- end hints.selectors -----------------------------------------------
                     // --- end config commands -----------------------------------------------
                     mlua::Value::Table(table) => {
                         let pairs = lua_table_pairs(&key, &table)?;
@@ -928,6 +938,35 @@ fn lua_table_pairs(option: &str, table: &mlua::Table) -> mlua::Result<Vec<(Strin
     pairs.sort();
     Ok(pairs)
 }
+
+// --- hints.selectors -------------------------------------------------------------------------
+/// A Lua table of arrays as the groups a dictionary-of-lists setting takes.
+///
+/// The groups are sorted, as [`lua_table_pairs`] sorts, because a table's keys have no order; each
+/// group's entries keep theirs, as [`lua_table_sequence`] keeps a list's, because a selector list is
+/// read in order. A value that is not an array — `{ all = ".a" }` — is refused by name rather than
+/// taken as a one-entry group: the braces are what say "a list", and guessing would make
+/// `{ all = ".a, .b" }` a single selector that happens to contain a comma.
+fn lua_table_of_sequences(
+    option: &str,
+    table: &mlua::Table,
+) -> mlua::Result<Vec<(String, Vec<String>)>> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let key = scalar_to_string(option, &key)?;
+        let mlua::Value::Table(entries) = value else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "{option}[{key}]: expected a list like {{ \"a\", \"b\" }}, got a {}",
+                value.type_name()
+            )));
+        };
+        groups.push((key.clone(), lua_table_sequence(&format!("{option}[{key}]"), &entries)?));
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(groups)
+}
+// --- end hints.selectors -------------------------------------------------------------------
 
 // --- config commands -----------------------------------------------------------------------
 /// A Lua array as the entries a list setting takes, **in the order they were written**.
@@ -1969,6 +2008,41 @@ mod tests {
             .unwrap()
             .starts_with("content.blocking.adblock.lists — 2 entries, 0 added"));
     }
+
+    // --- hints.selectors -------------------------------------------------------------------------
+    /// `hints.selectors`' value is a Lua table **of arrays**, and each array appends to its group.
+    #[test]
+    fn a_lua_table_of_arrays_is_a_dict_list_settings_value() {
+        let cfg = TempConfig::new(
+            "dict-list",
+            r#"
+                bru.set("hints.selectors", {
+                    all = { '[class*="drop-down-preview-area"]' },
+                    motion = { ".motion-drop-down", "[data-motion-cp-button]" },
+                })
+            "#,
+        );
+        let config = Config::load_from(Some(&cfg.path()));
+        let printed = config.settings.describe("hints.selectors", None).unwrap();
+        assert!(printed.starts_with("hints.selectors — 7 groups,"), "{printed}");
+        assert!(
+            printed.contains(r#"hints.selectors[all][30] = [class*="drop-down-preview-area"]   (added)"#),
+            "{printed}"
+        );
+        assert!(printed.contains("hints.selectors[motion]   (a group of yours)"), "{printed}");
+        assert!(printed.contains("hints.selectors[motion][1] = [data-motion-cp-button]"), "{printed}");
+
+        // A group given a string rather than an array is refused by name, not taken as a
+        // one-entry group — `{ all = ".a, .b" }` would otherwise be one selector with a comma in it.
+        let cfg = TempConfig::new("dict-list-scalar", r#"bru.set("hints.selectors", { all = ".a" })"#);
+        let config = Config::load_from(Some(&cfg.path()));
+        assert!(config
+            .settings
+            .describe("hints.selectors", None)
+            .unwrap()
+            .starts_with("hints.selectors — 6 groups,"));
+    }
+    // --- end hints.selectors ---------------------------------------------------------------------
 
     /// **`:config-source` builds a second Lua state, and the rule it looks like it breaks is about
     /// the key path.**

@@ -111,7 +111,7 @@ const HINTS_JS: &str = include_str!("../chrome/hints.js");
 /// this is only the name that crosses over. A group is **not** the `all` list filtered afterwards —
 /// `links` is `a[href], area[href], link[href], [role="link"][href]`, a different query — and
 /// `chrome/hints.js` refuses a name it does not know rather than answering with `all`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Group {
     All,
     Links,
@@ -119,11 +119,15 @@ pub enum Group {
     Media,
     Url,
     Inputs,
+    // --- hints.selectors -----------------------------------------------------------------------
+    /// A group of the user's, named in `hints.selectors` by `config.lua`.
+    Named(String),
+    // --- end hints.selectors -------------------------------------------------------------------
 }
 
 impl Group {
     /// The name `chrome/hints.js` keys `SELECTORS` by. Also what the parser accepts.
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Group::All => "all",
             Group::Links => "links",
@@ -131,6 +135,7 @@ impl Group {
             Group::Media => "media",
             Group::Url => "url",
             Group::Inputs => "inputs",
+            Group::Named(name) => name,
         }
     }
 }
@@ -418,6 +423,20 @@ fn hint_scattered(count: usize, chars: &[char], min_chars: usize) -> Vec<String>
 // Starting and ending a session
 // ------------------------------------------------------------------------------------------------
 
+// --- hints.selectors -----------------------------------------------------------------------------
+/// A group's selectors as the JavaScript array literal `chrome/hints.js` is handed.
+///
+/// Every entry goes through `ipc::json_escape`, which is written for text that lands inside a
+/// script: a selector is text a person typed into `config.lua`, and `[title="a\"b"]` is a real one.
+fn selectors_js(selectors: &[String]) -> String {
+    let entries: Vec<String> = selectors
+        .iter()
+        .map(|selector| format!("\"{}\"", crate::ipc::json_escape(selector)))
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+// --- end hints.selectors -------------------------------------------------------------------------
+
 /// `hint [--rapid] [--first] <group> <target>` — start hint mode on `browser`.
 ///
 /// Returns after asking the page for its elements; hint mode is not entered until the page answers,
@@ -443,7 +462,32 @@ pub fn start(
     let Some(frame) = browser.main_frame() else {
         return;
     };
+    // --- hints.selectors -------------------------------------------------------------------------
+    // **The group's selectors are handed to the page, not looked up there.** `chrome/hints.js` used
+    // to keep its own table and this sent only a name; the table is `hints.selectors` now, so an
+    // entry a `config.lua` added and one bru ships reach the page by the same road. A group the
+    // setting does not have is refused here, before any mode is entered — qutebrowser's
+    // "Undefined hinting group", with the groups there are.
+    let groups = crate::settings::dict_list_of("hints.selectors");
+    let Some(selectors) = groups.get(group.name()) else {
+        crate::message::error(&format!(
+            "hint: hints.selectors has no group {:?} — it has {}",
+            group.name(),
+            groups.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+        ));
+        return;
+    };
+    let selectors = selectors_js(selectors);
+    // --- end hints.selectors ---------------------------------------------------------------------
     let token = mint_token();
+    // The script is injected on every `f` rather than once per page load: a navigation throws the
+    // world away, and there is no cheap way to know from here whether this one still has it. Built
+    // before the session takes the group; the name is escaped because a group of the user's is
+    // text a person typed, and it lands inside a script.
+    let code = format!(
+        "{HINTS_JS}\nwindow.__bru_hints.collect(\"{token}\",\"{}\",{selectors});",
+        crate::ipc::json_escape(group.name())
+    );
     let commands = hint_mode_bindings(state);
     let live = state.lock().expect("state mutex poisoned").window_ids();
 
@@ -483,12 +527,6 @@ pub fn start(
         );
     }
 
-    // The script is injected on every `f` rather than once per page load: a navigation throws the
-    // world away, and there is no cheap way to know from here whether this one still has it.
-    let code = format!(
-        "{HINTS_JS}\nwindow.__bru_hints.collect(\"{token}\",\"{}\");",
-        group.name()
-    );
     frame.execute_java_script(Some(&CefString::from(code.as_str())), None, 0);
 
     // Nothing enters hint mode here — `on_collected` does, once there is something to hint. `f` on
@@ -678,10 +716,32 @@ pub fn on_page_query(browser: Option<&Browser>, request: &str) -> bool {
     match kind.as_str() {
         "elems" => on_collected(&state, window, &mut browser, &data),
         "href" => on_href(&state, window, &mut browser, &data),
+        // --- hints.selectors -------------------------------------------------------------------
+        "refused" => crate::message::warning(&refused_message(&data)),
+        // --- end hints.selectors ---------------------------------------------------------------
         _ => return false,
     }
     true
 }
+
+// --- hints.selectors -----------------------------------------------------------------------------
+/// The bar's line for selectors the page could not read: the group, then each entry.
+///
+/// A warning and not an error, because the hints still came up — from the entries that do read —
+/// and the point of naming the others is that a typo in `config.lua` is found by the person who
+/// made it, on the page where it mattered, rather than by nothing appearing at all.
+fn refused_message(data: &str) -> String {
+    let mut lines = data.lines();
+    let group = lines.next().unwrap_or("?");
+    let bad: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    format!(
+        "hints.selectors[{group}]: Chromium cannot read {} and skipped {}: {}",
+        if bad.len() == 1 { "this selector" } else { "these selectors" },
+        if bad.len() == 1 { "it" } else { "them" },
+        bad.join("  ·  ")
+    )
+}
+// --- end hints.selectors -------------------------------------------------------------------------
 
 /// The page has reported its hintable elements. Generate the labels, draw them, enter hint mode.
 fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &str) {
@@ -701,7 +761,7 @@ fn on_collected(state: &SharedState, window: u32, browser: &mut Browser, data: &
         let open = guard.get(&window);
         (
             open.map(|s| s.started.elapsed()),
-            open.map(|s| s.group.name()).unwrap_or("?"),
+            open.map(|s| s.group.name().to_string()).unwrap_or_else(|| "?".to_string()),
             open.map(|s| s.target.describe()).unwrap_or("?"),
         )
     };
@@ -1988,15 +2048,16 @@ mod tests {
         );
     }
 
-    /// Every `Group` bru can name must be a key of `SELECTORS` in `chrome/hints.js`, and the JS
-    /// must not offer a group Rust cannot ask for.
+    /// Every `Group` bru names is a group `hints.selectors` ships, and the page keeps no table of
+    /// its own to drift from it.
     ///
-    /// The two lists are in different languages in different files, and the failure when they
-    /// drift is silent: `;i` collects nothing and prints "no hintable elements found", which reads
-    /// as a page with no images. Checked against the file itself rather than against a copy of it.
+    /// The two lists used to be in different languages in different files, and the failure when they
+    /// drifted was silent: `;i` collected nothing and printed "no hintable elements found", which
+    /// reads as a page with no images. There is one list now, and this holds it to being one.
     #[test]
-    fn every_group_name_is_a_selector_list_the_page_knows() {
-        let groups = [
+    fn every_group_name_is_a_group_of_the_setting() {
+        let groups = crate::settings::dict_list_of("hints.selectors");
+        let named = [
             Group::All,
             Group::Links,
             Group::Images,
@@ -2004,39 +2065,65 @@ mod tests {
             Group::Url,
             Group::Inputs,
         ];
-        for group in groups {
-            assert!(
-                HINTS_JS.contains(&format!("\"{}\": [", group.name())),
-                "chrome/hints.js has no SELECTORS entry for {:?}",
-                group.name()
-            );
+        for group in &named {
+            assert!(groups.contains_key(group.name()), "hints.selectors ships no {:?}", group.name());
         }
-
-        // The other direction: count the entries in the object literal. `hints.selectors`'
-        // default has exactly these six (configdata.yml:1803).
-        let start = HINTS_JS.find("const SELECTORS = {").expect("SELECTORS is gone");
-        let end = start + HINTS_JS[start..].find("\n    };").expect("SELECTORS never closes");
-        let declared = HINTS_JS[start..end]
-            .lines()
-            .filter(|line| line.trim_end().ends_with("\": ["))
-            .count();
-        assert_eq!(declared, groups.len(), "chrome/hints.js declares a group Rust cannot name");
+        // qutebrowser's default has exactly these six (configdata.yml:1803).
+        assert_eq!(groups.len(), named.len(), "bru ships a group Rust cannot name");
+        assert!(
+            !HINTS_JS.contains("const SELECTORS"),
+            "chrome/hints.js has its own table again — the setting is the only one"
+        );
     }
 
     /// `;i` must ask for a different set of elements than `f`, not the same set filtered.
     #[test]
     fn the_group_selectors_are_qutebrowsers_own() {
+        let groups = crate::settings::dict_list_of("hints.selectors");
+        let group = |name: &str| groups.get(name).cloned().unwrap_or_default();
         // `links` is anchors *with an href* — the distinction that makes `;o` fill a command line
         // rather than sometimes filling nothing.
-        assert!(HINTS_JS.contains("\"a[href]\""));
-        assert!(HINTS_JS.contains("\"area[href]\""));
+        assert!(group("links").contains(&"a[href]".to_string()));
+        assert!(group("links").contains(&"area[href]".to_string()));
         // `images` is one selector, and the `all` list's `img` is a different entry.
-        assert!(HINTS_JS.contains("\"images\": [\n            \"img\",\n        ],"));
+        assert_eq!(group("images"), ["img"]);
         // `inputs` is typed inputs plus contenteditable and textarea — never `input[type=hidden]`,
         // never a button.
-        assert!(HINTS_JS.contains("'input[type=\"password\"]'"));
-        assert!(HINTS_JS.contains("\"input:not([type])\""));
-        assert!(!HINTS_JS.contains("\"inputs\": [\n            \"button\""));
+        assert!(group("inputs").contains(&"input[type=\"password\"]".to_string()));
+        assert!(group("inputs").contains(&"input:not([type])".to_string()));
+        assert!(!group("inputs").contains(&"button".to_string()));
+        // And `all` is the thirty qutebrowser ships, moved from the page script entry for entry.
+        assert_eq!(group("all").len(), 30);
+        assert_eq!(group("all")[0], "a");
+        assert_eq!(group("all")[29], "[tabindex]:not([tabindex=\"-1\"])");
+    }
+
+    /// A selector is text a person typed, and it lands inside a script. `[title="a\"b"]` is a real
+    /// selector, and its quote must not end the string it is in.
+    #[test]
+    fn a_group_reaches_the_page_as_a_safe_array() {
+        assert_eq!(selectors_js(&[]), "[]");
+        assert_eq!(
+            selectors_js(&["a".to_string(), "[title=\"x\"]".to_string()]),
+            "[\"a\",\"[title=\\\"x\\\"]\"]"
+        );
+        let hostile = selectors_js(&["\u{2028}\"]);alert(1);//".to_string()]);
+        assert!(!hostile.contains('\u{2028}'), "a line separator ends a JS string literal");
+        assert!(hostile.starts_with("[\"") && hostile.ends_with("\"]"), "{hostile}");
+    }
+
+    /// What the bar says when the page skipped entries it could not parse.
+    #[test]
+    fn a_refused_selector_is_named_with_its_group() {
+        assert_eq!(
+            refused_message("all\n[x=\n"),
+            "hints.selectors[all]: Chromium cannot read this selector and skipped it: [x="
+        );
+        assert_eq!(
+            refused_message("motion\n[x=\ndiv::nope("),
+            "hints.selectors[motion]: Chromium cannot read these selectors and skipped them: \
+             [x=  ·  div::nope("
+        );
     }
 
     #[test]

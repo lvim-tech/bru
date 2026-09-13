@@ -15,79 +15,10 @@
 "use strict";
 
 window.__bru_hints = (function () {
-    // hints.selectors, configdata.yml:1803 — every group, in qutebrowser's order and spelling.
-    // These lists are the accumulated answer to "what is clickable", and the groups are the whole
-    // point of `;i`, `;t` and `;o`: `links` is not "the `all` list filtered afterwards", it is a
-    // different query. Rust names the group; this file never chooses one.
-    const SELECTORS = {
-        "all": [
-            "a",
-            "area",
-            "textarea",
-            "select",
-            'input:not([type="hidden"])',
-            "button",
-            "frame",
-            "iframe",
-            "img",
-            "link",
-            "summary",
-            '[contenteditable]:not([contenteditable="false"])',
-            "[onclick]",
-            "[onmousedown]",
-            '[role="link"]',
-            '[role="option"]',
-            '[role="button"]',
-            '[role="tab"]',
-            '[role="checkbox"]',
-            '[role="switch"]',
-            '[role="menuitem"]',
-            '[role="menuitemcheckbox"]',
-            '[role="menuitemradio"]',
-            '[role="treeitem"]',
-            "[aria-haspopup]",
-            "[ng-click]",
-            "[ngClick]",
-            "[data-ng-click]",
-            "[x-ng-click]",
-            '[tabindex]:not([tabindex="-1"])',
-        ],
-        "links": [
-            "a[href]",
-            "area[href]",
-            "link[href]",
-            '[role="link"][href]',
-        ],
-        "images": [
-            "img",
-        ],
-        "media": [
-            "audio",
-            "img",
-            "video",
-        ],
-        "url": [
-            "[src]",
-            "[href]",
-        ],
-        "inputs": [
-            'input[type="text"]',
-            'input[type="date"]',
-            'input[type="datetime-local"]',
-            'input[type="email"]',
-            'input[type="month"]',
-            'input[type="number"]',
-            'input[type="password"]',
-            'input[type="search"]',
-            'input[type="tel"]',
-            'input[type="time"]',
-            'input[type="url"]',
-            'input[type="week"]',
-            "input:not([type])",
-            '[contenteditable]:not([contenteditable="false"])',
-            "textarea",
-        ],
-    };
+    // The selectors are **handed in**, not kept here. They were a table in this file — qutebrowser's
+    // `hints.selectors`, configdata.yml:1803 — and they are that setting now (`settings.rs`,
+    // `HINT_SELECTORS`), so one a `config.lua` added and one bru ships arrive by the same road.
+    // Rust names the group *and* sends its list; this file never chooses one.
 
     // A ceiling on how many hints one collection reports. The message router puts a request over
     // 16 KB through shared memory, where it arrives as binary and bru's string handler never sees
@@ -301,16 +232,43 @@ window.__bru_hints = (function () {
         });
     }
 
-    // Find every hintable element in `group` and tell Rust where each one would be clicked.
+    // Each selector on its own, against a parser that has nothing to match: the ones Chromium can
+    // read, and the ones it refuses.
     //
-    // An unknown group is refused rather than silently answered with `all`: hinting every button on
-    // the page when `;i` asked for images looks exactly like a bug in the visibility test, and
-    // costs an afternoon to find.
-    function collect(token, group) {
+    // **A group is queried as one selector list, and one bad entry refuses the whole list.**
+    // `querySelectorAll("a, [x=")` throws for `a` too — and the query below catches that and moves
+    // on, so a typo in `config.lua` used to make every hint on every page disappear without a word.
+    // Now the entry that cannot be read is dropped and named, and the rest still work.
+    function usable(selectors) {
+        const good = [];
+        const bad = [];
+        const probe = document.createDocumentFragment();
+        for (const selector of selectors || []) {
+            try {
+                probe.querySelector(selector);
+                good.push(selector);
+            } catch (exc) {
+                bad.push(selector);
+            }
+        }
+        return [good, bad];
+    }
+
+    // Find every hintable element `selectors` names and tell Rust where each one would be clicked.
+    //
+    // `group` is only for the report; the list is what is queried. A group the setting does not have
+    // is refused in Rust before this runs, rather than answered here with `all`: hinting every
+    // button on the page when `;i` asked for images looks exactly like a bug in the visibility test.
+    function collect(token, group, selectors) {
         clear();
         state.token = token;
 
-        const selector = (SELECTORS[group] || []).join(", ");
+        const [good, bad] = usable(selectors);
+        if (bad.length) {
+            // Before the elements, so the message is up by the time the labels are.
+            report(token, "refused", group + "\n" + bad.join("\n"));
+        }
+        const selector = good.join(", ");
         if (!selector) {
             report(token, "elems", "");
             return;

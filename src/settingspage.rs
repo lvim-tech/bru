@@ -174,6 +174,13 @@ fn default_of(def: &crate::settings::Def) -> String {
         // lists here would be picking one at random.
         Kind::List(shape) => format!("{} entries", shape.defaults.len()),
         // --- end config commands ------------------------------------------------------------
+        // --- hints.selectors ------------------------------------------------------------------
+        Kind::DictList(shape) => format!(
+            "{} groups, {} entries",
+            shape.defaults.len(),
+            shape.defaults.iter().map(|(_, entries)| entries.len()).sum::<usize>()
+        ),
+        // --- end hints.selectors --------------------------------------------------------------
         _ => def.default.unwrap_or("unset").to_string(),
     }
 }
@@ -211,6 +218,38 @@ fn in_force_cell(def: &crate::settings::Def, snapshot: Option<&Snapshot>) -> Str
             .join("<br>");
     }
     // --- end config commands ----------------------------------------------------------------
+    // --- hints.selectors --------------------------------------------------------------------
+    // Groups as the list above does entries: the group in `<code>`, each entry under it, and what
+    // is the user's marked — a whole group of theirs at its name, an entry added to bru's at itself.
+    if let Kind::DictList(shape) = def.kind {
+        let groups = crate::settings::dict_list_of(def.name);
+        if groups.is_empty() {
+            return "empty".to_string();
+        }
+        return groups
+            .iter()
+            .map(|(key, entries)| {
+                let own = shape.defaults.iter().find(|(known, _)| known == key).map(|(_, e)| *e);
+                let head = match own {
+                    Some(_) => format!("<code>{}</code>", escape(key)),
+                    None => format!("<code>{}</code> ·  added", escape(key)),
+                };
+                let lines: Vec<String> = entries
+                    .iter()
+                    .map(|entry| {
+                        let note = match own {
+                            Some(own) if !own.contains(&entry.as_str()) => " ·  added",
+                            _ => "",
+                        };
+                        format!("&nbsp;&nbsp;{}{}", escape(entry), note)
+                    })
+                    .collect();
+                std::iter::once(head).chain(lines).collect::<Vec<_>>().join("<br>")
+            })
+            .collect::<Vec<_>>()
+            .join("<br>");
+    }
+    // --- end hints.selectors ----------------------------------------------------------------
     let Kind::Dict(shape) = def.kind else {
         return escape(&in_force(def.name, snapshot));
     };
@@ -276,6 +315,8 @@ fn kind(kind: Kind) -> String {
         Kind::Dict(shape) if shape.open_keys => "a dictionary, any key".to_string(),
         Kind::Dict(_) => "a dictionary, fixed keys".to_string(),
         Kind::List(_) => "a list".to_string(),
+        Kind::DictList(shape) if shape.open_keys => "named lists, any name".to_string(),
+        Kind::DictList(_) => "named lists, fixed names".to_string(),
         // --- unhardcoded ---------------------------------------------------------------------
         // The range and the unit, because "a whole number" against `messages.timeout` says nothing
         // about whether 3000 is a long time, and against `scroll.step_px` says nothing about what
