@@ -345,7 +345,14 @@ body[data-view="top"] {
     gap: 6px;
     min-width: 0;
     max-width: 240px;
-    flex: 1 1 auto;
+    /* **A basis of 0, so every tab is the same width** — qutebrowser's strip, where
+       the unpinned tabs share the bar equally. This was `1 1 auto`, and `auto` is
+       the tab's own title: each started as wide as its text and, once the strip was
+       full, shrank in proportion to that, so a tab titled "4." stayed a sliver
+       beside one titled with a whole sentence. Reported 2026-09-13 with a
+       screenshot. From zero they grow alike and shrink alike, still capped at
+       240px; a pinned tab keeps its own `0 0 auto` below and sizes to its icon. */
+    flex: 1 1 0;
     padding: 0 var(--pad-x);
     color: var(--tabs-even-fg);
     background: var(--tabs-even-bg);
