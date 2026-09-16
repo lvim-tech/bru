@@ -295,26 +295,33 @@ pub fn run(state: &SharedState, browser: &mut Browser, command: &Command, count:
             // paste whatever was on the clipboard when bru launched. An empty selection aborts the
             // command, as `ClipboardError` does in qutebrowser: opening the literal `{clipboard}`
             // would search for it.
-            let url = match crate::clip::expand(url.as_deref()) {
-                Ok(url) => url,
-                Err(error) => {
-                    crate::clip::message(error);
-                    return;
-                }
-            };
-// --- end src/clip.rs -------------------------------------------------------
-// --- src/window.rs ---------------------------------------------------------
-            // `wo`, `wO`, `wp`, `wP` — a window of its own. The address is decided by the same
-            // function `open` uses, so `:open -w ddg rust` searches exactly as `:open ddg rust`
-            // does; a window is *created around* a URL, so there is no browser to hand over.
-            if *window {
-                if let Some(target) = crate::open::resolve(url.as_deref()) {
-                    crate::window::open(state, &target);
-                }
+            //
+            // **The read is off the UI thread**, and the open follows when the text arrives. Inline,
+            // `pp` after `Ctrl+C` in a page was a deadlock: bru owned the clipboard and its UI
+            // thread was the one waiting for `wl-paste` — see the head of `src/clip.rs`. The
+            // browser is looked up again at that point, because the one in hand here is borrowed
+            // for this turn only; an address without a selection in it opens inline, as before.
+            if url.as_deref().is_some_and(crate::clip::needs_selection) {
+                let (state, tab, bg, window) = (state.clone(), *tab, *bg, *window);
+                crate::clip::expand_then(url.clone(), move |url| {
+                    let url = match url {
+                        Ok(url) => url,
+                        Err(error) => {
+                            crate::clip::message(error);
+                            return;
+                        }
+                    };
+                    let Some(mut browser) =
+                        state.lock().expect("state mutex poisoned").active_browser()
+                    else {
+                        return;
+                    };
+                    open_expanded(&state, &mut browser, url.as_deref(), tab, bg, window);
+                });
                 return;
             }
-// --- end src/window.rs -----------------------------------------------------
-            crate::open::open(state, browser, url.as_deref(), *tab, *bg)
+// --- end src/clip.rs -------------------------------------------------------
+            open_expanded(state, browser, url.as_deref(), *tab, *bg, *window)
         }
 
         // --- navigation ---------------------------------------------------------------------
@@ -1492,6 +1499,29 @@ fn to_view(x: i32, y: i32, factor: f64) -> (i32, i32) {
         (x as f64 * factor).round() as i32,
         (y as f64 * factor).round() as i32,
     )
+}
+
+/// `open` once its address is final — every `{clipboard}` and `{primary}` already read.
+fn open_expanded(
+    state: &SharedState,
+    browser: &mut Browser,
+    url: Option<&str>,
+    tab: bool,
+    bg: bool,
+    window: bool,
+) {
+// --- src/window.rs ---------------------------------------------------------
+    // `wo`, `wO`, `wp`, `wP` — a window of its own. The address is decided by the same function
+    // `open` uses, so `:open -w ddg rust` searches exactly as `:open ddg rust` does; a window is
+    // *created around* a URL, so there is no browser to hand over.
+    if window {
+        if let Some(target) = crate::open::resolve(url) {
+            crate::window::open(state, &target);
+        }
+        return;
+    }
+// --- end src/window.rs -----------------------------------------------------
+    crate::open::open(state, browser, url, tab, bg)
 }
 
 fn set_zoom_percent(browser: &mut Browser, percent: u32) {

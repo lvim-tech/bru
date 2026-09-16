@@ -7,12 +7,23 @@
 //! A yanked URL that dies with the browser is not a yanked URL.
 //!
 //! Measured on this machine 2026-08-06: **ten `wl-copy` runs in 12 ms wall clock (1.2 ms each), ten
-//! `wl-paste` runs in 24 ms (2.4 ms each)**. Both therefore run **on the CEF UI thread**, inline in
-//! the dispatcher, on the same turn as the key that asked for them. That is deliberate: it keeps
-//! the yanked text and the status message in the same event, and 1.2 ms on a keystroke typed by
-//! hand is not a budget worth an extra thread. It is *not* the scroll path — nothing here is ever
-//! reached by `j`. CEF-NOTES trap 12 does not apply either: spawning a process creates no browser
-//! and starts no navigation, so this is safe even from inside a message-router query handler.
+//! `wl-paste` runs in 24 ms (2.4 ms each)**. `wl-copy` therefore runs **on the CEF UI thread**,
+//! inline in the dispatcher, on the same turn as the key that asked for it: it keeps the yanked text
+//! and the status message in the same event, and 1.2 ms on a keystroke is not worth a thread.
+//! CEF-NOTES trap 12 does not apply: spawning a process creates no browser and starts no navigation.
+//!
+//! **`wl-paste` does not, and the 2.4 ms was the wrong measurement to decide it by.** It was taken
+//! with the clipboard held by somebody else. On Wayland the selection is served by the client that
+//! owns it, and after `Ctrl+C` in a page *that client is bru*: Chromium answers the compositor's
+//! `send` on the UI thread. So `wl-paste` run inline asked bru for the text while bru's UI thread sat
+//! waiting for `wl-paste` — a deadlock with no timeout, and the whole browser stopped.
+//!
+//! Measured 2026-09-15, three times in one evening, each within a minute of a restart: the main
+//! thread in `anon_pipe_read` on a `wl-paste --no-newline` child, and the write end of the data
+//! pipe in *no* process's descriptor table — sent to the owner and sitting unread in the socket
+//! queue of the one client not reading its Wayland connection. `pp`, `Pp`, `wp` and command mode's
+//! `<Ctrl-Shift-V>` all reached it. See [`expand_then`], which reads off the UI thread, and [`get`],
+//! which gives up after [`PASTE_TIMEOUT`] rather than waiting forever.
 //!
 //! `wl-copy -n` is not optional. Measured: `wl-copy "abc"` and `printf abc | wl-copy` both store
 //! `abc\n` — a yanked URL with a newline on the end is a line a terminal will *run* when it is
@@ -161,21 +172,148 @@ pub fn set(selection: Selection, text: &str) -> Result<(), String> {
     }
 }
 
+/// How long [`get`] waits for a selection's owner. Measured answers are 2.4 ms; this is only the
+/// point past which an owner is taken to be gone rather than slow.
+pub const PASTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether expanding `arg` has to read a selection at all — the only case that has to leave the UI
+/// thread. Everything else keeps running inline, on the same turn as its key.
+pub fn needs_selection(arg: &str) -> bool {
+    arg.contains("{clipboard}") || arg.contains("{primary}")
+}
+
+/// What an expansion comes back as: the argument with every selection read in, `None` for no
+/// argument, or the message to show.
+type Pasted = Result<Option<String>, String>;
+type Expanded = Box<dyn FnOnce(Pasted) + Send>;
+/// A value handed across to the UI thread once. `wrap_task!` fields must be `Clone`, hence the `Arc`.
+type Once<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
+
+/// [`expand`], **without blocking the UI thread**, and `done` called back on it with the result.
+///
+/// The selections are read on a thread of their own and the answer comes back as a CEF task — the
+/// shape `editor.rs` uses for the external editor. With the UI thread free, a clipboard that bru
+/// itself owns is served by bru and `wl-paste` finishes in milliseconds; inline, the same read was a
+/// deadlock (see the module comment).
+///
+/// An argument with nothing to read is answered at once, inline, so a plain `:open example.com` is
+/// exactly as immediate as it always was.
+pub fn expand_then(
+    arg: Option<String>,
+    done: impl FnOnce(Pasted) + Send + 'static,
+) {
+    let arg = match arg {
+        Some(arg) if needs_selection(&arg) => arg,
+        other => {
+            done(expand(other.as_deref()));
+            return;
+        }
+    };
+    let done: Once<Expanded> = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(done))));
+    std::thread::spawn(move || {
+        let result = expand_with(&arg, get).map(Some);
+        let mut task = AfterPaste::new(done, std::sync::Arc::new(std::sync::Mutex::new(Some(result))));
+        post_task(ThreadId::UI, Some(&mut task));
+    });
+}
+
+// `wrap_task!` takes no doc comment on the struct it declares — CEF-NOTES trap 8 — and its fields
+// have to be `Clone`, which is why both halves are behind an `Arc`.
+wrap_task! {
+    struct AfterPaste {
+        done: Once<Expanded>,
+        result: Once<Pasted>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let done = self.done.lock().ok().and_then(|mut done| done.take());
+            let result = self.result.lock().ok().and_then(|mut result| result.take());
+            if let (Some(done), Some(result)) = (done, result) {
+                done(result);
+            }
+        }
+    }
+}
+
+/// Run `command` to completion and collect its stdout, or give up after `timeout`.
+///
+/// `Ok(None)` is the timeout. The child is put in a process group of its own and the **whole group**
+/// is killed then, because what holds stdout open is not necessarily the child: `wl-paste` forks a
+/// `cat` to move the bytes, and killing `wl-paste` alone left that `cat` holding the pipe, so the
+/// reader never saw EOF and the caller waited forever anyway. `the_timeout_kills_the_whole_group`
+/// is that case, with `sh` in place of `wl-paste`.
+///
+/// Stdout is read on a thread of its own, so a large selection cannot fill the pipe and stall the
+/// child while this one waits for it to exit.
+fn run_bounded(
+    mut command: Process,
+    timeout: std::time::Duration,
+) -> Result<Option<std::process::Output>, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("{program} could not be run: {error}"))?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = reader.join().unwrap_or_default();
+                return Ok(Some(std::process::Output { status, stdout, stderr: Vec::new() }));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) => {
+                // SAFETY: one syscall, on the process group this function created for the child.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                let _ = reader.join();
+                return Ok(None);
+            }
+            Err(error) => return Err(format!("{program} could not be waited for: {error}")),
+        }
+    }
+}
+
 /// Read a selection, through `wl-paste`.
 ///
 /// `--no-newline` drops the one trailing newline the protocol's text targets conventionally carry;
 /// everything else arrives verbatim, and trimming the rest is `open.rs`'s business, which already
 /// does it the way `urlutils.fuzzy_url` does.
+///
+/// **Bounded by [`PASTE_TIMEOUT`]**, through [`run_bounded`]. Off the UI thread bru serves its own
+/// clipboard and this answers in milliseconds, but an owner that never answers — a hung client, a
+/// bridge like `xwayland-satellite` that lost its peer — would otherwise hold a thread and a
+/// `wl-paste` forever while the key that asked simply did nothing.
 pub fn get(selection: Selection) -> Result<String, String> {
     let mut command = Process::new("wl-paste");
     command.arg("--no-newline");
     if selection == Selection::Primary {
         command.arg("--primary");
     }
-    let output = command
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("wl-paste could not be run: {error}"))?;
+    let Some(output) = run_bounded(command, PASTE_TIMEOUT)? else {
+        return Err(format!(
+            "The {} owner did not answer within {} s.",
+            selection.name(),
+            PASTE_TIMEOUT.as_secs()
+        ));
+    };
 
     // Measured: an unowned selection is not an error worth a stack trace — wl-paste prints
     // "Nothing is copied" and exits 1. qutebrowser says the same thing in its own words.
@@ -705,6 +843,53 @@ pub fn yank_plain(text: &str, selection: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- reading a selection without hanging ------------------------------------------------------
+
+    /// Only an argument that names a selection leaves the UI thread; everything else stays inline,
+    /// on the same turn as its key.
+    #[test]
+    fn only_a_selection_variable_needs_the_off_thread_read() {
+        assert!(needs_selection("{clipboard}"));
+        assert!(needs_selection("open -- {primary}"));
+        assert!(needs_selection(":open {clipboard} rust"));
+        assert!(!needs_selection("https://example.com"));
+        assert!(!needs_selection("{url}"));
+        assert!(!needs_selection(""));
+    }
+
+    #[test]
+    fn a_process_that_answers_is_read_to_the_end() {
+        let mut command = Process::new("sh");
+        command.args(["-c", "printf 'hello world'"]);
+        let output = run_bounded(command, std::time::Duration::from_secs(5))
+            .expect("sh runs")
+            .expect("it answers well inside the timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello world");
+    }
+
+    /// **The case that made the timeout necessary to get right, not only to have.** `wl-paste`
+    /// forks a `cat` to move the bytes, and the `cat` holds stdout. Killing only the direct child
+    /// left the grandchild holding the pipe, so the read never saw EOF and the caller waited out
+    /// the grandchild — here, thirty seconds.
+    ///
+    /// `sh -c 'sleep 30 & sleep 30'` is that shape: the backgrounded `sleep` inherits stdout. With
+    /// the whole group killed this returns in well under a second; with only `sh` killed it would
+    /// take the full thirty.
+    #[test]
+    fn the_timeout_kills_the_whole_group() {
+        let mut command = Process::new("sh");
+        command.args(["-c", "sleep 30 & sleep 30"]);
+        let started = std::time::Instant::now();
+        let outcome = run_bounded(command, std::time::Duration::from_millis(200)).expect("sh runs");
+        let took = started.elapsed();
+        assert!(outcome.is_none(), "a process that never finishes is a timeout");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "the grandchild kept stdout open: the read waited {took:?}"
+        );
+    }
 
     /// Every expectation below came out of a C++ program calling `QUrl::toString` with
     /// qutebrowser's own flags, on the Qt 6.11.1 this machine has. They are transcribed, not

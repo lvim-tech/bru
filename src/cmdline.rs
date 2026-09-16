@@ -745,20 +745,39 @@ fn unquote(arg: &str) -> String {
 pub fn cmd_set_text(text: &str, space: bool, append: bool, run_on_count: bool, count: Option<u32>) {
     let text = replace_variables(text);
 
+    // The window the key was pressed in — `keys.rs` has already made it current. Taken now rather
+    // than when the text arrives, because a selection is read off the UI thread and the answer is a
+    // later turn of the loop: the line to fill is the one that asked.
+    let window = window();
+
     // {clipboard} / {primary} expand here too, not only in `open`, so a command-mode binding like
     // `cmd-set-text -a {clipboard}` pastes the selection into the line. Read at keypress time, once
     // per selection, never rescanned — the same contract as the `open` arm, and after
     // `replace_variables` so a selection that holds `{url}` is not substituted a second time.
-    let text = match crate::clip::expand(Some(text.as_str())) {
-        Ok(Some(text)) => text,
-        Ok(None) => return,
-        Err(error) => {
-            crate::clip::message(error);
-            return;
-        }
-    };
+    //
+    // **Off the UI thread when there is a selection to read.** Read inline it deadlocked bru when
+    // bru itself owned the clipboard — see the head of `src/clip.rs`. Everything else is inline.
+    if crate::clip::needs_selection(&text) {
+        crate::clip::expand_then(Some(text), move |text| match text {
+            Ok(Some(text)) => set_text_in(window, &text, space, append, run_on_count, count),
+            Ok(None) => {}
+            Err(error) => crate::clip::message(error),
+        });
+        return;
+    }
+    set_text_in(window, &text, space, append, run_on_count, count)
+}
 
-    let text = match with(|cmd| cmd.cmd_set_text(&text, space, append)) {
+/// The half of [`cmd_set_text`] after every variable is known.
+fn set_text_in(
+    window: u32,
+    text: &str,
+    space: bool,
+    append: bool,
+    run_on_count: bool,
+    count: Option<u32>,
+) {
+    let text = match with_in(window, |cmd| cmd.cmd_set_text(text, space, append)) {
         Ok(text) => text,
         Err(message) => {
             eprintln!("bru: cmd-set-text: {message}");
@@ -773,9 +792,6 @@ pub fn cmd_set_text(text: &str, space: bool, append: bool, run_on_count: bool, c
         }
     }
 
-    // The window the command was run in, which for every `cmd-set-text` binding is the window the
-    // key was pressed in — `keys.rs` has already made it current.
-    let window = window();
     with_in(window, |cmd| cmd.set_text(&text));
     enter_command_mode(window);
     push();
