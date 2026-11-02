@@ -63,6 +63,7 @@
   // state object that Rust pushes on every keystring and scroll change.
   var icons = {};
   var state = { tabs: [] };
+  var drawn = null;
 
   // --- tabs and statusbar -------------------------------------------------
   // src/settings.rs `tabs.favicons.show`. `pinned` is the value that pays for
@@ -172,6 +173,13 @@
   window.bru = {
     // state = {tabs: [{title, url, active, pinned, muted}, ...]}
     render: function (pushed) {
+      // Every status bar change pushes here too, and an unchanged strip must not
+      // rebuild its DOM. `favicon` draws on its own, so no icon waits on this.
+      var next = JSON.stringify(pushed || { tabs: [] });
+      if (next === drawn) {
+        return;
+      }
+      drawn = next;
       state = pushed || { tabs: [] };
       draw();
     },

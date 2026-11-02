@@ -684,15 +684,11 @@ wrap_display_handler! {
             // at all — a chrome strip reporting its own bru:// URL.
             // The snapshot is taken under the lock and rendered after it — `render_tabs` can run a
             // Lua title function, which must never happen with `BruState` held. See its doc.
-            let (window, is_active, snapshot) = {
+            let (window, is_active) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
                 let window = state.set_tab_url(id, url.clone());
-                let snapshot = window.map(|w| state.tabs_snapshot_in(w));
-                (window, state.is_active_browser(id), snapshot)
+                (window, state.is_active_browser(id))
             };
-            let tabs = snapshot
-                .map(|snapshot| crate::tabs::render_tabs(&snapshot))
-                .unwrap_or_default();
             let Some(window) = window else {
                 return;
             };
@@ -705,7 +701,7 @@ wrap_display_handler! {
             if is_active {
                 crate::ipc::set_url_for(window, url);
             }
-            crate::ipc::set_tabs_for(window, tabs);
+            crate::tabs::schedule_strip(window);
         }
 
         fn on_title_change(&self, browser: Option<&mut Browser>, title: Option<&CefString>) {
@@ -715,15 +711,11 @@ wrap_display_handler! {
             let title = title.map(CefString::to_string).unwrap_or_default();
 
             // The window the tab is in — see `on_address_change` above.
-            let (window, is_active, snapshot) = {
+            let (window, is_active) = {
                 let mut state = self.state.lock().expect("state mutex poisoned");
                 let window = state.set_tab_title(id, title.clone());
-                let snapshot = window.map(|w| state.tabs_snapshot_in(w));
-                (window, state.is_active_browser(id), snapshot)
+                (window, state.is_active_browser(id))
             };
-            let tabs = snapshot
-                .map(|snapshot| crate::tabs::render_tabs(&snapshot))
-                .unwrap_or_default();
             let Some(window) = window else {
                 return;
             };
@@ -735,7 +727,7 @@ wrap_display_handler! {
             if is_active {
                 crate::ipc::set_title_for(window, title);
             }
-            crate::ipc::set_tabs_for(window, tabs);
+            crate::tabs::schedule_strip(window);
         }
 
         // The `<link rel=icon>` URLs of the page. Not keyed by browser here, unlike the two above:

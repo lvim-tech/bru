@@ -771,7 +771,7 @@ pub fn new_tab_in(state: &SharedState, window_id: u32, url: &str, background: bo
     // `select_in` indexing a list that no longer matched the tabs — measured 2026-08-25, and it
     // aborted the browser, because a panic inside a CEF task cannot unwind.
     if crate::term_frontend::is_active() {
-        let Some(identifier) = crate::term_frontend::new_page(state, url) else {
+        let Some(identifier) = crate::term_frontend::new_page(state, url, background) else {
             return;
         };
         let Some(index) =
@@ -1577,3 +1577,48 @@ wrap_task! {
         }
     }
 }
+
+// --- the strip, at most this often -----------------------------------------------------------------
+/// How long a window's strip may lag a title or an address, which is also its ceiling on redraws.
+const STRIP_DELAY_MS: i64 = 100;
+
+/// Windows with a strip redraw already posted.
+static STRIP_PENDING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Redraw a window's strip soon, however many tabs ask.
+///
+/// **Every tab's every title and address change used to rebuild the JSON of every tab and the DOM of
+/// the whole strip** — so the cost grew with the tabs twice over. Measured 2026-11-02: 30 busy tabs
+/// held 28% of the UI thread for a strip nobody can read at that speed.
+pub fn schedule_strip(window: u32) {
+    let Ok(mut pending) = STRIP_PENDING.lock() else {
+        return;
+    };
+    if pending.contains(&window) {
+        return;
+    }
+    pending.push(window);
+    drop(pending);
+    let mut task = RedrawStrip::new(window);
+    post_delayed_task(ThreadId::UI, Some(&mut task), STRIP_DELAY_MS);
+}
+
+wrap_task! {
+    struct RedrawStrip {
+        window: u32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if let Ok(mut pending) = STRIP_PENDING.lock() {
+                pending.retain(|window| *window != self.window);
+            }
+            let Some(state) = crate::state::BruState::instance() else {
+                return;
+            };
+            let snapshot = state.lock().expect("state mutex poisoned").tabs_snapshot_in(self.window);
+            crate::ipc::set_tabs_for(self.window, render_tabs(&snapshot));
+        }
+    }
+}
+// --- end the strip ---------------------------------------------------------------------------------

@@ -29,7 +29,7 @@ use cef::*;
 // CEF's own rectangle, which the compositor's `Rect` shadows in this file.
 use cef::Rect as CefRect;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::term_compose::{Frame, Layer, Layout, LayoutRequest, Rect, Surface, SurfaceKind, layout};
@@ -73,7 +73,8 @@ pub fn terminal_is_there() -> bool {
 /// Everything the terminal frontend holds, for the one window it has.
 struct TermState {
     session: TerminalSession,
-    painter: Painter,
+    /// Shared with the writer thread, which does the transmitting. Never held across a pty write.
+    painter: std::sync::Arc<Mutex<Painter>>,
     frame: Frame,
     layout: Layout,
     size: PaneSize,
@@ -182,8 +183,12 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
     let frame = Frame::new(layout.pane.width, layout.pane.height)
         .ok_or("the pane is too small to draw a browser in")?;
     let placement = Placement::new(image_id_view(), 1, 1, size.rows, size.cols);
-    let painter =
-        Painter::new(placement, session.in_tmux(), place_for_host(), session.transport());
+    let painter = std::sync::Arc::new(Mutex::new(Painter::new(
+        placement,
+        session.in_tmux(),
+        place_for_host(),
+        session.transport(),
+    )));
 
     let term = TermState {
         session,
@@ -227,7 +232,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
                 guard.session.kitty_flags_before(),
                 guard.session.mouse_in_pixels(),
                 place_for_host(),
-                guard.painter.transport(),
+                guard.painter.lock().map(|painter| painter.transport()).ok(),
             );
         }
     }
@@ -627,7 +632,12 @@ fn create_surface(
 /// changing which browser the compositor reads the page surface from, and the others go on living
 /// with their paints dropped. That is the whole of tab switching here, and it is why
 /// `TabSurface::Term` holds nothing.
-pub fn new_page(state: &crate::tabs::SharedState, url: &str) -> Option<i32> {
+///
+/// **`background` is honoured here because nothing after this function can honour it.** This used to
+/// show every new page unconditionally, so `:open -b` took the pane and the keyboard from the tab the
+/// strip still called current, and hid the page the person was reading. A background page is told it
+/// is hidden from birth, so it does not paint until [`show_page`] asks.
+pub fn new_page(state: &crate::tabs::SharedState, url: &str, background: bool) -> Option<i32> {
     let window_info = WindowInfo::default().set_as_windowless(0);
     let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     let mut client = crate::keys::BruClient::new(state.clone());
@@ -648,6 +658,13 @@ pub fn new_page(state: &crate::tabs::SharedState, url: &str) -> Option<i32> {
     guard.pending = None;
     let browser = browser?;
     let identifier = browser.identifier();
+    if background {
+        drop(guard);
+        if let Some(host) = browser.host() {
+            host.was_hidden(1);
+        }
+        return Some(identifier);
+    }
     guard.of_browser.push((identifier, SurfaceKind::Page));
     drop(guard);
     if let Some(host) = browser.host() {
@@ -924,6 +941,13 @@ wrap_task! {
 /// sub-rectangle, and kitty has no such thing under `a=t` (checked against the protocol, not
 /// assumed). At 78 fps for a full pane over shared memory there is nothing to buy by trying.
 fn present(term: &mut TermState) {
+    // **One frame at a time, and the newest one.** While the terminal is still taking the last frame
+    // nothing is composed: the damage stays in `term.dirty` and accumulates, and the writer asks for
+    // the next present when it finishes. So a slow host lowers the frame rate instead of building a
+    // queue of pictures that are already out of date.
+    if WRITE_IN_FLIGHT.load(Ordering::Acquire) {
+        return;
+    }
     // **What this frame is for, decided before a pixel is touched.** Everything below — the wipe,
     // the clip on every layer, and which bands go out — is that rectangle. Composing the whole pane
     // to send a row of it was 4 ms a frame of pure waste; the fill alone is a pass over 4 MB.
@@ -1026,6 +1050,7 @@ fn present(term: &mut TermState) {
     let cols = term.size.cols;
     let bands = crate::term_compose::bands(term.layout.pane.height, term.size.cell_height as i32);
     let mut sent = 0usize;
+    let mut jobs: Vec<BandJob> = Vec::new();
     for (index, band) in bands.iter().enumerate() {
         if band.height <= 0 || band.y + band.height <= damaged.y || band.y >= damaged.y + damaged.height
         {
@@ -1042,35 +1067,43 @@ fn present(term: &mut TermState) {
         let Some(pixels) = term.frame.rgb().get(start..end) else {
             continue;
         };
-        let placement = Placement::new(id, row, 1, rows, cols);
-        let _ =
-            term.painter.paint_at(&mut out, pixels, width as u32, band.height as u32, &placement);
+        jobs.push(BandJob {
+            placement: Placement::new(id, row, 1, rows, cols),
+            height: band.height as u32,
+            rgb: pixels.to_vec(),
+        });
         sent += 1;
     }
     // The bands that existed last time and do not now — the layout left fewer of them. Taken back
     // here, inside the synchronised update, so nothing is ever seen missing.
-    for index in bands.len()..term.bands_drawn {
-        if let Ok(index) = u32::try_from(index) {
-            let _ = term.painter.forget(&mut out, crate::term_paint::image_id_band(index));
-        }
-    }
+    let forget: Vec<u32> = (bands.len()..term.bands_drawn)
+        .filter_map(|index| u32::try_from(index).ok().map(crate::term_paint::image_id_band))
+        .collect();
     term.bands_drawn = bands.len();
-    let _ = term.session.end_sync(&mut out);
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(&out).and_then(|()| stdout.flush());
+    let mut suffix: Vec<u8> = Vec::with_capacity(16);
+    let _ = term.session.end_sync(&mut suffix);
+    send_to_terminal(FrameJob {
+        painter: term.painter.clone(),
+        prefix: out,
+        suffix,
+        width: width as u32,
+        bands_total: bands.len(),
+        bands: jobs,
+        forget,
+    });
     // **Where a frame's time actually goes, split at the one seam that matters.** Composing is
     // bru's own cost and is the same everywhere; the write is the terminal's, and a host that
     // decodes each frame and re-encodes it for the terminal underneath charges for it here. Every
     // thirtieth frame, because a line per frame is its own delay.
-    if let (Some(at), Some(composed)) = (started, composed) {
+    if let (Some(_), Some(composed)) = (started, composed) {
         let seen = PRESENTS.fetch_add(1, Ordering::Relaxed);
         if seen % 30 == 0 {
             eprintln!(
                 "bru[term]: present {seen}: composed in {}ms, written in {}ms ({:?}); \
                  {sent}/{} bands, dirty {}x{} at {},{}",
                 composed.as_millis(),
-                at.elapsed().saturating_sub(composed).as_millis(),
-                term.painter.transport(),
+                LAST_WRITE_MS.load(Ordering::Relaxed),
+                term.painter.lock().map(|painter| painter.transport()).ok().unwrap_or(crate::term_paint::Transport::Base64),
                 bands.len(),
                 damaged.width,
                 damaged.height,
@@ -1078,6 +1111,132 @@ fn present(term: &mut TermState) {
                 damaged.y
             );
         }
+    }
+}
+
+/// Copy one damaged rectangle of a BGRA surface over the held copy of it. Clamped to the surface, so
+/// a rectangle CEF reports past the edge costs nothing and overruns nothing.
+fn patch_rows(held: &mut [u8], fresh: &[u8], width: u32, height: u32, dirty: &CefRect) {
+    let (surface_w, surface_h) = (width as i32, height as i32);
+    let (left, top) = (dirty.x.clamp(0, surface_w), dirty.y.clamp(0, surface_h));
+    let right = dirty.x.saturating_add(dirty.width).clamp(left, surface_w);
+    let bottom = dirty.y.saturating_add(dirty.height).clamp(top, surface_h);
+    let stride = width as usize * 4;
+    for row in top as usize..bottom as usize {
+        let start = row * stride + left as usize * 4;
+        let end = row * stride + right as usize * 4;
+        if let (Some(to), Some(from)) = (held.get_mut(start..end), fresh.get(start..end)) {
+            to.copy_from_slice(from);
+        }
+    }
+}
+
+/// A frame has been handed to the writer and the terminal has not finished taking it.
+static WRITE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// How long zellij needs after a whole pane before the next image, or it draws nothing at all.
+const ZELLIJ_REST_MS: u64 = 250;
+
+/// Whether this pane is zellij's. Read once: it cannot change under a running browser.
+fn host_redraws_slowly() -> bool {
+    static ZELLIJ: OnceLock<bool> = OnceLock::new();
+    *ZELLIJ.get_or_init(|| std::env::var_os("ZELLIJ").is_some())
+}
+
+/// How long the writer waits after a frame of `sent` bands out of `total`.
+///
+/// **In zellij a stream of whole-pane frames is a blank pane, not a slow one.** Measured 2026-11-02,
+/// 11 screenshots while scrolling a 1998x1261 page in zellij 0.46: with no rest the page was on
+/// screen in 2, with 30 ms in 2, with 100 ms in 3, with 250 ms in 10. A whole pane appears to cost it
+/// about 300 ms, so this trades 10 frames a second nobody can see for about 5 they can. In proportion
+/// to the bands, so a spinner stays quick (29 frames a second, measured).
+fn frame_rest_ms(slow_host: bool, sent: u64, total: u64) -> u64 {
+    if !slow_host || total == 0 {
+        return 0;
+    }
+    ZELLIJ_REST_MS * sent.min(total) / total
+}
+
+/// One band of one frame, copied out of the kept picture.
+struct BandJob {
+    placement: Placement,
+    height: u32,
+    rgb: Vec<u8>,
+}
+
+/// Everything the writer needs for a frame, so that none of it costs the UI thread.
+struct FrameJob {
+    painter: std::sync::Arc<Mutex<Painter>>,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    width: u32,
+    bands_total: usize,
+    bands: Vec<BandJob>,
+    forget: Vec<u32>,
+}
+
+/// What the terminal charged for the last frame, for the debug line.
+static LAST_WRITE_MS: AtomicU64 = AtomicU64::new(0);
+/// Turn a frame into escapes and give them to the terminal. The writer thread's whole job.
+fn write_frame(job: FrameJob) {
+    let started = std::time::Instant::now();
+    let mut out = job.prefix;
+    if let Ok(mut painter) = job.painter.lock() {
+        for band in &job.bands {
+            let _ = painter.paint_at(&mut out, &band.rgb, job.width, band.height, &band.placement);
+        }
+        for id in &job.forget {
+            let _ = painter.forget(&mut out, *id);
+        }
+    }
+    out.extend_from_slice(&job.suffix);
+    {
+        // `LEFT` is read under the lock `leave` writes through, so a frame cannot land on a terminal
+        // that has already been handed back.
+        let mut stdout = std::io::stdout().lock();
+        if !LEFT.load(Ordering::Acquire) {
+            let _ = stdout.write_all(&out).and_then(|()| stdout.flush());
+        }
+    }
+    LAST_WRITE_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Give one finished frame to the writer thread.
+///
+/// **Neither the write nor the shared memory may happen on the UI thread.** A pty write blocks until
+/// the host has read it, and a host that decodes each image before reading on holds it there.
+/// Measured 2026-11-02 in zellij 0.46, a 1998x1261 page: 105-126 ms per frame inside `write_all`, and
+/// the UI thread answering in up to 900 ms — so keys and every other tab waited on the picture.
+fn send_to_terminal(frame: FrameJob) {
+    static WRITER: OnceLock<Option<std::sync::mpsc::Sender<FrameJob>>> = OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<FrameJob>();
+        std::thread::Builder::new()
+            .name("bru-term-writer".to_string())
+            .spawn(move || {
+                for frame in receiver {
+                    let (sent, total) = (frame.bands.len() as u64, frame.bands_total as u64);
+                    write_frame(frame);
+                    let rest = frame_rest_ms(host_redraws_slowly(), sent, total);
+                    if rest > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(rest));
+                    }
+                    WRITE_IN_FLIGHT.store(false, Ordering::Release);
+                    schedule_present();
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+    WRITE_IN_FLIGHT.store(true, Ordering::Release);
+    let refused = match writer {
+        Some(sender) => sender.send(frame).err().map(|error| error.0),
+        None => Some(frame),
+    };
+    // No thread could be started: late is still better than a pane that stops drawing.
+    if let Some(frame) = refused {
+        write_frame(frame);
+        WRITE_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
 
@@ -1125,8 +1284,9 @@ pub fn resized(size: PaneSize) {
             Some(frame) => term.frame = frame,
             None => return,
         }
-        term.painter
-            .set_placement(Placement::new(image_id_view(), 1, 1, size.rows, size.cols));
+        if let Ok(mut painter) = term.painter.lock() {
+            painter.set_placement(Placement::new(image_id_view(), 1, 1, size.rows, size.cols));
+        }
         term.of_browser.clone()
     };
     resize_browsers(&browsers);
@@ -1284,7 +1444,9 @@ pub fn leave() {
     // one thing a terminal answers even when it was told to be quiet.
     let mut out: Vec<u8> = Vec::with_capacity(512);
     // The presenter takes back its own image by id. That is the tidy half.
-    let _ = term.painter.clear(&mut out);
+    if let Ok(mut painter) = term.painter.lock() {
+        let _ = painter.clear(&mut out);
+    }
     // **And then everything, by hand, because the tidy half was not enough.** Measured 2026-08-25:
     // after `:quit` the pane still showed the tab strip and a band of the page under the shell's
     // prompt. `d=I` removes the image this presenter knows about; anything a previous presenter
@@ -1853,7 +2015,7 @@ wrap_render_handler! {
             &self,
             browser: Option<&mut Browser>,
             type_: PaintElementType,
-            _dirty_rects: Option<&[CefRect]>,
+            dirty_rects: Option<&[CefRect]>,
             buffer: *const u8,
             width: ::std::os::raw::c_int,
             height: ::std::os::raw::c_int,
@@ -1900,9 +2062,29 @@ wrap_render_handler! {
                 }
             }
             let slot = index_of(kind);
-            term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
             let rect = term.layout.rect_of(kind);
-            mark_dirty(&mut term, rect);
+            // **Only what changed.** CEF says which rectangles it redrew, and this ignored them: a
+            // blinking caret copied the whole surface, composed it and sent every band of the page.
+            // A buffer of the right size is patched in place; anything else is a new picture.
+            let changed = dirty_rects.unwrap_or(&[]);
+            let patched = match term.surfaces[slot].as_mut() {
+                Some(held) if held.width == width && held.height == height && !changed.is_empty() => {
+                    for dirty in changed {
+                        patch_rows(&mut held.bgra, bgra, width, height, dirty);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if patched {
+                for dirty in changed {
+                    let moved = Rect { x: rect.x + dirty.x, y: rect.y + dirty.y, width: dirty.width, height: dirty.height };
+                    mark_dirty(&mut term, moved.intersect(&rect));
+                }
+            } else {
+                term.surfaces[slot] = Some(Painted { bgra: bgra.to_vec(), width, height });
+                mark_dirty(&mut term, rect);
+            }
             // **A surface with no rectangle cannot change the picture, so it must not cost one.**
             // The panel is zero-height whenever nothing is open in it and CEF paints it a pixel
             // tall anyway — measured 2026-08-26, `Panel painted 990x1 into a 990x0 rectangle`.
@@ -1920,6 +2102,27 @@ wrap_render_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fast host never waits; a slow one waits in proportion to what it was just handed.
+    #[test]
+    fn only_a_slow_host_rests_and_only_for_what_it_was_sent() {
+        assert_eq!(frame_rest_ms(false, 27, 27), 0);
+        assert_eq!(frame_rest_ms(true, 27, 27), ZELLIJ_REST_MS);
+        assert_eq!(frame_rest_ms(true, 1, 27), ZELLIJ_REST_MS / 27);
+        assert_eq!(frame_rest_ms(true, 0, 0), 0);
+    }
+
+    /// A damaged rectangle patches its own pixels, and one reported past the edge is clamped.
+    #[test]
+    fn a_dirty_rectangle_patches_only_itself() {
+        let fresh = vec![1u8; 4 * 4 * 4];
+        let mut held = vec![0u8; 4 * 4 * 4];
+        patch_rows(&mut held, &fresh, 4, 4, &CefRect { x: 2, y: 3, width: 99, height: 99 });
+        let changed = held.iter().filter(|byte| **byte == 1).count();
+        assert_eq!(changed, 2 * 4);
+        assert_eq!(held[(3 * 4 + 2) * 4], 1);
+        assert_eq!(held[(3 * 4 + 1) * 4], 0);
+    }
 
     fn args(rest: &[&str]) -> Vec<String> {
         std::iter::once("bru".to_string())

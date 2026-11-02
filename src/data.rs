@@ -253,6 +253,11 @@ impl Data {
         // the tail of the log to a hard kill. WAL survives it, and lets the completion read while
         // a visit is being written.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // **`NORMAL`, because the default fsyncs every commit and every commit is on the UI thread.**
+        // WAL at `NORMAL` loses nothing to a crash of bru, only the last few visits to a power cut,
+        // which a browsing history can afford. Measured 2026-11-02: about 1 ms per commit at the
+        // default, and 30 busy tabs took the whole browser from 60 fps to 4.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         create_schema(&conn)?;
 
