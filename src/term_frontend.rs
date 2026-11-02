@@ -110,6 +110,9 @@ struct TermState {
     /// How many bands the terminal is holding pixels for, so that a layout with fewer of them can
     /// take the surplus back.
     bands_drawn: usize,
+    /// Whether the pane is on screen as the one whole-pane image rather than as bands. Only ever
+    /// true under a host that pays per image; see [`present`].
+    whole_drawn: bool,
     /// The part of the pane whose pixels have changed since the last frame went out.
     ///
     /// **Not what `compose` reports.** The frame is wiped and rebuilt on every present — it has to
@@ -206,6 +209,7 @@ pub fn start(state: &crate::tabs::SharedState, url: &str) -> Result<(), String> 
         background: background_from_theme(),
         redraw_all: true,
         bands_drawn: 0,
+        whole_drawn: false,
         dirty: None,
     };
     if TERM.set(Mutex::new(term)).is_err() {
@@ -1042,44 +1046,92 @@ fn present(term: &mut TermState) {
     // and with a fixed id, so re-sending one says nothing about the others. A keystroke in the
     // command line changes the bottom row and costs that row — measured 2026-08-27, a full pane
     // costs zellij enough per frame to fall behind a typist, and a small pane does not.
-    let damaged = target;
+    let mut damaged = target;
     term.redraw_all = false;
     term.dirty = None;
     let width = term.frame.width();
     let stride = (width as usize) * 3;
     let cols = term.size.cols;
-    let bands = crate::term_compose::bands(term.layout.pane.height, term.size.cell_height as i32);
-    let mut sent = 0usize;
+    let pane_height = term.layout.pane.height;
+    let cell_height = term.size.cell_height as i32;
+    let bands = crate::term_compose::bands(pane_height, cell_height);
+    let touches = |band: &crate::term_compose::Band, rect: &Rect| {
+        band.height > 0 && band.y + band.height > rect.y && band.y < rect.y + rect.height
+    };
+    // **Under zellij a big change goes out as one picture and a small one as bands.** zellij pays per
+    // image: a scrolling page as 25 bands kept it at 3.9 frames a second even with a 250 ms rest
+    // after each, and blank without the rest; the same frame as one image is 15.6 a second with no
+    // rest and never blank. But a spinner as one band is 46 a second, against 16.6 as the whole
+    // pane. So the bands stay for what they are good at, and more than half the pane is one image.
+    // Measured 2026-11-02, zellij 0.46, a 2016x1225 pane.
+    let slow = host_redraws_slowly();
+    let whole = slow && bands.iter().filter(|band| touches(band, &damaged)).count() * 2 > bands.len();
     let mut jobs: Vec<BandJob> = Vec::new();
-    for (index, band) in bands.iter().enumerate() {
-        if band.height <= 0 || band.y + band.height <= damaged.y || band.y >= damaged.y + damaged.height
-        {
-            continue;
+    let mut forget: Vec<u32> = Vec::new();
+    let mut sent = 0usize;
+    let rest_ms = if whole {
+        let rows = crate::term_compose::whole_pane(pane_height, cell_height);
+        if let (Some(band), Ok(height)) = (rows.first(), u32::try_from(pane_height)) {
+            let end = (band.height as usize) * stride;
+            if let (Some(pixels), Ok(rows)) = (term.frame.rgb().get(..end), u16::try_from(band.rows)) {
+                jobs.push(BandJob {
+                    placement: Placement::new(crate::term_paint::image_id_whole(), 1, 1, rows, cols),
+                    height,
+                    rgb: pixels.to_vec(),
+                });
+                sent = 1;
+            }
         }
-        let (Ok(row), Ok(rows), Ok(id)) = (
-            u16::try_from(band.row + 1),
-            u16::try_from(band.rows),
-            u32::try_from(index).map(crate::term_paint::image_id_band),
-        ) else {
-            continue;
-        };
-        let (start, end) = ((band.y as usize) * stride, ((band.y + band.height) as usize) * stride);
-        let Some(pixels) = term.frame.rgb().get(start..end) else {
-            continue;
-        };
-        jobs.push(BandJob {
-            placement: Placement::new(id, row, 1, rows, cols),
-            height: band.height as u32,
-            rgb: pixels.to_vec(),
-        });
-        sent += 1;
-    }
-    // The bands that existed last time and do not now — the layout left fewer of them. Taken back
-    // here, inside the synchronised update, so nothing is ever seen missing.
-    let forget: Vec<u32> = (bands.len()..term.bands_drawn)
-        .filter_map(|index| u32::try_from(index).ok().map(crate::term_paint::image_id_band))
-        .collect();
-    term.bands_drawn = bands.len();
+        // Every band goes, after the picture that covers them — inside the synchronised update, so
+        // nothing is ever seen missing.
+        forget.extend(
+            (0..term.bands_drawn)
+                .filter_map(|index| u32::try_from(index).ok().map(crate::term_paint::image_id_band)),
+        );
+        term.bands_drawn = 0;
+        term.whole_drawn = true;
+        0
+    } else {
+        // Back from the whole picture: every band has to be on screen before it can be taken away.
+        if term.whole_drawn {
+            damaged = Rect { x: 0, y: 0, width, height: pane_height };
+            forget.push(crate::term_paint::image_id_whole());
+            term.whole_drawn = false;
+        }
+        // **Only the bands the damage touched.** The picture is one image per band, at a fixed
+        // place and with a fixed id, so re-sending one says nothing about the others. A keystroke
+        // in the command line changes the bottom row and costs that row.
+        for (index, band) in bands.iter().enumerate() {
+            if !touches(band, &damaged) {
+                continue;
+            }
+            let (Ok(row), Ok(rows), Ok(id)) = (
+                u16::try_from(band.row + 1),
+                u16::try_from(band.rows),
+                u32::try_from(index).map(crate::term_paint::image_id_band),
+            ) else {
+                continue;
+            };
+            let (start, end) =
+                ((band.y as usize) * stride, ((band.y + band.height) as usize) * stride);
+            let Some(pixels) = term.frame.rgb().get(start..end) else {
+                continue;
+            };
+            jobs.push(BandJob {
+                placement: Placement::new(id, row, 1, rows, cols),
+                height: band.height as u32,
+                rgb: pixels.to_vec(),
+            });
+            sent += 1;
+        }
+        // The bands that existed last time and do not now — the layout left fewer of them.
+        forget.extend(
+            (bands.len()..term.bands_drawn)
+                .filter_map(|index| u32::try_from(index).ok().map(crate::term_paint::image_id_band)),
+        );
+        term.bands_drawn = bands.len();
+        frame_rest_ms(slow, sent as u64, bands.len() as u64)
+    };
     let mut suffix: Vec<u8> = Vec::with_capacity(16);
     let _ = term.session.end_sync(&mut suffix);
     send_to_terminal(FrameJob {
@@ -1087,7 +1139,7 @@ fn present(term: &mut TermState) {
         prefix: out,
         suffix,
         width: width as u32,
-        bands_total: bands.len(),
+        rest_ms,
         bands: jobs,
         forget,
     });
@@ -1150,6 +1202,9 @@ fn host_redraws_slowly() -> bool {
 /// screen in 2, with 30 ms in 2, with 100 ms in 3, with 250 ms in 10. A whole pane appears to cost it
 /// about 300 ms, so this trades 10 frames a second nobody can see for about 5 they can. In proportion
 /// to the bands, so a spinner stays quick (29 frames a second, measured).
+///
+/// **Bands only.** Since a change over half the pane goes to zellij as one image ([`present`]), this
+/// rests after at most half a pane of bands; the one image needs no rest at all.
 fn frame_rest_ms(slow_host: bool, sent: u64, total: u64) -> u64 {
     if !slow_host || total == 0 {
         return 0;
@@ -1170,7 +1225,8 @@ struct FrameJob {
     prefix: Vec<u8>,
     suffix: Vec<u8>,
     width: u32,
-    bands_total: usize,
+    /// How long the writer waits after this frame before it takes the next.
+    rest_ms: u64,
     bands: Vec<BandJob>,
     forget: Vec<u32>,
 }
@@ -1215,9 +1271,8 @@ fn send_to_terminal(frame: FrameJob) {
             .name("bru-term-writer".to_string())
             .spawn(move || {
                 for frame in receiver {
-                    let (sent, total) = (frame.bands.len() as u64, frame.bands_total as u64);
+                    let rest = frame.rest_ms;
                     write_frame(frame);
-                    let rest = frame_rest_ms(host_redraws_slowly(), sent, total);
                     if rest > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(rest));
                     }

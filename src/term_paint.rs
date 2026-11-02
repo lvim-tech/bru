@@ -227,10 +227,12 @@ pub(crate) fn image_id_probe_file() -> u32 {
 /// How many frame files are cycled through.
 ///
 /// **Rewriting the path the terminal was just handed is a race**, and the loser is a frame drawn
-/// half from one picture and half from the next. Three is the same reasoning as [`RETAINED_FRAMES`]:
-/// enough that the terminal is never reading the file being written, few enough that the cost is
-/// three frames of tmpfs.
-const FRAME_SLOTS: u64 = 3;
+/// half from one picture and half from the next. Same reasoning as [`RETAINED_FRAMES`], but eight and
+/// not three: only a host that refuses shared memory gets files, and that host (zellij) reads them
+/// when it gets round to parsing the escape — a sixty-byte escape is in the pty buffer long before
+/// then, so several frames can be queued ahead of the read. terminal-browser cycles eight for the
+/// same host. The cost is eight frames of tmpfs, about 80 MB at a 2000x1300 pane.
+const FRAME_SLOTS: u64 = 8;
 
 /// Where frame files live: bru's own runtime directory, which is tmpfs, so a "file" here costs what
 /// shared memory costs. `None` when there is no `$XDG_RUNTIME_DIR` to put them in.
@@ -312,6 +314,12 @@ pub(crate) fn query_answer(bytes: &[u8], id: u32) -> Option<bool> {
 /// not replace each other.
 pub fn image_id_popup() -> u32 {
     image_id(1)
+}
+
+/// The image that holds the whole pane in one picture, for a host that pays per image. See
+/// `term_frontend::present`, which decides between this and the bands.
+pub fn image_id_whole() -> u32 {
+    image_id(4)
 }
 
 /// The first band's image id; the others follow it. See `term_compose::bands`.
@@ -546,6 +554,18 @@ fn common_keys(placement: &Placement, width: u32, height: u32, place: Place) -> 
         Place::Placeholders => "U=1",
         Place::AtCursor => "C=1",
     };
+    // **At the cursor the picture is drawn at its own size, never fitted to cells.** The pixels are
+    // already exactly the rectangle's, so `c` and `r` say nothing kitty needs — but zellij takes them
+    // as an order to rescale every frame on its own thread. Measured 2026-11-02, zellij 0.46, a
+    // 2016x1225 pane scrolling: 3.9 frames a second with them and a 250 ms rest, 15.6 without them
+    // and with no rest, every screenshot showing the page. terminal-browser sends no `c`/`r` either.
+    // Placeholders keep them: there the cells are the geometry and the image has to fill them.
+    if place == Place::AtCursor {
+        return format!(
+            "a=T,{mode},q=2,i={},p={},f=24,s={width},v={height}",
+            placement.image_id, placement.placement_id
+        );
+    }
     format!(
         "a=T,{mode},q=2,i={},p={},f=24,s={width},v={height},c={},r={}",
         placement.image_id, placement.placement_id, placement.cols, placement.rows
@@ -1491,7 +1511,7 @@ mod tests {
         assert_eq!(
             escape,
             format!(
-                "\x1b_Ga=T,C=1,q=2,i=190,p=1,f=24,s=990,v=1350,c=100,r=40,t=s;{}\x1b\\",
+                "\x1b_Ga=T,C=1,q=2,i=190,p=1,f=24,s=990,v=1350,t=s;{}\x1b\\",
                 base64(b"/bru-7-1")
             )
         );

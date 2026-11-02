@@ -778,6 +778,15 @@ pub fn bands(pane_height: i32, cell_height: i32) -> Vec<Band> {
     bands
 }
 
+/// The whole pane as a single band.
+pub fn whole_pane(pane_height: i32, cell_height: i32) -> Vec<Band> {
+    if pane_height <= 0 {
+        return Vec::new();
+    }
+    let rows = if cell_height > 0 { (pane_height + cell_height - 1) / cell_height } else { 1 };
+    vec![Band { row: 0, rows, y: 0, height: pane_height }]
+}
+
 pub fn compose(frame: &mut Frame, layers: &[Layer<'_>]) -> Option<Rect> {
     let mut damage: Option<Rect> = None;
     for layer in layers {
